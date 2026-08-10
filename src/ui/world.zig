@@ -109,6 +109,9 @@ pub const World = struct {
     py: []f32,
     /// Per cell: accumulated parent openness, so a subtree fades as one.
     mul: []f32,
+    /// Per cell: the *topological* decision for this frame — recomputed from scratch every step
+    /// and never read by the decision that produces it. `anim` chases this.
+    open: []bool,
 
     marks: std.ArrayListUnmanaged(Mark) = .empty,
     links: std.ArrayListUnmanaged(LiftedLink) = .empty,
@@ -139,12 +142,14 @@ pub const World = struct {
             .py = try gpa.alloc(f32, n_cells),
             .mul = try gpa.alloc(f32, n_cells),
             .owner = try gpa.alloc(u32, @max(1, n_notes)),
+            .open = try gpa.alloc(bool, n_cells),
         };
         @memset(w.anim, 0);
         @memset(w.px, 0);
         @memset(w.py, 0);
         @memset(w.mul, 1);
         @memset(w.owner, fold.invalid);
+        @memset(w.open, false);
         w.field = try containment.init(gpa, n_cells, fold_opts.arity, place_opts);
         return w;
     }
@@ -157,6 +162,7 @@ pub const World = struct {
         self.gpa.free(self.py);
         self.gpa.free(self.mul);
         self.gpa.free(self.owner);
+        self.gpa.free(self.open);
         self.field.deinit(self.gpa);
         self.lad.deinit(self.gpa);
         self.* = undefined;
@@ -168,169 +174,209 @@ pub const World = struct {
         return self.field.radius(&self.lad, self.lad.root);
     }
 
-    /// Rebuild the living set for this view. `dt` in seconds drives the crossfades only — the
-    /// *set* of open cells depends on (view, budget) alone.
+    /// Rebuild the living set for this view.
+    ///
+    /// Two passes, deliberately. Topology first, as a **pure function of (tree, view, zoom,
+    /// budget)** with no reference to animation state; then presentation, which only interpolates
+    /// toward what the first pass decided.
+    ///
+    /// Collapsing these into one pass is the mistake that broke this on first contact: the budget
+    /// was counted over *emitted marks*, and a mark is only emitted while it is still fading, so
+    /// the count moved as animations progressed. That fed back into the open/closed cutoff, so
+    /// cells vanished instead of splitting, appeared from nowhere, and — because link ownership
+    /// keyed off the same fading state — edges popped in and out. A function that reads its own
+    /// output cannot be stable. Keeping the passes apart is what makes "parked camera ⇒ nothing
+    /// changes" true by construction rather than by luck.
     pub fn step(self: *World, view: View, p: Params, dt: f32) !void {
         self.marks.clearRetainingCapacity();
         self.links.clearRetainingCapacity();
         @memset(self.owner, fold.invalid);
+        @memset(self.open, false);
         self.bound = false;
         if (self.lad.root == fold.invalid) return;
 
-        const rate = @min(1.0, dt * p.rate);
-        const root = self.lad.root;
-        self.px[root] = self.field.pos[root].x;
-        self.py[root] = self.field.pos[root].y;
-        self.mul[root] = 1;
+        try self.decideTopology(view, p);
+        try self.present(view, p, dt);
+    }
 
+    /// Pass 1 — which cells are open. Reads only the ladder, the view, and the budget.
+    fn decideTopology(self: *World, view: View, p: Params) !void {
         var frontier: std.ArrayListUnmanaged(u32) = .empty;
         defer frontier.deinit(self.gpa);
         var next: std.ArrayListUnmanaged(u32) = .empty;
         defer next.deinit(self.gpa);
         var vis: std.ArrayListUnmanaged(u32) = .empty;
         defer vis.deinit(self.gpa);
-        try frontier.append(self.gpa, root);
+        try frontier.append(self.gpa, self.lad.root);
 
+        // Cells already settled as closed at shallower levels. This is the budget's running
+        // total, and it is topological — nothing here depends on a crossfade.
+        var closed: usize = 0;
         var guard: u32 = 0;
+
         while (frontier.items.len > 0 and guard < 64) : (guard += 1) {
-            // -- rule 1: cull before anything else --
+            // -- rule 1: cull first. Children live inside their parent's disc, so an off-screen
+            // cell's whole subtree is off-screen and this test is exact.
             vis.clearRetainingCapacity();
             for (frontier.items) |id| {
-                const sr = self.field.radius(&self.lad, id) * view.zoom;
-                const sx = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom;
-                const sy = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom;
-                const m = sr + p.cull_pad_px;
-                if (sx < -m or sx > view.w + m or sy < -m or sy > view.h + m) {
+                if (self.onScreen(id, view, p)) {
+                    try vis.append(self.gpa, id);
+                } else {
                     // still claim the range so a link leaving the viewport keeps a target
                     const c = self.lad.cells[id];
                     for (c.ls..c.le) |s| {
                         if (self.owner[s] == fold.invalid) self.owner[s] = id;
                     }
-                    self.anim[id] = 0;
-                    continue;
                 }
-                try vis.append(self.gpa, id);
             }
             if (vis.items.len == 0) break;
 
-            // -- rule 2: decide the level by a *count threshold*, never by visit order --
-            //
-            // Opening a whole level or none of it wastes most of the budget: level sizes go
-            // 1, arity, arity², … so a 280 budget at arity 7 can only ever take 49, never 343.
-            // The gauntlet showed 57 marks drawn against a budget of 280.
-            //
-            // Ranking cells and opening until the budget runs out recovers the budget but brings
-            // back the artifact organic-lod.md rejected — identical neighbours resolved
-            // differently depending on visit order. Thresholding on *count* avoids both: cells
-            // with equal count always make the same decision, so no seam can appear between two
-            // cells that look alike, and the rule is a pure function of the cell, not the walk.
-            var want_open: usize = 0;
+            // -- rule 2: a count threshold, never visit order (see the module header) --
             var extra: usize = 0;
+            var want_open: usize = 0;
             for (vis.items) |id| {
-                const c = self.lad.cells[id];
-                if (c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px) {
-                    extra += c.child_count - 1;
+                if (self.wantsSplit(id, view, p)) {
+                    extra += self.lad.cells[id].child_count - 1;
                     want_open += 1;
                 }
             }
 
-            // 0 means "no threshold, open everything that wants to".
             var cutoff: u32 = 0;
-            if (self.marks.items.len + vis.items.len + extra > p.budget and want_open > 0) {
+            if (closed + vis.items.len + extra > p.budget and want_open > 0) {
                 self.bound = true;
-                const counts = try self.gpa.alloc(u32, want_open);
-                defer self.gpa.free(counts);
-                var ci: usize = 0;
-                for (vis.items) |id| {
-                    const c = self.lad.cells[id];
-                    if (c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px) {
-                        counts[ci] = c.count;
-                        ci += 1;
-                    }
-                }
-                std.mem.sort(u32, counts, {}, comptime std.sort.desc(u32));
-                // Walk the distinct counts largest-first, spending budget a whole count-class at
-                // a time. The first class that does not fit becomes the cutoff: it and every
-                // smaller class stay closed, so cells of equal count never disagree.
-                var spent = self.marks.items.len + vis.items.len;
-                var prev: u32 = std.math.maxInt(u32);
-                for (counts) |cnt| {
-                    if (cnt == prev) continue; // same class, already paid for
-                    prev = cnt;
-                    var class_cost: usize = 0;
-                    for (vis.items) |id| {
-                        const c = self.lad.cells[id];
-                        if (c.count == cnt and c.child_count > 0 and
-                            self.field.radius(&self.lad, id) * view.zoom > p.split_px)
-                        {
-                            class_cost += c.child_count - 1;
-                        }
-                    }
-                    if (spent + class_cost > p.budget) {
-                        cutoff = cnt;
-                        break;
-                    }
-                    spent += class_cost;
-                }
+                cutoff = try self.countCutoff(vis.items, view, p, closed, want_open);
             }
 
             next.clearRetainingCapacity();
             for (vis.items) |id| {
                 const c = self.lad.cells[id];
-                const sr = self.field.radius(&self.lad, id) * view.zoom;
-
-                // -- rule 3: the wall refuses new opens only --
-                const already_open = self.anim[id] > 0.5;
-                const want = (c.count > cutoff or already_open) and
-                    c.child_count > 0 and sr > p.split_px;
-
-                self.anim[id] += ((if (want) @as(f32, 1) else 0) - self.anim[id]) * rate;
-                if (self.anim[id] < 0.004) self.anim[id] = 0;
-                if (self.anim[id] > 0.996) self.anim[id] = 1;
-
-                // the cut: this cell owns its whole note range for link lifting
-                if (self.anim[id] < 0.5) {
+                const will_open = self.wantsSplit(id, view, p) and c.count > cutoff;
+                self.open[id] = will_open;
+                if (!will_open) {
+                    closed += 1;
+                    // the cut: this cell owns its whole note range for link lifting
                     for (c.ls..c.le) |s| self.owner[s] = id;
+                    continue;
                 }
-
-                if (self.anim[id] < 1) {
-                    const alpha = self.mul[id] * (1 - self.anim[id]);
-                    if (alpha > 0.02) {
-                        const is_note = c.child_count == 0;
-                        // -- rules 4 & 5 --
-                        const r: f32 = if (is_note)
-                            p.note_r_px
-                        else
-                            @max(1.0, p.mass_cap_px * (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
-                        try self.marks.append(self.gpa, .{
-                            .cell = id,
-                            .wx = self.px[id],
-                            .wy = self.py[id],
-                            .x = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom,
-                            .y = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom,
-                            .r = r,
-                            .alpha = alpha,
-                            .is_note = is_note,
-                            .note = c.note,
-                        });
-                    }
-                }
-
-                // keep walking while a closing cell is still fading, so zoom-out crossfades
-                if (c.child_count > 0 and self.anim[id] > 0) {
-                    self.field.ensureChildren(&self.lad, id); // lazy placement pays off here
-                    for (self.lad.childrenOf(id)) |k| {
-                        const own = self.field.pos[k];
-                        self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
-                        self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
-                        self.mul[k] = self.mul[id] * self.anim[id];
-                        try next.append(self.gpa, k);
-                    }
-                }
+                for (self.lad.childrenOf(id)) |k| try next.append(self.gpa, k);
             }
             std.mem.swap(std.ArrayListUnmanaged(u32), &frontier, &next);
         }
     }
+
+    fn onScreen(self: *const World, id: u32, view: View, p: Params) bool {
+        const sr = self.field.radius(&self.lad, id) * view.zoom;
+        const sx = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom;
+        const sy = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom;
+        const m = sr + p.cull_pad_px;
+        return sx >= -m and sx <= view.w + m and sy >= -m and sy <= view.h + m;
+    }
+
+    fn wantsSplit(self: *const World, id: u32, view: View, p: Params) bool {
+        const c = self.lad.cells[id];
+        return c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px;
+    }
+
+    /// Largest count class that does not fit. That class and every smaller one stay closed, so
+    /// cells of equal count never disagree and no order-dependent seam can appear.
+    fn countCutoff(
+        self: *World,
+        vis: []const u32,
+        view: View,
+        p: Params,
+        closed: usize,
+        want_open: usize,
+    ) !u32 {
+        const counts = try self.gpa.alloc(u32, want_open);
+        defer self.gpa.free(counts);
+        var ci: usize = 0;
+        for (vis) |id| {
+            if (self.wantsSplit(id, view, p)) {
+                counts[ci] = self.lad.cells[id].count;
+                ci += 1;
+            }
+        }
+        std.mem.sort(u32, counts, {}, comptime std.sort.desc(u32));
+
+        var spent = closed + vis.len;
+        var prev: u32 = std.math.maxInt(u32);
+        for (counts) |cnt| {
+            if (cnt == prev) continue; // same class, already paid for
+            prev = cnt;
+            var class_cost: usize = 0;
+            for (vis) |id| {
+                const c = self.lad.cells[id];
+                if (c.count == cnt and self.wantsSplit(id, view, p)) class_cost += c.child_count - 1;
+            }
+            if (spent + class_cost > p.budget) return cnt;
+            spent += class_cost;
+        }
+        return 0;
+    }
+
+    /// Pass 2 — how the decided set looks right now. Chases `anim` toward `open`, lerps poses, and
+    /// emits marks. Keeps walking into a *closing* cell's children so a merge crossfades instead
+    /// of popping, but never lets any of that feed back into the decision above.
+    fn present(self: *World, view: View, p: Params, dt: f32) !void {
+        const rate = @min(1.0, dt * p.rate);
+        const root = self.lad.root;
+        self.px[root] = self.field.pos[root].x;
+        self.py[root] = self.field.pos[root].y;
+        self.mul[root] = 1;
+
+        var stack: std.ArrayListUnmanaged(u32) = .empty;
+        defer stack.deinit(self.gpa);
+        try stack.append(self.gpa, root);
+
+        var guard: u32 = 0;
+        while (stack.pop()) |id| {
+            guard += 1;
+            if (guard > 200_000) break;
+            const c = self.lad.cells[id];
+
+            const target: f32 = if (self.open[id]) 1 else 0;
+            self.anim[id] += (target - self.anim[id]) * rate;
+            if (self.anim[id] < 0.004) self.anim[id] = 0;
+            if (self.anim[id] > 0.996) self.anim[id] = 1;
+
+            if (self.anim[id] < 1) {
+                const alpha = self.mul[id] * (1 - self.anim[id]);
+                if (alpha > 0.02 and self.onScreen(id, view, p)) {
+                    const sr = self.field.radius(&self.lad, id) * view.zoom;
+                    const is_note = c.child_count == 0;
+                    // -- rules 4 & 5: a note is a fixed screen size; a mass is count-scaled and
+                    // soft-capped so one the budget refused cannot inflate to fill the screen --
+                    const r: f32 = if (is_note)
+                        p.note_r_px
+                    else
+                        @max(1.0, p.mass_cap_px * (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
+                    try self.marks.append(self.gpa, .{
+                        .cell = id,
+                        .wx = self.px[id],
+                        .wy = self.py[id],
+                        .x = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom,
+                        .y = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom,
+                        .r = r,
+                        .alpha = alpha,
+                        .is_note = is_note,
+                        .note = c.note,
+                    });
+                }
+            }
+
+            if (c.child_count > 0 and self.anim[id] > 0) {
+                self.field.ensureChildren(&self.lad, id); // lazy placement pays off here
+                for (self.lad.childrenOf(id)) |k| {
+                    const own = self.field.pos[k];
+                    self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
+                    self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
+                    self.mul[k] = self.mul[id] * self.anim[id];
+                    try stack.append(self.gpa, k);
+                }
+            }
+        }
+    }
+
 
     /// Lift note-level links onto the living set. Call after `step`. Duplicates between the same
     /// pair of cells are merged, so a coarse cell pair draws one line, not thousands.
@@ -501,6 +547,60 @@ test "links lift onto living cells" {
             if (m.cell == l.b) found_b = true;
         }
         try testing.expect(found_a and found_b);
+    }
+}
+
+test "topology does not depend on animation state" {
+    // The contract: given (tree, view, zoom, budget) the open set is determined; motion only
+    // interpolates. Breaking it is what made cells vanish instead of splitting and made edges pop
+    // — the budget was counted over marks, which only exist while fading, so the decision read its
+    // own output. Here: a fully-settled field and a field mid-crossfade must agree exactly.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 3000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 3000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 12, .cx = 0, .cy = 0 };
+    const p: Params = .{ .budget = 140 };
+    try settle(&w, view, p, 300);
+    const settled = try gpa.dupe(bool, w.open);
+    defer gpa.free(settled);
+
+    // slam every crossfade to a half-open state and step once more
+    @memset(w.anim, 0.5);
+    try w.step(view, p, 1.0 / 60.0);
+    try testing.expectEqualSlices(bool, settled, w.open);
+
+    // and from cold, with a single huge dt
+    @memset(w.anim, 0);
+    try w.step(view, p, 10.0);
+    try testing.expectEqualSlices(bool, settled, w.open);
+}
+
+test "the lifted link set is stable at a parked camera" {
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 10, .cx = 0, .cy = 0 };
+    const p: Params = .{};
+    try settle(&w, view, p, 300);
+    try w.liftLinks(links, p);
+    const first = try gpa.dupe(LiftedLink, w.links.items);
+    defer gpa.free(first);
+    try testing.expect(first.len > 0);
+
+    for (0..30) |_| {
+        try w.step(view, p, 1.0 / 60.0);
+        try w.liftLinks(links, p);
+        try testing.expectEqual(first.len, w.links.items.len);
+        for (first, w.links.items) |a, b| {
+            try testing.expectEqual(a.a, b.a);
+            try testing.expectEqual(a.b, b.b);
+        }
     }
 }
 
