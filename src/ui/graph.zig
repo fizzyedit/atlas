@@ -36,12 +36,17 @@ const interior = @import("interior.zig");
 const labels = @import("labels.zig");
 const layout_full = @import("layout_full.zig");
 const multilevel = @import("multilevel.zig");
-const lod = @import("lod.zig");
-const quadlod = @import("quadlod.zig");
-const quad_agents = @import("quad_agents.zig");
-const impostor = @import("impostor.zig");
 const galaxy = @import("galaxy.zig");
 const world_mod = @import("world.zig");
+
+/// A note the frame resolved as an individual, published by `stepWorld` and consumed by the label
+/// placer, the proximity field and hit-testing. `level` is vestigial — everything drawn as itself
+/// is level 0 now — but the passes that read it are shared with the interior, so it stays.
+const Visible = struct {
+    level: u32,
+    index: u32,
+    alpha: f32,
+};
 const fold = @import("fold.zig");
 const proximity = @import("proximity.zig");
 const resolve = @import("../index/resolve.zig");
@@ -465,9 +470,7 @@ const LayoutJob = struct {
     /// borrowing an arena, because it is the largest piece of per-rebuild work left: it walks
     /// every note once per level and coalesces the whole link set the same way. That is fine in
     /// the background and a visible stall on the frame that applies the rebuild.
-    pyramid: ?lod.Pyramid = null,
     /// Quadtree built on the worker for precomputed (synth) jobs so the UI thread only adopts.
-    quad_tree: ?quadlod.Tree = null,
 
     fn run(job: *LayoutJob) void {
         job.solve() catch |e| {
@@ -480,13 +483,6 @@ const LayoutJob = struct {
         if (job.precomputed) |pos| {
             if (pos.len != job.n) return error.SynthPosLen;
             @memcpy(job.targets, pos);
-            // Galaxy path needs the component-first quadtree; skip force layout + old pyramid
-            // (both cliff at 100k–1M). Build the tree here so apply stays a swap.
-            const qedges = try sdk.allocator().alloc(quadlod.Edge, job.layout_edges.len);
-            defer sdk.allocator().free(qedges);
-            for (job.layout_edges, qedges) |e, *qe| qe.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-            job.quad_tree = try quadlod.buildEx(sdk.allocator(), job.targets, qedges);
-            job.pyramid = null;
             return;
         }
 
@@ -514,20 +510,12 @@ const LayoutJob = struct {
         // From the *final* positions: packing and snapping move notes after the ladder exists,
         // and a marker has to sit where its notes actually ended up.
         //
-        // Built unconditionally — the pyramid takes its own copy of everything it needs, and it
-        // continues past the ladder by position when link structure runs out, so a vault full of
-        // orphans (whose ladder is one level) still gets level-of-detail.
-        const ce = try job.arena.allocator().alloc(lod.CEdge, job.edges.len);
-        for (job.edges, ce) |e, *c| c.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-        job.pyramid = try lod.build(sdk.allocator(), job.ladder, job.targets, ce);
     }
 
     fn deinit(job: *LayoutJob, gpa: std.mem.Allocator) void {
         if (job.thread) |t| t.join();
         // Only reached if nobody took it — an abandoned solve, or one that failed after this
         // point. `finishRebuild` clears the field when it adopts it.
-        if (job.pyramid) |*py| py.deinit();
-        if (job.quad_tree) |*t| t.deinit();
         job.arena.deinit();
         gpa.destroy(job);
     }
@@ -554,9 +542,7 @@ const Panel = struct {
     job: ?*LayoutJob = null,
     /// Level-of-detail hierarchy for the current arrangement, or null for a vault too small to
     /// have been solved multilevel. Allocated from `arena`, so it dies with the arrangement.
-    pyramid: ?lod.Pyramid = null,
     /// Point-region quadtree for organic overview masses (`quad_agents`).
-    quad_tree: ?quadlod.Tree = null,
     gen: u64 = std.math.maxInt(u64),
     open_hash: u64 = std.math.maxInt(u64),
     nodes: []GraphNode = &.{},
@@ -630,7 +616,7 @@ const Panel = struct {
     /// rather than per cluster: only one region is ever under the cursor, and the hierarchy is
     /// rebuilt often enough that per-cluster state would not survive to be worth keeping.
     hover_cluster_t: f32 = 0,
-    hover_cluster_prev: ?lod.Visible = null,
+    hover_cluster_prev: ?Visible = null,
     /// Bumped by every completed layout solve. The identity of the *arrangement*, as opposed to
     /// `gen`, which is the identity of the index behind it — the two come apart whenever a
     /// reshape re-solves the same notes into new positions.
@@ -638,7 +624,6 @@ const Panel = struct {
     /// Offscreen texture holding the baked note field, tile by tile — see `impostor.zig`. Not in
     /// the panel arena: it outlives an arrangement deliberately, so the texture is created once
     /// rather than per rebuild, and it holds a GPU resource that has to be released by hand.
-    atlas: impostor.Atlas = .{},
     /// Which drawing scales the field is shown at this frame, and how much each shows. Computed
     /// once by `updateSelection` before anything reads it, so the tiles, the notes drawn directly,
     /// the hierarchy and the web cannot disagree about the scale in force.
@@ -657,7 +642,7 @@ const Panel = struct {
     /// Cluster marker under the cursor, when the cursor is over a merged region rather than an
     /// individual note. Mutually exclusive with `hover_node` — only one of the two is drawn at
     /// any given place on screen.
-    hover_cluster: ?lod.Visible = null,
+    hover_cluster: ?Visible = null,
     /// The single level of detail the whole overview is drawn at this frame, as a fraction — see
     /// `lod.Pyramid.levelFor`. Set by `updateSelection` before anything reads it, and shared by
     /// the selection, the web, and the agent field so none of them can disagree about which
@@ -665,7 +650,6 @@ const Panel = struct {
     lod_level: f32 = 0,
     /// Keep-alive coalesced masses for the overview — see `quad_agents.zig`. Owns mid/far
     /// continuity; impostor tiles step aside while this is active.
-    agent_field: quad_agents.Field = undefined,
     /// Soft-sprite atlas + same-language density mips (Galaxy LOD).
     density: ?galaxy.Density = null,
 
@@ -684,7 +668,7 @@ const Panel = struct {
     /// What the overview draws this frame: notes where they have separated enough to be told
     /// apart, cluster markers where they have not. Rebuilt every frame by `updateSelection`,
     /// and kept on the panel rather than the frame arena so its capacity survives.
-    visible: std.ArrayList(lod.Visible) = .empty,
+    visible: std.ArrayList(Visible) = .empty,
     /// Per node, whether it is being drawn as itself this frame. Read by the edge pass, which
     /// has no business drawing a link to a note that has been merged into a marker. Lives in the
     /// panel arena, so it is sized with the arrangement.
@@ -697,9 +681,6 @@ const Panel = struct {
     selection_full: bool = false,
     /// Scratch copy of the current node positions, for handing to the hierarchy. Panel arena.
     live_pos: []dvui.Point = &.{},
-    /// The web to draw this frame: world-space endpoints, already resolved through the
-    /// hierarchy, coalesced, and culled to what crosses the view.
-    vis_edges: std.ArrayList(lod.Link) = .empty,
     /// Overview notes with a non-zero `pointer_t`. See `chasePointer`.
     pointer_warm: std.ArrayList(u32) = .empty,
     /// Overview notes with a non-zero `hover_t`. Same idea as `pointer_warm`: the proximity
@@ -737,15 +718,11 @@ const Panel = struct {
         return .{
             .arena = std.heap.ArenaAllocator.init(gpa),
             .interior = .{ .arena = std.heap.ArenaAllocator.init(gpa) },
-            .agent_field = quad_agents.Field.init(gpa),
         };
     }
 
     fn deinit(self: *Panel) void {
-        self.atlas.deinit(sdk.allocator());
         if (self.density) |*d| d.deinit();
-        self.agent_field.deinit();
-        if (self.quad_tree) |*t| t.deinit();
         self.visible.deinit(sdk.allocator());
         self.vis_edges.deinit(sdk.allocator());
         self.pointer_warm.deinit(sdk.allocator());
@@ -792,6 +769,60 @@ pub fn shutdown() void {
         p.world_state = null;
     }
 }
+
+/// Temporary on-screen readout of everything the reshape depends on.
+///
+/// Here because the panel's reshaping has been reported broken repeatedly while the layout it
+/// calls demonstrably reshapes correctly in isolation — so the fault is somewhere in what the
+/// panel *measures*, and that is precisely the part no test can see. Guessing at it blind has
+/// already cost several rounds; one look at the real numbers settles it.
+///
+/// `span` is the cloud's own width-over-height. If `aspect` tracks the pane while `span` does not
+/// follow it, the layout is being asked wrongly; if `aspect` itself does not track the pane, the
+/// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
+/// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
+/// text HUD and scanning every node for span every frame is pure overhead on the hot path.
+const debug_hud = false;
+/// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
+///
+/// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
+/// dominates changes completely with zoom — at overview it is whichever pass is not culled, mid
+/// zoom it is the web, close in it is labels. Guessing between them has already been wrong more
+/// than once, so each is timed separately and the counts of what actually reached the batch are
+/// reported alongside, since a pass being slow and a pass being *large* want different fixes.
+const FrameProfile = struct {
+    rebuild_ns: u64 = 0,
+    bubbles_ns: u64 = 0,
+    hover_ns: u64 = 0,
+    labels_ns: u64 = 0,
+    edge_anim_ns: u64 = 0,
+    draw_edges_ns: u64 = 0,
+    draw_nodes_ns: u64 = 0,
+    draw_clusters_ns: u64 = 0,
+    draw_labels_ns: u64 = 0,
+
+    /// Submitted to a batch, i.e. survived culling — not the size of the arrays walked.
+    edges_drawn: u32 = 0,
+    nodes_drawn: u32 = 0,
+    nodes_pathed: u32 = 0,
+    clusters_drawn: u32 = 0,
+    /// Tile quads submitted this frame, and how many of them were rendered into the atlas rather
+    /// than read from it. Baking should fall to zero within a frame or two of any camera move —
+    /// a picture outlives every pan and zoom — so a HUD showing it constantly non-zero means
+    /// something is invalidating the atlas every frame.
+    tiles_drawn: u32 = 0,
+    tiles_baked: u32 = 0,
+    /// Tiles with no picture yet, drawn straight to the screen this frame. Should fall to zero
+    /// within a frame or two of any camera move that reveals new ground.
+    tiles_direct: u32 = 0,
+
+    fn total(self: FrameProfile) u64 {
+        return self.rebuild_ns + self.bubbles_ns + self.hover_ns + self.labels_ns +
+            self.edge_anim_ns + self.draw_edges_ns + self.draw_nodes_ns +
+            self.draw_clusters_ns + self.draw_labels_ns;
+    }
+};
+var frame_profile: FrameProfile = .{};
 
 pub fn draw(_: ?*anyopaque) anyerror!void {
     drawn_recently = true;
@@ -843,10 +874,6 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     applyTrackpadPinch(p, vp);
     stepFling(p);
     animateCamera(p);
-    // After the camera has finished moving for this frame and before anything asks what is on
-    // screen: every pass below works from the selection rather than deciding detail for itself.
-    updateSelection(p);
-
     // *After* updateSelection, which clears `p.visible` and refills it from the classic LOD —
     // whose `Visible.index` is a cluster index at any level above 0, not a note index. Handing
     // that to the label placer put names at positions belonging to no node at all, and left none
@@ -858,9 +885,6 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     frame_profile.bubbles_ns = profLap(&prof);
     followParent(p);
     updateHover(p);
-    // After the hover shove has moved `pos` — a link is drawn between where its ends actually
-    // are, and gathering a frame earlier would leave the web trailing the discs by a frame.
-    updateVisibleEdges(p);
     frame_profile.hover_ns = profLap(&prof);
     // After `updateHover` — placement priority is led by which node is under the cursor.
     // Whichever level the reader is mostly looking at owns the names; see `updateLabels`.
@@ -897,10 +921,6 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         p.labels_vp = p.camera.viewport;
     }
     frame_profile.labels_ns = profLap(&prof);
-    // Pure mass overview: lifted agent edges only. Once leaf notes are on screen, resume
-    // per-note edge anim (open-star / connect). `agents_active` stays true for all Galaxy
-    // zooms — do not key off that alone.
-    if (p.notes_at_level0 > 0 or !p.agents_active) stepEdgeAnim(p);
     frame_profile.edge_anim_ns = profLap(&prof);
 
     {
@@ -925,11 +945,9 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         frame_profile.draw_nodes_ns = 0;
         frame_profile.draw_clusters_ns = 0;
         if (p.interior.nodes.len > 0) {
-            drawEdges(p, p.interior.nodes, p.interior.edges, t, false);
-            frame_profile.draw_edges_ns += profLap(&prof);
-            // Index 0 is the document sun — dashed outline so the exit reads differently from
-            // ordinary section bubbles.
-            drawNodes(p, p.interior.nodes, p.interior.slot, t, .{ .dashed_sun = true });
+            // No links inside a note: the headings *are* the document's structure, so they orbit
+            // the sun rather than being wired to it. Same soft-sprite language as the overview.
+            drawInteriorMarks(p, t);
             frame_profile.draw_nodes_ns += profLap(&prof);
         }
         // Labels last, as their own pass: a name must never end up under a bubble drawn
@@ -937,8 +955,6 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         drawLabels(p);
         frame_profile.draw_labels_ns = profLap(&prof);
         if (debug_hud) drawDebugHud(p);
-        // Last, over everything: the web has to pass *under* the shadow, not beside it.
-        drawEdgeShadows(vp);
     }
     if (st.synthBusy() and p.nodes.len > 0) drawSynthRegenCue();
     // Before `handleInput` so the button consumes its own press rather than the graph
@@ -1058,7 +1074,7 @@ fn applyProximity(
     slot: f32,
     cloud_radius: f32,
     t_hover: f32,
-    selection: ?[]const lod.Visible,
+    selection: ?[]const Visible,
 ) bool {
     if (nodes.len == 0) return false;
 
@@ -1413,94 +1429,6 @@ fn syncLivePosLeafAware(p: *Panel, leaves_on_screen: bool) []const dvui.Point {
     return p.live_pos;
 }
 
-fn edgeKeyFor(p: *const Panel, e: GraphEdge) EdgeKey {
-    const a = p.nodes[e.a].note_id;
-    const b = p.nodes[e.b].note_id;
-    // Sorted, so the key is direction-free: a link that flips which note declares it is
-    // still the same link and must not re-animate.
-    return if (a <= b) .{ .a = a, .b = b } else .{ .a = b, .b = a };
-}
-
-/// Reconcile `edge_anim` with the freshly rebuilt `edges`. New links start at 0 and grow;
-/// links that disappeared are left in the map with `alive = false` so they can retract.
-///
-/// `snap` is set on the very first build — the initial population of the panel is not a
-/// series of "connect" events and shouldn't play as one.
-fn syncEdgeAnim(p: *Panel, snap: bool) void {
-    const gpa = sdk.allocator();
-    var it = p.edge_anim.valueIterator();
-    while (it.next()) |v| v.alive = false;
-
-    for (p.edges) |e| {
-        const gop = p.edge_anim.getOrPut(gpa, edgeKeyFor(p, e)) catch continue;
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{
-                .t = if (snap) 1 else 0,
-                .from = p.nodes[e.a].pos,
-                .to = p.nodes[e.b].pos,
-            };
-        }
-        gop.value_ptr.alive = true;
-    }
-}
-
-/// Advance link extension/retraction and refresh the cached endpoints of live links.
-fn stepEdgeAnim(p: *Panel) void {
-    const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
-    const step = dt / edge_grow_s;
-    var unsettled = false;
-
-    const lit_step = dt / edge_lit_s;
-    for (p.edges) |e| {
-        const a = p.edge_anim.getPtr(edgeKeyFor(p, e)) orelse continue;
-        // Cached while alive so a later retraction has endpoints even if a note is gone.
-        a.from = p.nodes[e.a].pos;
-        a.to = p.nodes[e.b].pos;
-        if (a.t < 1) {
-            a.t = @min(1, a.t + step);
-            unsettled = true;
-        }
-
-        // Lit is chased toward "is either end open" rather than fired by an event: opening a
-        // note sweeps its links out, closing it draws them back, and switching notes does both
-        // at once, all from one boolean the open set already maintains.
-        const open_a = p.nodes[e.a].open;
-        const open_b = p.nodes[e.b].open;
-        const want: f32 = if (open_a or open_b) 1 else 0;
-        if (want > 0 and a.lit <= 0.002) a.lit_from_a = open_a;
-        if (a.lit != want) {
-            a.lit = if (want > a.lit) @min(want, a.lit + lit_step) else @max(want, a.lit - lit_step);
-            unsettled = true;
-        }
-    }
-
-    // Retract the dead ones. Removing inside the iteration would invalidate it, so collect
-    // finished keys first; anything past the buffer simply lands next frame.
-    var done: [64]EdgeKey = undefined;
-    var n_done: usize = 0;
-    var it = p.edge_anim.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.alive) continue;
-        kv.value_ptr.t -= step;
-        if (kv.value_ptr.t <= 0) {
-            if (n_done < done.len) {
-                done[n_done] = kv.key_ptr.*;
-                n_done += 1;
-            }
-        } else {
-            unsettled = true;
-        }
-    }
-    for (done[0..n_done]) |k| _ = p.edge_anim.remove(k);
-    if (n_done > 0) unsettled = true;
-
-    p.edges_settled = !unsettled;
-    if (unsettled) dvui.refresh(null, @src(), dvui.parentGet().data().id);
-}
-
-/// Drain the macOS/web trackpad pinch accumulator (same source CanvasWidget uses). Without
-/// this, pinch gestures fall through as scroll events and pan while the user expects zoom —
-/// the classic "zoom fights pan / view slides sideways" feel.
 fn applyTrackpadPinch(p: *Panel, vp: dvui.Rect.Physical) void {
     const ratio = core.takeTrackpadPinchRatio();
     if (ratio == 1.0) return;
@@ -1735,15 +1663,9 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         p.live_pos = &.{};
         p.pointer_warm.clearRetainingCapacity();
         p.hover_warm.clearRetainingCapacity();
-        p.vis_edges.clearRetainingCapacity();
         p.visible.clearRetainingCapacity();
         p.sel_zoom = 0;
         p.web_zoom = 0;
-        if (p.pyramid) |*py| py.deinit();
-        p.pyramid = null;
-        if (p.quad_tree) |*t| t.deinit();
-        p.quad_tree = null;
-        p.agent_field.reset();
         p.open_hash = open_hash;
         p.fitted_vp_w = 0;
         p.fitted_vp_h = 0;
@@ -1950,30 +1872,6 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     const open_hash = job.open_hash;
 
     p.layout_slot = layout_full.slotSpacingFor(n);
-
-    // Adopt the hierarchy the worker built — see `LayoutJob.pyramid`. It owns its memory, so the
-    // one it replaces has to go back rather than being left to an arena reset.
-    if (p.pyramid) |*old| old.deinit();
-    p.pyramid = job.pyramid;
-    job.pyramid = null;
-    // Organic overview spine: component-first quadtree (link islands stay pure; nearby islands
-    // merge only above their roots). Rebuild each layout epoch — or adopt the worker-built tree
-    // from a synth precomputed job (force layout was skipped).
-    if (p.quad_tree) |*old| old.deinit();
-    if (job.quad_tree) |qt| {
-        p.quad_tree = qt;
-        job.quad_tree = null;
-    } else {
-        p.quad_tree = blk: {
-            const qedges = sdk.allocator().alloc(quadlod.Edge, job.layout_edges.len) catch
-                break :blk quadlod.build(sdk.allocator(), targets) catch null;
-            defer sdk.allocator().free(qedges);
-            for (job.layout_edges, qedges) |e, *qe| qe.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-            break :blk quadlod.buildEx(sdk.allocator(), targets, qedges) catch null;
-        };
-    }
-    p.agent_field.reset();
-    p.agents_epoch = p.layout_epoch;
     p.at_level0 = arena.alloc(bool, n) catch &.{};
     p.notes_at_level0 = 0;
     // Union-find over all edges is a multi-second apply hitch at 400k — skip for synth / huge N.
@@ -2056,10 +1954,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     p.layout_settled = !any_layout_move;
     // The names have to be re-placed even if nothing moved — see `Panel.labels_stale`.
     p.labels_stale = true;
-    // Per-note edge anim over hundreds of thousands of links freezes the apply frame; Galaxy
-    // overview uses lifted agent edges instead. Keep anim only for modest real vaults.
-    if (job.precomputed == null and n <= 8_000) syncEdgeAnim(p, first_build)
-    else p.edge_anim.clearRetainingCapacity();
+    p.edge_anim.clearRetainingCapacity();
 
     // The vault can be closed while a solve is in flight; the job's data is its own copy and is
     // still fine to apply, but there is no folder left to ask which notes are open.
@@ -2594,17 +2489,12 @@ fn focusNode(p: *Panel, idx: usize) void {
 /// coalesced mass centroid made focus/open-star framing jump to a random parent COM — the
 /// "click pops the node somewhere else" failure.
 fn focusPoseOf(p: *const Panel, note_i: usize, n: GraphNode) dvui.Point {
-    if (!p.agents_active) return n.pos;
-    const tree = p.quad_tree orelse return n.pos;
-    if (note_i >= tree.note_owner.len) return n.pos;
-    const leaf = tree.note_owner[note_i];
-    if (tree.singleNote(leaf) != null) {
-        if (p.agent_field.find(.{ .node = leaf })) |a| {
-            if (!a.dying) return a.pos;
-        }
-    }
+    // `stepWorld` publishes the living pose straight onto the node, so there is nothing to climb.
+    _ = p;
+    _ = note_i;
     return n.pos;
 }
+
 
 fn hashOpenNotes(vault: []const u8) u64 {
     var h: u64 = 14695981039346656037;
@@ -2944,136 +2834,6 @@ fn animateCamera(p: *Panel) void {
     }
 }
 
-/// `anim` is off for an interior: its links are structure rather than events, so they are simply
-/// there rather than growing out of a source node the way a newly written wikilink does.
-fn drawEdges(
-    p: *Panel,
-    nodes: []const GraphNode,
-    edges: []const GraphEdge,
-    fade: f32,
-    anim: bool,
-) void {
-    if (fade <= 0.004) return;
-    const theme = dvui.themeGet();
-    const col = theme.color(.content, .text).opacity(0.14 * fade);
-    const highlight = theme.color(.highlight, .fill).opacity(fade);
-    const vp = p.camera.viewport;
-    // Inflate viewport so edges that only nick a corner still draw.
-    const margin: f32 = 40;
-    const view = vp.outsetAll(margin);
-    const thickness = @max(1.0, @min(2.0, p.camera.zoom));
-
-    // One batch across both passes below. Triangles rasterise in the order they were appended,
-    // so the lit links still land on top of the dim web without needing a separate call.
-    var batch = LineBatch.init(dvui.currentWindow().arena());
-    defer batch.flush();
-
-    // Two passes so lit links land on top of the dim web instead of being overdrawn by it.
-    // Colour is the only difference — thickness stays uniform so the web doesn't visibly
-    // re-weight when a tab opens.
-    //
-    // The dim pass draws *every* link at full length, including the lit ones, and the lit pass
-    // then runs the highlight along the ones that have a note open. That is what makes opening a
-    // note read as its connections lighting up outward from it: the web itself never moves, so
-    // nothing looks like it is being built or torn down, and a sweep that is halfway along still
-    // shows where the rest of the link goes.
-    // The overview draws the set `updateVisibleEdges` gathered: already coalesced, already
-    // resolved to what each end is drawn as, already culled to what crosses the view. An interior
-    // cloud has no hierarchy and is small, so it walks its own list.
-    const gathered: ?[]const lod.Link = if (anim) p.vis_edges.items else null;
-    const count = if (gathered) |g| g.len else edges.len;
-    const agent_web = anim and p.agents_active;
-
-    for ([_]bool{ false, true }) |pass_lit| {
-        for (0..count) |i| {
-            var wa: dvui.Point = undefined;
-            var wb: dvui.Point = undefined;
-            // A coarse link stands for many, so it has no single animation state to sweep and no
-            // one note whose opening should light it. It is drawn plain and whole.
-            var ei: u32 = lod.no_edge;
-            if (gathered) |g| {
-                wa = g[i].from;
-                wb = g[i].to;
-                ei = g[i].edge;
-            } else {
-                wa = nodes[edges[i].a].pos;
-                wb = nodes[edges[i].b].pos;
-                ei = @intCast(i);
-            }
-
-            if (ei == lod.no_edge) {
-                if (pass_lit) continue;
-                // Stop at the edge of the mark each end is drawn as, rather than at its centre.
-                //
-                // The mark, emphatically not the region. Trimming by a region's own extent leaves
-                // a hole: a hub whose notes are spread wide swallows the inner half of every spoke
-                // that reaches it, and a pinwheel comes out with its middle missing. What the
-                // reader sees at the end of a line is the mark, and a line should stop where the
-                // mark starts. Read through the optional rather than asserted — only a gathered
-                // link can be coarse, but an interior cloud reaches this loop with no gathered set.
-                const ra = if (gathered) |g| markWorldRadius(p, g[i].from_level) * p.camera.zoom else 0;
-                const rb = if (gathered) |g| markWorldRadius(p, g[i].to_level) * p.camera.zoom else 0;
-                const trimmed = trimToEnds(
-                    p.camera.worldToScreen(wa),
-                    p.camera.worldToScreen(wb),
-                    ra,
-                    rb,
-                ) orelse continue;
-                drawEdgeSegment(&batch, trimmed[0], trimmed[1], 1, thickness, col, view, agent_web);
-                continue;
-            }
-
-            const e = edges[ei];
-            const a = nodes[e.a];
-            const b = nodes[e.b];
-            const ea = if (anim) p.edge_anim.get(edgeKeyFor(p, e)) else null;
-            if (pass_lit) {
-                if (!(a.open or b.open)) continue;
-                // No entry means no animation state to sweep with — draw it lit and whole.
-                const lit = if (ea) |x| x.lit else 1;
-                if (lit <= 0.002) continue;
-                const from_a = if (ea) |x| x.lit_from_a else a.open;
-                const sa = p.camera.worldToScreen(if (from_a) wa else wb);
-                const sb = p.camera.worldToScreen(if (from_a) wb else wa);
-                drawEdgeSegment(&batch, sa, sb, lit, thickness, highlight, view, agent_web);
-                continue;
-            }
-            const t = if (ea) |x| x.t else 1;
-            drawEdgeSegment(
-                &batch,
-                p.camera.worldToScreen(wa),
-                p.camera.worldToScreen(wb),
-                t,
-                thickness,
-                col,
-                view,
-                agent_web,
-            );
-        }
-    }
-
-    // Links whose note or wikilink is gone: retract along their last known geometry. They
-    // are no longer reachable from `edges`, so they get their own pass.
-    if (!anim) return;
-    var it = p.edge_anim.valueIterator();
-    while (it.next()) |dead| {
-        if (dead.alive) continue;
-        drawEdgeSegment(
-            &batch,
-            p.camera.worldToScreen(dead.from),
-            p.camera.worldToScreen(dead.to),
-            dead.t,
-            thickness,
-            col,
-            view,
-            agent_web,
-        );
-    }
-}
-
-/// Draw a link extended `t` of the way from `sa` toward `sb`. `t` is the shared connect and
-/// disconnect channel — growing runs it up to 1, retracting runs it back down — so a link
-/// always emerges from and withdraws into its source node.
 fn drawEdgeSegment(
     batch: *LineBatch,
     sa: dvui.Point.Physical,
@@ -3218,7 +2978,7 @@ const DrawNodesOpts = struct {
     /// Draw only these nodes, at these alphas — the level-0 entries of `Panel.visible`. When
     /// null every node in the slice is drawn, which is what the interior cloud wants: it has no
     /// hierarchy and is small enough not to need one.
-    selection: ?[]const lod.Visible = null,
+    selection: ?[]const Visible = null,
 };
 
 /// `slot` is the lattice the nodes sit on, which differs per level, and `fade` scales every
@@ -3258,233 +3018,7 @@ const zoom_out_slack: f32 = 2.0;
 /// arrive with their surroundings rather than pressed against the panel edge.
 const cluster_frame_pad_px: f32 = 60.0;
 
-/// Work out what the overview draws this frame, and record which notes made the cut.
-///
-/// One call per frame, before anything reads `p.visible`. Everything downstream — the disc pass,
-/// the web, hit testing, labels — works from this list rather than re-deriving detail for
-/// itself, which is what keeps them from disagreeing about whether a given note exists.
-fn updateSelection(p: *Panel) void {
-    p.visible.clearRetainingCapacity();
-    if (p.at_level0.len == p.nodes.len) @memset(p.at_level0, false);
-    // Capture before clear — `syncLivePos` runs before this frame's leaf count is known.
-    const prev_leaves_on_screen = p.notes_at_level0 > 0;
-    p.notes_at_level0 = 0;
-    p.agents_active = false;
 
-    // No quadtree (tiny / empty vault), or a descent in progress — the interior view is a
-    // close-up by definition, and the overview behind it is the thing being zoomed *into*.
-    const tree = p.quad_tree orelse {
-        selectEverything(p);
-        return;
-    };
-    if (p.interior.t > 0.01) {
-        selectEverything(p);
-        return;
-    }
-
-    // Agents own the overview. Legacy impostor tiles stay cleared.
-    p.tiles = .{};
-    p.tiles_hold = null;
-    p.tiles_pending = false;
-
-    if (p.agents_epoch != p.layout_epoch) {
-        p.agent_field.reset();
-        p.agents_epoch = p.layout_epoch;
-    }
-
-    // Stable v1: organic topology is selectSticky (no levelFor). Keep lod_level at 0 on this path.
-    p.lod_level = 0;
-    p.agents_active = true;
-    p.selection_full = false;
-
-    const gtv = galaxy.tileViewFor(p.camera.zoom);
-    if (gtv.live_weight <= 0.05) return;
-
-    // Modest pad for pan LOD stability without flooding the living set off-screen.
-    const pad_px = @max(p.camera.viewport.w, p.camera.viewport.h) * 0.2;
-    const view_cull = worldViewPadded(p, pad_px);
-
-    const live = syncLivePosLeafAware(p, prev_leaves_on_screen);
-
-    const arena = dvui.currentWindow().arena();
-    p.agent_field.step(tree, arena, .{
-        .view = view_cull,
-        .live = live,
-        .zoom = p.camera.zoom,
-        .note_r_px = restingNodeRadiusPx(p),
-        .dt = dvui.secondsSinceLastFrame(),
-        .budget = @intFromFloat(lod_budget),
-    }) catch {
-        selectEverything(p);
-        return;
-    };
-
-    p.visible.ensureTotalCapacity(sdk.allocator(), p.agent_field.agents.items.len) catch {};
-    for (p.agent_field.agents.items) |a| {
-        const vis = agentToVisible(tree, a);
-        p.visible.append(sdk.allocator(), vis) catch break;
-        if (vis.level != 0 or vis.index >= p.nodes.len) continue;
-        p.notes_at_level0 += 1;
-        if (p.at_level0.len == p.nodes.len) p.at_level0[vis.index] = true;
-    }
-
-    if (!p.agent_field.settled) {
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-    }
-}
-
-/// Encode a living quad agent as `lod.Visible`: note leaves use level 0 + note index; masses use
-/// depth + node index (`index` is the quadtree node id when `level > 0`).
-fn agentToVisible(tree: quadlod.Tree, a: quad_agents.Agent) lod.Visible {
-    if (tree.singleNote(a.key.node)) |note| {
-        return .{ .level = 0, .index = note, .alpha = 1 };
-    }
-    const depth = tree.get(a.key.node).depth;
-    return .{ .level = @max(@as(u32, 1), depth), .index = a.key.node, .alpha = 1 };
-}
-
-/// Work out which links reach the view this frame, and where each end of them lands.
-///
-/// The hierarchy does the work — see `lod.Pyramid.gatherWeb`, which coalesces links between
-/// merged regions, keeps the ones that merely cross the view, and costs what is on screen. Live
-/// node positions are handed over so a line meets its disc where the hover shove left it.
-fn updateVisibleEdges(p: *Panel) void {
-    p.vis_edges.clearRetainingCapacity();
-    if (p.nodes.len == 0) return;
-
-    const gpa = sdk.allocator();
-    // Organic overview: lift note edges onto living quad cells (same topology as agents).
-    if (p.agents_active) {
-        if (p.quad_tree) |tree| {
-            // Open tabs keep a real edge star (lit sweep + full incident set) even when the
-            // lifted sample would drop or anonymise them as `no_edge`.
-            appendOpenDocEdges(p, tree);
-
-            const arena = dvui.currentWindow().arena();
-            // Don't copy the whole vault edge list — lift examines a strided sample with a hard cap.
-            const lift_defaults: quadlod.LiftOpts = .{};
-            const examine_n = @min(p.edges.len, lift_defaults.max_examine * 6);
-            const stride = @max(1, p.edges.len / @max(examine_n, 1));
-            const qn = (p.edges.len + stride - 1) / stride;
-            const qedges = arena.alloc(quadlod.Edge, qn) catch return;
-            var qi: usize = 0;
-            var ei: usize = 0;
-            while (ei < p.edges.len and qi < qn) : (ei += stride) {
-                const e = p.edges[ei];
-                qedges[qi] = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-                qi += 1;
-            }
-            var lifted: std.ArrayListUnmanaged(quadlod.LiftedEdge) = .empty;
-            defer lifted.deinit(arena);
-            p.agent_field.gatherLiftedEdges(tree, qedges[0..qi], arena, &lifted) catch return;
-            for (lifted.items) |le| {
-                if (p.vis_edges.items.len >= max_vis_edges) break;
-                p.vis_edges.append(gpa, .{
-                    .from = le.from,
-                    .to = le.to,
-                    // Coarse/lifted links have no single level-0 edge to animate.
-                    .edge = lod.no_edge,
-                }) catch break;
-            }
-            return;
-        }
-    }
-
-    // No hierarchy to descend, or a descent in progress and the overview behind it is deliberately
-    // unmerged: fall back to the whole link list, which is also what the interior cloud does.
-    const py = if (p.selection_full) null else p.pyramid;
-    if (py == null) {
-        for (p.edges, 0..) |e, i| {
-            if (e.a >= p.nodes.len or e.b >= p.nodes.len) continue;
-            p.vis_edges.append(gpa, .{
-                .from = p.nodes[e.a].pos,
-                .to = p.nodes[e.b].pos,
-                .edge = @intCast(i),
-            }) catch break;
-        }
-        return;
-    }
-
-    const live = syncLivePos(p);
-    var pyramid = py.?;
-    pyramid.gatherWeb(
-        gpa,
-        dvui.currentWindow().arena(),
-        p.lod_level,
-        worldViewPadded(p, 48),
-        live,
-        null,
-        &p.vis_edges,
-    ) catch {};
-    if (p.vis_edges.items.len > max_vis_edges) {
-        p.vis_edges.shrinkRetainingCapacity(max_vis_edges);
-    }
-}
-
-/// Incident links of every open note, with real edge indices so the lit sweep can run.
-/// Endpoints use living agent poses (mass or leaf) so the star meets the marks on screen.
-fn appendOpenDocEdges(p: *Panel, tree: quadlod.Tree) void {
-    var any_open = false;
-    for (p.nodes) |n| {
-        if (n.open) {
-            any_open = true;
-            break;
-        }
-    }
-    if (!any_open) return;
-
-    const PoseCtx = struct {
-        field: *const quad_agents.Field,
-        fn hasAgent(ctx: *const anyopaque, node: u32) bool {
-            const c: *const @This() = @ptrCast(@alignCast(ctx));
-            const a = c.field.find(.{ .node = node }) orelse return false;
-            return !a.dying;
-        }
-        fn posOf(ctx: *const anyopaque, node: u32) dvui.Point {
-            const c: *const @This() = @ptrCast(@alignCast(ctx));
-            if (c.field.find(.{ .node = node })) |a| return a.pos;
-            return .{};
-        }
-    };
-    var ctx = PoseCtx{ .field = &p.agent_field };
-
-    const gpa = sdk.allocator();
-    var added: usize = 0;
-    for (p.edges, 0..) |e, i| {
-        if (added >= max_open_star_edges) break;
-        if (e.a >= p.nodes.len or e.b >= p.nodes.len) continue;
-        if (!(p.nodes[e.a].open or p.nodes[e.b].open)) continue;
-
-        const na = quadlod.livingAgent(tree, @intCast(e.a), PoseCtx.hasAgent, &ctx);
-        const nb = quadlod.livingAgent(tree, @intCast(e.b), PoseCtx.hasAgent, &ctx);
-        // Same living mark ⇒ the link is internal to a mass (or both ends missing); skip.
-        if (na != null and nb != null and na.? == nb.?) continue;
-
-        // Open ends use the note's true position so the star grows from the disc that just
-        // opened, not from a coalesced parent COM if LOD hasn't split the leaf out yet.
-        const wa = if (p.nodes[e.a].open)
-            p.nodes[e.a].pos
-        else if (na) |n|
-            PoseCtx.posOf(&ctx, n)
-        else
-            p.nodes[e.a].pos;
-        const wb = if (p.nodes[e.b].open)
-            p.nodes[e.b].pos
-        else if (nb) |n|
-            PoseCtx.posOf(&ctx, n)
-        else
-            p.nodes[e.b].pos;
-        p.vis_edges.append(gpa, .{
-            .from = wa,
-            .to = wb,
-            .edge = @intCast(i),
-        }) catch break;
-        added += 1;
-    }
-}
-
-/// Visible region in world space. `pad_px` is a screen-pixel margin converted by zoom — use 0 for
-/// `levelFor` cost, a small pad for cull/web so edge masses don't pop.
 fn worldViewPadded(p: *const Panel, pad_px: f32) dvui.Rect {
     const vp = p.camera.viewport;
     const tl = p.camera.screenToWorld(.{ .x = vp.x, .y = vp.y });
@@ -3502,31 +3036,6 @@ fn worldView(p: *const Panel) dvui.Rect {
     return worldViewPadded(p, 48);
 }
 
-/// Every note as itself, nothing merged.
-fn selectEverything(p: *Panel) void {
-    p.selection_full = true;
-    p.lod_level = 0;
-    // Nothing is merged, so nothing is cached: every note is drawn as itself. Reset rather than
-    // left alone — this runs on the paths that skip the tile view entirely, and a stale one would
-    // keep fading out notes that are now the only thing being drawn.
-    p.tiles = .{};
-    p.tiles_hold = null;
-    p.tiles_pending = false;
-    p.visible.ensureTotalCapacity(sdk.allocator(), p.nodes.len) catch {};
-    for (0..p.nodes.len) |i| {
-        p.visible.append(sdk.allocator(), .{ .level = 0, .index = @intCast(i), .alpha = 1 }) catch break;
-    }
-    if (p.at_level0.len == p.nodes.len) @memset(p.at_level0, true);
-    p.notes_at_level0 = @intCast(p.nodes.len);
-}
-
-/// How solidly one link should be drawn, from how long it is on screen.
-///
-/// The same question the node hierarchy asks, asked of a link: is there enough of it to see?
-/// A link joining two notes a few pixels apart is a smudge no matter how far in you are — you
-/// cannot tell what it connects, and in a dense cluster there are thousands of them stacked into
-/// the same few pixels. Length is exactly the local density measure that matters here, and it
-/// costs a subtraction that the draw already had to do.
 fn edgeLengthFade(len_px: f32, agent_web: bool) f32 {
     const min_len = if (agent_web) agent_edge_min_len_px else edge_min_len_px;
     return std.math.clamp((len_px - min_len) / min_len, 0, 1);
@@ -3620,66 +3129,6 @@ fn tileDensity(p: *const Panel, level: i32) f32 {
     return tileSwitchZoom(p) * std.math.pow(f32, 2, -@as(f32, @floatFromInt(level)));
 }
 
-/// World units across one tile at a level.
-fn tileWorld(p: *const Panel, level: i32) f32 {
-    return @as(f32, @floatFromInt(impostor.tile_px)) / @max(tileDensity(p, level), 1e-9);
-}
-
-fn tileViewFor(p: *const Panel) TileView {
-    if (p.pyramid == null or p.layout_slot <= 0) return .{};
-    const zs = tileSwitchZoom(p);
-    const zoom = @max(p.camera.zoom, 1e-6);
-    // How many octaves out from the handover scale the camera is. Negative means zoomed past it.
-    const out = std.math.log2(zs / zoom);
-    if (out <= 0) return .{};
-
-    var v: TileView = .{ .node_weight = 0 };
-    // Just past the handover, real notes give way to the finest tiles over a short band.
-    if (out < tile_fade_band) {
-        // Same dissolve, between the real notes and the finest tiles: the notes hold full strength
-        // and the tiles come in over them.
-        v.node_weight = 1;
-        v.levels[0] = 0;
-        v.weights[0] = out / tile_fade_band;
-        v.n = 1;
-        return v;
-    }
-
-    // Continuous octave dissolve. Weights are complementary (sum to 1), not over-composed.
-    //
-    // Over-composing two full tile pictures was chosen so opaque marks would not dim mid-cross —
-    // but the web is only ~14% alpha, so two copies stack to ~30% and read as the lines changing
-    // colour every octave. Marks are already a bit open (`tile_mark_fill_alpha`), so a true
-    // cross-fade keeps ink stable; the old `@round` primary flip is still avoided by moving the
-    // pure-hi band to before the integer.
-    const lo_f = @floor(out);
-    const frac = out - lo_f;
-    const lo: i32 = @intFromFloat(lo_f);
-    const blend_lo = tile_fade_band;
-    const blend_hi = 1.0 - tile_fade_band;
-
-    if (frac >= blend_hi) {
-        v.levels[0] = lo + 1;
-        v.weights[0] = 1;
-        v.n = 1;
-    } else if (frac <= blend_lo) {
-        v.levels[0] = lo;
-        v.weights[0] = 1;
-        v.n = 1;
-    } else {
-        const t = (frac - blend_lo) / (blend_hi - blend_lo);
-        const s = t * t * (3 - 2 * t);
-        v.levels[0] = lo;
-        v.weights[0] = 1 - s;
-        v.levels[1] = lo + 1;
-        v.weights[1] = s;
-        v.n = 2;
-    }
-    return v;
-}
-
-/// Levels to enumerate tiles for this frame: what the zoom wants, the held level underneath, and
-/// the neighbours to bake ahead. Weights are the *draw* weights — zero means bake only.
 fn tileLayersForDraw(tv: TileView, hold: ?i32) struct {
     levels: [6]i32,
     weights: [6]f32,
@@ -3716,461 +3165,6 @@ fn tileLayersForDraw(tv: TileView, hold: ?i32) struct {
     return .{ .levels = levels, .weights = weights, .n = n };
 }
 
-/// The pyramid level a tile at `level` draws, as an integer.
-fn tilePyramidLevel(p: *const Panel, py: lod.Pyramid, level: i32) usize {
-    const f = py.levelForGap(tileDensity(p, level), tile_mark_gap_px);
-    return @intFromFloat(@floor(f));
-}
-
-/// Maps world coordinates into whatever surface is being drawn to — an atlas slot during a bake,
-/// the screen when a tile has not been baked yet. One transform for both so the two produce the
-/// same picture, which is what lets an unbaked tile stand in without being noticed.
-const MarkXform = struct {
-    /// World point that lands on the origin.
-    wx: f32,
-    wy: f32,
-    ox: f32,
-    oy: f32,
-    /// Pixels per world unit.
-    s: f32,
-
-    fn at(self: MarkXform, q: dvui.Point) dvui.Point.Physical {
-        return .{ .x = self.ox + (q.x - self.wx) * self.s, .y = self.oy + (q.y - self.wy) * self.s };
-    }
-};
-
-/// Draw the note field over one patch of world.
-///
-/// Marks come out at note size: `gap_radius_frac` of the lattice gap, scaled by the drawing
-/// density. At a tile's own density that is exactly the radius `bubbleScreenRadius` gives a
-/// resting note, which is what makes a tile and the notes it replaces the same picture.
-///
-/// Where the patch is too coarse to hold every note, the pyramid supplies marks that each stand
-/// for several. Those grow by the square root of what they contain, which holds the *ink* constant
-/// rather than the count — at a scale where a note is about a pixel, how much of the patch is
-/// covered is the only thing the reader can still read, and a mark drawn at one note's size would
-/// make a dense region look like it had emptied out.
-fn emitField(
-    p: *Panel,
-    py: lod.Pyramid,
-    level: usize,
-    rect: dvui.Rect,
-    xf: MarkXform,
-    lines: *LineBatch,
-    borders: *DiscBatch,
-    fills: *DiscBatch,
-    left: ?*i32,
-    link_alpha: f32,
-) void {
-    emitMarks(p, py, level, rect, xf, borders, fills, left);
-    emitLinksNear(p, py, level, rect, xf, lines, link_alpha);
-}
-
-/// The marks of one patch. See `emitField` for what the sizes mean.
-fn emitMarks(
-    p: *Panel,
-    py: lod.Pyramid,
-    level: usize,
-    rect: dvui.Rect,
-    xf: MarkXform,
-    borders: *DiscBatch,
-    fills: *DiscBatch,
-    left: ?*i32,
-) void {
-    if (left) |l| if (l.* <= 0) return;
-    const arena = dvui.currentWindow().arena();
-    var found: std.ArrayList(u32) = .empty;
-    py.collectAt(arena, level, rect, &found) catch return;
-    if (found.items.len > tile_mark_cap) found.shrinkRetainingCapacity(tile_mark_cap);
-    if (left) |l| l.* -= @intCast(found.items.len);
-
-    const theme = dvui.themeGet();
-    const fill = theme.color(.control, .fill).lighten(if (theme.dark) 6 else -6);
-    const border_col = theme.color(.window, .text);
-    const marks = py.levels[level];
-
-
-    const note_r = gap_radius_frac * p.layout_slot * xf.s;
-    // A mark may not outgrow its own place in the lattice, or a coarse patch fills solid.
-    const ceiling = @max(gap_radius_frac * py.spacing[level] * xf.s, note_r);
-
-    for (found.items) |mi| {
-        if (mi >= marks.len) continue;
-        const m = marks[mi];
-        const ink = @sqrt(@as(f32, @floatFromInt(@max(m.count, 1))));
-        const r = std.math.clamp(note_r * ink, 0.35, ceiling);
-        const q = xf.at(m.pos);
-        // At level 0 these are the vault's actual notes, so they can be drawn as themselves — an
-        // open note keeps its highlight in the picture rather than losing it to the cache.
-        const face = if (level == 0 and mi < p.nodes.len) nodeFill(theme, p.nodes[mi]) else fill;
-        // Feathered filled discs here, not `addRing`: the bake batch carries an AA skirt, and a
-        // ring mesh does not. At cell resolution the two-disc nest is exact enough.
-        const inset = @max(r * 0.16, 0.35);
-        // Coarse marks stay a little open so the web baked *over* them (and the under-octave
-        // during a dissolve) can read — a solid lid was the mid-band "fills cover the lines" look.
-        const fill_a: f32 = if (level == 0) 1.0 else tile_mark_fill_alpha;
-        borders.add(q, r, border_col.opacity(0.85 * fill_a));
-        fills.add(q, @max(r - inset, 0.3), face.opacity(fill_a));
-    }
-}
-
-/// The links among a patch's marks.
-///
-/// Baked with the field rather than drawn live every frame, and that is the point. A link drawn
-/// live has to pick a coalescing level from the current zoom, and every level it crosses swaps the
-/// whole web from one set of lines to another in a single frame — which is far more visible than
-/// the notes changing, because a line is long and the eye follows it. Put in the tile, a link
-/// belongs to a fixed level like everything else in the picture, and it dissolves when the tile
-/// does instead of snapping when the zoom does.
-///
-/// Drawn *over* the marks (see `bakeTile`): mid-band marks are large opaque discs, and a web under
-/// them vanishes wherever a spoke crosses a neighbour. Ends still stop at the mark rim via
-/// `trimToEnds`; what lands on top is the part that used to disappear *between* marks.
-///
-/// Each link is filed under both its ends, so a patch holding either end finds it; the same link
-/// reached from both is drawn once.
-fn emitLinksNear(
-    p: *Panel,
-    py: lod.Pyramid,
-    level: usize,
-    rect: dvui.Rect,
-    xf: MarkXform,
-    lines: *LineBatch,
-    link_alpha: f32,
-) void {
-    if (level >= py.edges.len) return;
-    const arena = dvui.currentWindow().arena();
-    const marks = py.levels[level];
-    const edges = py.edges[level];
-
-    var found: std.ArrayList(u32) = .empty;
-    py.collectAt(arena, level, rect, &found) catch return;
-
-    var seen = std.AutoHashMap(u32, void).init(arena);
-    defer seen.deinit();
-
-    const col = dvui.themeGet().color(.content, .text).opacity(link_alpha);
-    // Ends stop at the edge of the mark they join, not at its centre — see `trimToEnds`.
-    const trim = markWorldRadius(p, @intCast(level)) * xf.s;
-
-    for (found.items) |ci| {
-        for (py.incidentOf(level, ci)) |ei| {
-            if (ei >= edges.len) continue;
-            if ((seen.getOrPut(ei) catch continue).found_existing) continue;
-            const e = edges[ei];
-            if (e.a >= marks.len or e.b >= marks.len) continue;
-            const seg = trimToEnds(xf.at(marks[e.a].pos), xf.at(marks[e.b].pos), trim, trim) orelse continue;
-            lines.add(seg[0], seg[1], tile_link_thickness, col);
-        }
-    }
-}
-
-/// True when the primary tile octave already has a baked slot covering world point `(wx, wy)`.
-fn primaryTileReadyAt(p: *const Panel, primary: i32, wx: f32, wy: f32) bool {
-    const w = tileWorld(p, primary);
-    if (!(w > 0)) return false;
-    const tx: i32 = @intFromFloat(@floor(wx / w));
-    const ty: i32 = @intFromFloat(@floor(wy / w));
-    return p.atlas.get(.{ .level = primary, .tx = tx, .ty = ty }) != null;
-}
-
-/// The note field, drawn from cached tiles — see `impostor.zig`.
-///
-/// The flash this exists to kill is the swap between two drawings of the same thing that do not
-/// look the same: a tile drawn as live geometry is exact at the current zoom, and the texture that
-/// replaces it is resampled by up to √2. Showing the sharp one for a frame or two and then the
-/// soft one is a pop on every newly revealed tile, and zooming continuously reveals a level's
-/// worth of them every octave.
-///
-/// So unbaked tiles are not drawn. The last fully-baked level is held underneath while the level
-/// the zoom wants is baking, and each of its tiles appears over that hold as it lands — soft over
-/// soft, which the eye reads as focus rather than as a flash. Direct geometry is reserved for the
-/// cold start, when there is nothing held to show through.
-fn drawTiles(p: *Panel, fade: f32) void {
-    if (fade <= 0.004) return;
-    const py = p.pyramid orelse return;
-    const tv = p.tiles;
-    if (!tv.active()) {
-        p.tiles_hold = null;
-        p.tiles_pending = false;
-        return;
-    }
-    const gpa = sdk.allocator();
-
-    if (p.tiles_hold_epoch != p.layout_epoch) {
-        p.tiles_hold = null;
-        p.tiles_hold_epoch = p.layout_epoch;
-    }
-
-    if (!p.atlas.begin(p.layout_epoch, tileStyleHash(p))) {
-        drawClusterMarkers(p, fade);
-        p.tiles_pending = false;
-        return;
-    }
-
-    const arena = dvui.currentWindow().arena();
-    const view = worldView(p);
-    const primary: i32 = tv.levels[0];
-    const hold = p.tiles_hold;
-
-    const TileRole = enum { desired, hold, prefetch };
-    const Want = struct {
-        key: impostor.Key,
-        /// Draw weight from the zoom's `TileView`. Zero for hold-only and prefetch entries.
-        weight: f32,
-        slot: ?u32,
-        role: TileRole,
-    };
-    var wants: std.ArrayList(Want) = .empty;
-    const layers = tileLayersForDraw(tv, hold);
-    for (layers.levels[0..layers.n], layers.weights[0..layers.n]) |level, weight| {
-        const w = tileWorld(p, level);
-        if (!(w > 0)) continue;
-        const role: TileRole = blk: {
-            for (0..tv.n) |i| {
-                if (tv.levels[i] == level and tv.weights[i] > 0.004) break :blk .desired;
-            }
-            if (hold) |h| if (h == level) break :blk .hold;
-            break :blk .prefetch;
-        };
-        const tx0: i32 = @intFromFloat(@floor(view.x / w));
-        const tx1: i32 = @intFromFloat(@floor((view.x + view.w) / w));
-        const ty0: i32 = @intFromFloat(@floor(view.y / w));
-        const ty1: i32 = @intFromFloat(@floor((view.y + view.h) / w));
-        var ty = ty0;
-        while (ty <= ty1) : (ty += 1) {
-            var tx = tx0;
-            while (tx <= tx1) : (tx += 1) {
-                if (wants.items.len >= max_tiles_per_frame) break;
-                const key: impostor.Key = .{ .level = level, .tx = tx, .ty = ty };
-                wants.append(arena, .{
-                    .key = key,
-                    .weight = weight,
-                    .slot = p.atlas.get(key),
-                    .role = role,
-                }) catch break;
-            }
-        }
-    }
-
-    // How ready the zoom's primary level is — decides whether the hold can advance.
-    var primary_total: u32 = 0;
-    var primary_baked: u32 = 0;
-    for (wants.items) |want| {
-        if (want.key.level != primary or want.role != .desired) continue;
-        primary_total += 1;
-        if (want.slot != null) primary_baked += 1;
-    }
-    const ready = primary_total == 0 or
-        @as(f32, @floatFromInt(primary_baked)) >= tile_ready_frac * @as(f32, @floatFromInt(primary_total));
-    if (ready) p.tiles_hold = primary;
-
-    const showing_hold = if (p.tiles_hold) |h| h != primary and !ready else false;
-    p.tiles_pending = !ready or primary_baked < primary_total;
-
-    // Bake: desired first, then hold gaps, then prefetch. Catch up aggressively while held.
-    var full = false;
-    {
-        const order: []usize = arena.alloc(usize, wants.items.len) catch &.{};
-        for (order, 0..) |*o, i| o.* = i;
-        std.mem.sort(usize, order, wants.items, struct {
-            fn less(w: []const Want, a: usize, b: usize) bool {
-                const pa: u8 = switch (w[a].role) {
-                    .desired => 2,
-                    .hold => 1,
-                    .prefetch => 0,
-                };
-                const pb: u8 = switch (w[b].role) {
-                    .desired => 2,
-                    .hold => 1,
-                    .prefetch => 0,
-                };
-                if (pa != pb) return pa > pb;
-                return w[a].weight > w[b].weight;
-            }
-        }.less);
-
-        const tile_cap: usize = if (showing_hold or p.bake_burst) bake_per_frame_catchup else bake_per_frame;
-        var bake_left: i32 = if (p.bake_burst or showing_hold) bake_mark_budget * 4 else bake_mark_budget;
-        p.bake_burst = false;
-        var tasks: std.ArrayList(BakeTask) = .empty;
-        for (order) |oi| {
-            const want = &wants.items[oi];
-            if (want.slot != null) continue;
-            if (tasks.items.len >= tile_cap or bake_left <= 0) break;
-            const slot = p.atlas.claim(gpa, want.key) orelse {
-                full = true;
-                break;
-            };
-            const w = tileWorld(p, want.key.level);
-            const x0 = @as(f32, @floatFromInt(want.key.tx)) * w;
-            const y0 = @as(f32, @floatFromInt(want.key.ty)) * w;
-            const bleed = w * tile_bleed;
-            const rect = p.atlas.slotRect(slot);
-            tasks.append(arena, .{
-                .key = want.key,
-                .slot = slot,
-                .level = tilePyramidLevel(p, py, want.key.level),
-                .world = .{ .x = x0 - bleed, .y = y0 - bleed, .w = w + bleed * 2, .h = w + bleed * 2 },
-                .xf = .{
-                    .wx = x0,
-                    .wy = y0,
-                    .ox = rect.x,
-                    .oy = rect.y,
-                    .s = tileDensity(p, want.key.level),
-                },
-            }) catch {};
-            want.slot = slot;
-        }
-        if (tasks.items.len > 0) {
-            gatherTileLinks(p, py, tasks.items);
-            const pass = impostor.Pass.begin(&p.atlas);
-            defer if (pass) |ps| ps.end();
-            if (pass) |ps| {
-                for (tasks.items) |*task| bakeTile(p, py, ps, task, &bake_left);
-            }
-        }
-        frame_profile.tiles_baked = @intCast(tasks.items.len);
-
-        // Re-count after this frame's bake — the hold may be able to advance immediately.
-        primary_baked = 0;
-        primary_total = 0;
-        for (wants.items) |want| {
-            if (want.key.level != primary or want.role != .desired) continue;
-            primary_total += 1;
-            if (want.slot != null) primary_baked += 1;
-        }
-        const ready_now = primary_total == 0 or
-            @as(f32, @floatFromInt(primary_baked)) >= tile_ready_frac * @as(f32, @floatFromInt(primary_total));
-        if (ready_now) p.tiles_hold = primary;
-        p.tiles_pending = !ready_now or primary_baked < primary_total;
-    }
-
-    const tex = p.atlas.texture();
-    var quads = if (tex) |t| impostor.QuadBatch.init(arena, &p.atlas, t) else null;
-    var lines = LineBatch.init(arena);
-    var borders = DiscBatch.initBake(arena);
-    var fills = DiscBatch.initBake(arena);
-    var direct_left: i32 = direct_mark_budget;
-    var cold_rect: ?dvui.Rect = null;
-    defer {
-        // Marks under links for cold direct geometry — same stack as `bakeTile`. Baked quads last
-        // so a finished tile still covers the stand-in it replaces.
-        borders.flush();
-        fills.flush();
-        lines.flush();
-        if (quads) |*q| q.flush();
-        drawHoverRegion(p, fade);
-    }
-
-    const hold_now = p.tiles_hold;
-    const use_hold = if (hold_now) |h| h != primary and primary_baked < primary_total else false;
-    const cold = hold_now == null;
-
-    // Underlay: held level only where the primary has not yet landed. A full-strength hold under
-    // every primary tile double-composites the web (lines are ~14% alpha → nearly 2× ink) and is
-    // exactly the "lines change colour then flash" read while a level catches up.
-    if (use_hold) {
-        const h = hold_now.?;
-        for (wants.items) |want| {
-            if (want.key.level != h) continue;
-            const slot = want.slot orelse continue;
-            var q = quads orelse continue;
-            const w = tileWorld(p, h);
-            const x0 = @as(f32, @floatFromInt(want.key.tx)) * w;
-            const y0 = @as(f32, @floatFromInt(want.key.ty)) * w;
-            if (primaryTileReadyAt(p, primary, x0 + w * 0.5, y0 + w * 0.5)) continue;
-            const tl = p.camera.worldToScreen(.{ .x = x0, .y = y0 });
-            const br = p.camera.worldToScreen(.{ .x = x0 + w, .y = y0 + w });
-            q.add(
-                p.atlas.slotRect(slot),
-                .{ .x = tl.x, .y = tl.y, .w = br.x - tl.x, .h = br.y - tl.y },
-                fade,
-            );
-            frame_profile.tiles_drawn += 1;
-        }
-    }
-
-    // Desired levels: baked tiles only. Soft over soft when a hold is underneath; never a sharp
-    // stand-in for a texture that is about to land.
-    for (wants.items) |want| {
-        if (want.role != .desired) continue;
-        const a = fade * @max(want.weight, if (use_hold and want.key.level == primary) @as(f32, 1) else 0);
-        if (a <= 0.004) continue;
-        if (want.slot) |slot| {
-            if (quads) |*q| {
-                const w = tileWorld(p, want.key.level);
-                const x0 = @as(f32, @floatFromInt(want.key.tx)) * w;
-                const y0 = @as(f32, @floatFromInt(want.key.ty)) * w;
-                const tl = p.camera.worldToScreen(.{ .x = x0, .y = y0 });
-                const br = p.camera.worldToScreen(.{ .x = x0 + w, .y = y0 + w });
-                q.add(
-                    p.atlas.slotRect(slot),
-                    .{ .x = tl.x, .y = tl.y, .w = br.x - tl.x, .h = br.y - tl.y },
-                    a,
-                );
-                frame_profile.tiles_drawn += 1;
-                continue;
-            }
-        }
-        // Cold start only: nothing held, nothing baked for this tile. While a hold is showing,
-        // unbaked desired tiles are skipped — counting them as "direct" would lie about what
-        // the frame drew.
-        if (!cold) continue;
-        frame_profile.tiles_direct += 1;
-        const w = tileWorld(p, want.key.level);
-        const x0 = @as(f32, @floatFromInt(want.key.tx)) * w;
-        const y0 = @as(f32, @floatFromInt(want.key.ty)) * w;
-        const r: dvui.Rect = .{ .x = x0, .y = y0, .w = w, .h = w };
-        cold_rect = if (cold_rect) |cur| unionRect(cur, r) else r;
-    }
-
-    if (cold_rect) |r| {
-        const tl = p.camera.worldToScreen(.{ .x = r.x, .y = r.y });
-        emitField(
-            p,
-            py,
-            tilePyramidLevel(p, py, primary),
-            r,
-            .{ .wx = r.x, .wy = r.y, .ox = tl.x, .oy = tl.y, .s = p.camera.zoom },
-            &lines,
-            &borders,
-            &fills,
-            &direct_left,
-            tile_link_alpha,
-        );
-    }
-
-    if (full and wants.items.len <= p.atlas.capacity()) {
-        p.atlas.clear();
-        p.tiles_hold = null;
-        p.bake_burst = true;
-    }
-
-    if (p.tiles_pending) {
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-    }
-}
-
-/// One tile queued for baking, with the links crossing it already found.
-///
-/// Links are gathered before any drawing starts because they cannot be found tile by tile. A tile
-/// knows which clusters sit inside it; a link crossing it may have both ends far outside, and such
-/// a link belongs to no tile it passes through. Looking only at a tile's own clusters is what left
-/// rectangular holes in every long spoke — the line stopped at the boundary of whichever tile
-/// still contained one of its ends.
-const BakeTask = struct {
-    key: impostor.Key,
-    slot: u32,
-    /// Pyramid level this tile draws.
-    level: usize,
-    /// The patch of world it covers, including bleed.
-    world: dvui.Rect,
-    xf: MarkXform,
-    /// Segments in slot pixels, ready to draw.
-    lines: std.ArrayList([2]dvui.Point.Physical) = .empty,
-};
-
 fn unionRect(a: dvui.Rect, b: dvui.Rect) dvui.Rect {
     const x0 = @min(a.x, b.x);
     const y0 = @min(a.y, b.y);
@@ -4179,200 +3173,15 @@ fn unionRect(a: dvui.Rect, b: dvui.Rect) dvui.Rect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
-/// Find the links crossing each tile about to be baked.
-///
-/// One pass over a level's links, not one per tile: a link is offered to every tile its *segment*
-/// meets, which is the only way a tile in the middle of a long link learns that it has one to
-/// draw. Links whose bounding box misses everything being baked are rejected on a single test,
-/// which is what keeps the pass affordable when the level is fine and its link list is the whole
-/// vault's.
-fn gatherTileLinks(p: *Panel, py: lod.Pyramid, tasks: []BakeTask) void {
-    const arena = dvui.currentWindow().arena();
 
-    // Tiles of one drawing scale share a link list, so the pass is run once per distinct level
-    // present. There are at most two — the level showing and the one crossing with it.
-    var seen_levels: [2]usize = undefined;
-    var n_levels: usize = 0;
-    for (tasks) |t| {
-        var known = false;
-        for (seen_levels[0..n_levels]) |l| {
-            if (l == t.level) known = true;
-        }
-        if (!known and n_levels < seen_levels.len) {
-            seen_levels[n_levels] = t.level;
-            n_levels += 1;
-        }
-    }
-
-    for (seen_levels[0..n_levels]) |level| {
-        if (level >= py.edges.len) continue;
-
-        // The ground this level's tiles cover between them, for one cheap rejection per link.
-        var bounds: ?dvui.Rect = null;
-        for (tasks) |t| {
-            if (t.level != level) continue;
-            bounds = if (bounds) |b| unionRect(b, t.world) else t.world;
-        }
-        const box = bounds orelse continue;
-
-        const marks = py.levels[level];
-        const trim_world = markWorldRadius(p, @intCast(level));
-        for (py.edges[level]) |e| {
-            if (e.a >= marks.len or e.b >= marks.len) continue;
-            const pa = marks[e.a].pos;
-            const pb = marks[e.b].pos;
-            if (!lod.segmentHitsRect(pa, pb, box, 0)) continue;
-            for (tasks) |*t| {
-                if (t.level != level) continue;
-                if (!lod.segmentHitsRect(pa, pb, t.world, 0)) continue;
-                const trim = trim_world * t.xf.s;
-                const seg = trimToEnds(t.xf.at(pa), t.xf.at(pb), trim, trim) orelse continue;
-                t.lines.append(arena, seg) catch {};
-            }
-        }
-    }
-}
-
-/// One patch of world, drawn into one atlas slot at that level's density.
-fn bakeTile(p: *Panel, py: lod.Pyramid, pass: impostor.Pass, task: *BakeTask, bake_left: *i32) void {
-    const arena = dvui.currentWindow().arena();
-    const rect = p.atlas.slotRect(task.slot);
-    // The clip is what makes the bleed safe: marks and links are drawn past the tile's own edge so
-    // anything straddling it appears whole in both neighbours, and the spill is trimmed here.
-    pass.clipTo(rect);
-
-    // Marks first, web on top — from the first baked octave, not only near handoff. Mid-band
-    // discs are large; a web under them is lost on every spoke that crosses a neighbour.
-    // Segments already gathered — see `gatherTileLinks`.
-    var borders = DiscBatch.initBake(arena);
-    var fills = DiscBatch.initBake(arena);
-    emitMarks(p, py, task.level, task.world, task.xf, &borders, &fills, bake_left);
-    borders.flush();
-    fills.flush();
-
-    const col = dvui.themeGet().color(.content, .text).opacity(tile_link_alpha);
-    var lines = LineBatch.init(arena);
-    for (task.lines.items) |seg| lines.add(seg[0], seg[1], tile_link_thickness, col);
-    lines.flush();
-}
-
-/// Ring the region under the cursor, for a view whose notes come from cached tiles.
-///
-/// Drawn over the field rather than into it: hover changes every frame and a tile is baked once,
-/// so anything that lit up inside a picture would have to invalidate the picture to do it.
-///
-/// Around the cursor, not around the region's centre. There is no marker under the pointer to
-/// light up — the field is one continuous picture and every part of it leads somewhere — so what
-/// the ring has to say is "there is something here to go into", and it says it where the reader is
-/// looking. Its size is the region it would frame, so the gesture also shows how far in a click
-/// will take you.
-fn drawHoverRegion(p: *Panel, fade: f32) void {
-    const py = p.pyramid orelse return;
-    const h = p.hover_cluster orelse return;
-    if (h.level == 0 or h.level >= py.levels.len or h.index >= py.levels[h.level].len) return;
-
-    const lvl: usize = h.level;
-    const sp = if (lvl < py.spacing.len) py.spacing[lvl] else p.layout_slot;
-    const r = std.math.clamp(sp * p.camera.zoom * 0.5, 16, 120) * clusterHoverSwell(p, h);
-
-    const at = dvui.currentWindow().mouse_pt;
-    const accent = dvui.themeGet().color(.highlight, .fill);
-    const arena = dvui.currentWindow().arena();
-
-    var fill = dvui.Path.Builder.init(arena);
-    fill.addArc(at, r, std.math.tau, 0, true);
-    fill.build().fillConvex(.{ .color = accent.opacity(fade * 0.10), .fade = 1 });
-
-    var ring = dvui.Path.Builder.init(arena);
-    ring.addArc(at, r, std.math.tau, 0, true);
-    // `addArc` with `skip_end` leaves the loop open at angle 0 (center-right); without
-    // `closed` the stroke ends there and the ring shows a hitch where it began.
-    ring.build().stroke(.{ .thickness = 1.5, .color = accent.opacity(fade * 0.75), .closed = true });
-}
-
-/// Bump when baked mark/link stacking or ink changes, so a warm atlas does not keep the old picture.
-const tile_bake_style: u32 = 4;
-
-/// Everything about a tile's appearance that isn't the layout. Folded into the atlas key, so a
-/// theme switch or a change to which notes are open rebakes rather than leaving stale pictures.
-fn tileStyleHash(p: *const Panel) u64 {
-    var h = std.hash.Wyhash.init(0);
-    h.update(std.mem.asBytes(&tile_bake_style));
-    h.update(std.mem.asBytes(&p.open_hash));
-    const theme = dvui.themeGet();
-    h.update(std.mem.asBytes(&theme.dark));
-    const accent = theme.color(.highlight, .fill);
-    h.update(std.mem.asBytes(&accent));
-    return h.final();
-}
-
-/// How much larger a merged region is drawn for being under the cursor.
-///
-/// The same eased `outBack` channel a note's hover uses — see `bubbleScreenRadius` — but at a
-/// gentler amount. A note doubles because it is a small fixed target that has to become a
-/// readable one; a region is already as large as the area it covers.
-fn clusterHoverSwell(p: *const Panel, v: lod.Visible) f32 {
+fn clusterHoverSwell(p: *const Panel, v: Visible) f32 {
     const h = p.hover_cluster orelse return 1;
     if (h.level != v.level or h.index != v.index) return 1;
     return 1 + cluster_grow_factor * dvui.easing.outBack(std.math.clamp(p.hover_cluster_t, 0, 1));
 }
 
-/// Plain markers for every merged region — the fallback for a backend with no render target to
-/// bake into, where drawing the field directly every frame is not affordable either.
-fn drawClusterMarkers(p: *Panel, fade: f32) void {
-    const py = p.pyramid orelse return;
-    const arena = dvui.currentWindow().arena();
-    var borders = DiscBatch.init(arena);
-    var fills = DiscBatch.init(arena);
-    defer {
-        borders.flush();
-        fills.flush();
-    }
-    for (p.visible.items) |v| {
-        if (v.level == 0) continue;
-        frame_profile.clusters_drawn += 1;
-        addClusterMarker(p, &borders, &fills, v, py.levels[v.level][v.index], fade * v.alpha);
-    }
-}
 
-/// One merged region as a disc, drawn exactly like a note: same disc, same ring, same batching.
-fn addClusterMarker(
-    p: *Panel,
-    borders: *DiscBatch,
-    fills: *DiscBatch,
-    v: lod.Visible,
-    c: lod.Cluster,
-    a: f32,
-) void {
-    const theme = dvui.themeGet();
-    const fill = theme.color(.control, .fill).lighten(if (theme.dark) 6 else -6);
-    const border_col = theme.color(.window, .text);
-    const hot = theme.color(.highlight, .fill);
-    const hovered = if (p.hover_cluster) |h| h.level == v.level and h.index == v.index else false;
 
-    const screen = p.camera.worldToScreen(c.pos);
-    const r = clusterMarkerRadiusPx(p, c) * clusterHoverSwell(p, v);
-    const inner = @max(r - node_border_px, 0.5);
-    borders.addRing(screen, r, inner, (if (hovered) hot else border_col).opacity(a));
-    fills.add(screen, inner, (if (hovered) hot else fill).opacity(a));
-}
-
-/// Screen radius of a merged marker.
-///
-/// Kept at the size a note is drawn at here, growing only slightly with how much the region
-/// holds. A region is not a big note — sizing it by its contents is what made a merged group
-/// read as one enormous bubble that then burst into small ones.
-fn clusterMarkerRadiusPx(p: *Panel, c: lod.Cluster) f32 {
-    const node_r = restingNodeRadiusPx(p);
-    const load = @log(1.0 + @as(f32, @floatFromInt(c.count))) / @log(1.0 + 256.0);
-    return node_r * (1.0 + 0.35 * std.math.clamp(load, 0, 1));
-}
-
-/// The radius a resting note is drawn at right now, in screen pixels.
-///
-/// Mirrors `bubbleScreenRadius` for a plain, unhovered, unopened note — the same gap-capped
-/// size, so "how big is a note here" has one answer whether it is being asked by the note draw
-/// or by the merged marker standing in for it.
 fn restingNodeRadiusPx(p: *Panel) f32 {
     const gap = p.layout_slot * p.camera.zoom;
     const zoom_t = detailRevealT(p.layout_slot, p.camera.zoom);
@@ -4384,12 +3193,12 @@ fn restingNodeRadiusPx(p: *Panel) f32 {
 /// The coalesced mass under `screen_pt`, if any. Among overlapping masses prefer the **tightest**
 /// (fewest notes / highest depth) — nearest-centre picked a tiny mass sitting inside a large
 /// dashed ring and framed two nodes for a click that looked like the big cluster.
-fn hitTestClusters(p: *Panel, screen_pt: dvui.Point.Physical) ?lod.Visible {
+fn hitTestClusters(p: *Panel, screen_pt: dvui.Point.Physical) ?Visible {
     // Containment has no quadtree; its masses are just the non-note marks. `level` carries only
     // "this is a mass" here, and `index` is the fold cell id.
     {
         const w = if (p.world_state) |*ws| ws else return null;
-        var hit: ?lod.Visible = null;
+        var hit: ?Visible = null;
         var best_r: f32 = std.math.floatMax(f32);
         for (w.marks.items) |m| {
             if (m.is_note or m.alpha < 0.15) continue;
@@ -4407,114 +3216,9 @@ fn hitTestClusters(p: *Panel, screen_pt: dvui.Point.Physical) ?lod.Visible {
         return hit;
     }
 
-    var best: ?lod.Visible = null;
-    var best_count: u32 = std.math.maxInt(u32);
-    var best_depth: i32 = -1;
-    var best_d2: f32 = std.math.floatMax(f32);
-
-    if (p.agents_active) {
-        const tree = p.quad_tree orelse return null;
-        for (p.agent_field.agents.items) |a| {
-            if (a.dying) continue;
-            if (tree.singleNote(a.key.node) != null) continue;
-            const screen = p.camera.worldToScreen(a.pos);
-            // Match the drawn mass radius (log-scaled) so the dashed rim stays clickable.
-            const r = massScreenRadiusPx(a) + 8;
-            const dx = screen.x - screen_pt.x;
-            const dy = screen.y - screen_pt.y;
-            const d2 = dx * dx + dy * dy;
-            if (d2 > r * r) continue;
-            const depth: i32 = @intCast(tree.get(a.key.node).depth);
-            const tighter = a.count < best_count or
-                (a.count == best_count and depth > best_depth) or
-                (a.count == best_count and depth == best_depth and d2 < best_d2);
-            if (tighter) {
-                best_count = a.count;
-                best_depth = depth;
-                best_d2 = d2;
-                best = agentToVisible(tree, a);
-            }
-        }
-        return best;
-    }
-
-    const py = p.pyramid orelse return null;
-
-    // Fallback: `select` / tile marker path when agents are not driving the overview.
-    const tiled = p.tiles.active();
-    for (p.visible.items) |v| {
-        if (v.level == 0 or v.alpha < 0.5) continue;
-        const c = py.levels[v.level][v.index];
-        const screen = p.camera.worldToScreen(c.pos);
-        const r = if (tiled)
-            @max(c.radius, py.spacing[v.level] * 0.5) * p.camera.zoom
-        else
-            clusterMarkerRadiusPx(p, c) + 5;
-        const dx = screen.x - screen_pt.x;
-        const dy = screen.y - screen_pt.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 <= r * r and d2 < best_d2) {
-            best_d2 = d2;
-            best = v;
-        }
-    }
-    return best;
+    return null;
 }
 
-/// Far-field density mips — degree-weighted soft marks + baked link web.
-fn drawGalaxyDensity(p: *Panel, fade: f32, tv: galaxy.TileView) void {
-    if (fade <= 0.004 or tv.density_weight <= 0.01) return;
-    const dens = p.ensureDensity() orelse return;
-    const style = tileStyleHash(p) ^ galaxy.density_bake_style;
-    if (!dens.begin(p.layout_epoch, style)) return;
-
-    const live = syncLivePos(p);
-    const arena = dvui.currentWindow().arena();
-    const degrees = arena.alloc(u32, p.nodes.len) catch return;
-    const edge_a = arena.alloc(u32, p.edges.len) catch return;
-    const edge_b = arena.alloc(u32, p.edges.len) catch return;
-    for (p.nodes, degrees) |n, *d| d.* = n.degree;
-    for (p.edges, edge_a, edge_b) |e, *a, *b| {
-        a.* = @intCast(e.a);
-        b.* = @intCast(e.b);
-    }
-    const bake_in: galaxy.BakeInput = .{
-        .live = live,
-        .degrees = degrees,
-        .edge_a = edge_a,
-        .edge_b = edge_b,
-    };
-    const view = worldViewPadded(p, 8);
-    // Steady budget — catch-up storms + atlas wipe were the dive FPS sawtooth.
-    const bake_n: usize = 6;
-    dens.bakeVisible(tv.primary, view, bake_in, bake_n);
-    if (tv.neighbour) |n| dens.bakeVisible(n.level, view, bake_in, bake_n / 2);
-
-    const a = fade * tv.density_weight;
-    if (dens.hold_level) |hl| {
-        if (hl != tv.primary) dens.drawLevel(hl, view, &p.camera, a);
-    }
-    dens.drawLevel(tv.primary, view, &p.camera, a);
-    if (tv.neighbour) |n| dens.drawLevel(n.level, view, &p.camera, fade * n.weight);
-
-    if (dens.pending) {
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-    }
-}
-
-/// Draw the living agent field via shared galaxy soft sprites. Hover/open tint stay in-batch.
-// ---- containment path ------------------------------------------------------------------------
-//
-// The classic path lays every note out flat and then infers a hierarchy back out of the positions.
-// This one inverts that: `fold` builds one hierarchy from links (folder adjacency as a weak
-// tiebreak), `containment` derives positions from it, and `world` decides what is open. It draws
-// through the same `galaxy.drawStyledMarks` the agents do, so this is a layout/LOD swap, not a
-// second renderer.
-
-/// Rebuild the world when the arrangement changed. Synchronous on purpose for now: `fold.build`
-/// is O(n log n)-ish and the gauntlet's ~11k notes land in milliseconds. A vault large enough to
-/// stutter here wants the same background-job treatment `rebuildIfNeeded` already gives the
-/// classic layout.
 fn ensureWorld(p: *Panel) ?*world_mod.World {
     if (p.world_epoch == p.layout_epoch and p.world_state != null) return &p.world_state.?;
     if (p.nodes.len == 0) return null;
@@ -4571,6 +3275,36 @@ fn stepWorld(p: *Panel) void {
     const links = arena.alloc(fold.Edge, p.edges.len) catch return;
     for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
     w.liftLinks(links, params) catch {};
+}
+
+/// The open document as a dashed sun with its headings orbiting it, in the same mark language
+/// the overview uses.
+fn drawInteriorMarks(p: *Panel, fade: f32) void {
+    if (fade <= 0.004 or p.interior.nodes.len == 0) return;
+    const dens = p.ensureDensity() orelse return;
+    const arena = dvui.currentWindow().arena();
+    const theme = dvui.themeGet();
+    const border_rest = theme.color(.window, .text);
+    const hot = theme.color(.highlight, .fill);
+
+    const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
+    const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
+    const gap_px = p.interior.slot * p.camera.zoom;
+    var n: usize = 0;
+    for (p.interior.nodes) |node| {
+        buf[n] = .{
+            .screen = p.camera.worldToScreen(node.pos),
+            .r_px = bubbleScreenRadius(node, zoom_t, gap_px),
+            .fill = nodeFill(theme, node),
+            // The sun is the note you are inside — dashed, so leaving reads differently from
+            // stepping between headings.
+            .border = if (node.is_sun) hot else border_rest,
+            .is_note = !node.is_sun,
+            .dying = false,
+        };
+        n += 1;
+    }
+    _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf[0..n]);
 }
 
 /// Paint the living set stepped by `stepWorld`.
@@ -4701,135 +3435,7 @@ fn worldMarkHoldsOpen(p: *const Panel, w: *const world_mod.World, m: world_mod.M
     return false;
 }
 
-fn drawAgents(p: *Panel, fade: f32) void {
-    if (fade <= 0.004) return;
-    const dens = p.ensureDensity() orelse return;
-    const tree = p.quad_tree orelse return;
-    const arena = dvui.currentWindow().arena();
-    const theme = dvui.themeGet();
-    const border_rest = theme.color(.window, .text);
-    const hot = theme.color(.highlight, .fill);
-
-    // Open tabs tint their living mark at every LOD — a coalesced mass that owns an open note
-    // reads as highlight, not only once the note has split out as a leaf.
-    const open_marks = openLivingAgents(p, tree, arena);
-
-    const buf = arena.alloc(galaxy.StyledMark, p.agent_field.agents.items.len) catch return;
-    var n: usize = 0;
-    var notes_drawn: u32 = 0;
-    var clusters_drawn: u32 = 0;
-    for (p.agent_field.agents.items) |a| {
-        if (a.dying and a.r_px < 1.0) continue;
-        const vis = agentToVisible(tree, a);
-        const hovered_mass = if (p.hover_cluster) |h|
-            vis.level > 0 and h.level == vis.level and h.index == vis.index
-        else
-            false;
-        const holds_open = open_marks.contains(a.key.node);
-        var r = @max(a.r_px, 0.6);
-        if (hovered_mass or holds_open) {
-            r *= 1 + cluster_grow_factor * dvui.easing.outBack(std.math.clamp(
-                if (hovered_mass) p.hover_cluster_t else 1,
-                0,
-                1,
-            ));
-        }
-
-        if (vis.level == 0 and vis.index < p.nodes.len) {
-            const note = p.nodes[vis.index];
-            // Same radius labels / hit-testing use — agent `r_px` is the spring rest size and
-            // never saw proximity `hover_t`, so the disc stayed put while the name jumped out.
-            const zoom_t = detailRevealT(p.layout_slot, p.camera.zoom);
-            var note_r = bubbleScreenRadius(note, zoom_t, p.layout_slot * p.camera.zoom);
-            if (a.dying and a.target_r > 1e-3) {
-                note_r *= std.math.clamp(a.r_px / a.target_r, 0.05, 1);
-            }
-            buf[n] = .{
-                // `note.pos` includes the proximity shove; agent pose may still be catching up.
-                .screen = p.camera.worldToScreen(note.pos),
-                .r_px = @min(note_r, 48),
-                .fill = nodeFill(theme, note),
-                .border = if (note.open or holds_open) hot else border_rest,
-                .is_note = true,
-                .dying = a.dying,
-            };
-            n += 1;
-            notes_drawn += 1;
-            continue;
-        }
-
-        const lit = hovered_mass or holds_open;
-        buf[n] = .{
-            .screen = p.camera.worldToScreen(a.pos),
-            .r_px = @min(@max(r, 2.5), 36) * (0.85 + 0.2 * @min(@log2(@as(f32, @floatFromInt(@min(a.count, 256))) + 1) / 6.0, 1)),
-            .fill = if (lit) hot else border_rest,
-            .border = if (lit) hot else border_rest,
-            .is_note = false,
-            .dying = a.dying,
-        };
-        n += 1;
-        clusters_drawn += 1;
-    }
-    const stats = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf[0..n]);
-    frame_profile.nodes_drawn += notes_drawn;
-    frame_profile.clusters_drawn += clusters_drawn;
-    _ = stats;
-}
-
-/// Living agent node ids that currently cover at least one open document.
-fn openLivingAgents(p: *const Panel, tree: quadlod.Tree, arena: std.mem.Allocator) std.AutoHashMapUnmanaged(u32, void) {
-    var out: std.AutoHashMapUnmanaged(u32, void) = .{};
-    const PoseCtx = struct {
-        field: *const quad_agents.Field,
-        fn hasAgent(ctx: *const anyopaque, node: u32) bool {
-            const c: *const @This() = @ptrCast(@alignCast(ctx));
-            const a = c.field.find(.{ .node = node }) orelse return false;
-            return !a.dying;
-        }
-    };
-    var ctx = PoseCtx{ .field = &p.agent_field };
-    for (p.nodes, 0..) |n, i| {
-        if (!n.open) continue;
-        const agent = quadlod.livingAgent(tree, @intCast(i), PoseCtx.hasAgent, &ctx) orelse continue;
-        out.put(arena, agent, {}) catch {};
-    }
-    return out;
-}
-
-/// Level-0 agent under the cursor — same pose/radius as `drawAgents` (note.pos + bubble radius).
-fn hitTestAgentLeaves(p: *Panel, screen_pt: dvui.Point.Physical) ?usize {
-    const tree = p.quad_tree orelse return null;
-    var best: ?usize = null;
-    var best_d2: f32 = std.math.floatMax(f32);
-    const zoom_t = detailRevealT(p.layout_slot, p.camera.zoom);
-    const gap = p.layout_slot * p.camera.zoom;
-    for (p.agent_field.agents.items) |a| {
-        const note_i = tree.singleNote(a.key.node) orelse continue;
-        if (note_i >= p.nodes.len) continue;
-        const note = p.nodes[note_i];
-        const screen = p.camera.worldToScreen(note.pos);
-        const r = bubbleScreenRadius(note, zoom_t, gap) + 6;
-        const dx = screen.x - screen_pt.x;
-        const dy = screen.y - screen_pt.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 <= r * r and d2 < best_d2) {
-            best_d2 = d2;
-            best = note_i;
-        }
-    }
-    return best;
-}
-
-/// Drawn mass radius — kept in sync with `drawAgents` / galaxy mark sizing.
-fn massScreenRadiusPx(a: quad_agents.Agent) f32 {
-    const r = @max(a.r_px, 2.5);
-    return @min(r, 36) * (0.85 + 0.2 * @min(@log2(@as(f32, @floatFromInt(@min(a.count, 256))) + 1) / 6.0, 1));
-}
-
-/// Click a dashed coalesced mass → frame that mass's **own** note content (what the ring drew),
-/// zoomed just past the sticky open line so children appear. Framing only a subset of kids (or
-/// a mis-hit tiny mass) was diving to one/two nodes while the ring still read as a large cluster.
-fn frameCluster(p: *Panel, target: lod.Visible) void {
+fn frameCluster(p: *Panel, target: Visible) void {
     if (target.level == 0) return;
 
     {
@@ -4857,46 +3463,6 @@ fn frameCluster(p: *Panel, target: lod.Visible) void {
         return;
     }
 
-    if (p.quad_tree) |tree| {
-        if (target.index >= tree.nodes.len) return;
-        const n = tree.get(target.index);
-        if (!n.hasChildren()) return;
-
-        const rad = @max(n.radius, @max(n.spread, p.layout_slot * 0.5));
-        var cx = n.centroid.x;
-        var cy = n.centroid.y;
-        if (p.agent_field.find(.{ .node = target.index })) |a| {
-            cx = a.pos.x;
-            cy = a.pos.y;
-        }
-        const content = dvui.Rect{
-            .x = cx - rad,
-            .y = cy - rad,
-            .w = @max(rad * 2, p.layout_slot),
-            .h = @max(rad * 2, p.layout_slot),
-        };
-        var pose = p.camera.poseForBounds(content, cluster_frame_pad_px);
-        // Land past the open threshold so this mass actually unfolds; without it a fit to the
-        // same content can leave sticky closed and the click feels like a no-op.
-        const kids_leaves = blk: {
-            for (n.children) |c| {
-                if (c == quadlod.no_child) continue;
-                if (tree.nodes[c].hasChildren()) break :blk false;
-            }
-            break :blk true;
-        };
-        const z_open = n.zoomToExceedSpan(quadlod.openThresholdPx(kids_leaves));
-        pose.zoom = p.camera.clamp(@max(pose.zoom, z_open * 1.05));
-
-        p.camera.center_target = pose.center;
-        p.camera.zoom_target = pose.zoom;
-        p.agent_field.sel_zoom = -1;
-        p.agent_field.settled = false;
-        p.framing = .free;
-        p.camera.user_driving = false;
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-        return;
-    }
 
     const py = p.pyramid orelse return;
     if (target.level >= py.levels.len) return;
@@ -5108,12 +3674,12 @@ const DiscBatch = struct {
 /// instead of two copies of its body.
 const NodeIter = struct {
     nodes_len: usize,
-    selection: ?[]const lod.Visible,
+    selection: ?[]const Visible,
     i: usize = 0,
 
     const Step = struct { index: usize, alpha: f32 };
 
-    fn init(nodes: []const GraphNode, selection: ?[]const lod.Visible) NodeIter {
+    fn init(nodes: []const GraphNode, selection: ?[]const Visible) NodeIter {
         return .{ .nodes_len = nodes.len, .selection = selection };
     }
 
@@ -5133,110 +3699,6 @@ const NodeIter = struct {
     }
 };
 
-fn drawNodes(p: *Panel, nodes: []const GraphNode, slot: f32, fade: f32, opts: DrawNodesOpts) void {
-    if (fade <= 0.004) return;
-    const theme = dvui.themeGet();
-    const arena = dvui.currentWindow().arena();
-    const vp = p.camera.viewport;
-    const margin: f32 = 80;
-    const view = vp.outsetAll(margin);
-    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), @as(f32, 1));
-    const highlight = theme.color(.highlight, .fill);
-    // Resting border is window text; open notes (the ones selected into the editor) take the
-    // highlight so they read as the current selection without needing a second fill language.
-    const border_rest = theme.color(.window, .text);
-
-    // Borders under fills. The border is a closed annular ring (not a full disc with the fill
-    // punched over it), so there is no begin/end seam and the two polygons cannot disagree about
-    // how many sides they have.
-    var borders = DiscBatch.init(arena);
-    var fills = DiscBatch.init(arena);
-    defer {
-        borders.flush();
-        fills.flush();
-    }
-
-    var it = NodeIter.init(nodes, opts.selection);
-    while (it.next()) |step| {
-        var n = nodes[step.index];
-        n.alpha *= fade * step.alpha;
-        if (n.alpha <= 0.004) continue;
-        const screen = p.camera.worldToScreen(n.pos);
-        if (!view.contains(screen)) continue;
-
-        // A note emerging from a picture starts at the size its mark was drawn at and grows to
-        // its own, over the same fade that brings it in. Without this it arrives at full size
-        // inside a cross-fade with a mark of a different size, and the two are visibly two
-        // things. `step.alpha` is 1 for anything not mid-split, so this is the identity
-        // everywhere else — including the interior, which has no hierarchy to emerge from.
-        const emerge = std.math.clamp(step.alpha, 0, 1);
-        const settled_r = bubbleScreenRadius(n, zoom_t, slot * p.camera.zoom);
-        const mark_r = @max(gap_radius_frac * slot * p.camera.zoom, 0.6);
-        const r_px = mark_r + (settled_r - mark_r) * emerge;
-        const stroke_t = @max(n.hover_t, zoom_t * 0.5);
-        const is_sun = opts.dashed_sun and n.is_sun;
-
-        const fill = nodeFill(theme, n);
-        const border = (if (n.open) highlight else border_rest).opacity(n.alpha);
-
-        if (r_px <= batch_max_r and !is_sun) {
-            frame_profile.nodes_drawn += 1;
-            const inner = @max(r_px - node_border_px, 0.5);
-            borders.addRing(screen, r_px, inner, border);
-            fills.add(screen, inner, fill.opacity(n.alpha));
-        } else {
-            frame_profile.nodes_pathed += 1;
-            // Drop shadow: skip for the sun — a shadow under an "empty" disc reads as a
-            // floating chip, which fights the hollow exit affordance — and skip it once the
-            // node is too small for it to be visible.
-            //
-            // A shadow is a second tessellated convex fill per node, offset by 1.5px with a 4px
-            // fade. Under `shadow_min_r` that is entirely inside the disc's own antialiasing:
-            // it doubles the path work for every node on screen and changes nothing the reader
-            // can see. Zoomed out on a large vault, nearly every node is in that band.
-            if (!is_sun and r_px >= shadow_min_r) {
-                var shadow_builder = dvui.Path.Builder.init(arena);
-                shadow_builder.addArc(
-                    .{ .x = screen.x + shadow_offset, .y = screen.y + shadow_offset },
-                    r_px,
-                    std.math.tau,
-                    0,
-                    true,
-                );
-                shadow_builder.build().fillConvex(.{
-                    .color = dvui.Color.black.opacity(shadow_alpha * n.alpha),
-                    .fade = shadow_fade,
-                });
-            }
-
-            var builder = dvui.Path.Builder.init(arena);
-            builder.addArc(screen, r_px, std.math.tau, 0, true);
-            builder.build().fillConvex(.{ .color = fill.opacity(n.alpha), .fade = 1 });
-
-            if (is_sun) {
-                // Dashed highlight ring: the sun is the exit, and has to read as something other
-                // than another heading bubble.
-                strokeCircleDashed(screen, r_px, .{
-                    .thickness = 2.0,
-                    .color = highlight.opacity((0.55 + 0.35 * stroke_t) * n.alpha),
-                });
-            } else {
-                var ring = dvui.Path.Builder.init(arena);
-                ring.addArc(screen, r_px, std.math.tau, 0, true);
-                // Close the loop: the arc starts and ends at center-right, and an open stroke
-                // leaves a one-pixel hitch exactly there.
-                ring.build().stroke(.{
-                    .thickness = node_border_px,
-                    .color = border,
-                    .closed = true,
-                });
-            }
-        }
-    }
-}
-
-/// Approximate a circle with a dashed polyline. dvui's stroke has no dash pattern, so this
-/// samples the arc and paints dash spans the same way pixi's marquee does.
 fn strokeCircleDashed(center: dvui.Point.Physical, radius: f32, stroke: dvui.Path.StrokeOptions) void {
     if (radius < 2) return;
     const arena = dvui.currentWindow().arena();
@@ -5413,7 +3875,7 @@ fn updateLabels(
     nodes: []GraphNode,
     edges: []const GraphEdge,
     slot: f32,
-    selection: ?[]const lod.Visible,
+    selection: ?[]const Visible,
     /// Minimum reveal for every candidate, regardless of zoom.
     ///
     /// The classic path fades names in as `slot * zoom` crosses a pixel gap, because it draws
@@ -5457,14 +3919,7 @@ fn updateLabels(
     // refused slot after slot for collisions with a web that was not being drawn.
     const containment_links: ?[]const world_mod.LiftedLink =
         if (p.world_state) |*w| w.links.items else null;
-    const gathered: ?[]const lod.Link =
-        if (containment_links != null) null else if (selection != null) p.vis_edges.items else null;
-    const seg_cap = if (containment_links) |cl|
-        cl.len
-    else if (gathered) |g|
-        g.len
-    else
-        edges.len;
+    const seg_cap = if (containment_links) |cl| cl.len else edges.len;
     const seg_buf = arena.alloc(labels.Segment, seg_cap) catch return;
     var seg_n: usize = 0;
     for (0..seg_cap) |i| {
@@ -5476,9 +3931,6 @@ fn updateLabels(
             const cb = markWorldPos(w, cl[i].b) orelse continue;
             wa = ca;
             wb = cb;
-        } else if (gathered) |g| {
-            wa = g[i].from;
-            wb = g[i].to;
         } else {
             const e = edges[i];
             if (e.a >= nodes.len or e.b >= nodes.len) continue;
@@ -5836,97 +4288,6 @@ fn drawFitButton(p: *Panel, container: *dvui.WidgetData) void {
 
     if (btn.clicked()) zoomExtents();
 }
-
-/// Inner shadow hugging the four edges of the graph viewport, the way pixi shades its canvas.
-///
-/// Four opaque strips laid just *outside* the viewport, one per edge. Only their fade bands
-/// fall inside the clip, and the band is the shadow.
-///
-/// This leans on how `fillConvex` actually applies `fade`: for `fade > 1` the ramp runs from
-/// half a pixel inside the shape's edge to `fade - 0.5` px *outside* it. So a strip flush
-/// against the boundary is at full alpha on the boundary itself and gone `depth` pixels in,
-/// with its body — and its other three fade bands — clipped away entirely. Corners get two
-/// overlapping strips and read darker, which is what a recessed viewport should do.
-///
-/// Not `Options.box_shadow`: that casts outward from a widget rect. This is the inverse — a
-/// lip that content passes underneath.
-fn drawEdgeShadows(vp: dvui.Rect.Physical) void {
-    const depth = edge_shadow_depth * dvui.currentWindow().natural_scale;
-    // On a panel dragged to a sliver, opposite shadows would meet and just dim the whole thing.
-    if (depth < 1 or vp.w < depth * 3 or vp.h < depth * 3) return;
-
-    const theme = dvui.themeGet();
-    const opts: dvui.Path.FillConvexOptions = .{
-        .color = dvui.Color.black.opacity(if (theme.dark) edge_shadow_alpha_dark else edge_shadow_alpha_light),
-        .fade = depth,
-    };
-    // Deep enough that each strip's far side, and the fade band hanging off it, clear the clip.
-    const over = depth * 3;
-
-    const strips = [_]dvui.Rect.Physical{
-        .{ .x = vp.x - over, .y = vp.y - over, .w = vp.w + over * 2, .h = over },
-        .{ .x = vp.x - over, .y = vp.y + vp.h, .w = vp.w + over * 2, .h = over },
-        .{ .x = vp.x - over, .y = vp.y - over, .w = over, .h = vp.h + over * 2 },
-        .{ .x = vp.x + vp.w, .y = vp.y - over, .w = over, .h = vp.h + over * 2 },
-    };
-    for (strips) |s| s.fill(.{}, opts);
-}
-
-/// Temporary on-screen readout of everything the reshape depends on.
-///
-/// Here because the panel's reshaping has been reported broken repeatedly while the layout it
-/// calls demonstrably reshapes correctly in isolation — so the fault is somewhere in what the
-/// panel *measures*, and that is precisely the part no test can see. Guessing at it blind has
-/// already cost several rounds; one look at the real numbers settles it.
-///
-/// `span` is the cloud's own width-over-height. If `aspect` tracks the pane while `span` does not
-/// follow it, the layout is being asked wrongly; if `aspect` itself does not track the pane, the
-/// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
-/// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
-/// text HUD and scanning every node for span every frame is pure overhead on the hot path.
-const debug_hud = false;
-
-/// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
-///
-/// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
-/// dominates changes completely with zoom — at overview it is whichever pass is not culled, mid
-/// zoom it is the web, close in it is labels. Guessing between them has already been wrong more
-/// than once, so each is timed separately and the counts of what actually reached the batch are
-/// reported alongside, since a pass being slow and a pass being *large* want different fixes.
-const FrameProfile = struct {
-    rebuild_ns: u64 = 0,
-    bubbles_ns: u64 = 0,
-    hover_ns: u64 = 0,
-    labels_ns: u64 = 0,
-    edge_anim_ns: u64 = 0,
-    draw_edges_ns: u64 = 0,
-    draw_nodes_ns: u64 = 0,
-    draw_clusters_ns: u64 = 0,
-    draw_labels_ns: u64 = 0,
-
-    /// Submitted to a batch, i.e. survived culling — not the size of the arrays walked.
-    edges_drawn: u32 = 0,
-    nodes_drawn: u32 = 0,
-    nodes_pathed: u32 = 0,
-    clusters_drawn: u32 = 0,
-    /// Tile quads submitted this frame, and how many of them were rendered into the atlas rather
-    /// than read from it. Baking should fall to zero within a frame or two of any camera move —
-    /// a picture outlives every pan and zoom — so a HUD showing it constantly non-zero means
-    /// something is invalidating the atlas every frame.
-    tiles_drawn: u32 = 0,
-    tiles_baked: u32 = 0,
-    /// Tiles with no picture yet, drawn straight to the screen this frame. Should fall to zero
-    /// within a frame or two of any camera move that reveals new ground.
-    tiles_direct: u32 = 0,
-
-    fn total(self: FrameProfile) u64 {
-        return self.rebuild_ns + self.bubbles_ns + self.hover_ns + self.labels_ns +
-            self.edge_anim_ns + self.draw_edges_ns + self.draw_nodes_ns +
-            self.draw_clusters_ns + self.draw_labels_ns;
-    }
-};
-
-var frame_profile: FrameProfile = .{};
 
 fn profNow() i96 {
     if (!debug_hud) return 0;
@@ -6418,9 +4779,6 @@ fn hitTestActive(p: *Panel, screen: dvui.Point.Physical) ?usize {
     if (p.interior.t >= 0.5 and p.interior.nodes.len > 0) {
         return hitTestNodes(p, p.interior.nodes, p.interior.slot, screen);
     }
-    // Overview clicks must use living agent poses (same as hover) — resting layout positions
-    // disagree mid split/join and open the wrong note or miss entirely.
-    if (p.agents_active) return hitTestAgentLeaves(p, screen);
     return hitTestNodes(p, p.nodes, p.layout_slot, screen);
 }
 
@@ -6581,8 +4939,6 @@ pub fn wantsRepaint() bool {
     return p.fling_x.coasting or p.fling_y.coasting or p.drag_active or p.gesture_active or
         !p.proximity_settled or !p.layout_settled or !p.pointer_settled or !p.edges_settled or
         !p.labels_settled or p.camera.chasing() or p.aspect_waiting or p.rebuild_waiting or
-        p.tiles_pending or
-        (p.agents_active and !p.agent_field.settled) or
         (if (p.world_state) |*w| !w.settled else false) or
         // Keep ticking while a descent is still *arriving*. Gating on `t < 0.98` alone never
         // stops for a note whose interior cannot fill the panel — the zoom ceiling

@@ -120,11 +120,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "atlas-camera-tests", "src/ui/camera.zig" },
         .{ "atlas-layout-full-tests", "src/ui/layout_full.zig" },
-        .{ "atlas-multilevel-tests", "src/ui/multilevel.zig" },
-        .{ "atlas-lod-tests", "src/ui/lod.zig" },
         // Point-region quadtree spine + thin present layer (Stable v1 organic LOD).
-        .{ "atlas-quadlod-tests", "src/ui/quadlod.zig" },
-        .{ "atlas-quad-agents-tests", "src/ui/quad_agents.zig" },
         .{ "atlas-galaxy-tests", "src/ui/galaxy.zig" },
         .{ "atlas-vault-synth-tests", "src/ui/vault_synth.zig" },
         .{ "atlas-hex-tests", "src/ui/hex.zig" },
@@ -157,6 +153,7 @@ pub fn build(b: *std.Build) void {
 
     // Headless timing harness over a real folder of markdown — see `src/bench_main.zig`. Kept out
     // of the default step: it needs a vault path and is only useful under ReleaseFast.
+    // `--world` sweeps the layout/LOD path across a zoom range; `--stats` reports graph structure.
     {
         const bench = b.addExecutable(.{
             .name = "atlas-bench",
@@ -168,36 +165,15 @@ pub fn build(b: *std.Build) void {
         });
         // The sources come in by *path*, not as separate modules: `Scanner.zig` relative-imports
         // `resolve.zig`, and a file may belong to only one module — declaring both as modules is
-        // an immediate "file exists in modules 'resolve' and 'Scanner'". Pulling them into the
-        // bench's own root module instead lets the existing relative imports resolve normally,
-        // which is also why the root lives in `src/`: a module may not import above its own root.
+        // an immediate "file exists in modules 'resolve' and 'Scanner'".
         bench.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         bench.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
         const run_bench = b.addRunArtifact(bench);
         if (b.args) |a| run_bench.addArgs(a);
-        b.step("bench", "Time scan/resolve/layout over a vault folder").dependOn(&run_bench.step);
+        b.step("bench", "Scan/resolve timings, --stats structure, --world LOD sweep").dependOn(&run_bench.step);
     }
 
-    // Draw-path stress test: synth N nodes, time cull / LOD / impostor-tile strategies against a
-    // 120 fps budget. No window — see `src/render_bench_main.zig`.
-    {
-        const rbench = b.addExecutable(.{
-            .name = "atlas-render-bench",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .root_source_file = b.path("src/render_bench_main.zig"),
-            }),
-        });
-        rbench.root_module.addImport("dvui", fizzy_dep.module("dvui"));
-        const run_rbench = b.addRunArtifact(rbench);
-        if (b.args) |a| run_rbench.addArgs(a);
-        b.step("render-bench", "Time graph draw strategies at vault scale").dependOn(&run_rbench.step);
-    }
-
-    // Windowed GPU harness on the same plain SDL3 / `SDL_Renderer` path fizzy uses
-    // (`dvui_sdl3`), not sdl3gpu. Reaches fizzy's dvui pin so the plugin and this exe stay
-    // on one tree — see `src/render_gpu_main.zig`.
+    // markworld demos (rings / coalesce) — package owns sources + zflecs; brain thin-wraps.
     {
         const dvui_sdl3_dep = fizzy_dep.builder.dependency("dvui", .{
             .target = target,
@@ -206,6 +182,8 @@ pub fn build(b: *std.Build) void {
             .accesskit = .off,
         });
         const gpu_dvui = dvui_sdl3_dep.module("dvui_sdl3");
+        // batch2d must share the consumer's dvui module object — here the sdl3 one, not the
+        // plugin proxy the panel builds against.
         const batch2d_gpu = b.createModule(.{
             .root_source_file = batch2d_dep.path("src/root.zig"),
             .target = target,
@@ -213,19 +191,6 @@ pub fn build(b: *std.Build) void {
         });
         batch2d_gpu.addImport("dvui", gpu_dvui);
 
-        const gpu = b.addExecutable(.{
-            .name = "atlas-render-gpu",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .root_source_file = b.path("src/render_gpu_main.zig"),
-            }),
-        });
-        gpu.root_module.addImport("dvui", gpu_dvui);
-        gpu.root_module.addImport("batch2d", batch2d_gpu);
-        const run_gpu = b.addRunArtifact(gpu);
-        if (b.args) |a| run_gpu.addArgs(a);
-        b.step("render-gpu", "Windowed plain-SDL3 graph draw stress harness").dependOn(&run_gpu.step);
 
         // markworld demos (rings / coalesce) — package owns sources + zflecs; brain thin-wraps.
         const markworld_dep = b.dependency("markworld", .{ .target = target, .optimize = optimize });
@@ -271,21 +236,6 @@ pub fn build(b: *std.Build) void {
     }
 
     // Headless organic LOD zoom tour — CSV + diagnostic PPM frames (no window).
-    {
-        const t = b.addExecutable(.{
-            .name = "atlas-organic-tour",
-            .root_module = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-                .root_source_file = b.path("src/organic_tour_main.zig"),
-            }),
-        });
-        t.root_module.addImport("dvui", fizzy_dep.module("dvui"));
-        t.root_module.addImport("batch2d", batch2d_mod);
-        const run_t = b.addRunArtifact(t);
-        if (b.args) |a| run_t.addArgs(a);
-        b.step("organic-tour", "Headless organic LOD zoom tour (CSV + PPM frames)").dependOn(&run_t.step);
-    }
 
     // batch2d package tests (soft atlas / sprite+line batches / camera / hit).
     {

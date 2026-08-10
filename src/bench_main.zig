@@ -20,10 +20,6 @@ const Scanner = @import("index/Scanner.zig");
 const resolve = @import("index/resolve.zig");
 const layout_full = @import("ui/layout_full.zig");
 const multilevel = @import("ui/multilevel.zig");
-const lod = @import("ui/lod.zig");
-const quadlod = @import("ui/quadlod.zig");
-const quad_agents = @import("ui/quad_agents.zig");
-const galaxy = @import("ui/galaxy.zig");
 const vault_synth = @import("ui/vault_synth.zig");
 const bench_stats = @import("bench_stats.zig");
 const world_mod = @import("ui/world.zig");
@@ -32,7 +28,6 @@ const fold = @import("ui/fold.zig");
 /// When set (via `--svg <dir>`), every solved layout is also written there as an SVG.
 var svg_dir: ?[]const u8 = null;
 /// When set, after each layout run the plugin Galaxy LOD path (budget / settle / lift).
-var galaxy_smoke: bool = false;
 /// Synth placement: pack (fast, default) or full layout_full solve.
 var synth_place: vault_synth.Place = .pack;
 var synth_place_explicit: bool = false;
@@ -87,10 +82,6 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--world")) continue;
         if (std.mem.eql(u8, a, "--stats")) {
             continue; // handled in the pre-pass above
-        }
-        if (std.mem.eql(u8, a, "--galaxy")) {
-            galaxy_smoke = true;
-            continue;
         }
         if (std.mem.eql(u8, a, "--place")) {
             i += 1;
@@ -363,9 +354,6 @@ fn benchSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void 
         const svg_label = try std.fmt.allocPrint(arena, "synth-{s}-{d}", .{ spec.shape.label(), n });
         try writeSvg(io, d, svg_label, out, graph.edges, graph.degrees, arena);
     }
-    if (galaxy_smoke) {
-        try smokeGalaxy(gpa, io, label, out, graph.edges);
-    }
 }
 
 fn benchVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
@@ -461,9 +449,6 @@ fn benchVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
         },
     );
     std.debug.print("    fill={d:.3}  cross-dir-edges={d}  max-degree={d}\n", .{ fillRatio(out, n), cross_dir, max_deg });
-    if (galaxy_smoke) {
-        try smokeGalaxy(gpa, io, std.fs.path.basename(dir_path), out, edges.items);
-    }
     if (svg_dir) |d| {
         try writeSvg(io, d, std.fs.path.basename(dir_path), out, edges.items, degrees, arena);
         // Raw multilevel output, before packing/snap/refine — isolates whether the ladder is
@@ -475,146 +460,8 @@ fn benchVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
         const label = try std.fmt.allocPrint(arena, "{s}-raw-ml", .{std.fs.path.basename(dir_path)});
         try writeSvg(io, d, label, raw, edges.items, degrees, arena);
 
-        // And the merged-region view, at a couple of levels of the hierarchy.
-        var ladder = try multilevel.coarsen(gpa, n, ml_edges);
-        defer ladder.deinit(gpa);
-        const cedges = try arena.alloc(lod.CEdge, edges.items.len);
-        for (edges.items, cedges) |e, *ce| ce.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-        var py = try lod.build(gpa, ladder, out, cedges);
-        defer py.deinit();
-        var lv: usize = 1;
-        while (lv < py.levels.len) : (lv += 2) {
-            const clabel = try std.fmt.allocPrint(arena, "{s}-clusters-L{d}", .{ std.fs.path.basename(dir_path), lv });
-            try writeClusterSvg(io, d, clabel, py.levels[lv], arena);
-        }
     }
 }
-
-/// Plugin overview path without a window: build → selectSticky agents → lift edges.
-/// Fails the process if living marks exceed `plugin_mark_budget` or the field never settles.
-fn smokeGalaxy(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    name: []const u8,
-    positions: []const dvui.Point,
-    layout_edges: []const layout_full.Edge,
-) !void {
-    const qedges = try gpa.alloc(quadlod.Edge, layout_edges.len);
-    defer gpa.free(qedges);
-    for (layout_edges, qedges) |e, *qe| qe.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-
-    var tree = try quadlod.buildEx(gpa, positions, qedges);
-    defer tree.deinit();
-
-    var field = quad_agents.Field.init(gpa);
-    defer field.deinit();
-
-    const root = tree.get(tree.root);
-    const span_w = root.max_x - root.min_x;
-    const span_h = root.max_y - root.min_y;
-    const pad = @max(@max(span_w, span_h) * 0.05, 1);
-    const full_view = dvui.Rect{
-        .x = root.min_x - pad,
-        .y = root.min_y - pad,
-        .w = span_w + 2 * pad,
-        .h = span_h + 2 * pad,
-    };
-    // Dive: ~¼ of the world, centred — forces split toward leaves without leaving the vault.
-    const dive_view = dvui.Rect{
-        .x = root.min_x + span_w * 0.35,
-        .y = root.min_y + span_h * 0.35,
-        .w = @max(span_w * 0.3, 1),
-        .h = @max(span_h * 0.3, 1),
-    };
-
-    const budget = galaxy.plugin_mark_budget;
-    const cases = [_]struct { label: []const u8, view: dvui.Rect, zoom: f32 }{
-        .{ .label = "overview", .view = full_view, .zoom = 0.08 },
-        .{ .label = "dive", .view = dive_view, .zoom = 1.2 },
-    };
-
-    for (cases) |c| {
-        field.reset();
-        const t0 = now(io);
-        var settled_at: ?usize = null;
-        var frame: usize = 0;
-        while (frame < 90) : (frame += 1) {
-            const sel_pad = @max(c.view.w, c.view.h) * 0.2;
-            const sel = dvui.Rect{
-                .x = c.view.x - sel_pad,
-                .y = c.view.y - sel_pad,
-                .w = c.view.w + 2 * sel_pad,
-                .h = c.view.h + 2 * sel_pad,
-            };
-            try field.step(tree, gpa, .{
-                .view = sel,
-                .live = positions,
-                .zoom = c.zoom,
-                .note_r_px = 6,
-                .dt = 1.0 / 60.0,
-                .budget = budget,
-            });
-            // Living topology ≤ livingCap; draw list may briefly include fading (dying) marks.
-            const cap = quadlod.livingCap(budget);
-            const living_n = blk: {
-                var n: usize = 0;
-                for (field.agents.items) |a| {
-                    if (!a.dying) n += 1;
-                }
-                break :blk n;
-            };
-            if (living_n > cap) {
-                std.debug.print(
-                    "    GALAXY FAIL {s}/{s}: living={d} > livingCap={d} (agents={d} budget={d})\n",
-                    .{ name, c.label, living_n, cap, field.agents.items.len, budget },
-                );
-                return error.GalaxyBudgetExceeded;
-            }
-            if (field.settled and settled_at == null) settled_at = frame;
-            if (field.settled and frame > 8) break;
-        }
-        const step_ms = ms(elapsed(io, t0));
-
-        var lifted: std.ArrayListUnmanaged(quadlod.LiftedEdge) = .empty;
-        defer lifted.deinit(gpa);
-        try field.gatherLiftedEdges(tree, qedges, gpa, &lifted);
-
-        const leaf_marks = blk: {
-            var n: usize = 0;
-            for (field.agents.items) |a| {
-                if (!a.dying and a.count <= 1) n += 1;
-            }
-            break :blk n;
-        };
-        if (settled_at) |sf| {
-            std.debug.print(
-                "    galaxy {s}: agents={d} living={d} leaves={d} edges={d} settled@{d} {d:.0}ms\n",
-                .{ c.label, field.agents.items.len, field.living.items.len, leaf_marks, lifted.items.len, sf, step_ms },
-            );
-        } else {
-            std.debug.print(
-                "    galaxy {s}: agents={d} living={d} leaves={d} edges={d} settled@never {d:.0}ms\n",
-                .{ c.label, field.agents.items.len, field.living.items.len, leaf_marks, lifted.items.len, step_ms },
-            );
-        }
-        if (settled_at == null) {
-            std.debug.print("    GALAXY FAIL {s}/{s}: field never settled\n", .{ name, c.label });
-            return error.GalaxyNeverSettled;
-        }
-        if (positions.len > 0 and field.living.items.len == 0) {
-            std.debug.print("    GALAXY FAIL {s}/{s}: empty living set\n", .{ name, c.label });
-            return error.GalaxyEmptyLiving;
-        }
-    }
-}
-
-/// How much of the cloud's own bounding box the nodes actually fill, in units of the snap
-/// lattice.
-///
-/// A solid hex-packed *disc* — every cell taken, no voids — reads ~0.91 (hex cells fill 1/0.866
-/// of their spacing squared, times π/4 for a disc inside its bounding box). A layout with real
-/// structure, where clusters are separated by empty lattice, reads far below that. It is the
-/// numeric form of "did this collapse into one massive hex".
 fn fillRatio(pts: []const dvui.Point, n: usize) f64 {
     var min_x: f32 = std.math.floatMax(f32);
     var min_y: f32 = std.math.floatMax(f32);
@@ -769,69 +616,3 @@ fn collect(
     }
 }
 
-/// Render one pyramid level the way the panel now draws merged regions — a soft glow sized to
-/// the region's footprint, plus a small crisp core — so the look can be judged before it ships.
-fn writeClusterSvg(
-    io: std.Io,
-    dir: []const u8,
-    name: []const u8,
-    clusters: []const lod.Cluster,
-    arena: std.mem.Allocator,
-) !void {
-    const size: f32 = 1400;
-    var min_x: f32 = std.math.floatMax(f32);
-    var min_y: f32 = std.math.floatMax(f32);
-    var max_x: f32 = -std.math.floatMax(f32);
-    var max_y: f32 = -std.math.floatMax(f32);
-    for (clusters) |c| {
-        min_x = @min(min_x, c.pos.x - c.radius);
-        min_y = @min(min_y, c.pos.y - c.radius);
-        max_x = @max(max_x, c.pos.x + c.radius);
-        max_y = @max(max_y, c.pos.y + c.radius);
-    }
-    const span = @max(@max(max_x - min_x, max_y - min_y), 1e-3);
-    const k = (size - 40) / span;
-
-    var out: std.ArrayList(u8) = .empty;
-    const add = struct {
-        fn f(list: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
-            try list.appendSlice(a, try std.fmt.allocPrint(a, fmt, args));
-        }
-    }.f;
-
-    try add(&out, arena,
-        \\<svg xmlns="http://www.w3.org/2000/svg" width="{d:.0}" height="{d:.0}" viewBox="0 0 {d:.0} {d:.0}">
-        \\<rect width="{d:.0}" height="{d:.0}" fill="#0b0d12"/>
-        \\
-    , .{ size, size, size, size, size, size });
-
-    // Mirrors `graph.drawClusters` in additive mode: wide, low-weight splats summed together.
-    // `plus-lighter` is the same arithmetic dvui's premultiplied src-over performs when a vertex
-    // carries zero alpha, so this previews what the panel actually draws.
-    try add(&out, arena, "<g style=\"mix-blend-mode:plus-lighter\">\n", .{});
-    try add(&out, arena,
-        \\<defs><radialGradient id="s">
-        \\<stop offset="0%" stop-color="#fff" stop-opacity="1"/>
-        \\<stop offset="28%" stop-color="#fff" stop-opacity="0.55"/>
-        \\<stop offset="60%" stop-color="#fff" stop-opacity="0.18"/>
-        \\<stop offset="100%" stop-color="#fff" stop-opacity="0"/>
-        \\</radialGradient></defs>
-        \\
-    , .{});
-    const node_r: f32 = 9.0;
-    for (clusters) |c| {
-        const cx = 20 + (c.pos.x - min_x) * k;
-        const cy = 20 + (c.pos.y - min_y) * k;
-        const extent = c.radius * k + node_r;
-        const splat = @max(extent * 1.9, node_r * 3.0);
-        const load = @log(1.0 + @as(f32, @floatFromInt(c.count))) / @log(1.0 + 256.0);
-        const w = 0.10 + 0.16 * std.math.clamp(load, 0, 1);
-        try add(&out, arena, "<circle cx=\"{d:.1}\" cy=\"{d:.1}\" r=\"{d:.1}\" fill=\"url(#s)\" opacity=\"{d:.3}\"/>\n", .{ cx, cy, splat, w });
-    }
-    try add(&out, arena, "</g>\n", .{});
-
-    try add(&out, arena, "</svg>\n", .{});
-
-    const path = try std.fmt.allocPrint(arena, "{s}/{s}.svg", .{ dir, name });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
-}
