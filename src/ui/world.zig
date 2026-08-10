@@ -120,6 +120,10 @@ pub const World = struct {
     owner: []u32,
     /// True when the budget refused an open this frame (HUD / tests).
     bound: bool = false,
+    /// False while any crossfade is still running. The host needs this to keep asking for frames:
+    /// a camera chase reports itself, but a split that finishes after the camera stops would
+    /// otherwise freeze half-open until some unrelated event woke the app.
+    settled: bool = true,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -325,6 +329,7 @@ pub const World = struct {
     /// of popping, but never lets any of that feed back into the decision above.
     fn present(self: *World, view: View, p: Params, dt: f32) !void {
         const rate = @min(1.0, dt * p.rate);
+        self.settled = true;
         var stack: std.ArrayListUnmanaged(u32) = .empty;
         defer stack.deinit(self.gpa);
         for (self.lad.roots) |r| {
@@ -344,6 +349,7 @@ pub const World = struct {
             self.anim[id] += (target - self.anim[id]) * rate;
             if (self.anim[id] < 0.004) self.anim[id] = 0;
             if (self.anim[id] > 0.996) self.anim[id] = 1;
+            if (self.anim[id] != target) self.settled = false;
 
             if (self.anim[id] < 1) {
                 const alpha = self.mul[id] * (1 - self.anim[id]);

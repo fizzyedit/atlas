@@ -1336,7 +1336,12 @@ fn updateHover(p: *Panel) void {
     } else {
         // Leaves first — a note on/near a dashed mass must stay the hover target. Masses only
         // when no leaf hits (same order as click).
-        p.hover_node = if (p.agents_active)
+        // `hitTestAgentLeaves` walks the classic agent field, which containment never fills — so
+        // in containment mode every note hover missed, the cursor never became a hand, and clicking
+        // a note could not open its document.
+        p.hover_node = if (p.containment_mode)
+            hitTestNodes(p, p.nodes, p.layout_slot, mouse)
+        else if (p.agents_active)
             hitTestAgentLeaves(p, mouse)
         else
             hitTestNodes(p, p.nodes, p.layout_slot, mouse);
@@ -6618,6 +6623,7 @@ pub fn wantsRepaint() bool {
         !p.labels_settled or p.camera.chasing() or p.aspect_waiting or p.rebuild_waiting or
         p.tiles_pending or
         (p.agents_active and !p.agent_field.settled) or
+        (p.containment_mode and if (p.world_state) |*w| !w.settled else false) or
         // Keep ticking while a descent is still *arriving*. Gating on `t < 0.98` alone never
         // stops for a note whose interior cannot fill the panel — the zoom ceiling
         // (`fitMaxGapPx`) or a clamped nest can leave the descent topping out below 0.98, and

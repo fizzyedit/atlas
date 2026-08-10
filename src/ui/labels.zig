@@ -102,6 +102,8 @@ pub const Placer = struct {
     segs: []const Segment = &.{},
     /// Half-thickness of the corridor around each segment, in the same space as `pad`.
     seg_pad: f32 = 0,
+    /// Retry ignoring links when no slot avoids them. See `place`.
+    relax_segments: bool = true,
     /// The cloud's own silhouette, if the caller knows it: a *preferred* limit tried before
     /// `bounds`. The camera frames node centres, not names, so the outermost node's label is the
     /// one thing that can stick out past the shape the reader reads as "the graph" — a long name
@@ -184,7 +186,20 @@ pub const Placer = struct {
                 if (self.tryOrder(anchor, bubble_r, w, h, gap, order, sticky, limit)) |got| return got;
             }
         }
-        return self.tryOrder(anchor, bubble_r, w, h, gap, order, sticky, self.bounds);
+        if (self.tryOrder(anchor, bubble_r, w, h, gap, order, sticky, self.bounds)) |got| return got;
+
+        // Last resort: allow the name to cross a link. A node in the middle of an island or a
+        // dense nest is ringed by edges on every side, so every slot collides and it never gets a
+        // name at any zoom — the label is suppressed to protect a line the reader can still see
+        // perfectly well underneath it. Discs and other labels stay hard constraints, since those
+        // genuinely make a name unreadable; a line does not.
+        if (self.relax_segments and self.segs.len > 0) {
+            const saved = self.segs;
+            self.segs = &.{};
+            defer self.segs = saved;
+            return self.tryOrder(anchor, bubble_r, w, h, gap, order, sticky, self.bounds);
+        }
+        return null;
     }
 
     fn tryOrder(
