@@ -20,8 +20,11 @@
 //!    off-screen cell's whole subtree is off-screen and the test is exact. Without this the
 //!    candidate list fills with the entire vault, the budget check never passes, and the dive
 //!    stalls partway showing nothing but coalesced rings.
-//! 2. **Open a whole level or none of it.** Opening biggest-first until the budget runs out leaves
-//!    identical neighbours resolved differently depending on visit order — a visible seam.
+//! 2. **Decide a level by a count threshold, never by visit order.** Opening biggest-first until
+//!    the budget runs out leaves identical neighbours resolved differently depending on the walk —
+//!    a visible seam. But opening a whole level or none of it wastes most of the budget, since
+//!    level sizes go 1, arity, arity²…: the gauntlet drew 57 marks against a budget of 280.
+//!    Thresholding on *count* gets both — equal-count cells always agree, and the budget fills.
 //! 3. **Never force an open cell closed at the budget wall.** Closing frees budget, which allows
 //!    reopening, which exceeds it again. The wall refuses only *new* opens.
 //! 4. **A note is a fixed screen size.** Only masses are count-and-zoom scaled, and soft-capped so
@@ -37,7 +40,11 @@ const containment = @import("containment.zig");
 
 pub const Mark = struct {
     cell: u32,
-    /// Screen position and radius.
+    /// Animated world position. The caller applies its own camera transform, so there is exactly
+    /// one place that knows how world maps to screen.
+    wx: f32,
+    wy: f32,
+    /// Screen position (viewport-relative, origin top-left) and radius in pixels.
     x: f32,
     y: f32,
     r: f32,
@@ -73,6 +80,13 @@ pub const Params = struct {
     rate: f32 = 7,
     /// Pad the cull test so a cell just off-screen still animates rather than popping in.
     cull_pad_px: f32 = 48,
+    /// Links the frame may draw, kept by descending weight.
+    ///
+    /// Marks and links need separate budgets: n living cells admit up to n(n-1)/2 lifted pairs,
+    /// so a dense vault reaches ~25,000 lines behind only 280 marks. That is a hairball, not a
+    /// web — it costs draw time and shows nothing, since every cell appears joined to every
+    /// other. Keeping the heaviest links keeps the structure that carries information.
+    link_budget: usize = 900,
 };
 
 pub const World = struct {
@@ -191,15 +205,66 @@ pub const World = struct {
             }
             if (vis.items.len == 0) break;
 
-            // -- rule 2: cost the whole level, then open all of it or none --
+            // -- rule 2: decide the level by a *count threshold*, never by visit order --
+            //
+            // Opening a whole level or none of it wastes most of the budget: level sizes go
+            // 1, arity, arity², … so a 280 budget at arity 7 can only ever take 49, never 343.
+            // The gauntlet showed 57 marks drawn against a budget of 280.
+            //
+            // Ranking cells and opening until the budget runs out recovers the budget but brings
+            // back the artifact organic-lod.md rejected — identical neighbours resolved
+            // differently depending on visit order. Thresholding on *count* avoids both: cells
+            // with equal count always make the same decision, so no seam can appear between two
+            // cells that look alike, and the rule is a pure function of the cell, not the walk.
+            var want_open: usize = 0;
             var extra: usize = 0;
             for (vis.items) |id| {
                 const c = self.lad.cells[id];
                 if (c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px) {
                     extra += c.child_count - 1;
+                    want_open += 1;
                 }
             }
-            if (self.marks.items.len + vis.items.len + extra > p.budget) self.bound = true;
+
+            // 0 means "no threshold, open everything that wants to".
+            var cutoff: u32 = 0;
+            if (self.marks.items.len + vis.items.len + extra > p.budget and want_open > 0) {
+                self.bound = true;
+                const counts = try self.gpa.alloc(u32, want_open);
+                defer self.gpa.free(counts);
+                var ci: usize = 0;
+                for (vis.items) |id| {
+                    const c = self.lad.cells[id];
+                    if (c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px) {
+                        counts[ci] = c.count;
+                        ci += 1;
+                    }
+                }
+                std.mem.sort(u32, counts, {}, comptime std.sort.desc(u32));
+                // Walk the distinct counts largest-first, spending budget a whole count-class at
+                // a time. The first class that does not fit becomes the cutoff: it and every
+                // smaller class stay closed, so cells of equal count never disagree.
+                var spent = self.marks.items.len + vis.items.len;
+                var prev: u32 = std.math.maxInt(u32);
+                for (counts) |cnt| {
+                    if (cnt == prev) continue; // same class, already paid for
+                    prev = cnt;
+                    var class_cost: usize = 0;
+                    for (vis.items) |id| {
+                        const c = self.lad.cells[id];
+                        if (c.count == cnt and c.child_count > 0 and
+                            self.field.radius(&self.lad, id) * view.zoom > p.split_px)
+                        {
+                            class_cost += c.child_count - 1;
+                        }
+                    }
+                    if (spent + class_cost > p.budget) {
+                        cutoff = cnt;
+                        break;
+                    }
+                    spent += class_cost;
+                }
+            }
 
             next.clearRetainingCapacity();
             for (vis.items) |id| {
@@ -208,7 +273,7 @@ pub const World = struct {
 
                 // -- rule 3: the wall refuses new opens only --
                 const already_open = self.anim[id] > 0.5;
-                const want = (!self.bound or already_open) and
+                const want = (c.count > cutoff or already_open) and
                     c.child_count > 0 and sr > p.split_px;
 
                 self.anim[id] += ((if (want) @as(f32, 1) else 0) - self.anim[id]) * rate;
@@ -231,6 +296,8 @@ pub const World = struct {
                             @max(1.0, p.mass_cap_px * (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
                         try self.marks.append(self.gpa, .{
                             .cell = id,
+                            .wx = self.px[id],
+                            .wy = self.py[id],
                             .x = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom,
                             .y = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom,
                             .r = r,
@@ -259,7 +326,7 @@ pub const World = struct {
 
     /// Lift note-level links onto the living set. Call after `step`. Duplicates between the same
     /// pair of cells are merged, so a coarse cell pair draws one line, not thousands.
-    pub fn liftLinks(self: *World, note_links: []const fold.Edge) !void {
+    pub fn liftLinks(self: *World, note_links: []const fold.Edge, p: Params) !void {
         self.links.clearRetainingCapacity();
         if (self.lad.root == fold.invalid) return;
 
@@ -284,6 +351,18 @@ pub const World = struct {
                 .b = @intCast(kv.key_ptr.* & 0xffff_ffff),
                 .w = kv.value_ptr.*,
             });
+        }
+        if (self.links.items.len > p.link_budget) {
+            const S = struct {
+                pub fn heavier(_: void, x: LiftedLink, y: LiftedLink) bool {
+                    if (x.w != y.w) return x.w > y.w;
+                    // deterministic tie-break, so a parked camera keeps the same web
+                    if (x.a != y.a) return x.a < y.a;
+                    return x.b < y.b;
+                }
+            };
+            std.mem.sort(LiftedLink, self.links.items, {}, S.heavier);
+            self.links.shrinkRetainingCapacity(p.link_budget);
         }
     }
 
@@ -403,7 +482,7 @@ test "links lift onto living cells" {
     defer w.deinit();
 
     try settle(&w, .{ .w = 900, .h = 600, .zoom = 8, .cx = 0, .cy = 0 }, .{}, 120);
-    try w.liftLinks(links);
+    try w.liftLinks(links, .{});
     try testing.expect(w.links.items.len > 0);
     // every lifted endpoint must be a cell that is actually on screen this frame
     for (w.links.items) |l| {

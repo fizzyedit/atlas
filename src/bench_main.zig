@@ -26,6 +26,8 @@ const quad_agents = @import("ui/quad_agents.zig");
 const galaxy = @import("ui/galaxy.zig");
 const vault_synth = @import("ui/vault_synth.zig");
 const bench_stats = @import("bench_stats.zig");
+const world_mod = @import("ui/world.zig");
+const fold = @import("ui/fold.zig");
 
 /// When set (via `--svg <dir>`), every solved layout is also written there as an SVG.
 var svg_dir: ?[]const u8 = null;
@@ -37,6 +39,7 @@ var synth_place_explicit: bool = false;
 /// `--stats`: report graph structure (degree/components/hub-fragility/coarsening-ladder/folder
 /// correlation) instead of running layout. Fast even on a huge vault — no force solve, no Galaxy.
 var stats_mode: bool = false;
+var world_mode: bool = false;
 
 const Note = struct {
     path: []const u8,
@@ -67,9 +70,10 @@ pub fn main(init: std.process.Init) !void {
     // regardless of where it appears among the targets.
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--stats")) stats_mode = true;
+        if (std.mem.eql(u8, a, "--world")) world_mode = true;
     }
 
-    if (!stats_mode) {
+    if (!stats_mode and !world_mode) {
         std.debug.print(
             "{s:<22}{s:>7}{s:>8}{s:>9}{s:>8}{s:>10}{s:>8}{s:>9}{s:>8}{s:>8}{s:>9}{s:>11}\n",
             .{ "vault", "notes", "edges", "read", "scan", "resolve", "hop2", "force", "pack", "relax", "snap+ref", "LAYOUT" },
@@ -80,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        if (std.mem.eql(u8, a, "--world")) continue;
         if (std.mem.eql(u8, a, "--stats")) {
             continue; // handled in the pre-pass above
         }
@@ -119,17 +124,109 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 spec.place = .pack;
             }
-            if (stats_mode) {
+            if (world_mode) {
+                try worldSynth(gpa, io, spec);
+            } else if (stats_mode) {
                 try statsSynth(gpa, io, spec);
             } else {
                 try benchSynth(gpa, io, spec);
             }
+        } else if (world_mode) {
+            try worldVault(gpa, io, a);
         } else if (stats_mode) {
             try statsVault(gpa, io, a);
         } else {
             try benchVault(gpa, io, a);
         }
     }
+}
+
+/// `--world`: sweep the containment path (fold ladder → containment placement → budgeted select)
+/// across a zoom range and report what each zoom actually draws.
+///
+/// This exists because the budget cannot be judged from a live window: a bug that only shows at
+/// zooms you do not happen to stop at looks fine by eye. The sweep prints estimate against actual
+/// at every step, which is how two separate bounds bugs were caught in the classic path.
+fn worldSweep(gpa: std.mem.Allocator, n: usize, edges: []const fold.Edge, paths: []const []const u8, label: []const u8) !void {
+    var w = try world_mod.World.init(gpa, n, edges, paths, .{}, .{});
+    defer w.deinit();
+
+    const budget: usize = 280;
+    const params: world_mod.Params = .{ .budget = budget };
+    const vw: f32 = 1200;
+    const vh: f32 = 700;
+    const ext = w.extent();
+    const z_fit = @min(vw, vh) * 0.44 / ext;
+
+    std.debug.print("\n==== world: {s} ====\n", .{label});
+    std.debug.print("  notes={d}  links={d}  ladder depth={d}  cells={d}  root r={d:.1}\n", .{
+        n, edges.len, w.lad.depth, w.lad.cells.len, ext,
+    });
+    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6}\n", .{ "zoom", "marks", "notes", "masses", "links", "bound" });
+
+    var zoom = z_fit;
+    var stepn: usize = 0;
+    while (stepn < 14) : (stepn += 1) {
+        // settle, so what is printed is the resting set rather than a mid-crossfade frame
+        for (0..120) |_| try w.step(.{ .w = vw, .h = vh, .zoom = zoom, .cx = 0, .cy = 0 }, params, 1.0 / 60.0);
+        try w.liftLinks(edges, params);
+        const notes = w.noteMarks();
+        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6}\n", .{
+            zoom, w.marks.items.len, notes, w.marks.items.len - notes, w.links.items.len,
+            if (w.bound) "Y" else "",
+        });
+        if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});
+        zoom *= 2.0;
+    }
+}
+
+fn worldSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void {
+    _ = io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var graph = try vault_synth.generate(gpa, arena, spec);
+    defer graph.deinit(gpa);
+    var name_buf: [48]u8 = undefined;
+    const label = spec.nameBuf(&name_buf);
+    const edges = try arena.alloc(fold.Edge, graph.edges.len);
+    for (graph.edges, edges) |e, *fe| fe.* = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
+    const have_paths = graph.paths.len == spec.n and (spec.n == 0 or graph.paths[0].len > 0);
+    const paths: []const []const u8 = if (have_paths) graph.paths else &.{};
+    try worldSweep(gpa, spec.n, edges, paths, label);
+}
+
+fn worldVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var notes: std.ArrayList(Note) = .empty;
+    var read_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    try collect(gpa, arena, io, dir_path, dir_path, &notes, &read_ns, &scan_ns);
+    if (notes.items.len == 0) return;
+    const n = notes.items.len;
+
+    const candidates = try arena.alloc(resolve.Candidate, n);
+    for (notes.items, candidates) |note, *c| c.* = .{ .path = note.path, .stem = note.stem };
+
+    var edges: std.ArrayList(fold.Edge) = .empty;
+    var buf: [resolve.max_path_len]u8 = undefined;
+    var cand_index = try resolve.Index.init(gpa, candidates);
+    defer cand_index.deinit();
+    for (notes.items, 0..) |note, i| {
+        for (note.links) |raw| {
+            if (!resolve.isNoteLikeTarget(raw)) continue;
+            const m = resolve.resolveIndexed(raw, note.path, candidates, &cand_index, &buf) orelse continue;
+            if (m.index == i) continue;
+            try edges.append(arena, .{ .a = @intCast(i), .b = @intCast(m.index), .w = 1 });
+        }
+    }
+    const paths = try arena.alloc([]const u8, n);
+    for (notes.items, paths) |note, *p| p.* = note.path;
+
+    try worldSweep(gpa, n, edges.items, paths, std.fs.path.basename(dir_path));
 }
 
 /// `--stats` over a synth spec: build the same graph a normal synth bench would (pack placement,

@@ -41,6 +41,8 @@ const quadlod = @import("quadlod.zig");
 const quad_agents = @import("quad_agents.zig");
 const impostor = @import("impostor.zig");
 const galaxy = @import("galaxy.zig");
+const world_mod = @import("world.zig");
+const fold = @import("fold.zig");
 const proximity = @import("proximity.zig");
 const resolve = @import("../index/resolve.zig");
 
@@ -666,6 +668,13 @@ const Panel = struct {
     agent_field: quad_agents.Field = undefined,
     /// Soft-sprite atlas + same-language density mips (Galaxy LOD).
     density: ?galaxy.Density = null,
+
+    /// Containment path (`Settings.graph_layout == .containment`): one hierarchy from links +
+    /// folder adjacency, positions derived from it, budgeted select. Runs *instead of* the
+    /// classic layout/agents/tiles stack, not alongside it — see `drawWorldMarks`.
+    world_state: ?world_mod.World = null,
+    /// `layout_epoch` the world was last built against, so it rebuilds only when the graph does.
+    world_epoch: u64 = std.math.maxInt(u64),
     /// `layout_epoch` the agent field was last reset against.
     agents_epoch: u64 = std.math.maxInt(u64),
     /// True when this frame's overview is drawn from `agent_field` rather than tiles/`select`.
@@ -776,6 +785,10 @@ pub fn shutdown() void {
     if (p.job) |job| {
         job.deinit(sdk.allocator());
         p.job = null;
+    }
+    if (p.world_state) |*w| {
+        w.deinit();
+        p.world_state = null;
     }
 }
 
@@ -898,7 +911,14 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         _ = profLap(&prof);
         // Agents own the overview when active: one living mark set + bound web. Tiles stay parked
         // so their baked web cannot stack with the field (semi-transparent lines double in ink).
-        if (p.agents_active) {
+        if (st.settings.graph_layout.get() == .containment) {
+            // One hierarchy, positions derived from it. Owns the whole overview — no tiles, no
+            // agent field, no flat layout.
+            drawWorldMarks(p, 1 - t);
+            frame_profile.draw_edges_ns = profLap(&prof);
+            frame_profile.draw_nodes_ns = 0;
+            frame_profile.draw_clusters_ns = 0;
+        } else if (p.agents_active) {
             // Galaxy LOD: sticky soft-sprite agents end-to-end. Density mips parked — dual-system
             // dissolve did not match split/join configuration (see `galaxy.density_enabled`).
             const tv = galaxy.tileViewFor(p.camera.zoom);
@@ -4462,6 +4482,119 @@ fn drawGalaxyDensity(p: *Panel, fade: f32, tv: galaxy.TileView) void {
 }
 
 /// Draw the living agent field via shared galaxy soft sprites. Hover/open tint stay in-batch.
+// ---- containment path ------------------------------------------------------------------------
+//
+// The classic path lays every note out flat and then infers a hierarchy back out of the positions.
+// This one inverts that: `fold` builds one hierarchy from links (folder adjacency as a weak
+// tiebreak), `containment` derives positions from it, and `world` decides what is open. It draws
+// through the same `galaxy.drawStyledMarks` the agents do, so this is a layout/LOD swap, not a
+// second renderer.
+
+/// Rebuild the world when the arrangement changed. Synchronous on purpose for now: `fold.build`
+/// is O(n log n)-ish and the gauntlet's ~11k notes land in milliseconds. A vault large enough to
+/// stutter here wants the same background-job treatment `rebuildIfNeeded` already gives the
+/// classic layout.
+fn ensureWorld(p: *Panel) ?*world_mod.World {
+    if (p.world_epoch == p.layout_epoch and p.world_state != null) return &p.world_state.?;
+    if (p.nodes.len == 0) return null;
+
+    const gpa = sdk.allocator();
+    const arena = dvui.currentWindow().arena();
+
+    const links = arena.alloc(fold.Edge, p.edges.len) catch return null;
+    for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
+    const paths = arena.alloc([]const u8, p.nodes.len) catch return null;
+    for (p.nodes, 0..) |n, i| paths[i] = n.path;
+
+    var built = world_mod.World.init(gpa, p.nodes.len, links, paths, .{}, .{}) catch return null;
+    if (p.world_state) |*old| old.deinit();
+    p.world_state = built;
+    p.world_epoch = p.layout_epoch;
+    // `built` is moved into the panel; do not deinit it here.
+    _ = &built;
+    return &p.world_state.?;
+}
+
+/// Step the living set for this frame's camera and paint it.
+fn drawWorldMarks(p: *Panel, fade: f32) void {
+    if (fade <= 0.004) return;
+    const w = ensureWorld(p) orelse return;
+    const dens = p.ensureDensity() orelse return;
+    const arena = dvui.currentWindow().arena();
+    const theme = dvui.themeGet();
+    const border_rest = theme.color(.window, .text);
+    const hot = theme.color(.highlight, .fill);
+
+    const vp = p.camera.viewport;
+    const view: world_mod.View = .{
+        .w = vp.w,
+        .h = vp.h,
+        .zoom = p.camera.zoom,
+        .cx = p.camera.center.x,
+        .cy = p.camera.center.y,
+    };
+    const params: world_mod.Params = .{ .budget = galaxy.plugin_mark_budget };
+    w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
+
+    // Links first so the web passes under the marks rather than over them.
+    {
+        const links = arena.alloc(fold.Edge, p.edges.len) catch return;
+        for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
+        w.liftLinks(links, params) catch {};
+        if (w.links.items.len > 0) {
+            var batch = galaxy.LineBatch.init(arena);
+            var ink = border_rest;
+            ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * 0.22 * fade);
+            for (w.links.items) |l| {
+                const a = markScreen(p, w, l.a) orelse continue;
+                const b = markScreen(p, w, l.b) orelse continue;
+                batch.add(a, b, 1.0, ink);
+            }
+            batch.flush();
+        }
+    }
+
+    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return;
+    var n: usize = 0;
+    var notes_drawn: u32 = 0;
+    var clusters_drawn: u32 = 0;
+    for (w.marks.items) |m| {
+        const holds_open = worldMarkHoldsOpen(p, w, m);
+        buf[n] = .{
+            .screen = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy }),
+            .r_px = m.r,
+            .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
+            .border = if (holds_open) hot else border_rest,
+            .is_note = m.is_note,
+            .dying = false,
+        };
+        n += 1;
+        if (m.is_note) notes_drawn += 1 else clusters_drawn += 1;
+    }
+    _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf[0..n]);
+    frame_profile.nodes_drawn += notes_drawn;
+    frame_profile.clusters_drawn += clusters_drawn;
+}
+
+/// Screen position of a living cell, or null when it is not currently drawn.
+fn markScreen(p: *const Panel, w: *const world_mod.World, cell: u32) ?dvui.Point.Physical {
+    for (w.marks.items) |m| {
+        if (m.cell == cell) return p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
+    }
+    return null;
+}
+
+/// True when this mark covers at least one open document, at any level — so a coalesced mass
+/// holding an open note reads as highlight before it has split out as a leaf.
+fn worldMarkHoldsOpen(p: *const Panel, w: *const world_mod.World, m: world_mod.Mark) bool {
+    const c = w.lad.cells[m.cell];
+    for (c.ls..c.le) |slot| {
+        const note = w.lad.note_at[slot];
+        if (note < p.nodes.len and p.nodes[note].open) return true;
+    }
+    return false;
+}
+
 fn drawAgents(p: *Panel, fade: f32) void {
     if (fade <= 0.004) return;
     const dens = p.ensureDensity() orelse return;
