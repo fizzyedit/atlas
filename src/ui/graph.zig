@@ -850,6 +850,9 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     animateCamera(p);
     // After the camera has finished moving for this frame and before anything asks what is on
     // screen: every pass below works from the selection rather than deciding detail for itself.
+    // Containment publishes its poses before anything reads them.
+    if (p.containment_mode) stepWorld(p);
+
     updateSelection(p);
     _ = profLap(&prof);
     updateBubbles(p);
@@ -4413,6 +4416,28 @@ fn restingNodeRadiusPx(p: *Panel) f32 {
 /// (fewest notes / highest depth) — nearest-centre picked a tiny mass sitting inside a large
 /// dashed ring and framed two nodes for a click that looked like the big cluster.
 fn hitTestClusters(p: *Panel, screen_pt: dvui.Point.Physical) ?lod.Visible {
+    // Containment has no quadtree; its masses are just the non-note marks. `level` carries only
+    // "this is a mass" here, and `index` is the fold cell id.
+    if (p.containment_mode) {
+        const w = if (p.world_state) |*ws| ws else return null;
+        var hit: ?lod.Visible = null;
+        var best_r: f32 = std.math.floatMax(f32);
+        for (w.marks.items) |m| {
+            if (m.is_note or m.alpha < 0.15) continue;
+            const c = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
+            const dx = screen_pt.x - c.x;
+            const dy = screen_pt.y - c.y;
+            const r = @max(m.r, 6);
+            if (dx * dx + dy * dy > r * r) continue;
+            // smallest containing mass wins, so a click inside nested rings picks the innermost
+            if (m.r < best_r) {
+                best_r = m.r;
+                hit = .{ .level = 1, .index = m.cell, .alpha = m.alpha };
+            }
+        }
+        return hit;
+    }
+
     var best: ?lod.Visible = null;
     var best_count: u32 = std.math.maxInt(u32);
     var best_depth: i32 = -1;
@@ -4552,16 +4577,16 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     return &p.world_state.?;
 }
 
-/// Step the living set for this frame's camera and paint it.
-fn drawWorldMarks(p: *Panel, fade: f32) void {
-    if (fade <= 0.004) return;
+/// Advance the living set for this frame's camera and publish it onto `p.nodes`.
+///
+/// Runs *before* hover, proximity and label placement, not inside the draw. Those all read
+/// `node.pos`, so stepping the world inside `drawWorldMarks` left every one of them a frame
+/// behind — hover latched onto whatever was under the cursor last frame, the label placer
+/// measured collisions against stale positions and refused nearly every slot, and clicks
+/// resolved against the wrong node.
+fn stepWorld(p: *Panel) void {
     const w = ensureWorld(p) orelse return;
-    const dens = p.ensureDensity() orelse return;
     const arena = dvui.currentWindow().arena();
-    const theme = dvui.themeGet();
-    const border_rest = theme.color(.window, .text);
-    const hot = theme.color(.highlight, .fill);
-
     const vp = p.camera.viewport;
     const view: world_mod.View = .{
         .w = vp.w,
@@ -4574,11 +4599,23 @@ fn drawWorldMarks(p: *Panel, fade: f32) void {
     w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
     syncNodesFromWorld(p, w);
 
+    const links = arena.alloc(fold.Edge, p.edges.len) catch return;
+    for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
+    w.liftLinks(links, params) catch {};
+}
+
+/// Paint the living set stepped by `stepWorld`.
+fn drawWorldMarks(p: *Panel, fade: f32) void {
+    if (fade <= 0.004) return;
+    const w = if (p.world_state) |*ws| ws else return;
+    const dens = p.ensureDensity() orelse return;
+    const arena = dvui.currentWindow().arena();
+    const theme = dvui.themeGet();
+    const border_rest = theme.color(.window, .text);
+    const hot = theme.color(.highlight, .fill);
+
     // Links first so the web passes under the marks rather than over them.
     {
-        const links = arena.alloc(fold.Edge, p.edges.len) catch return;
-        for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
-        w.liftLinks(links, params) catch {};
         if (w.links.items.len > 0) {
             var batch = galaxy.LineBatch.init(arena);
             var ink = border_rest;
@@ -4650,6 +4687,14 @@ fn syncNodesFromWorld(p: *Panel, w: *const world_mod.World) void {
         notes += 1;
     }
     p.notes_at_level0 = notes;
+}
+
+/// World position of a living cell, or null when it is not drawn this frame.
+fn markWorldPos(w: *const world_mod.World, cell: u32) ?dvui.Point {
+    for (w.marks.items) |m| {
+        if (m.cell == cell) return .{ .x = m.wx, .y = m.wy };
+    }
+    return null;
 }
 
 /// Screen position of a living cell, or null when it is not currently drawn.
@@ -4801,6 +4846,31 @@ fn massScreenRadiusPx(a: quad_agents.Agent) f32 {
 /// a mis-hit tiny mass) was diving to one/two nodes while the ring still read as a large cluster.
 fn frameCluster(p: *Panel, target: lod.Visible) void {
     if (target.level == 0) return;
+
+    if (p.containment_mode) {
+        const w = if (p.world_state) |*ws| ws else return;
+        if (target.index >= w.lad.cells.len) return;
+        if (w.lad.cells[target.index].child_count == 0) return;
+        const pos = markWorldPos(w, target.index) orelse blk: {
+            const fp = w.field.pos[target.index];
+            break :blk dvui.Point{ .x = fp.x, .y = fp.y };
+        };
+        const rad = w.field.radius(&w.lad, target.index);
+        const content = dvui.Rect{
+            .x = pos.x - rad,
+            .y = pos.y - rad,
+            .w = rad * 2,
+            .h = rad * 2,
+        };
+        // Framing the cell's own disc puts its radius at roughly half the viewport, which is well
+        // past `split_px` — so the mass actually unfolds rather than sitting there framed and shut.
+        const pose = p.camera.poseForBounds(content, cluster_frame_pad_px);
+        p.framing = .extents;
+        p.camera.center_target = pose.center;
+        p.camera.zoom_target = pose.zoom;
+        p.camera.user_driving = false;
+        return;
+    }
 
     if (p.quad_tree) |tree| {
         if (target.index >= tree.nodes.len) return;
@@ -5397,14 +5467,31 @@ fn updateLabels(
     // The overview reads the same gathered web the draw pass does, so the placer avoids exactly
     // the lines that exist — and, as with the draw pass, does not walk the vault's whole link set
     // to find them. An interior cloud has no gathered set and is small enough to scan.
-    const gathered: ?[]const lod.Link = if (selection != null) p.vis_edges.items else null;
-    const seg_cap = if (gathered) |g| g.len else edges.len;
+    // Containment's web is `world.links`, already lifted onto living cells. Feeding the classic
+    // path's `vis_edges` here instead described lines that are not on screen, so the placer
+    // refused slot after slot for collisions with a web that was not being drawn.
+    const containment_links: ?[]const world_mod.LiftedLink =
+        if (p.containment_mode) if (p.world_state) |*w| w.links.items else null else null;
+    const gathered: ?[]const lod.Link =
+        if (containment_links != null) null else if (selection != null) p.vis_edges.items else null;
+    const seg_cap = if (containment_links) |cl|
+        cl.len
+    else if (gathered) |g|
+        g.len
+    else
+        edges.len;
     const seg_buf = arena.alloc(labels.Segment, seg_cap) catch return;
     var seg_n: usize = 0;
     for (0..seg_cap) |i| {
         var wa: dvui.Point = undefined;
         var wb: dvui.Point = undefined;
-        if (gathered) |g| {
+        if (containment_links) |cl| {
+            const w = &p.world_state.?;
+            const ca = markWorldPos(w, cl[i].a) orelse continue;
+            const cb = markWorldPos(w, cl[i].b) orelse continue;
+            wa = ca;
+            wb = cb;
+        } else if (gathered) |g| {
             wa = g[i].from;
             wb = g[i].to;
         } else {
