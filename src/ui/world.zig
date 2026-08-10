@@ -346,10 +346,16 @@ pub const World = struct {
                     const is_note = c.child_count == 0;
                     // -- rules 4 & 5: a note is a fixed screen size; a mass is count-scaled and
                     // soft-capped so one the budget refused cannot inflate to fill the screen --
-                    const r: f32 = if (is_note)
-                        p.note_r_px
-                    else
-                        @max(1.0, p.mass_cap_px * (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
+                    const r: f32 = if (is_note) p.note_r_px else blk: {
+                        const full = @max(1.0, p.mass_cap_px *
+                            (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
+                        // A splitting mass shrinks to a single note's size as it fades, rather
+                        // than hanging at full radius while children appear inside it. The ring
+                        // reads as collapsing into the point its children emerge from, which is
+                        // what makes a split look like one object becoming several instead of two
+                        // unrelated things crossfading. Runs in reverse on merge, for free.
+                        break :blk full + (p.note_r_px - full) * self.anim[id];
+                    };
                     try self.marks.append(self.gpa, .{
                         .cell = id,
                         .wx = self.px[id],
@@ -548,6 +554,44 @@ test "links lift onto living cells" {
         }
         try testing.expect(found_a and found_b);
     }
+}
+
+test "a splitting mass shrinks toward a note's size as it fades" {
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 1200);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 1200, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 14, .cx = 0, .cy = 0 };
+    const p: Params = .{};
+    // settle closed, so masses are drawn at full radius
+    try settle(&w, view, p, 300);
+
+    // find a mass that is about to open, and record its resting radius
+    var target: u32 = fold.invalid;
+    var full_r: f32 = 0;
+    for (w.marks.items) |m| {
+        if (!m.is_note and w.open[m.cell]) {
+            target = m.cell;
+            full_r = m.r;
+            break;
+        }
+    }
+    if (target == fold.invalid) return; // nothing splitting at this zoom; nothing to assert
+
+    // part-way through the crossfade it must be smaller than at rest, and never below a note
+    var saw_smaller = false;
+    for (0..8) |_| {
+        try w.step(view, p, 1.0 / 60.0);
+        for (w.marks.items) |m| {
+            if (m.cell != target) continue;
+            try testing.expect(m.r <= full_r + 0.001);
+            try testing.expect(m.r >= p.note_r_px - 0.001);
+            if (m.r < full_r - 0.5) saw_smaller = true;
+        }
+    }
+    try testing.expect(saw_smaller);
 }
 
 test "topology does not depend on animation state" {
