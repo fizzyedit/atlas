@@ -4633,11 +4633,24 @@ fn drawWorldMarks(p: *Panel, fade: f32) void {
     var n: usize = 0;
     var notes_drawn: u32 = 0;
     var clusters_drawn: u32 = 0;
+    // A note is drawn at exactly the radius `updateLabels` reserves for it and `nodeAtAim`
+    // hit-tests against. `world` reports a flat note size because it is headless and knows
+    // nothing about hover or open tabs; the panel does, so the panel decides. Keeping the three
+    // in sync is what lets the placer find real gaps — reserving one size and drawing another had
+    // it dodging discs that were not there — and it restores the proximity swell, so a note grows
+    // under the cursor and carries that size into the interior as a dashed ring.
+    const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
+    const gap_px = p.layout_slot * p.camera.zoom;
+
     for (w.marks.items) |m| {
         const holds_open = worldMarkHoldsOpen(p, w, m);
+        const radius_px: f32 = if (m.is_note and m.note < p.nodes.len)
+            bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px)
+        else
+            m.r;
         buf[n] = .{
             .screen = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy }),
-            .r_px = m.r,
+            .r_px = radius_px,
             .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
             .border = if (holds_open) hot else border_rest,
             .is_note = m.is_note,
@@ -4676,7 +4689,10 @@ fn syncNodesFromWorld(p: *Panel, w: *const world_mod.World) void {
         n.home = .{ .x = m.wx, .y = m.wy };
         n.target = n.home;
         n.pos = n.home;
-        n.radius = m.r / @max(p.camera.zoom, 1e-6);
+        // World-space radius matching what will be drawn, so hit-testing and framing agree.
+        // hover_t is applied later by updateBubbles; the draw pass re-derives the final size.
+        n.radius = bubbleScreenRadius(n.*, 1, p.layout_slot * p.camera.zoom) /
+            @max(p.camera.zoom, 1e-6);
         n.alpha = m.alpha;
         if (p.at_level0.len == p.nodes.len) p.at_level0[m.note] = true;
         p.visible.append(sdk.allocator(), .{
@@ -5638,8 +5654,33 @@ fn drawLabels(p: *Panel) void {
         }
         return;
     }
-    const zoom_t = detailRevealT(p.layout_slot, p.camera.zoom);
+    // Containment defers to the LOD, exactly as placement does — a mark that resolved to an
+    // individual note is one, at any zoom. Without the same floor here `drawLabel` multiplies by a
+    // near-zero reveal and throws away the label the placer just positioned, which is why names
+    // appeared only in the narrow band where the zoom heuristic happened to agree.
+    const zoom_t = @max(
+        detailRevealT(p.layout_slot, p.camera.zoom),
+        if (p.containment_mode) @as(f32, 1) else 0,
+    );
     const fade = 1 - p.interior.t;
+
+    if (p.containment_mode) {
+        // Only notes resolved *this* frame. `label_rect` is screen space and valid for the frame
+        // it was placed in, so drawing a note that has since merged away puts its name at a stale
+        // screen position — which is what made labels drift and zoom independently of the field.
+        for (p.visible.items) |v| {
+            if (v.index >= p.nodes.len) continue;
+            if (p.hover_node == v.index) continue;
+            drawLabel(p.nodes[v.index], zoom_t, fade);
+        }
+        if (p.hover_node) |i| {
+            if (i < p.nodes.len and p.at_level0.len == p.nodes.len and p.at_level0[i]) {
+                drawLabel(p.nodes[i], zoom_t, fade);
+            }
+        }
+        return;
+    }
+
     for (p.nodes, 0..) |n, i| {
         if (p.hover_node == i) continue;
         drawLabel(n, zoom_t, fade);
