@@ -58,8 +58,10 @@ pub const Options = struct {
     rotation_per_level: ?f32 = null,
 };
 
+/// Deliberately holds no pointer back to the ladder: a struct that stores a pointer into itself
+/// (or into a sibling field of the same value) dangles the moment it is returned or moved. The
+/// ladder is passed in at each call instead.
 pub const Field = struct {
-    lad: *const fold.Ladder,
     opts: Options,
     pos: []Vec2,
     /// Whether this cell's *children* have been placed yet. Placement is lazy: only cells the
@@ -73,28 +75,28 @@ pub const Field = struct {
         self.* = undefined;
     }
 
-    pub fn radius(self: Field, cell: u32) f32 {
-        const c = self.lad.cells[cell];
+    pub fn radius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
+        const c = lad.cells[cell];
         return self.opts.note_r * @sqrt(@as(f32, @floatFromInt(@max(1, c.count))));
     }
 
     /// Place `cell`'s children. Idempotent, and safe to call on a leaf.
-    pub fn ensureChildren(self: *Field, cell: u32) void {
+    pub fn ensureChildren(self: *Field, lad: *const fold.Ladder, cell: u32) void {
         if (self.expanded[cell]) return;
         self.expanded[cell] = true;
 
-        const kids = self.lad.childrenOf(cell);
+        const kids = lad.childrenOf(cell);
         if (kids.len == 0) return;
 
         const centre = self.pos[cell];
-        const r_parent = self.radius(cell);
+        const r_parent = self.radius(lad, cell);
 
         // Biggest child takes the centre slot: it holds most of the mass, so centring it keeps the
         // cell's visual weight where its parent's ring already was, and the split reads as an
         // expansion rather than a jump.
         var big: usize = 0;
         for (kids, 0..) |k, i| {
-            if (self.lad.cells[k].count > self.lad.cells[kids[big]].count) big = i;
+            if (lad.cells[k].count > lad.cells[kids[big]].count) big = i;
         }
 
         if (kids.len == 1) {
@@ -108,14 +110,14 @@ pub const Field = struct {
         var max_ring_r: f32 = 0;
         for (kids, 0..) |k, i| {
             if (i == big) continue;
-            max_ring_r = @max(max_ring_r, self.radius(k));
+            max_ring_r = @max(max_ring_r, self.radius(lad, k));
         }
         const ring = @max(r_parent * 0.15, r_parent * self.opts.fill - max_ring_r);
 
         const ring_slots = self.arity - 1;
         const step = std.math.tau / @as(f32, @floatFromInt(ring_slots));
         const rot = (self.opts.rotation_per_level orelse (step * 0.5)) *
-            @as(f32, @floatFromInt(self.lad.cells[cell].level));
+            @as(f32, @floatFromInt(lad.cells[cell].level));
 
         var slot: [8]Vec2 = undefined;
         for (0..ring_slots) |s| {
@@ -137,8 +139,8 @@ pub const Field = struct {
         var best: [8]u8 = undefined;
         for (0..nr) |i| best[i] = @intCast(i);
         var perm: [8]u8 = best;
-        var best_cost = self.arrangementCost(cell, ring_idx[0..nr], perm[0..nr], slot[0..ring_slots], ring_kids[0..nr], @intCast(big));
-        permute(self, cell, ring_idx[0..nr], &perm, 0, nr, slot[0..ring_slots], ring_kids[0..nr], @intCast(big), &best, &best_cost);
+        var best_cost = self.arrangementCost(lad, cell, ring_idx[0..nr], perm[0..nr], slot[0..ring_slots], ring_kids[0..nr], @intCast(big));
+        permute(self, lad, cell, ring_idx[0..nr], &perm, 0, nr, slot[0..ring_slots], ring_kids[0..nr], @intCast(big), &best, &best_cost);
 
         self.pos[kids[big]] = centre;
         for (0..nr) |i| {
@@ -151,6 +153,7 @@ pub const Field = struct {
     /// heavy children near the centre. Lower is better.
     fn arrangementCost(
         self: Field,
+        lad: *const fold.Ladder,
         cell: u32,
         ring_idx: []const u8,
         perm: []const u8,
@@ -168,12 +171,12 @@ pub const Field = struct {
         is_centre[big] = true;
 
         var cost: f32 = 0;
-        for (self.lad.pairsOf(cell)) |p| {
+        for (lad.pairsOf(cell)) |p| {
             cost += p.w * Vec2.dist(at[p.i], at[p.j]);
         }
         if (self.opts.mass_k != 0) {
             for (ring_kids, 0..) |k, i| {
-                const c: f32 = @floatFromInt(self.lad.cells[k].count);
+                const c: f32 = @floatFromInt(lad.cells[k].count);
                 cost += self.opts.mass_k * @sqrt(c) * Vec2.dist(at[ring_idx[i]], .{});
             }
         }
@@ -185,6 +188,7 @@ pub const Field = struct {
 /// when a cell is opened, so a frame at the usual budget searches a few hundred of these.
 fn permute(
     f: *Field,
+    lad: *const fold.Ladder,
     cell: u32,
     ring_idx: []const u8,
     perm: *[8]u8,
@@ -197,7 +201,7 @@ fn permute(
     best_cost: *f32,
 ) void {
     if (k == n) {
-        const c = f.arrangementCost(cell, ring_idx, perm[0..n], slot, ring_kids, big);
+        const c = f.arrangementCost(lad, cell, ring_idx, perm[0..n], slot, ring_kids, big);
         if (c < best_cost.*) {
             best_cost.* = c;
             best.* = perm.*;
@@ -207,39 +211,28 @@ fn permute(
     var i = k;
     while (i < n) : (i += 1) {
         std.mem.swap(u8, &perm[k], &perm[i]);
-        permute(f, cell, ring_idx, perm, k + 1, n, slot, ring_kids, big, best, best_cost);
+        permute(f, lad, cell, ring_idx, perm, k + 1, n, slot, ring_kids, big, best, best_cost);
         std.mem.swap(u8, &perm[k], &perm[i]);
     }
 }
 
-pub fn init(
-    gpa: std.mem.Allocator,
-    lad: *const fold.Ladder,
-    arity: fold.Arity,
-    opts: Options,
-) !Field {
-    const pos = try gpa.alloc(Vec2, lad.cells.len);
+pub fn init(gpa: std.mem.Allocator, n_cells: usize, arity: fold.Arity, opts: Options) !Field {
+    const pos = try gpa.alloc(Vec2, n_cells);
     @memset(pos, .{});
-    const expanded = try gpa.alloc(bool, lad.cells.len);
+    const expanded = try gpa.alloc(bool, n_cells);
     @memset(expanded, false);
-    return .{
-        .lad = lad,
-        .opts = opts,
-        .pos = pos,
-        .expanded = expanded,
-        .arity = arity.n(),
-    };
+    return .{ .opts = opts, .pos = pos, .expanded = expanded, .arity = arity.n() };
 }
 
 /// Expand the whole ladder. Real use is lazy — this exists for tests and benches.
-pub fn placeAll(f: *Field) void {
-    if (f.lad.root == fold.invalid) return;
-    expandRec(f, f.lad.root);
+pub fn placeAll(f: *Field, lad: *const fold.Ladder) void {
+    if (lad.root == fold.invalid) return;
+    expandRec(f, lad, lad.root);
 }
 
-fn expandRec(f: *Field, cell: u32) void {
-    f.ensureChildren(cell);
-    for (f.lad.childrenOf(cell)) |k| expandRec(f, k);
+fn expandRec(f: *Field, lad: *const fold.Ladder, cell: u32) void {
+    f.ensureChildren(lad, cell);
+    for (lad.childrenOf(cell)) |k| expandRec(f, lad, k);
 }
 
 // ---- tests ----------------------------------------------------------------------------------
@@ -261,16 +254,16 @@ test "every child is contained inside its parent's disc" {
     var lad = try fold.build(gpa, 301, edges, &.{}, .{});
     defer lad.deinit(gpa);
 
-    var f = try init(gpa, &lad, .seven, .{});
+    var f = try init(gpa, lad.cells.len, .seven, .{});
     defer f.deinit(gpa);
-    placeAll(&f);
+    placeAll(&f, &lad);
 
     for (lad.cells, 0..) |c, id| {
         if (c.child_count == 0) continue;
-        const R = f.radius(@intCast(id));
+        const R = f.radius(&lad, @intCast(id));
         for (lad.childrenOf(@intCast(id))) |k| {
             const d = Vec2.dist(f.pos[@intCast(id)], f.pos[k]);
-            try testing.expect(d + f.radius(k) <= R * 1.001);
+            try testing.expect(d + f.radius(&lad, k) <= R * 1.001);
         }
     }
 }
@@ -281,13 +274,13 @@ test "radius is the area-conserving law" {
     defer gpa.free(edges);
     var lad = try fold.build(gpa, 51, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, &lad, .seven, .{ .note_r = 2 });
+    var f = try init(gpa, lad.cells.len, .seven, .{ .note_r = 2 });
     defer f.deinit(gpa);
 
     for (lad.cells, 0..) |c, id| {
         if (c.count == 0) continue;
         const want = 2 * @sqrt(@as(f32, @floatFromInt(c.count)));
-        try testing.expectApproxEqAbs(want, f.radius(@intCast(id)), 0.001);
+        try testing.expectApproxEqAbs(want, f.radius(&lad, @intCast(id)), 0.001);
     }
 }
 
@@ -299,11 +292,11 @@ test "the whole vault fits inside the root disc" {
     for (0..n - 1) |i| edges[i] = .{ .a = @intCast(i), .b = @intCast(i + 1) };
     var lad = try fold.build(gpa, n, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, &lad, .seven, .{});
+    var f = try init(gpa, lad.cells.len, .seven, .{});
     defer f.deinit(gpa);
-    placeAll(&f);
+    placeAll(&f, &lad);
 
-    const R = f.radius(lad.root);
+    const R = f.radius(&lad, lad.root);
     const origin = f.pos[lad.root];
     for (lad.cells, 0..) |c, id| {
         if (c.note == fold.invalid) continue;
@@ -322,9 +315,9 @@ test "slot assignment shortens sibling links" {
     var lad = try fold.build(gpa, n, edges, &.{}, .{});
     defer lad.deinit(gpa);
 
-    var chosen = try init(gpa, &lad, .seven, .{ .mass_k = 0 });
+    var chosen = try init(gpa, lad.cells.len, .seven, .{ .mass_k = 0 });
     defer chosen.deinit(gpa);
-    placeAll(&chosen);
+    placeAll(&chosen, &lad);
 
     var total_chosen: f32 = 0;
     var pairs_seen: usize = 0;
@@ -343,7 +336,7 @@ test "slot assignment shortens sibling links" {
     var worst: f32 = 0;
     for (lad.cells, 0..) |c, id| {
         if (c.pair_count == 0) continue;
-        const R = chosen.radius(@intCast(id));
+        const R = chosen.radius(&lad, @intCast(id));
         for (lad.pairsOf(@intCast(id))) |p| worst += p.w * 2 * R;
     }
     try testing.expect(total_chosen < worst * 0.9);
@@ -355,10 +348,10 @@ test "lazy expansion places only what is opened" {
     defer gpa.free(edges);
     var lad = try fold.build(gpa, 501, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, &lad, .seven, .{});
+    var f = try init(gpa, lad.cells.len, .seven, .{});
     defer f.deinit(gpa);
 
-    f.ensureChildren(lad.root);
+    f.ensureChildren(&lad, lad.root);
     var expanded: usize = 0;
     for (f.expanded) |e| {
         if (e) expanded += 1;
@@ -373,12 +366,12 @@ test "deterministic" {
     var lad = try fold.build(gpa, 121, edges, &.{}, .{});
     defer lad.deinit(gpa);
 
-    var a = try init(gpa, &lad, .seven, .{});
+    var a = try init(gpa, lad.cells.len, .seven, .{});
     defer a.deinit(gpa);
-    var b = try init(gpa, &lad, .seven, .{});
+    var b = try init(gpa, lad.cells.len, .seven, .{});
     defer b.deinit(gpa);
-    placeAll(&a);
-    placeAll(&b);
+    placeAll(&a, &lad);
+    placeAll(&b, &lad);
     for (a.pos, b.pos) |pa, pb| {
         try testing.expectEqual(pa.x, pb.x);
         try testing.expectEqual(pa.y, pb.y);

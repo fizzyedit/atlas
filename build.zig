@@ -57,6 +57,9 @@ pub fn build(b: *std.Build) void {
         // Positions derived from the fold ladder: children inside the parent's disc, one rule,
         // no force solve. Plain `Vec2`, so it stays headless too.
         .{ "atlas-containment-tests", "src/ui/containment.zig" },
+        // The living set: budgeted, view-culled, level-uniform select over the fold ladder,
+        // emitting screen-space marks. Replaces quadlod + quad_agents + lod.
+        .{ "atlas-world-tests", "src/ui/world.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],
@@ -116,7 +119,6 @@ pub fn build(b: *std.Build) void {
     // bugs and the "adding a note spins the whole graph" failure mode.
     inline for (.{
         .{ "atlas-camera-tests", "src/ui/camera.zig" },
-        .{ "atlas-layout-tests", "src/ui/layout.zig" },
         .{ "atlas-layout-full-tests", "src/ui/layout_full.zig" },
         .{ "atlas-multilevel-tests", "src/ui/multilevel.zig" },
         .{ "atlas-lod-tests", "src/ui/lod.zig" },
