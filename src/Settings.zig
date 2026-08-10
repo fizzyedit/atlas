@@ -3,12 +3,6 @@
 const sdk = @import("fizzy_sdk");
 const settings = sdk.settings;
 
-/// Which layout/level-of-detail pipeline the graph panel uses. See `graph_layout` below.
-pub const GraphLayout = enum {
-    classic,
-    containment,
-};
-
 /// Graph shape for **Atlas: Load Synth Graph** — in-memory scale tests (no markdown on disk).
 pub const SynthShape = enum {
     islands,
@@ -36,26 +30,6 @@ convert_wikilinks_on_save: settings.Value(bool, .{
         "resolvable [[wikilinks]] as [label](path.md) markdown links. Unresolved links, " ++
         "embeds, and links inside code are left alone.",
 }) = .init(false),
-
-/// Selects between two entirely separate ways of deciding where notes go.
-///
-/// The classic path lays every note out flat (`layout_full.zig`: force solve, folder cohesion,
-/// lattice snap, component packing, aspect envelope, crossing-minimising refine) and then infers
-/// a level-of-detail hierarchy back out of the resulting positions (`quadlod.zig`). Because that
-/// hierarchy is spatial, a coalesced ring can hold notes from unrelated topics that merely landed
-/// near each other.
-///
-/// The containment path inverts it: `fold.zig` builds one hierarchy from links (with folder
-/// adjacency as a weak tiebreak), and `containment.zig` derives positions by placing each cell's
-/// children inside that cell's disc. A coalesced ring is then related by construction, and the
-/// vault always fits one circle — so aspect ratio cannot degenerate and the same rule holds at 5
-/// notes and at a million.
-graph_layout: settings.Value(GraphLayout, .{
-    .name = "Graph layout",
-    .description = "Classic: flat force layout with a spatial quadtree for level-of-detail. " ++
-        "Containment: one link-derived hierarchy, with each cluster's children placed inside it. " ++
-        "Containment is the newer path — switch back if a vault lays out worse under it.",
-}) = .init(.classic),
 
 synth_notes: settings.Value(i64, .{
     .name = "Synth note count",

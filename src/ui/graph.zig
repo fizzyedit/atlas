@@ -675,10 +675,7 @@ const Panel = struct {
     world_state: ?world_mod.World = null,
     /// `layout_epoch` the world was last built against, so it rebuilds only when the graph does.
     world_epoch: u64 = std.math.maxInt(u64),
-    /// Whether this frame draws the containment path. Read by the camera fit, which runs before
-    /// the draw branch and would otherwise frame the classic layout's extent while the marks sit
-    /// at containment positions.
-    containment_mode: bool = false,
+
     /// `layout_epoch` the agent field was last reset against.
     agents_epoch: u64 = std.math.maxInt(u64),
     /// True when this frame's overview is drawn from `agent_field` rather than tiles/`select`.
@@ -801,9 +798,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     const st = runtime.state();
     const gpa = sdk.allocator();
     const p = ensurePanel(gpa);
-    // Set before anything reads it — the camera fit runs earlier than the draw branch.
-    p.containment_mode = st.settings.graph_layout.get() == .containment;
-    if (p.containment_mode) _ = ensureWorld(p);
+    _ = ensureWorld(p);
 
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
@@ -857,7 +852,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     // that to the label placer put names at positions belonging to no node at all, and left none
     // to place whenever the classic selection was empty at a zoom containment had resolved.
     // Still before updateBubbles/updateHover/updateLabels, all of which read what this publishes.
-    if (p.containment_mode) stepWorld(p);
+    stepWorld(p);
     _ = profLap(&prof);
     updateBubbles(p);
     frame_profile.bubbles_ns = profLap(&prof);
@@ -879,7 +874,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     // nothing will draw is the worst possible time to pay for it.
     const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0;
     const labels_dirty = !at_cluster_zoom and
-        (p.containment_mode or
+        (true or
             p.labels_stale or !p.labels_settled or !p.proximity_settled or
             !p.pointer_settled or !p.layout_settled or p.camera.chasing() or labelViewMoved(p));
     if (at_cluster_zoom) {
@@ -889,7 +884,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         // that does draw names has to redo them.
         p.labels_stale = true;
     } else if (p.interior.t < 0.5) {
-        if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items, if (p.containment_mode) 1 else 0);
+        if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items, 1);
         for (p.interior.nodes) |*n| n.label_vis = 0;
     } else {
         if (labels_dirty) updateLabels(p, p.interior.nodes, p.interior.edges, p.interior.slot, null, 0);
@@ -924,41 +919,11 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         // Notes where they have separated enough to be told apart, merged markers where they
         // have not — decided per region, and cross-faded, by `updateSelection`.
         _ = profLap(&prof);
-        // Agents own the overview when active: one living mark set + bound web. Tiles stay parked
-        // so their baked web cannot stack with the field (semi-transparent lines double in ink).
-        if (p.containment_mode) {
-            // One hierarchy, positions derived from it. Owns the whole overview — no tiles, no
-            // agent field, no flat layout.
-            drawWorldMarks(p, 1 - t);
-            frame_profile.draw_edges_ns = profLap(&prof);
-            frame_profile.draw_nodes_ns = 0;
-            frame_profile.draw_clusters_ns = 0;
-        } else if (p.agents_active) {
-            // Galaxy LOD: sticky soft-sprite agents end-to-end. Density mips parked — dual-system
-            // dissolve did not match split/join configuration (see `galaxy.density_enabled`).
-            const tv = galaxy.tileViewFor(p.camera.zoom);
-            if (galaxy.density_enabled) drawGalaxyDensity(p, 1 - t, tv);
-            if (tv.live_weight > 0.05) {
-                drawEdges(p, p.nodes, p.edges, (1 - t) * tv.live_weight, true);
-                frame_profile.draw_edges_ns = profLap(&prof);
-                drawAgents(p, (1 - t) * tv.live_weight);
-                frame_profile.draw_nodes_ns = profLap(&prof);
-            } else {
-                frame_profile.draw_edges_ns = profLap(&prof);
-                frame_profile.draw_nodes_ns = 0;
-            }
-            frame_profile.draw_clusters_ns = 0;
-        } else {
-            const tile_w = p.tiles.maxWeight();
-            drawEdges(p, p.nodes, p.edges, (1 - t) * p.tiles.node_weight * (1 - tile_w), true);
-            frame_profile.draw_edges_ns = profLap(&prof);
-            drawNodes(p, p.nodes, p.layout_slot, (1 - t) * p.tiles.node_weight, .{
-                .selection = p.visible.items,
-            });
-            frame_profile.draw_nodes_ns = profLap(&prof);
-            drawTiles(p, 1 - t);
-            frame_profile.draw_clusters_ns = profLap(&prof);
-        }
+        // One hierarchy, positions derived from it. Owns the whole overview.
+        drawWorldMarks(p, 1 - t);
+        frame_profile.draw_edges_ns = profLap(&prof);
+        frame_profile.draw_nodes_ns = 0;
+        frame_profile.draw_clusters_ns = 0;
         if (p.interior.nodes.len > 0) {
             drawEdges(p, p.interior.nodes, p.interior.edges, t, false);
             frame_profile.draw_edges_ns += profLap(&prof);
@@ -1339,12 +1304,7 @@ fn updateHover(p: *Panel) void {
         // `hitTestAgentLeaves` walks the classic agent field, which containment never fills — so
         // in containment mode every note hover missed, the cursor never became a hand, and clicking
         // a note could not open its document.
-        p.hover_node = if (p.containment_mode)
-            hitTestNodes(p, p.nodes, p.layout_slot, mouse)
-        else if (p.agents_active)
-            hitTestAgentLeaves(p, mouse)
-        else
-            hitTestNodes(p, p.nodes, p.layout_slot, mouse);
+        p.hover_node = hitTestNodes(p, p.nodes, p.layout_slot, mouse);
         p.hover_cluster = if (p.hover_node != null) null else hitTestClusters(p, mouse);
     }
 
@@ -2833,7 +2793,7 @@ fn vaultExtentsPose(p: *const Panel) ?Camera.Pose {
     // Containment owns its own positions, and the islands are packed around the origin. Framing
     // `p.nodes` here would fit the classic layout's extent instead — a different arrangement
     // entirely — so read the world's island discs directly. O(islands), and exact.
-    if (p.containment_mode) {
+    {
         if (p.world_state) |*w| {
             if (w.lad.roots.len > 0) {
                 const e = w.extent();
@@ -4427,7 +4387,7 @@ fn restingNodeRadiusPx(p: *Panel) f32 {
 fn hitTestClusters(p: *Panel, screen_pt: dvui.Point.Physical) ?lod.Visible {
     // Containment has no quadtree; its masses are just the non-note marks. `level` carries only
     // "this is a mass" here, and `index` is the fold cell id.
-    if (p.containment_mode) {
+    {
         const w = if (p.world_state) |*ws| ws else return null;
         var hit: ?lod.Visible = null;
         var best_r: f32 = std.math.floatMax(f32);
@@ -4872,7 +4832,7 @@ fn massScreenRadiusPx(a: quad_agents.Agent) f32 {
 fn frameCluster(p: *Panel, target: lod.Visible) void {
     if (target.level == 0) return;
 
-    if (p.containment_mode) {
+    {
         const w = if (p.world_state) |*ws| ws else return;
         if (target.index >= w.lad.cells.len) return;
         if (w.lad.cells[target.index].child_count == 0) return;
@@ -5180,7 +5140,7 @@ fn drawNodes(p: *Panel, nodes: []const GraphNode, slot: f32, fade: f32, opts: Dr
     const vp = p.camera.viewport;
     const margin: f32 = 80;
     const view = vp.outsetAll(margin);
-    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), if (p.containment_mode) @as(f32, 1) else 0);
+    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), @as(f32, 1));
     const highlight = theme.color(.highlight, .fill);
     // Resting border is window text; open notes (the ones selected into the editor) take the
     // highlight so they read as the current selection without needing a second fill language.
@@ -5496,7 +5456,7 @@ fn updateLabels(
     // path's `vis_edges` here instead described lines that are not on screen, so the placer
     // refused slot after slot for collisions with a web that was not being drawn.
     const containment_links: ?[]const world_mod.LiftedLink =
-        if (p.containment_mode) if (p.world_state) |*w| w.links.items else null else null;
+        if (p.world_state) |*w| w.links.items else null;
     const gathered: ?[]const lod.Link =
         if (containment_links != null) null else if (selection != null) p.vis_edges.items else null;
     const seg_cap = if (containment_links) |cl|
@@ -5669,11 +5629,11 @@ fn drawLabels(p: *Panel) void {
     // appeared only in the narrow band where the zoom heuristic happened to agree.
     const zoom_t = @max(
         detailRevealT(p.layout_slot, p.camera.zoom),
-        if (p.containment_mode) @as(f32, 1) else 0,
+        @as(f32, 1),
     );
     const fade = 1 - p.interior.t;
 
-    if (p.containment_mode) {
+    {
         // Only notes resolved *this* frame. `label_rect` is screen space and valid for the frame
         // it was placed in, so drawing a note that has since merged away puts its name at a stale
         // screen position — which is what made labels drift and zoom independently of the field.
@@ -6467,7 +6427,7 @@ fn hitTestActive(p: *Panel, screen: dvui.Point.Physical) ?usize {
 fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Point.Physical) ?usize {
     var best: ?usize = null;
     var best_d: f32 = std.math.floatMax(f32);
-    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), if (p.containment_mode) @as(f32, 1) else 0);
+    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), @as(f32, 1));
     // Only what is actually on screen as itself. A note merged into a marker is not clickable —
     // and walking the selection instead of the whole vault is also what keeps this off the
     // per-frame O(n) list, since the selection is bounded by the viewport.
@@ -6623,7 +6583,7 @@ pub fn wantsRepaint() bool {
         !p.labels_settled or p.camera.chasing() or p.aspect_waiting or p.rebuild_waiting or
         p.tiles_pending or
         (p.agents_active and !p.agent_field.settled) or
-        (p.containment_mode and if (p.world_state) |*w| !w.settled else false) or
+        (if (p.world_state) |*w| !w.settled else false) or
         // Keep ticking while a descent is still *arriving*. Gating on `t < 0.98` alone never
         // stops for a note whose interior cannot fill the panel — the zoom ceiling
         // (`fitMaxGapPx`) or a clamped nest can leave the descent topping out below 0.98, and
