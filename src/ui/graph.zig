@@ -4506,7 +4506,17 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     const paths = arena.alloc([]const u8, p.nodes.len) catch return null;
     for (p.nodes, 0..) |n, i| paths[i] = n.path;
 
-    var built = world_mod.World.init(gpa, p.nodes.len, links, paths, .{}, .{}) catch return null;
+    // World scale has to match the classic layout's, because everything downstream of the panel
+    // — camera fit, zoom thresholds, `interiorWant`, label placement — is calibrated in those
+    // units. `layout_slot` is the world distance between adjacent notes (224 for a vault over 80
+    // notes). Containment puts two ring-adjacent leaves `leaf_pitch × note_r` apart, so solve for
+    // `note_r`. Getting this wrong by the default 1.0 made the entire vault smaller than the gap
+    // between two classic notes: marks drew as a speck at the centre, every LOD transition
+    // happened inside a sliver of the zoom range, and the interior triggered almost immediately.
+    const slot = if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(@max(p.nodes.len, 1));
+    var built = world_mod.World.init(gpa, p.nodes.len, links, paths, .{}, .{
+        .note_r = slot / world_mod.leaf_pitch,
+    }) catch return null;
     if (p.world_state) |*old| old.deinit();
     p.world_state = built;
     p.world_epoch = p.layout_epoch;
@@ -4535,6 +4545,7 @@ fn drawWorldMarks(p: *Panel, fade: f32) void {
     };
     const params: world_mod.Params = .{ .budget = galaxy.plugin_mark_budget };
     w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
+    syncNodesFromWorld(p, w);
 
     // Links first so the web passes under the marks rather than over them.
     {
@@ -4574,6 +4585,33 @@ fn drawWorldMarks(p: *Panel, fade: f32) void {
     _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf[0..n]);
     frame_profile.nodes_drawn += notes_drawn;
     frame_profile.clusters_drawn += clusters_drawn;
+}
+
+/// Publish the world's leaf poses back onto `p.nodes`, and mark which notes are drawn as
+/// themselves this frame.
+///
+/// Labels, hover, hit-testing and the click-to-open path all read `node.pos` / `at_level0` and
+/// know nothing about which layout produced them. Writing back is what makes them work in
+/// containment mode instead of pointing at wherever the classic layout happened to leave the note
+/// — which is why labels first appeared scattered across the field while the marks sat in a
+/// cluster at the centre.
+fn syncNodesFromWorld(p: *Panel, w: *const world_mod.World) void {
+    if (p.at_level0.len == p.nodes.len) @memset(p.at_level0, false);
+    for (p.nodes) |*n| n.alpha = 0;
+
+    var notes: u32 = 0;
+    for (w.marks.items) |m| {
+        if (!m.is_note or m.note >= p.nodes.len) continue;
+        const n = &p.nodes[m.note];
+        n.home = .{ .x = m.wx, .y = m.wy };
+        n.target = n.home;
+        n.pos = n.home;
+        n.radius = m.r / @max(p.camera.zoom, 1e-6);
+        n.alpha = m.alpha;
+        if (p.at_level0.len == p.nodes.len) p.at_level0[m.note] = true;
+        notes += 1;
+    }
+    p.notes_at_level0 = notes;
 }
 
 /// Screen position of a living cell, or null when it is not currently drawn.

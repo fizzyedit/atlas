@@ -58,6 +58,14 @@ pub const Mark = struct {
 /// A link between two *living* cells, already lifted from the note pair that produced it.
 pub const LiftedLink = struct { a: u32, b: u32, w: f32 };
 
+/// Centre-to-centre distance between two ring-adjacent leaves, in units of `note_r`.
+///
+/// A cell of `arity` leaves has radius `√arity · note_r`; its ring sits at
+/// `√arity · fill − note_r` and adjacent ring slots are one step apart, whose chord at arity 7 is
+/// the ring radius itself. A caller that needs notes a specific world distance apart — to match
+/// an existing lattice, say — divides that pitch by this.
+pub const leaf_pitch: f32 = 1.381;
+
 pub const View = struct {
     w: f32,
     h: f32,
@@ -494,6 +502,35 @@ test "links lift onto living cells" {
         }
         try testing.expect(found_a and found_b);
     }
+}
+
+test "leaf_pitch matches the geometry it claims to describe" {
+    // A caller matching an existing lattice divides its slot spacing by `leaf_pitch` to get
+    // `note_r`. If the constant drifts from the real geometry the whole vault comes out at the
+    // wrong scale — which reads as a speck at the centre of the view, with every LOD transition
+    // crammed into a sliver of the zoom range.
+    const gpa = testing.allocator;
+    const edges = try gpa.alloc(fold.Edge, 6);
+    defer gpa.free(edges);
+    for (0..6) |i| edges[i] = .{ .a = 0, .b = @intCast(i + 1) };
+
+    var lad = try fold.build(gpa, 7, edges, &.{}, .{ .arity = .seven });
+    defer lad.deinit(gpa);
+    var f = try containment.init(gpa, lad.cells.len, .seven, .{ .note_r = 1 });
+    defer f.deinit(gpa);
+    containment.placeAll(&f, &lad);
+
+    // nearest neighbour distance among the leaves of a full cell
+    var best: f32 = std.math.floatMax(f32);
+    for (lad.cells, 0..) |a, ia| {
+        if (a.note == fold.invalid) continue;
+        for (lad.cells, 0..) |b, ib| {
+            if (ib <= ia or b.note == fold.invalid) continue;
+            const d = containment.Vec2.dist(f.pos[ia], f.pos[ib]);
+            if (d > 1e-4) best = @min(best, d);
+        }
+    }
+    try testing.expectApproxEqAbs(leaf_pitch, best, 0.05);
 }
 
 test "an empty vault does not crash" {
