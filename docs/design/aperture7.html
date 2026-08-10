@@ -1,0 +1,1144 @@
+<title>Synthetic vault × aperture-7 fold</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ground:#eaeef0; --surface:#ffffff; --sunken:#dfe5e8; --line:#c4ced3;
+    --ink:#10161a; --ink-2:#4a5860; --muted:#78888f;
+    --leaf:#0f8a62; --mass:#4a63c8; --rot:#8f5f10; --orphan:#8b7f74;
+    --canvas-bg:#e6ebed;
+    --r:3px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0c1013; --surface:#141a1e; --sunken:#090c0e; --line:#263036;
+      --ink:#dfe7ea; --ink-2:#97a7af; --muted:#67777f;
+      --leaf:#5fd4a2; --mass:#8fa6f0; --rot:#e8b04b; --orphan:#8a7f75;
+      --canvas-bg:#080b0d;
+    }
+  }
+  :root[data-theme="light"] {
+    --ground:#eaeef0; --surface:#ffffff; --sunken:#dfe5e8; --line:#c4ced3;
+    --ink:#10161a; --ink-2:#4a5860; --muted:#78888f;
+    --leaf:#0f8a62; --mass:#4a63c8; --rot:#8f5f10; --orphan:#8b7f74; --canvas-bg:#e6ebed;
+  }
+  :root[data-theme="dark"] {
+    --ground:#0c1013; --surface:#141a1e; --sunken:#090c0e; --line:#263036;
+    --ink:#dfe7ea; --ink-2:#97a7af; --muted:#67777f;
+    --leaf:#5fd4a2; --mass:#8fa6f0; --rot:#e8b04b; --orphan:#8a7f75; --canvas-bg:#080b0d;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin:0; background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:15px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .wrap { max-width:1180px; margin:0 auto; padding:28px 20px 72px;
+          display:flex; flex-direction:column; gap:28px; }
+
+  .masthead { display:flex; flex-direction:column; gap:10px; }
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.14em;
+             text-transform:uppercase; color:var(--muted);
+             display:flex; gap:10px; flex-wrap:wrap; }
+  .eyebrow .sep { color:var(--line); }
+  h1 { font-family:var(--mono); font-size:clamp(22px,3.3vw,33px); font-weight:600;
+       letter-spacing:-.02em; line-height:1.15; margin:0; text-wrap:balance; }
+  .standfirst { margin:0; max-width:68ch; color:var(--ink-2); font-size:16px; }
+
+  .instrument { background:var(--surface); border:1px solid var(--line);
+                border-radius:var(--r); overflow:hidden; }
+
+  .stage { position:relative; background:var(--canvas-bg);
+           border-bottom:1px solid var(--line); aspect-ratio:16/9; min-height:320px; }
+  @media (max-width:640px){ .stage { aspect-ratio:4/5; } }
+  canvas { display:block; width:100%; height:100%; }
+
+  .stage-tag { position:absolute; top:12px; left:14px; font-family:var(--mono);
+               font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+               color:var(--muted); pointer-events:none; }
+
+  .rack { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+          gap:16px 26px; padding:18px 20px; border-bottom:1px solid var(--line); }
+  .rack + .rack { border-top:none; }
+
+  .field { display:flex; flex-direction:column; gap:7px; min-width:0; }
+  .field > label, .field > .field-label {
+    font-family:var(--mono); font-size:10.5px; letter-spacing:.13em;
+    text-transform:uppercase; color:var(--muted);
+    display:flex; justify-content:space-between; gap:8px; align-items:baseline;
+  }
+  .field .val { color:var(--ink); font-variant-numeric:tabular-nums; letter-spacing:0; }
+
+  .seg { display:flex; }
+  .seg button { flex:1; font-family:var(--mono); font-size:12px; padding:7px 8px;
+                background:transparent; color:var(--ink-2); border:1px solid var(--line);
+                cursor:pointer; transition:background .12s,color .12s; white-space:nowrap; }
+  .seg button + button { border-left:none; }
+  .seg button:first-child { border-radius:var(--r) 0 0 var(--r); }
+  .seg button:last-child { border-radius:0 var(--r) var(--r) 0; }
+  .seg button:hover { color:var(--ink); }
+  .seg button[aria-pressed="true"] { background:var(--ink); color:var(--surface); border-color:var(--ink); }
+  .seg button:focus-visible { outline:2px solid var(--mass); outline-offset:1px; z-index:1; }
+
+  input[type="range"] { -webkit-appearance:none; appearance:none; width:100%;
+                        height:20px; background:transparent; cursor:pointer; margin:0; }
+  input[type="range"]::-webkit-slider-runnable-track { height:2px; background:var(--line); }
+  input[type="range"]::-moz-range-track { height:2px; background:var(--line); }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance:none; appearance:none;
+    width:12px; height:12px; border-radius:50%; background:var(--ink); border:none; margin-top:-5px; }
+  input[type="range"]::-moz-range-thumb { width:12px; height:12px; border-radius:50%;
+    background:var(--ink); border:none; }
+  input[type="range"]:focus-visible { outline:2px solid var(--mass); outline-offset:3px; }
+
+  .readout { display:grid; grid-template-columns:repeat(auto-fit,minmax(112px,1fr));
+             gap:1px; background:var(--line); }
+  .stat { background:var(--surface); padding:12px 15px 14px; display:flex;
+          flex-direction:column; gap:2px; }
+  .stat .k { font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+             text-transform:uppercase; color:var(--muted); }
+  .stat .v { font-family:var(--mono); font-size:19px; font-variant-numeric:tabular-nums; }
+  .stat .v .u { font-size:11px; color:var(--muted); margin-left:1px; }
+  .v-rot { color:var(--rot); } .v-mass { color:var(--mass); } .v-leaf { color:var(--leaf); }
+
+  section { display:flex; flex-direction:column; gap:14px; }
+  h2 { font-family:var(--mono); font-size:12px; font-weight:600; letter-spacing:.13em;
+       text-transform:uppercase; color:var(--muted); margin:0;
+       padding-bottom:9px; border-bottom:1px solid var(--line); }
+  p { margin:0; max-width:68ch; }
+  .cols { display:grid; grid-template-columns:repeat(auto-fit,minmax(285px,1fr)); gap:24px 36px; }
+
+  code { font-family:var(--mono); font-size:.88em; background:var(--sunken);
+         padding:1px 5px; border-radius:2px; }
+  pre { font-family:var(--mono); font-size:12.5px; line-height:1.6; background:var(--sunken);
+        border:1px solid var(--line); border-radius:var(--r); padding:14px 16px; margin:0;
+        overflow-x:auto; }
+  pre code { background:none; padding:0; font-size:inherit; }
+
+  .tbl-scroll { overflow-x:auto; }
+  table { border-collapse:collapse; font-size:13.5px; width:100%; min-width:440px; }
+  th,td { text-align:left; padding:8px 14px 8px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-family:var(--mono); font-size:10.5px; letter-spacing:.11em;
+       text-transform:uppercase; color:var(--muted); font-weight:500; }
+  td.num { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  tr.hi td { color:var(--ink); } tr:not(.hi) td { color:var(--ink-2); }
+
+  .verdict { border-left:2px solid var(--rot); padding:2px 0 2px 16px;
+             display:flex; flex-direction:column; gap:10px; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:16px 22px;
+            font-family:var(--mono); font-size:11.5px; color:var(--ink-2); }
+  .legend span { display:flex; align-items:center; gap:7px; }
+  .swatch { width:13px; height:13px; border-radius:50%; flex:none; }
+  .sw-leaf { background:var(--leaf); }
+  .sw-mass { border:1.5px dashed var(--mass); }
+  .sw-orph { background:var(--orphan); opacity:.75; }
+  .sw-edge { width:15px; height:0; border-top:1px solid var(--ink-2); border-radius:0; opacity:.6; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span>Atlas · note graph</span><span class="sep">/</span>
+      <span>synthetic vault × hex fold</span><span class="sep">/</span>
+      <span>2026-08-10</span>
+    </div>
+    <h1>A vault that isn't uniform, folded seven at a time</h1>
+    <p class="standfirst">
+      A seeded synthetic vault — islands of unequal size, a rim of orphans, a few bridges between
+      topics — coarsened into a hex ladder and drawn with its links. Every ring is a cluster of
+      real generated notes, so the field is as ragged as the data is. Same knobs as
+      <code>vault_synth.zig</code>: change one and the whole vault regenerates.
+    </p>
+  </header>
+
+  <div class="instrument">
+    <div class="stage">
+      <canvas id="cv"></canvas>
+      <div class="stage-tag" id="stagetag">generating…</div>
+    </div>
+
+    <div class="rack">
+      <div class="field">
+        <label for="n">Notes <span class="val" id="nVal">4,000</span></label>
+        <input type="range" id="n" min="0" max="1000" value="520">
+      </div>
+      <div class="field">
+        <span class="field-label">Shape</span>
+        <div class="seg" role="group" aria-label="Vault shape">
+          <button id="sIslands" aria-pressed="true">islands</button>
+          <button id="sScale" aria-pressed="false">scale&#8209;free</button>
+          <button id="sHub" aria-pressed="false">hub</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="deg">Avg degree <span class="val" id="degVal">3.0</span></label>
+        <input type="range" id="deg" min="10" max="80" value="30">
+      </div>
+      <div class="field">
+        <label for="orph">Orphans <span class="val" id="orphVal">14%</span></label>
+        <input type="range" id="orph" min="0" max="45" value="14">
+      </div>
+      <div class="field">
+        <label for="spread">Island size spread <span class="val" id="spreadVal">400</span></label>
+        <input type="range" id="spread" min="0" max="1000" value="640">
+      </div>
+      <div class="field">
+        <label for="bridge">Bridges between islands <span class="val" id="bridgeVal">0.8%</span></label>
+        <input type="range" id="bridge" min="0" max="60" value="8">
+      </div>
+      <div class="field">
+        <span class="field-label">Seed</span>
+        <div class="seg">
+          <button id="seedPrev">&#8592;</button>
+          <button id="seedShuf" style="flex:2">reroll <span id="seedVal">7</span></button>
+          <button id="seedNext">&#8594;</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="rack">
+      <div class="field">
+        <span class="field-label">Aperture</span>
+        <div class="seg" role="group" aria-label="Aperture">
+          <button id="ap7" aria-pressed="true">7 — hex fold</button>
+          <button id="ap4" aria-pressed="false">4 — ×2 (today)</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="budget">Ring budget <span class="val" id="budgetVal">280</span></label>
+        <input type="range" id="budget" min="0" max="1000" value="290">
+      </div>
+      <div class="field">
+        <span class="field-label">Links</span>
+        <div class="seg" role="group" aria-label="Links">
+          <button id="edgeOn" aria-pressed="true">show</button>
+          <button id="edgeOff" aria-pressed="false">hide</button>
+        </div>
+      </div>
+      <div class="field">
+        <span class="field-label">Transport</span>
+        <div class="seg" role="group" aria-label="Transport">
+          <button id="play" aria-pressed="true">Pause dive</button>
+          <button id="reset">Reset</button>
+        </div>
+      </div>
+      <div class="field" style="grid-column:span 2;">
+        <label for="dive">Dive — overview to notes</label>
+        <input type="range" id="dive" min="0" max="1000" value="0">
+      </div>
+    </div>
+
+    <div class="readout">
+      <div class="stat"><span class="k">Notes</span><span class="v" id="rNotes">0</span></div>
+      <div class="stat"><span class="k">Links</span><span class="v" id="rLinks">0</span></div>
+      <div class="stat"><span class="k">Islands</span><span class="v" id="rIslands">0</span></div>
+      <div class="stat"><span class="k">Ladder depth</span><span class="v" id="rDepth">0</span></div>
+      <div class="stat"><span class="k">Rings drawn</span><span class="v v-mass" id="rDrawn">0</span></div>
+      <div class="stat"><span class="k">Links drawn</span><span class="v" id="rEdrawn">0</span></div>
+      <div class="stat"><span class="k">Fold rotation</span><span class="v v-rot" id="rRot">0<span class="u">°</span></span></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="swatch sw-leaf"></i> filled — a note</span>
+    <span><i class="swatch sw-mass"></i> dashed — a coalesced cluster</span>
+    <span><i class="swatch sw-orph"></i> orphan pile</span>
+    <span><i class="swatch sw-edge"></i> lifted link</span>
+    <span>ring radius = r₀·√count</span>
+  </div>
+
+  <section>
+    <h2>What changed from the uniform prototype</h2>
+    <div class="cols">
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <p>
+          The lattice version was a perfect 7-ary tree over an empty field, so every cell was the
+          same size and every fold looked identical. This one starts from a generated vault and
+          derives the hierarchy from its <em>links</em>, so cluster sizes are log-normal, some cells
+          hold seven children and some hold two, and the ladder is deeper over a dense island than
+          over a sparse one. The raggedness is the data, not noise added on top.
+        </p>
+        <p>
+          <strong>Coarsening never crosses a component.</strong> That single rule is what makes the
+          overview read as a handful of islands instead of one blob, and it guarantees a dashed
+          cluster can never mix two unrelated topics — the disorientation complaint, fixed by
+          construction rather than by tuning.
+        </p>
+        <p>
+          Orphans are the exception. Each is its own component, so left alone they would stay
+          thousands of separate dots forever and eat the whole budget. They get bundled into one
+          <em>orphan pile</em> that coarsens spatially — which is also how they read to a person:
+          not a topic, just the unfiled drawer.
+        </p>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px;">
+<pre><code>generate(seed, spec)      // vault_synth.zig
+    ↓  notes + links
+components()              // islands, + orphan pile
+    ↓
+coarsen(arity)            // ≤7 linked children
+    ↓  ragged ladder
+place()                   // hex slots, ℓ·19.1066°
+    ↓
+select(zoom, budget)      // biggest-first, capped
+    ↓
+lift(links) → draw</code></pre>
+        <p style="font-size:13.5px;color:var(--ink-2);">
+          The dashed rings are the coarsening ladder's interior nodes, drawn directly. There is no
+          second structure and no bake — which is the property every rejected handoff in
+          <code>galaxy-lod.md</code> lacked.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Four rules I left out, and what each one broke</h2>
+    <p>
+      Getting the dive to actually reach notes took four fixes. Three of them are rules already
+      written down in <code>organic-lod.md</code> that I had simply not implemented — and each one
+      failed in exactly the way that document says it does, which is a good sign the rules are load
+      bearing rather than historical.
+    </p>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>Missing rule</th><th>Symptom</th></tr></thead>
+        <tbody>
+          <tr class="hi">
+            <td>Cull inside select, not at draw</td>
+            <td>The whole vault sat on the open-candidate list, so the budget test never passed.
+                The dive stalled about a fifth of the way in and never showed a note. Children are
+                placed inside their parent's radius, so the off-screen test is exact and cheap.</td>
+          </tr>
+          <tr class="hi">
+            <td>Level-uniform opening</td>
+            <td>Opening biggest-first until the budget ran out left identical neighbours resolved
+                differently by visit order — the half-fine/half-coarse seam. Open a whole level or
+                none of it.</td>
+          </tr>
+          <tr class="hi">
+            <td>Never force-close an open cell at the wall</td>
+            <td>Closing freed budget, which allowed reopening, which exceeded it again. Max zoom
+                juddered. Refusing only <em>new</em> opens fixed it: parked at the wall, the ring
+                count is now identical for 19 consecutive frames.</td>
+          </tr>
+          <tr class="hi">
+            <td>A note is a fixed screen size</td>
+            <td>Scaling notes with zoom like masses turned the close view into overlapping discs
+                with the links buried underneath. Only <em>masses</em> are count-and-zoom scaled,
+                and soft-capped so a cell the budget refused can't inflate to fill the screen.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The fourth is not in any document and is worth writing down: <strong>the far end of the zoom
+      range has to overshoot</strong> the point where the budget could just about hold the visible
+      notes. Landing exactly there stalls one level short, because opening that last level costs
+      seven times what the level above did. Sizing max zoom off the budget, then multiplying by
+      ~1.7, is what makes the dive end on notes instead of rings.
+    </p>
+  </section>
+
+  <section>
+    <h2>One thing the prototype changed my mind about</h2>
+    <div class="verdict">
+      <p>
+        A globally rigid hex lattice and real cluster sizes fight each other. If every cell must
+        land on a shared lattice point, a 3-note cluster and a 300-note cluster claim the same slot
+        pitch, and you are back to the uniform field — the lattice wins and the data disappears.
+      </p>
+      <p>
+        What works here instead: hex slots are <strong>local to the parent</strong> and scaled to
+        its radius, with the fold's 19.1066° rotation kept. You get the hex language — centre plus
+        six, nesting, the turn on each dive — while cell spacing follows √count. Worth deciding
+        deliberately, because it is a real departure from "every node lands exactly on a background
+        grid dot" in <code>hex.zig</code>.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2>The knobs, and one that surprised me</h2>
+    <p>
+      <code>vault_synth.zig</code> had notes, shape, average degree, orphan fraction and island size
+      bounds. It now also has the two below — <code>bridge_frac</code> (default <code>0.0</code>, so
+      existing benches are unchanged) and a folder tree derived from the generated components with a
+      <code>folder_leak_frac</code> of misfiled notes, replacing the random <code>fakePaths</code>
+      that was feeding noise to <code>layout_full.zig</code>'s folder-cohesion force.
+    </p>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>Knob</th><th>What it models</th><th>Why it matters</th></tr></thead>
+        <tbody>
+          <tr class="hi">
+            <td class="num">bridges</td>
+            <td>links between two different islands, biased toward high-degree endpoints</td>
+            <td>Real vaults are not cleanly separable — and the graph is far more fragile to this
+                than it looks. See the sweep below.</td>
+          </tr>
+          <tr class="hi">
+            <td class="num">size spread</td>
+            <td><code>island_max</code>, driving the log-uniform size draw</td>
+            <td>Already a field in <code>Spec</code>, but not exposed as a bench axis. It is the
+                single strongest control over how ragged the ladder gets.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Sweeping that knob at 2,193 notes / seed 7 / islands produced the thing I did not expect, and
+      it is the reason a generator like this is worth having at all:
+    </p>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>Bridges</th><th>Components</th><th>Largest as % of vault</th><th>Ladder depth</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0.0%</td><td class="num">29</td><td class="num">18%</td><td class="num">4</td></tr>
+          <tr><td class="num">0.1%</td><td class="num">27</td><td class="num">19%</td><td class="num">4</td></tr>
+          <tr class="hi"><td class="num">0.2%</td><td class="num">25</td><td class="num">37%</td><td class="num">4</td></tr>
+          <tr class="hi"><td class="num">0.4%</td><td class="num">22</td><td class="num">52%</td><td class="num">4</td></tr>
+          <tr class="hi"><td class="num">0.8%</td><td class="num">18</td><td class="num">74%</td><td class="num">5</td></tr>
+          <tr><td class="num">2.0%</td><td class="num">13</td><td class="num">79%</td><td class="num">5</td></tr>
+          <tr><td class="num">5.0%</td><td class="num">9</td><td class="num">83%</td><td class="num">5</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>Four extra links per thousand notes take the largest component from 18% of the vault
+      to 52%.</strong> That is a percolation threshold sitting right where a real vault lives — a
+      handful of index notes that link across topics is enough to fuse most of a vault into one
+      component. Anything that treats "islands" as a structural given, including the
+      never-coarsen-across-components rule this prototype relies on, is resting on a knife edge:
+      the same vault is 29 tidy islands or one 52% blob depending on a few links. Worth measuring on
+      real vaults before the LOD leans on it.
+    </p>
+    <p>
+      The folder change matters for a similar reason. <code>fakePaths</code> assigned paths at
+      random, so <code>layout_full.zig</code>'s folder-cohesion force (<code>folder_k = 0.42</code>,
+      scoring same-directory <code>1.0</code> and parent/child <code>0.55</code>) has been measured
+      against noise on every synth bench it has ever run. The scale plan wants folder path promoted
+      from a force to a <em>coarsening prior</em> — that cannot be evaluated at all until the
+      generator emits folders that agree with the links it generated.
+    </p>
+  </section>
+
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ── seeded rng ───────────────────────────────────────────────────────────
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const SQRT3_2 = Math.sqrt(3) / 2;
+  const THETA7 = Math.atan2(SQRT3_2, 2.5);   // 19.1066°
+
+  // ── vault generation (mirrors vault_synth.zig) ───────────────────────────
+  // Preferential attachment inside each island, log-uniform island sizes,
+  // orphan fraction, plus cross-island bridges (not yet in the Zig version).
+
+  function attachmentsPerNew(avgDeg, rnd) {
+    const k = Math.max(0, avgDeg / 2);
+    const lo = Math.floor(k);
+    return rnd() < k - lo ? lo + 1 : lo;
+  }
+
+  function generate(spec) {
+    const rnd = mulberry32(spec.seed >>> 0);
+    const n = spec.n;
+    const ea = [], eb = [];
+    const addEdge = (a, b) => { if (a !== b) { ea.push(a); eb.push(b); } };
+
+    const orphanTarget = Math.min(n, Math.round(n * spec.orphanFrac));
+
+    if (spec.shape === "scale-free") {
+      const linked = n - orphanTarget;
+      const pool = [0];
+      for (let i = 1; i < linked; i++) {
+        const k = attachmentsPerNew(spec.avgDeg, rnd);
+        for (let a = 0; a < k; a++) {
+          const j = pool[(rnd() * pool.length) | 0];
+          addEdge(i, j); pool.push(j);
+        }
+        pool.push(i);
+      }
+    } else if (spec.shape === "hub") {
+      const linked = n - orphanTarget;
+      const hubs = Math.max(1, Math.round(linked / 220));
+      for (let i = hubs; i < linked; i++) {
+        addEdge(i, (rnd() * hubs) | 0);
+        if (rnd() < (spec.avgDeg - 2) / 6) addEdge(i, hubs + ((rnd() * (linked - hubs)) | 0));
+      }
+      for (let h = 1; h < hubs; h++) addEdge(h, 0);
+    } else {
+      // islands
+      const oMin = 4, oMax = Math.max(6, spec.islandMax);
+      const sizes = [];
+      let remaining = n;
+      for (let i = 0; i < orphanTarget && remaining > 0; i++) { sizes.push(1); remaining--; }
+      const logLo = Math.log(oMin), logHi = Math.log(oMax);
+      while (remaining > 0) {
+        if (remaining < oMin) { sizes.push(remaining); remaining = 0; break; }
+        let sz = Math.round(Math.exp(logLo + rnd() * (logHi - logLo)));
+        sz = Math.max(oMin, Math.min(oMax, sz));
+        if (sz > remaining) sz = remaining;
+        sizes.push(sz); remaining -= sz;
+      }
+      let cursor = 0;
+      for (const sz of sizes) {
+        if (sz >= 2) {
+          const pool = [cursor];
+          for (let k = 1; k < sz; k++) {
+            const ni = cursor + k;
+            const kk = Math.max(1, attachmentsPerNew(spec.avgDeg, rnd));
+            for (let a = 0; a < kk; a++) {
+              const j = pool[(rnd() * pool.length) | 0];
+              addEdge(ni, j); pool.push(j);
+            }
+            pool.push(ni);
+          }
+        }
+        cursor += sz;
+      }
+    }
+
+    // degrees so far, for bridge endpoint bias
+    const deg = new Int32Array(n);
+    for (let i = 0; i < ea.length; i++) { deg[ea[i]]++; deg[eb[i]]++; }
+
+    // bridges: prefer well-connected endpoints, like a MOC note linking out
+    const linkedIdx = [];
+    for (let i = 0; i < n; i++) if (deg[i] > 0) linkedIdx.push(i);
+    if (linkedIdx.length > 4) {
+      const bridges = Math.round(spec.bridgeFrac * n);
+      for (let i = 0; i < bridges; i++) {
+        const pick = () => {
+          let best = linkedIdx[(rnd() * linkedIdx.length) | 0];
+          for (let t = 0; t < 3; t++) {
+            const c = linkedIdx[(rnd() * linkedIdx.length) | 0];
+            if (deg[c] > deg[best]) best = c;
+          }
+          return best;
+        };
+        const a = pick(), b = pick();
+        if (a !== b) { addEdge(a, b); deg[a]++; deg[b]++; }
+      }
+    }
+
+    return { n, ea: Int32Array.from(ea), eb: Int32Array.from(eb), deg };
+  }
+
+  // ── components (orphans folded into one pile) ────────────────────────────
+
+  function components(g) {
+    const { n, ea, eb } = g;
+    const comp = new Int32Array(n).fill(-1);
+    // CSR adjacency
+    const cnt = new Int32Array(n + 1);
+    for (let i = 0; i < ea.length; i++) { cnt[ea[i]]++; cnt[eb[i]]++; }
+    const off = new Int32Array(n + 1);
+    for (let i = 0; i < n; i++) off[i + 1] = off[i] + cnt[i];
+    const cur = off.slice();
+    const adj = new Int32Array(off[n]);
+    for (let i = 0; i < ea.length; i++) { adj[cur[ea[i]]++] = eb[i]; adj[cur[eb[i]]++] = ea[i]; }
+
+    let nc = 0;
+    const stack = [];
+    for (let s = 0; s < n; s++) {
+      if (comp[s] !== -1 || off[s + 1] === off[s]) continue;
+      stack.length = 0; stack.push(s); comp[s] = nc;
+      while (stack.length) {
+        const u = stack.pop();
+        for (let k = off[u]; k < off[u + 1]; k++) {
+          const v = adj[k];
+          if (comp[v] === -1) { comp[v] = nc; stack.push(v); }
+        }
+      }
+      nc++;
+    }
+    const orphanComp = nc;                       // the pile
+    let orphans = 0;
+    for (let i = 0; i < n; i++) if (comp[i] === -1) { comp[i] = orphanComp; orphans++; }
+    return { comp, nc: orphans > 0 ? nc + 1 : nc, orphanComp: orphans > 0 ? orphanComp : -1, adj, off };
+  }
+
+  // ── ladder: ≤arity linked children, never across components ──────────────
+
+  function buildLadder(g, cmp, arity, seed) {
+    const rnd = mulberry32((seed * 2654435761) >>> 0);
+    const cells = [];   // {id,level,count,kids,parent,comp,wx,wy,r,ls,le,anim,px,py}
+    for (let i = 0; i < g.n; i++)
+      cells.push({ id: i, level: 0, count: 1, kids: null, parent: -1, comp: cmp.comp[i],
+                   wx: 0, wy: 0, r: 1, ls: 0, le: 0, anim: 0, px: 0, py: 0, mul: 1, leaf: i });
+
+    let cur = [];
+    for (let i = 0; i < g.n; i++) cur.push(i);
+
+    // level-0 adjacency between current cells
+    let adjOf = new Map();
+    const push = (m, a, b) => { let s = m.get(a); if (!s) { s = []; m.set(a, s); } s.push(b); };
+    for (let i = 0; i < g.ea.length; i++) { push(adjOf, g.ea[i], g.eb[i]); push(adjOf, g.eb[i], g.ea[i]); }
+
+    let depth = 0;
+    while (depth < 24) {
+      // one cell per component left? then stop
+      const perComp = new Map();
+      for (const c of cur) perComp.set(cells[c].comp, (perComp.get(cells[c].comp) || 0) + 1);
+      let anyMultiple = false;
+      for (const v of perComp.values()) if (v > 1) { anyMultiple = true; break; }
+      if (!anyMultiple) break;
+
+      const taken = new Set();
+      const groups = [];
+      // biggest-first is deterministic and keeps hubs at group centres
+      const order = cur.slice().sort((a, b) =>
+        (cells[b].count - cells[a].count) || (a - b));
+
+      for (const u of order) {
+        if (taken.has(u)) continue;
+        const uc = cells[u].comp;
+        const grp = [u]; taken.add(u);
+        // grow over links first
+        const nb = adjOf.get(u) || [];
+        for (const v of nb) {
+          if (grp.length >= arity) break;
+          if (!taken.has(v) && cells[v].comp === uc) { grp.push(v); taken.add(v); }
+        }
+        // then over the group's own neighbourhood (2-hop), still same component
+        if (grp.length < arity) {
+          outer: for (let gi = 1; gi < grp.length; gi++) {
+            for (const v of (adjOf.get(grp[gi]) || [])) {
+              if (grp.length >= arity) break outer;
+              if (!taken.has(v) && cells[v].comp === uc) { grp.push(v); taken.add(v); }
+            }
+          }
+        }
+        groups.push(grp);
+      }
+
+      // Leftovers. A cell whose neighbours were all claimed becomes a singleton
+      // and would pass through unchanged — and around a hub that is *most* of the
+      // star, so the ladder degenerates into a 20-deep chain and the hub's leaves
+      // never coalesce at all. Bundle every same-component leftover instead; the
+      // orphan pile (no links, so always leftover) falls out of the same rule.
+      const kept = [], leftover = new Map();
+      for (const gp of groups) {
+        if (gp.length > 1) { kept.push(gp); continue; }
+        const k = cells[gp[0]].comp;
+        let b = leftover.get(k); if (!b) { b = []; leftover.set(k, b); }
+        b.push(gp[0]);
+      }
+      for (const bucket of leftover.values()) {
+        if (bucket.length === 1) { kept.push([bucket[0]]); continue; }
+        for (let i = 0; i < bucket.length; i += arity) kept.push(bucket.slice(i, i + arity));
+      }
+      groups.length = 0; groups.push(...kept);
+
+      if (groups.length >= cur.length) break;   // no progress
+
+      const next = [];
+      const nextAdj = new Map();
+      const parentOf = new Map();
+      for (const grp of groups) {
+        if (grp.length === 1) { next.push(grp[0]); parentOf.set(grp[0], grp[0]); continue; }
+        const id = cells.length;
+        let count = 0;
+        for (const c of grp) { cells[c].parent = id; count += cells[c].count; parentOf.set(c, id); }
+        cells.push({ id, level: depth + 1, count, kids: grp, parent: -1, comp: cells[grp[0]].comp,
+                     wx: 0, wy: 0, r: 1, ls: 0, le: 0, anim: 0, px: 0, py: 0, mul: 1, leaf: -1 });
+        next.push(id);
+      }
+      // lift adjacency
+      for (const [u, vs] of adjOf) {
+        const pu = parentOf.get(u); if (pu === undefined) continue;
+        for (const v of vs) {
+          const pv = parentOf.get(v); if (pv === undefined || pv === pu) continue;
+          push(nextAdj, pu, pv);
+        }
+      }
+      cur = next; adjOf = nextAdj; depth++;
+      if (cur.length <= 1) break;
+    }
+
+    // roots = whatever is left
+    const roots = cur.slice();
+    // contiguous leaf ranges via DFS
+    let cursor = 0;
+    const order = new Int32Array(g.n);
+    const stack = roots.slice().reverse();
+    const visit = (id) => {
+      const c = cells[id];
+      c.ls = cursor;
+      if (!c.kids) { order[cursor] = c.leaf; cursor++; }
+      else for (const k of c.kids) visit(k);
+      c.le = cursor;
+      c.r = Math.sqrt(c.count);
+    };
+    for (const r of roots) visit(r);
+    void stack;
+    return { cells, roots, depth };
+  }
+
+  // ── placement: pack roots, then local hex slots ──────────────────────────
+
+  function slots(arity, rot) {
+    const out = [[0, 0]];
+    if (arity === 7) {
+      for (let k = 0; k < 6; k++) {
+        const a = rot + (k * Math.PI) / 3;
+        out.push([Math.cos(a), Math.sin(a)]);
+      }
+    } else {
+      // aperture-4 residues {0,1,ω,1+ω}, re-centred
+      const raw = [[0, 0], [1, 0], [0.5, SQRT3_2], [1.5, SQRT3_2]];
+      const mx = 0.75, my = SQRT3_2 / 2;
+      out.length = 0;
+      for (const [x, y] of raw) out.push([(x - mx) / 0.9, (y - my) / 0.9]);
+    }
+    return out;
+  }
+
+  function place(lad, arity, aspect) {
+    const { cells, roots } = lad;
+
+    // roots: biggest first on a golden-angle spiral, radius ∝ √count
+    const sorted = roots.slice().sort((a, b) => cells[b].count - cells[a].count);
+    const GA = Math.PI * (3 - Math.sqrt(5));
+    let acc = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      const c = cells[sorted[i]];
+      const rad = Math.sqrt(acc);      // before adding, so the biggest sits at the origin
+      acc += c.r * c.r * 5.2;
+      const a = i * GA;
+      c.wx = Math.cos(a) * rad * aspect;
+      c.wy = Math.sin(a) * rad;
+    }
+
+    // children: local hex slots scaled to the parent's radius, rotated per level
+    const walk = (id) => {
+      const c = cells[id];
+      if (!c.kids) return;
+      const sl = slots(arity, c.level * (arity === 7 ? THETA7 : 0));
+      const kids = c.kids.slice().sort((a, b) => cells[b].count - cells[a].count);
+      // Leave room for the biggest child rather than using a fixed fraction —
+      // an uneven split (one fat child, five thin) otherwise overlaps badly.
+      let maxKid = 0;
+      for (const k of kids) maxKid = Math.max(maxKid, cells[k].r);
+      const ring = Math.max(c.r * 0.30, c.r - maxKid * 0.92);
+      for (let i = 0; i < kids.length; i++) {
+        const k = cells[kids[i]];
+        const s = sl[i % sl.length];
+        k.wx = c.wx + s[0] * ring;
+        k.wy = c.wy + s[1] * ring;
+        walk(kids[i]);
+      }
+    };
+    for (const r of roots) walk(r);
+
+    let ext = 1;
+    for (const r of roots) {
+      const c = cells[r];
+      ext = Math.max(ext, Math.hypot(c.wx, c.wy) + c.r);
+    }
+    return ext;
+  }
+
+  // ── state ────────────────────────────────────────────────────────────────
+
+  const st = {
+    spec: { n: 4000, shape: "islands", avgDeg: 3, orphanFrac: 0.14,
+            islandMax: 400, bridgeFrac: 0.008, seed: 7 },
+    arity: 7, budget: 280, showEdges: true,
+    dive: 0, dir: 1, playing: true,
+    g: null, cmp: null, lad: null, ext: 1, edgesCap: 1400,
+  };
+
+  function rebuild() {
+    st.g = generate(st.spec);
+    st.cmp = components(st.g);
+    st.lad = buildLadder(st.g, st.cmp, st.arity, st.spec.seed);
+    st.ext = place(st.lad, st.arity, 1.35);
+    elNotes.textContent = fmt.format(st.g.n);
+    elLinks.textContent = fmt.format(st.g.ea.length);
+    elIslands.textContent = fmt.format(st.lad.roots.length);
+    elDepth.textContent = String(st.lad.depth);
+  }
+
+  // ── canvas ───────────────────────────────────────────────────────────────
+
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d");
+  let W = 0, H = 0, DPR = 1;
+  function resize() {
+    const r = cv.getBoundingClientRect();
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = Math.max(1, Math.round(r.width)); H = Math.max(1, Math.round(r.height));
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  new ResizeObserver(resize).observe(cv);
+
+  const cssRoot = getComputedStyle(document.documentElement);
+  let COL = {};
+  function readColors() {
+    const g = (nm) => cssRoot.getPropertyValue(nm).trim();
+    COL = { leaf: g("--leaf"), mass: g("--mass"), muted: g("--muted"),
+            line: g("--line"), rot: g("--rot"), orphan: g("--orphan"), ink: g("--ink-2") };
+  }
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-color-scheme: dark)")
+      .addEventListener("change", () => setTimeout(readColors, 0));
+  }
+  new MutationObserver(() => setTimeout(readColors, 0))
+    .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  function rgba(hex, a) {
+    const h = hex.replace("#", "");
+    const v = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+    const nn = parseInt(v, 16);
+    return `rgba(${(nn >> 16) & 255},${(nn >> 8) & 255},${nn & 255},${a})`;
+  }
+  const smooth = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+
+  const fmt = new Intl.NumberFormat("en-US");
+  const $ = (id) => document.getElementById(id);
+  const elNotes = $("rNotes"), elLinks = $("rLinks"), elIslands = $("rIslands"),
+        elDepth = $("rDepth"), elDrawn = $("rDrawn"), elEdrawn = $("rEdrawn"),
+        elRot = $("rRot"), elTag = $("stagetag"), elDive = $("dive");
+
+  // ── frame ────────────────────────────────────────────────────────────────
+
+  const SPLIT_PX = 30;
+  const MASS_CAP = 46;      // soft ceiling on a coalesced ring's drawn radius
+  const NOTE_R_PX = 8.5;    // a note is a fixed screen size, never zoom-scaled
+  const drawList = [];
+
+  function frameDraw(dt) {
+    const { cells, roots } = st.lad;
+    const minDim = Math.min(W, H);
+    const zMin = (minDim * 0.44) / st.ext;
+    // Far end has to satisfy two things at once, or the dive ends on dashed rings.
+    //  1. past the last split: a parent of leaves has r = √arity, so it only
+    //     opens once √arity · zoom > SPLIT_PX;
+    //  2. few enough notes left in view that the budget can actually resolve
+    //     them. Cells pack at ~1 note per π world units², so the viewport holds
+    //     W·H/(π·z²) notes — solve that for half the budget.
+    // The ×2.2 is the part that matters: landing exactly on "the budget could
+    // just about hold these notes" stalls one level short, because opening that
+    // last level costs arity× what the level above did. Overshoot so the end of
+    // the dive is unambiguously a cluster of notes and their links.
+    const zLastSplit = (SPLIT_PX / Math.sqrt(st.arity)) * 1.7;
+    const zFitsBudget = Math.sqrt((W * H) / (Math.PI * Math.max(40, st.budget) * 0.5));
+    const zMax = Math.max(zMin * 4, zLastSplit, zFitsBudget * 1.7);
+    const zoom = zMin * Math.pow(zMax / zMin, st.dive);
+
+    // Camera targets the biggest *linked* island — never the orphan pile, which
+    // can easily be the largest component and is the least interesting thing to
+    // dive into.
+    let anchor = null;
+    for (const r of roots) {
+      const c = cells[r];
+      if (c.comp === st.cmp.orphanComp) continue;
+      if (!anchor || c.count > anchor.count) anchor = c;
+    }
+    if (!anchor) anchor = cells[roots[0]];
+    const t = smooth((st.dive - 0.06) / 0.5);
+    const camX = anchor.wx * t, camY = anchor.wy * t;
+    const cx = W / 2, cy = H / 2;
+    const toX = (wx) => cx + (wx - camX) * zoom;
+    const toY = (wy) => cy + (wy - camY) * zoom;
+
+    // ── select: level-uniform BFS, budget-capped.
+    // Per organic-lod.md: at each depth open every want-open cell or none. A
+    // per-node "biggest first until the budget runs out" pass leaves identical
+    // neighbours resolved differently depending on visit order — the documented
+    // half-fine/half-coarse seam. BFS also gives parents-before-children for
+    // free, which the pose lerp below depends on.
+    drawList.length = 0;
+    st.cellOf.fill(-1);
+    const rate = Math.min(1, dt * 7);
+    let frontier = [];
+    for (const r of roots) {
+      const c = cells[r];
+      c.px = c.wx; c.py = c.wy; c.mul = 1;
+      frontier.push(r);
+    }
+
+    let budgetBound = false;
+    let guard = 0;
+    while (frontier.length && guard++ < 64) {
+      // cull first: children live inside their parent's radius, so an off-screen
+      // cell's whole subtree is off-screen and the test is exact.
+      const vis = [];
+      for (const id of frontier) {
+        const c = cells[id];
+        const sr = c.r * zoom, sx = toX(c.px), sy = toY(c.py), m = sr + 48;
+        if (sx < -m || sx > W + m || sy < -m || sy > H + m) {
+          // still claim its range so links leaving the viewport keep a target
+          const o = st.cellOf; for (let s = c.ls; s < c.le; s++) if (o[s] < 0) o[s] = c.id;
+          c.anim = 0;
+          continue;
+        }
+        vis.push(id);
+      }
+      if (!vis.length) break;
+
+      // would opening this whole level fit?
+      let extra = 0;
+      for (const id of vis) {
+        const c = cells[id];
+        if (c.kids && c.r * zoom > SPLIT_PX) extra += c.kids.length - 1;
+      }
+      if (drawList.length + vis.length + extra > st.budget) budgetBound = true;
+
+      const next = [];
+      for (const id of vis) {
+        const c = cells[id];
+        // Never force an already-open cell closed at the budget wall. Doing so
+        // oscillates: closing frees budget, which lets it reopen, which exceeds
+        // it again — the "idle reopen forever" failure in organic-lod.md's
+        // rejected table, and what makes max zoom judder. The wall only refuses
+        // *new* opens.
+        const alreadyOpen = c.anim > 0.5;
+        const willOpen = (!budgetBound || alreadyOpen) && !!c.kids && c.r * zoom > SPLIT_PX;
+        c.anim += ((willOpen ? 1 : 0) - c.anim) * rate;
+        if (c.anim < 0.004) c.anim = 0;
+        if (c.anim > 0.996) c.anim = 1;
+
+        if (c.anim < 0.5) { const o = st.cellOf; for (let s = c.ls; s < c.le; s++) o[s] = c.id; }
+        if (c.anim < 1) drawList.push(c);
+
+        // keep walking while a closing cell is still fading, so zoom-out
+        // crossfades instead of popping
+        if (c.kids && c.anim > 0) {
+          for (const k of c.kids) {
+            const kc = cells[k];
+            kc.px = c.px + (kc.wx - c.px) * c.anim;
+            kc.py = c.py + (kc.wy - c.py) * c.anim;
+            kc.mul = c.mul * c.anim;
+            next.push(k);
+          }
+        }
+      }
+      frontier = next;
+    }
+    st.bound = budgetBound;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // ── links: lift each note to its cut cell
+    let edrawn = 0;
+    if (st.showEdges) {
+      // note id → DFS slot → the cut cell that currently owns it
+      const idx = st.leafSlot, own = st.cellOf;
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = rgba(COL.ink, 0.3);
+      ctx.beginPath();
+      const ea = st.g.ea, eb = st.g.eb;
+      const stride = Math.max(1, Math.ceil(ea.length / st.edgesCap));
+      for (let i = 0; i < ea.length; i += stride) {
+        const ca = own[idx[ea[i]]], cb2 = own[idx[eb[i]]];
+        if (ca < 0 || cb2 < 0 || ca === cb2) continue;
+        const A = cells[ca], B = cells[cb2];
+        if (A.mul < 0.05 || B.mul < 0.05) continue;
+        const ax = toX(A.px), ay = toY(A.py), bx = toX(B.px), by = toY(B.py);
+        if ((ax < -60 && bx < -60) || (ax > W + 60 && bx > W + 60)) continue;
+        if ((ay < -60 && by < -60) || (ay > H + 60 && by > H + 60)) continue;
+        ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+        edrawn++;
+      }
+      ctx.stroke();
+    }
+
+    // ── rings
+    let drawn = 0;
+    for (const c of drawList) {
+      // Two different radius laws, per organic-lod.md:
+      //   count == 1  → a fixed screen size. A note is a note; scaling it with
+      //                 zoom makes the close view a field of overlapping discs
+      //                 with the links buried underneath.
+      //   count  > 1  → count-scaled with zoom, soft-capped so a cell the budget
+      //                 refused to open cannot inflate to fill the screen.
+      const raw = c.r * zoom * 0.82;
+      const rad = c.kids
+        ? Math.max(1.1, MASS_CAP * (1 - Math.exp(-raw / MASS_CAP)))
+        : NOTE_R_PX;
+      const x = toX(c.px), y = toY(c.py);
+      if (x < -rad - 8 || x > W + rad + 8 || y < -rad - 8 || y > H + rad + 8) continue;
+      const a = c.mul * (1 - c.anim);
+      if (a < 0.02) continue;
+      drawn++;
+
+      const isLeaf = !c.kids;
+      const isOrphan = c.comp === st.cmp.orphanComp;
+      const col = isLeaf ? (isOrphan ? COL.orphan : COL.leaf) : (isOrphan ? COL.orphan : COL.mass);
+
+      ctx.beginPath();
+      ctx.arc(x, y, rad, 0, Math.PI * 2);
+      if (isLeaf) {
+        ctx.fillStyle = rgba(col, a * 0.82);
+        ctx.fill();
+      } else {
+        ctx.setLineDash([Math.max(2, rad * 0.42), Math.max(2, rad * 0.34)]);
+        ctx.lineWidth = Math.max(1, Math.min(2.4, rad * 0.13));
+        ctx.strokeStyle = rgba(col, a * 0.95);
+        ctx.fillStyle = rgba(col, a * 0.07);
+        ctx.fill(); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    elDrawn.textContent = fmt.format(drawn);
+    elEdrawn.textContent = fmt.format(edrawn);
+    const lvl = Math.max(0, st.lad.depth - Math.log(zoom / zMin) / Math.log(2.6458));
+    elRot.innerHTML = (st.arity === 7 ? (lvl * THETA7 * 180 / Math.PI).toFixed(1) : "0.0") +
+                      '<span class="u">°</span>';
+    elTag.textContent = `${st.spec.shape} · ${fmt.format(st.spec.n)} notes · aperture ${st.arity}`;
+  }
+
+  // leaf-order lookup, rebuilt with the ladder.
+  // Cells own a contiguous [ls,le) range over the DFS leaf order, so lifting a
+  // link is two array reads — no ancestor walk, no per-frame map.
+  function buildLeafIndex() {
+    st.leafSlot = new Int32Array(st.g.n);   // note id → DFS slot
+    st.cellOf = new Int32Array(st.g.n);     // DFS slot → owning cut cell, per frame
+    const walk = (id) => {
+      const c = st.lad.cells[id];
+      if (!c.kids) { st.leafSlot[c.leaf] = c.ls; return; }
+      for (const k of c.kids) walk(k);
+    };
+    for (const r of st.lad.roots) walk(r);
+  }
+
+  // ── loop ─────────────────────────────────────────────────────────────────
+
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) st.playing = false;
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (st.playing) {
+      st.dive += st.dir * 0.075 * dt;
+      if (st.dive >= 1) { st.dive = 1; st.dir = -1; }
+      if (st.dive <= 0) { st.dive = 0; st.dir = 1; }
+      elDive.value = String(Math.round(st.dive * 1000));
+    }
+    frameDraw(dt);
+    requestAnimationFrame(loop);
+  }
+
+  // ── controls ─────────────────────────────────────────────────────────────
+
+  const logMap = (t, lo, hi) => Math.round(Math.exp(Math.log(lo) + t * (Math.log(hi) - Math.log(lo))));
+
+  const ui = {
+    n: $("n"), deg: $("deg"), orph: $("orph"), spread: $("spread"),
+    bridge: $("bridge"), budget: $("budget"),
+  };
+  const lab = {
+    n: $("nVal"), deg: $("degVal"), orph: $("orphVal"), spread: $("spreadVal"),
+    bridge: $("bridgeVal"), budget: $("budgetVal"), seed: $("seedVal"),
+  };
+
+  function readParams() {
+    st.spec.n = logMap(+ui.n.value / 1000, 200, 20000);
+    st.spec.avgDeg = +ui.deg.value / 10;
+    st.spec.orphanFrac = +ui.orph.value / 100;
+    st.spec.islandMax = logMap(+ui.spread.value / 1000, 8, 4000);
+    st.spec.bridgeFrac = +ui.bridge.value / 1000;
+    st.budget = logMap(+ui.budget.value / 1000, 60, 6000);
+
+    lab.n.textContent = fmt.format(st.spec.n);
+    lab.deg.textContent = st.spec.avgDeg.toFixed(1);
+    lab.orph.textContent = ui.orph.value + "%";
+    lab.spread.textContent = fmt.format(st.spec.islandMax);
+    lab.bridge.textContent = (st.spec.bridgeFrac * 100).toFixed(1) + "%";
+    lab.budget.textContent = fmt.format(st.budget);
+    lab.seed.textContent = String(st.spec.seed);
+  }
+
+  let pending = 0;
+  function reparam(regen) {
+    readParams();
+    if (!regen) return;
+    clearTimeout(pending);
+    pending = setTimeout(() => { rebuild(); buildLeafIndex(); }, 90);
+  }
+
+  for (const k of ["n", "deg", "orph", "spread", "bridge"])
+    ui[k].oninput = () => reparam(true);
+  ui.budget.oninput = () => reparam(false);
+
+  function shape(s) {
+    st.spec.shape = s;
+    $("sIslands").setAttribute("aria-pressed", String(s === "islands"));
+    $("sScale").setAttribute("aria-pressed", String(s === "scale-free"));
+    $("sHub").setAttribute("aria-pressed", String(s === "hub"));
+    rebuild(); buildLeafIndex();
+  }
+  $("sIslands").onclick = () => shape("islands");
+  $("sScale").onclick = () => shape("scale-free");
+  $("sHub").onclick = () => shape("hub");
+
+  function arity(a) {
+    st.arity = a;
+    $("ap7").setAttribute("aria-pressed", String(a === 7));
+    $("ap4").setAttribute("aria-pressed", String(a === 4));
+    rebuild(); buildLeafIndex();
+  }
+  $("ap7").onclick = () => arity(7);
+  $("ap4").onclick = () => arity(4);
+
+  function edges(on) {
+    st.showEdges = on;
+    $("edgeOn").setAttribute("aria-pressed", String(on));
+    $("edgeOff").setAttribute("aria-pressed", String(!on));
+  }
+  $("edgeOn").onclick = () => edges(true);
+  $("edgeOff").onclick = () => edges(false);
+
+  function seed(v) { st.spec.seed = v; lab.seed.textContent = String(v); rebuild(); buildLeafIndex(); }
+  $("seedPrev").onclick = () => seed(Math.max(1, st.spec.seed - 1));
+  $("seedNext").onclick = () => seed(st.spec.seed + 1);
+  $("seedShuf").onclick = () => seed(1 + ((Math.random() * 9999) | 0));
+
+  const btnPlay = $("play");
+  function sync() {
+    btnPlay.setAttribute("aria-pressed", String(st.playing));
+    btnPlay.textContent = st.playing ? "Pause dive" : "Play dive";
+  }
+  btnPlay.onclick = () => { st.playing = !st.playing; sync(); };
+  $("reset").onclick = () => { st.dive = 0; st.dir = 1; elDive.value = "0"; };
+  elDive.oninput = () => { st.playing = false; st.dive = +elDive.value / 1000; sync(); };
+
+  window.__atlas = st;                                        // debug hook
+  window.__rebuild = () => { rebuild(); buildLeafIndex(); };  // synchronous, for sweeps
+
+  // ── go ───────────────────────────────────────────────────────────────────
+  resize();
+  readColors();
+  readParams();
+  rebuild();
+  buildLeafIndex();
+  sync();
+  requestAnimationFrame(loop);
+})();
+</script>

@@ -1,0 +1,44 @@
+.{
+    .name = .atlas,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "plugin.zig",
+        "plugin.zig.zon",
+        "ICON.png",
+        "src",
+    },
+    .fingerprint = 0x720ad60ff03945c1,
+    .dependencies = .{
+        // Local path during development; swap to the release-asset URL before tagging — CI
+        // requires a URL+hash pin, and it must be the `fizzy-sdk-v*.tar.gz` **asset**, never the
+        // git archive of the tag (that's the monorepo root zon, which drags in Velopack).
+        .fizzy = .{
+            //.url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.49/fizzy-sdk-v0.1.49.tar.gz",
+            //.hash = "",
+            .path = "../../fizzy/sdk/",
+        },
+        // Textured-quad 2D batching (soft discs / lines) for the galaxy node map.
+        .batch2d = .{
+            .path = "../batch2d",
+        },
+        // Flecs living marks + sticky LOD (examples: rings / coalesce). Owns zflecs.
+        .markworld = .{
+            .path = "../markworld",
+        },
+        // SQLite, as a hash-pinned package rather than a vendored amalgamation. This one wraps
+        // the official sqlite.org amalgamation zip in its own hash-pinned dependency and adds
+        // Zig bindings, so the C never lands in this repo and both hops are content-addressed.
+        .sqlite = .{
+            .url = "git+https://github.com/vrischmann/zig-sqlite#946d77c526258760b52836187af32d1a192c5d36",
+            .hash = "sqlite-3.48.0-F2R_azCQDgBGaWDIX4g2vxKpuqzYEQOOfAeJGMNocPu0",
+        },
+        .icons = .{
+            .url = "https://github.com/foxnne/zig-lib-icons/archive/db034786a1286ab28dc35aba534c098aa4f1a3aa.tar.gz",
+            .hash = "icons-0.0.0-iJxA-VvGMwAgiKSXRe_Y0O7RpasdtEJhBfVx8IGGEBl_",
+            .lazy = true,
+        },
+    },
+}
