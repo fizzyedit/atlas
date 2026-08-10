@@ -675,6 +675,10 @@ const Panel = struct {
     world_state: ?world_mod.World = null,
     /// `layout_epoch` the world was last built against, so it rebuilds only when the graph does.
     world_epoch: u64 = std.math.maxInt(u64),
+    /// Whether this frame draws the containment path. Read by the camera fit, which runs before
+    /// the draw branch and would otherwise frame the classic layout's extent while the marks sit
+    /// at containment positions.
+    containment_mode: bool = false,
     /// `layout_epoch` the agent field was last reset against.
     agents_epoch: u64 = std.math.maxInt(u64),
     /// True when this frame's overview is drawn from `agent_field` rather than tiles/`select`.
@@ -797,6 +801,9 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     const st = runtime.state();
     const gpa = sdk.allocator();
     const p = ensurePanel(gpa);
+    // Set before anything reads it — the camera fit runs earlier than the draw branch.
+    p.containment_mode = st.settings.graph_layout.get() == .containment;
+    if (p.containment_mode) _ = ensureWorld(p);
 
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .both,
@@ -911,7 +918,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         _ = profLap(&prof);
         // Agents own the overview when active: one living mark set + bound web. Tiles stay parked
         // so their baked web cannot stack with the field (semi-transparent lines double in ink).
-        if (st.settings.graph_layout.get() == .containment) {
+        if (p.containment_mode) {
             // One hierarchy, positions derived from it. Owns the whole overview — no tiles, no
             // agent field, no flat layout.
             drawWorldMarks(p, 1 - t);
@@ -2809,6 +2816,25 @@ fn vaultExtentsPose(p: *const Panel) ?Camera.Pose {
     if (p.nodes.len == 0) return null;
     const vp = p.camera.viewport;
     if (vp.w < 32 or vp.h < 32) return null;
+
+    // Containment owns its own positions, and the islands are packed around the origin. Framing
+    // `p.nodes` here would fit the classic layout's extent instead — a different arrangement
+    // entirely — so read the world's island discs directly. O(islands), and exact.
+    if (p.containment_mode) {
+        if (p.world_state) |*w| {
+            if (w.lad.roots.len > 0) {
+                const e = w.extent();
+                const pad_px: f32 = 24;
+                const usable_w = @max(1, vp.w - pad_px * 2);
+                const usable_h = @max(1, vp.h - pad_px * 2);
+                const z = @min(usable_w, usable_h) / (2 * @max(e, 1e-3));
+                return .{
+                    .center = .{ .x = 0, .y = 0 },
+                    .zoom = std.math.clamp(z, Camera.abs_min_zoom, Camera.max_zoom),
+                };
+            }
+        }
+    }
 
     const slot = if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(p.nodes.len);
 

@@ -68,6 +68,9 @@ pub const Cell = struct {
     level: u16 = 0,
     /// Set iff this cell is a single real note.
     note: u32 = invalid,
+    /// Connected component of the *link* graph this cell belongs to. Coarsening never merges
+    /// across it, so a coalesced cell can never mix two unconnected islands.
+    comp: u32 = 0,
     /// Contiguous [ls, le) range over `note_at` — every note beneath this cell. Lets a link be
     /// lifted to the cell that currently owns it with two array reads and no ancestor walk.
     ls: u32 = 0,
@@ -87,7 +90,11 @@ pub const Ladder = struct {
     /// dfs slot -> note id, and its inverse.
     note_at: []u32 = &.{},
     slot_of: []u32 = &.{},
-    root: u32 = invalid,
+    /// One root per connected component of the link graph (plus one for the pooled orphans).
+    /// They are *packed* in the plane by `containment.zig` rather than folded under a single
+    /// root — folding them would put unrelated islands inside one disc, which is exactly the
+    /// overlap that made a vault of discrete islands read as one converging blob.
+    roots: []u32 = &.{},
     depth: u16 = 0,
 
     pub fn deinit(self: *Ladder, gpa: std.mem.Allocator) void {
@@ -97,6 +104,7 @@ pub const Ladder = struct {
         gpa.free(self.leaf_cell);
         gpa.free(self.note_at);
         gpa.free(self.slot_of);
+        gpa.free(self.roots);
         self.* = .{};
     }
 
@@ -142,6 +150,12 @@ pub fn build(
         edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = e.w });
     }
 
+    // Components come from real links only, and are computed *before* the folder chain is added:
+    // the chain deliberately connects every note to its path-neighbour, so including it would
+    // fuse the whole vault into one component and defeat the constraint below.
+    const comp = try arena.alloc(u32, n_notes);
+    const n_comps = try linkComponents(arena, comp, edges.items, n_notes);
+
     const total: u32 = @intCast(n_notes);
     if (paths.len == n_notes and opts.folder_w > 0) {
         try addPathChain(arena, &edges, paths, opts.folder_w);
@@ -153,8 +167,9 @@ pub fn build(
     errdefer cells.deinit(gpa);
     for (0..total) |i| {
         try cells.append(gpa, .{
-            .count = if (i < n_notes) 1 else 0,
-            .note = if (i < n_notes) @intCast(i) else invalid,
+            .count = 1,
+            .note = @intCast(i),
+            .comp = comp[i],
         });
     }
 
@@ -166,7 +181,7 @@ pub fn build(
     var level_edges = try arena.dupe(Edge, edges.items);
 
     var depth: u16 = 0;
-    while (depth < opts.max_levels and cur.len > 1) {
+    while (depth < opts.max_levels and cur.len > n_comps) {
         const res = try coarsenLevel(arena, gpa, &cells, &children, cur, level_edges, opts.arity, depth);
         if (res.cells.len >= cur.len) break; // no progress
         cur = res.cells;
@@ -174,39 +189,17 @@ pub fn build(
         depth += 1;
     }
 
-    // A disconnected vault can leave several tops; give them one root so the ladder is a tree.
-    var root: u32 = undefined;
-    if (cur.len == 1) {
-        root = cur[0];
-    } else {
-        root = @intCast(cells.items.len);
-        var sum: u32 = 0;
-        const start: u32 = @intCast(children.items.len);
-        for (cur) |c| {
-            cells.items[c].parent = root;
-            sum += cells.items[c].count;
-            try children.append(gpa, c);
-        }
-        try cells.append(gpa, .{
-            .count = sum,
-            .level = depth + 1,
-            .child_start = start,
-            .child_count = @intCast(cur.len),
-        });
-        depth += 1;
-    }
-
     var lad: Ladder = .{
         .cells = try cells.toOwnedSlice(gpa),
         .children = try children.toOwnedSlice(gpa),
-        .root = root,
+        .roots = try gpa.dupe(u32, cur),
         .depth = depth,
     };
     errdefer lad.deinit(gpa);
 
-    // Folder nodes have done their job; drop them and any cell left holding nothing real, then
-    // splice out single-child chains so the ladder stays ~log_arity(n) deep.
-    lad.root = prune(&lad, lad.root) orelse return .{};
+    // Splice out single-child chains so the ladder stays ~log_arity(n) deep.
+    for (lad.roots) |*r| r.* = prune(&lad, r.*) orelse r.*;
+    for (lad.roots) |r| lad.cells[r].parent = invalid;
 
     lad.leaf_cell = try gpa.alloc(u32, n_notes);
     @memset(lad.leaf_cell, invalid);
@@ -214,14 +207,76 @@ pub fn build(
     lad.slot_of = try gpa.alloc(u32, n_notes);
     @memset(lad.slot_of, invalid);
     var cursor: u32 = 0;
-    assignRanges(&lad, lad.root, 0, &cursor);
-    lad.depth = maxDepth(lad, lad.root);
+    var deepest: u16 = 0;
+    for (lad.roots) |r| {
+        assignRanges(&lad, r, 0, &cursor);
+        deepest = @max(deepest, maxDepth(lad, r));
+    }
+    lad.depth = deepest;
 
     try buildPairs(gpa, &lad, links, n_notes);
     return lad;
 }
 
 // ---- folder nodes ---------------------------------------------------------------------------
+
+/// Connected components of the link graph, with every isolated note pooled into a single extra
+/// component. Fills `comp` with dense ids and returns how many there are.
+///
+/// Pooling matters: an unlinked note is its own component, so without it a vault with thousands of
+/// orphans would have thousands of roots that can never coarsen with anything, each holding its own
+/// slot in the pack forever. Pooled, they coarsen among themselves — and since their only edges are
+/// the folder chain, they group by directory, which is also how a person reads them: not a topic,
+/// just the unfiled drawer.
+fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_notes: usize) !u32 {
+    const uf = try arena.alloc(u32, n_notes);
+    for (uf, 0..) |*x, i| x.* = @intCast(i);
+    const has_link = try arena.alloc(bool, n_notes);
+    @memset(has_link, false);
+
+    const find = struct {
+        fn f(u: []u32, x0: u32) u32 {
+            var x = x0;
+            while (u[x] != x) {
+                u[x] = u[u[x]]; // path halving
+                x = u[x];
+            }
+            return x;
+        }
+    }.f;
+
+    for (links) |e| {
+        if (e.a >= n_notes or e.b >= n_notes or e.a == e.b) continue;
+        has_link[e.a] = true;
+        has_link[e.b] = true;
+        const ra = find(uf, e.a);
+        const rb = find(uf, e.b);
+        if (ra != rb) uf[@max(ra, rb)] = @min(ra, rb);
+    }
+
+    // Dense renumbering. `dense[root] + 1` is stored so 0 can mean "unassigned".
+    const dense = try arena.alloc(u32, n_notes);
+    @memset(dense, 0);
+    var next: u32 = 0;
+    var pool: u32 = invalid;
+    for (0..n_notes) |i| {
+        if (!has_link[i]) {
+            if (pool == invalid) {
+                pool = next;
+                next += 1;
+            }
+            comp[i] = pool;
+            continue;
+        }
+        const r = find(uf, @intCast(i));
+        if (dense[r] == 0) {
+            next += 1;
+            dense[r] = next; // stored +1
+        }
+        comp[i] = dense[r] - 1;
+    }
+    return next;
+}
 
 /// One edge per note, between path-order neighbours. Lexicographic order on vault-relative paths
 /// is a depth-first walk of the folder tree, so this single chain expresses the whole hierarchy:
@@ -314,6 +369,9 @@ fn coarsenLevel(
 
     const taken = try arena.alloc(bool, m);
     @memset(taken, false);
+    // component per dense index, so grouping can be constrained to one island
+    const comp_of = try arena.alloc(u32, m);
+    for (cur, 0..) |c, i| comp_of[i] = cells.items[c].comp;
 
     var groups: std.ArrayListUnmanaged([]u32) = .empty;
     var leftovers: std.ArrayListUnmanaged(u32) = .empty;
@@ -326,13 +384,16 @@ fn coarsenLevel(
         var len: usize = 1;
         buf[0] = u;
 
-        // 1-hop, heaviest link first.
-        len = growFrom(u, adj, adjw, off, taken, buf, len, k);
+        // 1-hop, heaviest link first. `comp_of` keeps a group inside one island: the folder
+        // chain deliberately links every note to its path-neighbour, so without this an island
+        // would happily absorb the note that happens to sort next to it.
+        const my_comp = cells.items[cell_id].comp;
+        len = growFrom(u, adj, adjw, off, taken, buf, len, k, comp_of, my_comp);
         // then the group's own neighbourhood, so a star's rim can still coalesce
         if (len < k) {
             var gi: usize = 1;
             while (gi < len and len < k) : (gi += 1) {
-                len = growFrom(buf[gi], adj, adjw, off, taken, buf, len, k);
+                len = growFrom(buf[gi], adj, adjw, off, taken, buf, len, k, comp_of, my_comp);
             }
         }
 
@@ -345,27 +406,31 @@ fn coarsenLevel(
 
     // A cell whose neighbours were all claimed would otherwise pass through unchanged. Around a
     // hub that is *most* of the star, and the ladder degenerates into a chain tens of levels deep
-    // instead of log_arity(n) — the leaves never coalesce at all. Bundle them instead. Isolated
-    // nodes (no links, no folder) fall out of the same rule with no special case.
-    if (leftovers.items.len > 1) {
-        var i: usize = 0;
-        while (i < leftovers.items.len) : (i += k) {
-            const end = @min(i + k, leftovers.items.len);
-            if (end - i == 1 and groups.items.len > 0) {
-                // a lone tail: hand it to the last group rather than making a 1-cell parent
-                const last = groups.items[groups.items.len - 1];
-                if (last.len < k) {
-                    const grown = try arena.alloc(u32, last.len + 1);
-                    @memcpy(grown[0..last.len], last);
-                    grown[last.len] = leftovers.items[i];
-                    groups.items[groups.items.len - 1] = grown;
-                    continue;
-                }
+    // instead of log_arity(n) — the leaves never coalesce at all. Bundle them instead, **within a
+    // component**: bundling across islands is what made discrete islands overlap into one blob.
+    if (leftovers.items.len > 0) {
+        const ByComp = struct {
+            cells: []const Cell,
+            cur: []const u32,
+            pub fn lessThan(self: @This(), a: u32, b: u32) bool {
+                const ca = self.cells[self.cur[a]].comp;
+                const cb = self.cells[self.cur[b]].comp;
+                if (ca != cb) return ca < cb;
+                return a < b;
             }
-            try groups.append(arena, try arena.dupe(u32, leftovers.items[i..end]));
+        };
+        std.mem.sort(u32, leftovers.items, ByComp{ .cells = cells.items, .cur = cur }, ByComp.lessThan);
+        var i: usize = 0;
+        while (i < leftovers.items.len) {
+            const this_comp = cells.items[cur[leftovers.items[i]]].comp;
+            var j = i;
+            while (j < leftovers.items.len and
+                cells.items[cur[leftovers.items[j]]].comp == this_comp and
+                j - i < k) : (j += 1)
+            {}
+            try groups.append(arena, try arena.dupe(u32, leftovers.items[i..j]));
+            i = j;
         }
-    } else if (leftovers.items.len == 1) {
-        try groups.append(arena, try arena.dupe(u32, leftovers.items[0..1]));
     }
 
     // ---- materialise parents ----
@@ -394,6 +459,7 @@ fn coarsenLevel(
             .level = level + 1,
             .child_start = start,
             .child_count = @intCast(grp.len),
+            .comp = cells.items[cur[grp[0]]].comp,
         });
         next[gi] = id;
     }
@@ -445,6 +511,8 @@ fn growFrom(
     buf: []u32,
     len_in: usize,
     k: usize,
+    comp_of: []const u32,
+    my_comp: u32,
 ) usize {
     var len = len_in;
     while (len < k) {
@@ -453,7 +521,7 @@ fn growFrom(
         var e = off[u];
         while (e < off[u + 1]) : (e += 1) {
             const v = adj[e];
-            if (taken[v]) continue;
+            if (taken[v] or comp_of[v] != my_comp) continue;
             if (adjw[e] > best_w) {
                 best_w = adjw[e];
                 best = v;
@@ -594,6 +662,19 @@ fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes
 
 const testing = std.testing;
 
+fn totalCount(lad: Ladder) u32 {
+    var n: u32 = 0;
+    for (lad.roots) |r| n += lad.cells[r].count;
+    return n;
+}
+
+fn isRoot(lad: Ladder, id: u32) bool {
+    for (lad.roots) |r| {
+        if (r == id) return true;
+    }
+    return false;
+}
+
 fn star(gpa: std.mem.Allocator, leaves: u32) ![]Edge {
     const e = try gpa.alloc(Edge, leaves);
     for (0..leaves) |i| e[i] = .{ .a = 0, .b = @intCast(i + 1) };
@@ -612,7 +693,7 @@ test "a star does not degenerate into a chain" {
 
         const ideal = std.math.log(f64, @floatFromInt(ar.n()), 201.0);
         try testing.expect(@as(f64, @floatFromInt(lad.depth)) <= ideal * 2.5 + 1);
-        try testing.expectEqual(@as(u32, 201), lad.cells[lad.root].count);
+        try testing.expectEqual(@as(u32, 201), totalCount(lad));
     }
 }
 
@@ -634,7 +715,7 @@ test "every note lands in exactly one leaf, ranges are contiguous" {
 
     // a cell's range covers exactly the notes beneath it
     for (lad.cells, 0..) |c, i| {
-        if (c.parent == invalid and i != lad.root) continue;
+        if (c.parent == invalid and !isRoot(lad, @intCast(i))) continue;
         try testing.expectEqual(c.count, c.le - c.ls);
     }
 }
@@ -653,7 +734,7 @@ test "unlinked notes group by folder" {
     var found_pure_a = false;
     var found_pure_b = false;
     for (lad.cells, 0..) |c, id| {
-        if (c.count != 4 or id == lad.root) continue;
+        if (c.count != 4 or isRoot(lad, @intCast(id))) continue;
         var all_a = true;
         var all_b = true;
         for (c.ls..c.le) |s| {
@@ -676,7 +757,7 @@ test "every drawn leaf is a real note" {
     for (lad.cells) |c| {
         if (c.child_count == 0) try testing.expect(c.note != invalid);
     }
-    try testing.expectEqual(@as(u32, 4), lad.cells[lad.root].count);
+    try testing.expectEqual(@as(u32, 4), totalCount(lad));
 }
 
 test "a real link outranks folder adjacency" {
@@ -691,6 +772,54 @@ test "a real link outranks folder adjacency" {
     var lad = try build(gpa, paths.len, &links, &paths, .{ .arity = .four });
     defer lad.deinit(gpa);
     try testing.expectEqual(lad.cells[lad.leaf_cell[0]].parent, lad.cells[lad.leaf_cell[3]].parent);
+}
+
+test "islands never share a cell" {
+    // The failure this guards: the folder chain links every note to its path-neighbour, so without
+    // a component constraint coarsening happily merges two unconnected islands into one cell — and
+    // containment then draws them inside one disc, which is what made a vault of discrete islands
+    // read as overlapping blobs.
+    const gpa = testing.allocator;
+    const per = 40;
+    const islands = 12;
+    const n = per * islands;
+
+    var edges: std.ArrayListUnmanaged(Edge) = .empty;
+    defer edges.deinit(gpa);
+    for (0..islands) |isl| {
+        const base: u32 = @intCast(isl * per);
+        for (1..per) |j| try edges.append(gpa, .{ .a = base, .b = base + @as(u32, @intCast(j)) });
+    }
+    // paths interleave the islands, so path order actively disagrees with link structure
+    var paths: [n][]const u8 = undefined;
+    var bufs: [n][24]u8 = undefined;
+    for (0..n) |i| {
+        paths[i] = std.fmt.bufPrint(&bufs[i], "dir/{d:0>4}.md", .{i}) catch unreachable;
+    }
+
+    var lad = try build(gpa, n, edges.items, &paths, .{ .arity = .seven });
+    defer lad.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, islands), lad.roots.len);
+    for (lad.cells) |c| {
+        if (c.count == 0) continue;
+        // every note beneath a cell must come from the same island
+        const first_island = lad.note_at[c.ls] / per;
+        for (c.ls..c.le) |s| try testing.expectEqual(first_island, lad.note_at[s] / per);
+    }
+}
+
+test "orphans pool into one root rather than one root each" {
+    const gpa = testing.allocator;
+    const n = 64;
+    var paths: [n][]const u8 = undefined;
+    var bufs: [n][24]u8 = undefined;
+    for (0..n) |i| paths[i] = std.fmt.bufPrint(&bufs[i], "d/{d:0>3}.md", .{i}) catch unreachable;
+
+    var lad = try build(gpa, n, &.{}, &paths, .{ .arity = .seven });
+    defer lad.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lad.roots.len);
+    try testing.expectEqual(@as(u32, n), lad.cells[lad.roots[0]].count);
 }
 
 test "deterministic for the same input" {
@@ -730,7 +859,7 @@ test "scale-free 20k stays log depth" {
 
     const ideal = std.math.log(f64, 7.0, @as(f64, @floatFromInt(n)));
     try testing.expect(@as(f64, @floatFromInt(lad.depth)) <= ideal * 2.5);
-    try testing.expectEqual(n, lad.cells[lad.root].count);
+    try testing.expectEqual(n, totalCount(lad));
     // and every note is reachable exactly once
     var seen = try gpa.alloc(bool, n);
     defer gpa.free(seen);

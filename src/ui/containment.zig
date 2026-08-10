@@ -51,6 +51,11 @@ pub const Options = struct {
     /// Weight on keeping heavy children near the centre, against shortening sibling links. Zero
     /// means links alone decide; large means mass alone decides.
     mass_k: f32 = 0.4,
+    /// Air between packed island discs, as a multiple of their area. Above 1 so islands read as
+    /// separate chunks rather than a tiled surface.
+    pack_gap: f32 = 5.2,
+    /// Horizontal stretch of the island pack, to suit a wide panel.
+    pack_aspect: f32 = 1.35,
     /// Extra turn applied per level, in radians. Defaults to half a slot step, which staggers
     /// consecutive levels so children never line up radially with their parent and the field does
     /// not band. (The lattice-exact aperture-7 value is 19.1066°, if a global lattice ever
@@ -67,11 +72,14 @@ pub const Field = struct {
     /// Whether this cell's *children* have been placed yet. Placement is lazy: only cells the
     /// LOD actually opens ever pay for the slot search.
     expanded: []bool,
+    /// Scratch for ordering the roots during the pack; owned, so packing allocates nothing.
+    root_order: []u32,
     arity: usize,
 
     pub fn deinit(self: *Field, gpa: std.mem.Allocator) void {
         gpa.free(self.pos);
         gpa.free(self.expanded);
+        gpa.free(self.root_order);
         self.* = undefined;
     }
 
@@ -216,18 +224,71 @@ fn permute(
     }
 }
 
-pub fn init(gpa: std.mem.Allocator, n_cells: usize, arity: fold.Arity, opts: Options) !Field {
+pub fn init(
+    gpa: std.mem.Allocator,
+    n_cells: usize,
+    n_roots: usize,
+    arity: fold.Arity,
+    opts: Options,
+) !Field {
     const pos = try gpa.alloc(Vec2, n_cells);
     @memset(pos, .{});
     const expanded = try gpa.alloc(bool, n_cells);
     @memset(expanded, false);
-    return .{ .opts = opts, .pos = pos, .expanded = expanded, .arity = arity.n() };
+    const root_order = try gpa.alloc(u32, n_roots);
+    return .{
+        .opts = opts,
+        .pos = pos,
+        .expanded = expanded,
+        .root_order = root_order,
+        .arity = arity.n(),
+    };
+}
+
+/// Place the component roots relative to each other.
+///
+/// Containment only ever says where a cell's children go *inside* it. The islands themselves have
+/// no parent, so they need one arrangement of their own: a golden-angle spiral with each root's
+/// area reserved in turn, biggest first at the centre. That keeps a vault of discrete islands
+/// reading as separate chunks spread over the field, instead of the single converging blob you get
+/// from folding unrelated components under one disc.
+///
+/// Must run before any `ensureChildren`, since children are placed relative to their root.
+pub fn placeRoots(f: *Field, lad: *const fold.Ladder) void {
+    if (lad.roots.len == 0) return;
+    if (lad.roots.len == 1) {
+        f.pos[lad.roots[0]] = .{};
+        return;
+    }
+    // biggest first, so the largest island anchors the middle
+    const order = f.root_order;
+    for (order, lad.roots) |*o, r| o.* = r;
+    const ByCount = struct {
+        lad: *const fold.Ladder,
+        pub fn lessThan(self: @This(), a: u32, b: u32) bool {
+            const ca = self.lad.cells[a].count;
+            const cb = self.lad.cells[b].count;
+            if (ca != cb) return ca > cb;
+            return a < b;
+        }
+    };
+    std.mem.sort(u32, order, ByCount{ .lad = lad }, ByCount.lessThan);
+
+    const golden = std.math.pi * (3.0 - @sqrt(5.0));
+    var acc: f32 = 0;
+    for (order, 0..) |r, i| {
+        const rad = @sqrt(acc);
+        const rr = f.radius(lad, r);
+        acc += rr * rr * f.opts.pack_gap;
+        const a = @as(f32, @floatFromInt(i)) * golden;
+        f.pos[r] = .{ .x = @cos(a) * rad * f.opts.pack_aspect, .y = @sin(a) * rad };
+    }
 }
 
 /// Expand the whole ladder. Real use is lazy — this exists for tests and benches.
 pub fn placeAll(f: *Field, lad: *const fold.Ladder) void {
-    if (lad.root == fold.invalid) return;
-    expandRec(f, lad, lad.root);
+    placeRoots(f, lad);
+    for (lad.roots) |r| expandRec(f, lad, r);
 }
 
 fn expandRec(f: *Field, lad: *const fold.Ladder, cell: u32) void {
@@ -254,7 +315,7 @@ test "every child is contained inside its parent's disc" {
     var lad = try fold.build(gpa, 301, edges, &.{}, .{});
     defer lad.deinit(gpa);
 
-    var f = try init(gpa, lad.cells.len, .seven, .{});
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
     defer f.deinit(gpa);
     placeAll(&f, &lad);
 
@@ -274,7 +335,7 @@ test "radius is the area-conserving law" {
     defer gpa.free(edges);
     var lad = try fold.build(gpa, 51, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, lad.cells.len, .seven, .{ .note_r = 2 });
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 2 });
     defer f.deinit(gpa);
 
     for (lad.cells, 0..) |c, id| {
@@ -292,12 +353,12 @@ test "the whole vault fits inside the root disc" {
     for (0..n - 1) |i| edges[i] = .{ .a = @intCast(i), .b = @intCast(i + 1) };
     var lad = try fold.build(gpa, n, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, lad.cells.len, .seven, .{});
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
     defer f.deinit(gpa);
     placeAll(&f, &lad);
 
-    const R = f.radius(&lad, lad.root);
-    const origin = f.pos[lad.root];
+    const R = f.radius(&lad, lad.roots[0]);
+    const origin = f.pos[lad.roots[0]];
     for (lad.cells, 0..) |c, id| {
         if (c.note == fold.invalid) continue;
         try testing.expect(Vec2.dist(origin, f.pos[@intCast(id)]) <= R * 1.001);
@@ -315,7 +376,7 @@ test "slot assignment shortens sibling links" {
     var lad = try fold.build(gpa, n, edges, &.{}, .{});
     defer lad.deinit(gpa);
 
-    var chosen = try init(gpa, lad.cells.len, .seven, .{ .mass_k = 0 });
+    var chosen = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .mass_k = 0 });
     defer chosen.deinit(gpa);
     placeAll(&chosen, &lad);
 
@@ -348,10 +409,11 @@ test "lazy expansion places only what is opened" {
     defer gpa.free(edges);
     var lad = try fold.build(gpa, 501, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, lad.cells.len, .seven, .{});
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
     defer f.deinit(gpa);
 
-    f.ensureChildren(&lad, lad.root);
+    placeRoots(&f, &lad);
+    f.ensureChildren(&lad, lad.roots[0]);
     var expanded: usize = 0;
     for (f.expanded) |e| {
         if (e) expanded += 1;
@@ -366,9 +428,9 @@ test "deterministic" {
     var lad = try fold.build(gpa, 121, edges, &.{}, .{});
     defer lad.deinit(gpa);
 
-    var a = try init(gpa, lad.cells.len, .seven, .{});
+    var a = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
     defer a.deinit(gpa);
-    var b = try init(gpa, lad.cells.len, .seven, .{});
+    var b = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
     defer b.deinit(gpa);
     placeAll(&a, &lad);
     placeAll(&b, &lad);

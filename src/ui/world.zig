@@ -150,7 +150,9 @@ pub const World = struct {
         @memset(w.mul, 1);
         @memset(w.owner, fold.invalid);
         @memset(w.open, false);
-        w.field = try containment.init(gpa, n_cells, fold_opts.arity, place_opts);
+        w.field = try containment.init(gpa, n_cells, lad.roots.len, fold_opts.arity, place_opts);
+        // Islands are placed relative to each other once; everything below them is lazy.
+        containment.placeRoots(&w.field, &w.lad);
         return w;
     }
 
@@ -168,10 +170,14 @@ pub const World = struct {
         self.* = undefined;
     }
 
-    /// World radius of the root, so a caller can frame the whole vault.
+    /// Radius of a disc at the origin containing every island, so a caller can frame the vault.
     pub fn extent(self: World) f32 {
-        if (self.lad.root == fold.invalid) return 1;
-        return self.field.radius(&self.lad, self.lad.root);
+        var e: f32 = 1;
+        for (self.lad.roots) |r| {
+            const p = self.field.pos[r];
+            e = @max(e, @sqrt(p.x * p.x + p.y * p.y) + self.field.radius(&self.lad, r));
+        }
+        return e;
     }
 
     /// Rebuild the living set for this view.
@@ -193,7 +199,7 @@ pub const World = struct {
         @memset(self.owner, fold.invalid);
         @memset(self.open, false);
         self.bound = false;
-        if (self.lad.root == fold.invalid) return;
+        if (self.lad.roots.len == 0) return;
 
         try self.decideTopology(view, p);
         try self.present(view, p, dt);
@@ -207,7 +213,7 @@ pub const World = struct {
         defer next.deinit(self.gpa);
         var vis: std.ArrayListUnmanaged(u32) = .empty;
         defer vis.deinit(self.gpa);
-        try frontier.append(self.gpa, self.lad.root);
+        for (self.lad.roots) |r| try frontier.append(self.gpa, r);
 
         // Cells already settled as closed at shallower levels. This is the budget's running
         // total, and it is topological — nothing here depends on a crossfade.
@@ -319,14 +325,14 @@ pub const World = struct {
     /// of popping, but never lets any of that feed back into the decision above.
     fn present(self: *World, view: View, p: Params, dt: f32) !void {
         const rate = @min(1.0, dt * p.rate);
-        const root = self.lad.root;
-        self.px[root] = self.field.pos[root].x;
-        self.py[root] = self.field.pos[root].y;
-        self.mul[root] = 1;
-
         var stack: std.ArrayListUnmanaged(u32) = .empty;
         defer stack.deinit(self.gpa);
-        try stack.append(self.gpa, root);
+        for (self.lad.roots) |r| {
+            self.px[r] = self.field.pos[r].x;
+            self.py[r] = self.field.pos[r].y;
+            self.mul[r] = 1;
+            try stack.append(self.gpa, r);
+        }
 
         var guard: u32 = 0;
         while (stack.pop()) |id| {
@@ -388,7 +394,7 @@ pub const World = struct {
     /// pair of cells are merged, so a coarse cell pair draws one line, not thousands.
     pub fn liftLinks(self: *World, note_links: []const fold.Edge, p: Params) !void {
         self.links.clearRetainingCapacity();
-        if (self.lad.root == fold.invalid) return;
+        if (self.lad.roots.len == 0) return;
 
         var acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
         defer acc.deinit(self.gpa);
@@ -660,7 +666,7 @@ test "leaf_pitch matches the geometry it claims to describe" {
 
     var lad = try fold.build(gpa, 7, edges, &.{}, .{ .arity = .seven });
     defer lad.deinit(gpa);
-    var f = try containment.init(gpa, lad.cells.len, .seven, .{ .note_r = 1 });
+    var f = try containment.init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 1 });
     defer f.deinit(gpa);
     containment.placeAll(&f, &lad);
 
