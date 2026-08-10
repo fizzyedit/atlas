@@ -872,7 +872,8 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     // nothing will draw is the worst possible time to pay for it.
     const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0;
     const labels_dirty = !at_cluster_zoom and
-        (p.labels_stale or !p.labels_settled or !p.proximity_settled or
+        (p.containment_mode or
+            p.labels_stale or !p.labels_settled or !p.proximity_settled or
             !p.pointer_settled or !p.layout_settled or p.camera.chasing() or labelViewMoved(p));
     if (at_cluster_zoom) {
         // Do not walk every note — at 100k+ that alone tanks the frame. Labels are not drawn.
@@ -881,10 +882,10 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         // that does draw names has to redo them.
         p.labels_stale = true;
     } else if (p.interior.t < 0.5) {
-        if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items);
+        if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items, if (p.containment_mode) 1 else 0);
         for (p.interior.nodes) |*n| n.label_vis = 0;
     } else {
-        if (labels_dirty) updateLabels(p, p.interior.nodes, p.interior.edges, p.interior.slot, null);
+        if (labels_dirty) updateLabels(p, p.interior.nodes, p.interior.edges, p.interior.slot, null, 0);
         for (p.nodes) |*n| n.label_vis = 0;
     }
     if (labels_dirty) {
@@ -4625,6 +4626,12 @@ fn syncNodesFromWorld(p: *Panel, w: *const world_mod.World) void {
     if (p.at_level0.len == p.nodes.len) @memset(p.at_level0, false);
     for (p.nodes) |*n| n.alpha = 0;
 
+    // The label placer works over a *selection*, so hand it exactly the notes this frame resolved
+    // as individuals. Bounded by the mark budget, which is what makes re-placing every frame
+    // affordable — walking the whole vault to place names is the expensive path the classic
+    // gating exists to avoid.
+    p.visible.clearRetainingCapacity();
+
     var notes: u32 = 0;
     for (w.marks.items) |m| {
         if (!m.is_note or m.note >= p.nodes.len) continue;
@@ -4635,6 +4642,11 @@ fn syncNodesFromWorld(p: *Panel, w: *const world_mod.World) void {
         n.radius = m.r / @max(p.camera.zoom, 1e-6);
         n.alpha = m.alpha;
         if (p.at_level0.len == p.nodes.len) p.at_level0[m.note] = true;
+        p.visible.append(sdk.allocator(), .{
+            .level = 0,
+            .index = m.note,
+            .alpha = m.alpha,
+        }) catch {};
         notes += 1;
     }
     p.notes_at_level0 = notes;
@@ -5073,7 +5085,7 @@ fn drawNodes(p: *Panel, nodes: []const GraphNode, slot: f32, fade: f32, opts: Dr
     const vp = p.camera.viewport;
     const margin: f32 = 80;
     const view = vp.outsetAll(margin);
-    const zoom_t = detailRevealT(slot, p.camera.zoom);
+    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), if (p.containment_mode) @as(f32, 1) else 0);
     const highlight = theme.color(.highlight, .fill);
     // Resting border is window text; open notes (the ones selected into the editor) take the
     // highlight so they read as the current selection without needing a second fill language.
@@ -5347,6 +5359,16 @@ fn updateLabels(
     edges: []const GraphEdge,
     slot: f32,
     selection: ?[]const lod.Visible,
+    /// Minimum reveal for every candidate, regardless of zoom.
+    ///
+    /// The classic path fades names in as `slot * zoom` crosses a pixel gap, because it draws
+    /// every note at every zoom and needs *something* to decide when a name is legible. The
+    /// containment path has already made that call: a mark is either an individual note or a
+    /// coalesced mass, and it resolved the note precisely because there is room for it. Re-deriving
+    /// legibility from a global zoom threshold then disagrees with the LOD — one island resolves
+    /// early and another late, but the threshold is the same for both, so names appear only in a
+    /// narrow band of zoom. Pass 1 to defer to the LOD instead.
+    reveal_floor: f32,
 ) void {
     const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
     const t_chase = 1.0 - @exp(-label_chase_k * dt);
@@ -5359,7 +5381,7 @@ fn updateLabels(
     const cw = dvui.currentWindow();
     const arena = cw.arena();
     const scale = cw.natural_scale;
-    const zoom_t = detailRevealT(slot, p.camera.zoom);
+    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), reveal_floor);
     const font = dvui.Font.theme(.body).larger(label_font_delta);
     const vp = p.camera.viewport;
 
@@ -6308,7 +6330,7 @@ fn hitTestActive(p: *Panel, screen: dvui.Point.Physical) ?usize {
 fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Point.Physical) ?usize {
     var best: ?usize = null;
     var best_d: f32 = std.math.floatMax(f32);
-    const zoom_t = detailRevealT(slot, p.camera.zoom);
+    const zoom_t = @max(detailRevealT(slot, p.camera.zoom), if (p.containment_mode) @as(f32, 1) else 0);
     // Only what is actually on screen as itself. A note merged into a marker is not clickable —
     // and walking the selection instead of the whole vault is also what keeps this off the
     // per-frame O(n) list, since the selection is bounded by the viewport.
