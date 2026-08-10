@@ -850,10 +850,14 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     animateCamera(p);
     // After the camera has finished moving for this frame and before anything asks what is on
     // screen: every pass below works from the selection rather than deciding detail for itself.
-    // Containment publishes its poses before anything reads them.
-    if (p.containment_mode) stepWorld(p);
-
     updateSelection(p);
+
+    // *After* updateSelection, which clears `p.visible` and refills it from the classic LOD —
+    // whose `Visible.index` is a cluster index at any level above 0, not a note index. Handing
+    // that to the label placer put names at positions belonging to no node at all, and left none
+    // to place whenever the classic selection was empty at a zoom containment had resolved.
+    // Still before updateBubbles/updateHover/updateLabels, all of which read what this publishes.
+    if (p.containment_mode) stepWorld(p);
     _ = profLap(&prof);
     updateBubbles(p);
     frame_profile.bubbles_ns = profLap(&prof);
