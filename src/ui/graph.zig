@@ -582,6 +582,11 @@ pub const Panel = struct {
     /// floating window (Vault Simulator). The main bottom panel leaves this false so editor
     /// floating tool windows still suppress the vault canvas underneath them.
     dialog_canvas: bool = false,
+    /// Marks this panel's overview may draw in a frame — `world_mod.Params.budget`. Per panel
+    /// rather than the bare `galaxy.plugin_mark_budget` constant so the simulator can expose it
+    /// as a live knob (raising it resolves more notes as themselves instead of coalescing them
+    /// into masses) without changing what the real bottom panel is tuned to.
+    mark_budget: usize = galaxy.plugin_mark_budget,
     /// Rebuild being solved on a worker, if any. See `LayoutJob`.
     job: ?*LayoutJob = null,
     /// Level-of-detail hierarchy for the current arrangement, or null for a vault too small to
@@ -805,6 +810,43 @@ var drawn_recently: bool = false;
 fn ensurePanel(gpa: std.mem.Allocator) *Panel {
     if (panel == null) panel = Panel.init(gpa);
     return &panel.?;
+}
+
+/// What a panel actually put on screen this frame, against what it was asked to draw.
+///
+/// The gap between the two is the whole point of the LOD: `notes` is how many notes resolved as
+/// *themselves*, `masses` is how many coalesced markers stood in for the rest, and
+/// `notes + masses` is what the budget actually caps — never `total_notes`. A 1M-note vault
+/// drawing 300-odd marks is the system working, not a bug, and this is what says so on screen.
+pub const PanelStats = struct {
+    /// Marks drawn as individual notes.
+    notes: usize = 0,
+    /// Coalesced markers, each standing in for many notes.
+    masses: usize = 0,
+    /// Links lifted onto the living set and drawn.
+    links: usize = 0,
+    /// Everything the arrangement holds, drawn or not.
+    total_notes: usize = 0,
+    total_edges: usize = 0,
+    /// Marks the frame was allowed (`Panel.mark_budget`).
+    budget: usize = 0,
+    /// True when the budget refused an open this frame — i.e. raising it would show more.
+    bound: bool = false,
+};
+
+pub fn panelStats(p: *const Panel) PanelStats {
+    var s: PanelStats = .{
+        .total_notes = p.nodes.len,
+        .total_edges = p.edges.len,
+        .budget = p.mark_budget,
+    };
+    const w = if (p.world_state) |*ws| ws else return s;
+    for (w.marks.items) |m| {
+        if (m.is_note) s.notes += 1 else s.masses += 1;
+    }
+    s.links = w.links.items.len;
+    s.bound = w.bound;
+    return s;
 }
 
 /// Join any layout worker still running and drop the living world. Must happen before a `Panel`
@@ -3543,7 +3585,12 @@ fn stepWorld(p: *Panel) void {
         .cx = p.camera.center.x,
         .cy = p.camera.center.y,
     };
-    const params: world_mod.Params = .{ .budget = galaxy.plugin_mark_budget };
+    // Links scale with marks at the same 2.5:1 ratio the defaults use (360 marks / 900 links), so
+    // raising the mark budget doesn't leave the web pinned at a cap the marks have outgrown.
+    const params: world_mod.Params = .{
+        .budget = p.mark_budget,
+        .link_budget = p.mark_budget * 5 / 2,
+    };
     w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
     syncNodesFromWorld(p, w);
 

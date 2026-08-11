@@ -337,6 +337,20 @@ pub const Sim = struct {
             self.scheduleReload();
         }
 
+        // Mark budget — the LOD's cap on marks per frame, not a property of the generated vault,
+        // so it takes effect on the very next frame rather than scheduling a regen.
+        // Capped well under dvui's own ~16k sprite ceiling (a u16 index limit, not an SDL one):
+        // marks and the web's line segments share that budget, so a mark cap anywhere near it
+        // would drop geometry rather than draw more.
+        var budget_f: f32 = @floatFromInt(self.panel.mark_budget);
+        if (dvui.sliderEntry(@src(), "Mark budget: {d:.0}", .{
+            .value = &budget_f,
+            .min = 50,
+            .max = 4_000,
+        }, .{ .expand = .horizontal, .margin = .{ .y = 8 } })) {
+            self.panel.mark_budget = @intFromFloat(std.math.clamp(budget_f, 50, 4_000));
+        }
+
         if (self.job != null) {
             dvui.labelNoFmt(@src(), "Regenerating…", .{}, .{
                 .margin = .{ .y = 12 },
@@ -354,6 +368,22 @@ pub const Sim = struct {
                 .color_text = dvui.themeGet().color(.content, .text).opacity(0.55),
             });
         }
+
+        // What is actually on screen, against what the arrangement holds. A million-note vault
+        // drawing a few hundred marks is the LOD working — `notes` resolved as themselves,
+        // `masses` standing in for everything else — and the gap between the two numbers is the
+        // thing worth being able to see while tuning the budget above.
+        const st = graph.panelStats(&self.panel);
+        const dim = dvui.themeGet().color(.content, .text).opacity(0.55);
+        dvui.labelNoFmt(@src(), "Drawn", .{}, .{ .margin = .{ .y = 10 } });
+        dvui.label(@src(), "marks: {d} / {d} budget{s}", .{
+            st.notes + st.masses,
+            st.budget,
+            if (st.bound) " (capped)" else "",
+        }, .{ .color_text = dim });
+        dvui.label(@src(), "notes: {d} of {d}", .{ st.notes, st.total_notes }, .{ .color_text = dim });
+        dvui.label(@src(), "masses: {d}", .{st.masses}, .{ .color_text = dim });
+        dvui.label(@src(), "links: {d} of {d}", .{ st.links, st.total_edges }, .{ .color_text = dim });
     }
 
     fn drawCanvas(self: *Sim) !void {
