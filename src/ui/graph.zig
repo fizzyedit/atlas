@@ -2295,7 +2295,13 @@ fn buildInterior(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         hex.layoutLevelFor(@max(p.nodes.len, 1)),
         interior.default_footprint,
     );
-    p.interior.slot = hex.levelSpacing(p.interior.nest.level);
+    // `slot` is "the distance between two neighbouring things", which the fit uses to decide how
+    // far it may zoom in. Under the old force solve that was the hex cell the solve snapped to;
+    // orbits do not snap to a lattice, so the honest answer is the gap between adjacent orbits.
+    // Reading it off the hex level instead left `slot` far larger than anything actually on
+    // screen, and `fitInteriorSun`'s `max_gap / slot` clamp then held the camera way back — the
+    // interior opened zoomed far out.
+    p.interior.slot = interior_orbit_gap * p.interior.nest.scale;
     p.interior.radius = local_radius * p.interior.nest.scale;
     p.interior.parent = p.nodes[idx].home;
 
@@ -3635,6 +3641,10 @@ fn frameCluster(p: *Panel, target: Visible) void {
         p.camera.center_target = pose.center;
         p.camera.zoom_target = pose.zoom;
         p.camera.user_driving = false;
+        // Input is handled at the *end* of the frame, after the host has already asked whether
+        // more frames are wanted — so setting a camera target here is invisible until some other
+        // event wakes the app. Ask explicitly, exactly as the old path did.
+        dvui.refresh(null, @src(), dvui.parentGet().data().id);
         return;
     }
 
