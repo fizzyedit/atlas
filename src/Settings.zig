@@ -3,16 +3,6 @@
 const sdk = @import("fizzy_sdk");
 const settings = sdk.settings;
 
-/// Graph shape for **Atlas: Load Synth Graph** — in-memory scale tests (no markdown on disk).
-pub const SynthShape = enum {
-    islands,
-    scale_free,
-    hub,
-    bipartite,
-    chain,
-    orphans,
-};
-
 /// Rewrites every resolvable `[[wikilink]]` in a markdown document as a `[label](path.md)`
 /// markdown link when the document is formatted — which includes format-on-save.
 ///
@@ -30,26 +20,3 @@ convert_wikilinks_on_save: settings.Value(bool, .{
         "resolvable [[wikilinks]] as [label](path.md) markdown links. Unresolved links, " ++
         "embeds, and links inside code are left alone.",
 }) = .init(false),
-
-synth_notes: settings.Value(i64, .{
-    .name = "Synth note count",
-    .description = "Notes for the in-memory synth (no files). Quantized while dragging; rebuilds " ++
-        "on a background thread and keeps the previous graph until ready. Start with Atlas: Load Synth Graph.",
-    .min = 100,
-    .max = 1_000_000,
-}) = .init(10_000),
-
-synth_shape: settings.Value(SynthShape, .{
-    .name = "Synth shape",
-    .description = "Link topology: islands, scale-free, hub, bipartite, chain, or orphans. " ++
-        "Swaps in asynchronously after a short debounce when a synth is already open.",
-}) = .init(.islands),
-
-synth_avg_degree: settings.Value(f32, .{
-    .name = "Synth avg degree",
-    .description = "Target mean undirected degree (≈ 2×edges / notes). Background regen; " ++
-        "previous graph stays interactive until the new one lands.",
-    .min = 0,
-    .max = 16,
-    .step = 0.5,
-}) = .init(4),

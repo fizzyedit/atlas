@@ -908,8 +908,8 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     // A rebuild of a graph that *is* already on screen deliberately falls through and keeps
     // drawing the old one; swapping it for a spinner on every reindex would be worse than the
     // wait it reports.
-    if ((p.job != null or st.synthBusy()) and p.nodes.len == 0) {
-        drawLayoutSpinner(if (st.synthBusy()) @intCast(State.quantizedSynthNotes(st.settings.synth_notes.get())) else p.note_count);
+    if (p.job != null and p.nodes.len == 0) {
+        drawLayoutSpinner(p.note_count);
         return;
     }
 
@@ -1008,7 +1008,6 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         frame_profile.draw_labels_ns = profLap(&prof);
         if (debug_hud) drawDebugHud(p);
     }
-    if (st.synthBusy() and p.nodes.len > 0) drawSynthRegenCue();
     // Before `handleInput` so the button consumes its own press rather than the graph
     // treating it as the start of a pan.
     drawFitButton(p, content);
@@ -1869,12 +1868,6 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     job.hist_valid = hist_valid;
     job.changed = changed;
     job.targets = targets;
-    // Synth: packed positions keyed by note id 1..N → graph index after id-sort is 0..N-1.
-    if (st.synth_mode) {
-        if (st.synth_pos) |pos| {
-            if (pos.len == n) job.precomputed = try arena.dupe(dvui.Point, pos);
-        }
-    }
 
     // Small vaults solve here and now: a worker would cost a frame of latency for work that is
     // already too fast to see. Everything bigger goes to a thread, and the panel draws a spinner
@@ -4712,27 +4705,6 @@ fn drawLayoutSpinner(note_count: u32) void {
         .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
         .gravity_x = 0.5,
         .margin = .{ .y = 8 },
-    });
-}
-
-/// Corner cue while an async synth rebuild runs — previous graph stays pan/zoomable underneath.
-fn drawSynthRegenCue() void {
-    var box = dvui.box(@src(), .{ .dir = .horizontal }, .{
-        .expand = .none,
-        .background = false,
-        .gravity_x = 0.0,
-        .gravity_y = 0.0,
-        .margin = .{ .x = 10, .y = 8 },
-    });
-    defer box.deinit();
-    dvui.spinner(@src(), .{
-        .min_size_content = .{ .w = 14, .h = 14 },
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.45),
-    });
-    dvui.labelNoFmt(@src(), "Updating synth…", .{}, .{
-        .font = dvui.Font.theme(.body).larger(-2),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.45),
-        .margin = .{ .x = 6 },
     });
 }
 

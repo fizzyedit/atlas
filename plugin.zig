@@ -42,7 +42,6 @@ const vtable: sdk.Plugin.VTable = .{
     .folderPathsChanged = folderPathsChanged,
     .needsContinuousRepaint = needsContinuousRepaint,
     .endFrame = endFrame,
-    .settingsChanged = settingsChanged,
 };
 
 var plugin_state: State = .{};
@@ -143,21 +142,6 @@ pub fn register(host: *sdk.Host) !void {
         .isEnabled = cmdConvertWikilinksEnabled,
         .icon = icons.tvg.lucide.@"link",
     });
-    try host.registerCommand(.{
-        .id = "atlas.loadSynthGraph",
-        .owner = &plugin,
-        .title = "Atlas: Load Synth Graph",
-        .run = loadSynthGraph,
-        .icon = icons.tvg.lucide.@"orbit",
-    });
-    try host.registerCommand(.{
-        .id = "atlas.clearSynthGraph",
-        .owner = &plugin,
-        .title = "Atlas: Clear Synth Graph",
-        .run = clearSynthGraph,
-        .isEnabled = clearSynthGraphEnabled,
-        .icon = icons.tvg.lucide.@"circle-x",
-    });
 
     // A folder may already be open when a plugin is loaded mid-session (install, or re-enable
     // from the store), and `onFolderOpen` only fires on a *change*. Without this, atlas would
@@ -202,10 +186,7 @@ fn folderPathsChanged(state: *anyopaque, changes: sdk.Plugin.PathChanges) void {
     st.folderPathsChanged(changes);
 }
 
-fn needsContinuousRepaint(state: *anyopaque) bool {
-    const st: *State = @ptrCast(@alignCast(state));
-    // Debounced reload / background synth build must tick even if the Atlas tab is idle.
-    if (st.synthBusy()) return true;
+fn needsContinuousRepaint(_: *anyopaque) bool {
     // Graph fling/drag only — not `busy`. Indexer busy used to force the whole editor
     // (including markdown preview) to redraw every frame while a scan ran, which felt like
     // the graph was "re-parsing". Sidebar counters still update on the next natural frame /
@@ -219,14 +200,6 @@ fn needsContinuousRepaint(state: *anyopaque) bool {
 fn endFrame(state: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(state));
     st.tickWatcher();
-}
-
-fn settingsChanged(state: *anyopaque, blob: []const u8) void {
-    _ = blob; // Schema already wrote the live Settings cells before this fires.
-    const st: *State = @ptrCast(@alignCast(state));
-    st.scheduleSynthReloadFromSettings();
-    // Keep frames pumping while debouncing / building so the old graph stays interactive.
-    if (st.synth_mode or st.synthBusy()) sdk.refresh();
 }
 
 fn rebuildIndex(state: *anyopaque) !void {
@@ -243,31 +216,6 @@ fn openGraph(_: *anyopaque) !void {
     sdk.host().setActiveBottomView(graph.view_id);
 }
 
-/// In-memory scale vault from Atlas settings (note count / shape / avg degree). Skips force
-/// layout — packed positions + Galaxy LOD. Raise N toward 1M to stress the overview path.
-fn loadSynthGraph(state: *anyopaque) !void {
-    const st: *State = @ptrCast(@alignCast(state));
-    const gpa = sdk.allocator();
-    st.loadSynth(gpa) catch |err| {
-        dvui.log.err("atlas: load synth graph: {any}", .{err});
-        return err;
-    };
-    sdk.host().setActiveBottomView(graph.view_id);
-    graph.zoomExtents();
-    sdk.refresh();
-}
-
-fn clearSynthGraphEnabled(state: *anyopaque) bool {
-    const st: *State = @ptrCast(@alignCast(state));
-    return st.synth_mode;
-}
-
-fn clearSynthGraph(state: *anyopaque) !void {
-    const st: *State = @ptrCast(@alignCast(state));
-    st.clearSynth(sdk.allocator());
-    sdk.host().setActiveBottomView(graph.view_id);
-    sdk.refresh();
-}
 
 fn cmdConvertWikilinksEnabled(state: *anyopaque) bool {
     const st: *State = @ptrCast(@alignCast(state));
