@@ -2238,6 +2238,9 @@ fn updateInterior(p: *Panel, st: anytype) void {
 const interior_ring_gap: f32 = 1.6;
 /// How far outside its own heading's ring a non-heading item (paragraph, list, tag, ...) sits.
 const interior_content_offset: f32 = 0.6;
+/// Radial jitter within a depth band, as a fraction of `interior_ring_gap` — an asteroid belt
+/// scattered roughly at one radius, not every item pinned to exactly one fine circle.
+const interior_ring_band: f32 = 0.85;
 
 /// Build a note's interior as an "asteroid field": every content item placed directly by polar
 /// position, angle from document order (swept clockwise around the full circle) and radius from
@@ -2342,14 +2345,21 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     }
 
     // Polar position: angle is this item's rank in document order swept clockwise around the full
-    // turn (so "next in the document" is also "next around the ring"); radius is its depth band.
+    // turn (so "next in the document" is also "next around the ring"); radius is its depth band,
+    // with a deterministic per-item jitter within that band — a belt of asteroids at roughly one
+    // radius, not a single fine line at exactly one radius. Jitter is seeded off the item's own id
+    // (`mix64`, the same hash `linkSignatures` already uses for a stable per-item value), not the
+    // rank used for angle, so it doesn't correlate with position around the ring.
     const local_pos = try arena.alloc(dvui.Point, n);
     local_pos[0] = .{}; // unused — the sun is pinned at `parent`, not placed in this space
     var extent: f32 = 1.0;
     for (1..n) |i| {
         const rank: f32 = @floatFromInt(i - 1);
         const a = (rank / @as(f32, @floatFromInt(@max(m, 1)))) * std.math.tau;
-        const r = 1.0 + depth[i] * interior_ring_gap;
+        const h = mix64(@bitCast(items[i].id));
+        const jitter01 = @as(f32, @floatFromInt(h % 1_000_000)) / 1_000_000.0; // [0, 1)
+        const jitter = (jitter01 - 0.5) * interior_ring_gap * interior_ring_band;
+        const r = 1.0 + depth[i] * interior_ring_gap + jitter;
         local_pos[i] = .{ .x = @cos(a) * r, .y = @sin(a) * r };
         extent = @max(extent, r);
     }
@@ -2604,12 +2614,18 @@ fn focusNode(p: *Panel, idx: usize) void {
         must_n += 1;
     }
 
-    // Soft 1-hop neighbours — sizes the frame so the open-doc star is legible after a click,
-    // without forcing every remote spoke into view (percentile coverage in `focus.frame`).
+    // Soft 1-hop neighbours — sizes the frame so a *star of open docs* is legible after a click,
+    // without forcing every remote spoke into view (percentile coverage in `focus.frame`). Only
+    // built when there is more than one open doc to accommodate: with a single must-point, this
+    // 1-hop set is every note the clicked one links to, and on a hub note (hundreds of outbound
+    // links, e.g. gauntlet's giant-*.md) that percentile frame could still end up wide enough that
+    // the clicked note itself re-coalesces into a mass at the resulting zoom — the opposite of
+    // "clicking a node zooms in on it." A single click should always zoom in on just that node;
+    // zooming out for context is earned by having other open docs to actually frame around.
     const is_ctx = arena.alloc(bool, p.nodes.len) catch return;
     @memset(is_ctx, false);
     var ctx_n: usize = 0;
-    for (p.edges) |e| {
+    if (must_n > 1) for (p.edges) |e| {
         if (e.a >= p.nodes.len or e.b >= p.nodes.len) continue;
         const a_must = is_must[e.a];
         const b_must = is_must[e.b];
@@ -2618,7 +2634,7 @@ fn focusNode(p: *Panel, idx: usize) void {
         if (is_ctx[other] or is_must[other]) continue;
         is_ctx[other] = true;
         ctx_n += 1;
-    }
+    };
 
     const must_pts = arena.alloc(dvui.Point, must_n) catch return;
     var mi: usize = 0;
