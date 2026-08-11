@@ -3039,11 +3039,18 @@ fn fitToNodes(p: *Panel, mode: FitMode) void {
 }
 
 pub fn zoomExtents() void {
-    if (panel == null) return;
-    const p = &panel.?;
-    // User-triggered recenter — retarget and let `animateCamera` ease us there.
-    // `user_driving` must drop or the chase is suppressed. Record the viewport as fitted so
-    // `maybeFitCamera` doesn't see "never fitted" next frame and snap on top of the animation.
+    zoomExtentsFor(&(panel orelse return));
+}
+
+/// User-triggered recenter, parameterized — the real bottom panel's `zoomExtents` is a one-line
+/// wrapper over this on the module-global `panel`; the vault simulator's own fit button (inside
+/// `drawFitButton`, called with whichever `Panel` it was actually given) calls this directly on
+/// its own `Panel` instead, so "recenter" affects the panel the button is drawn over rather than
+/// always the real one regardless of which window it was clicked in.
+pub fn zoomExtentsFor(p: *Panel) void {
+    // Retarget and let `animateCamera` ease us there. `user_driving` must drop or the chase is
+    // suppressed. Record the viewport as fitted so `maybeFitCamera` doesn't see "never fitted"
+    // next frame and snap on top of the animation.
     p.camera.user_driving = false;
     // Still inside an open note → tighten on that cloud (same intent as overview extents).
     // Otherwise frame the vault. Closing the descended note clears `.open` first, so this
@@ -4576,7 +4583,7 @@ fn drawFitButton(p: *Panel, container: *dvui.WidgetData) void {
         },
     );
 
-    if (btn.clicked()) zoomExtents();
+    if (btn.clicked()) zoomExtentsFor(p);
 }
 
 fn profNow() i96 {

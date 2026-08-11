@@ -274,14 +274,24 @@ pub const Sim = struct {
         defer job.destroy();
 
         if (job.cancel.load(.acquire)) return;
-        if (job.fail != null) return;
+        if (job.fail) |err| {
+            dvui.log.err("atlas: vault simulator regen: {any}", .{err});
+            return;
+        }
         const nodes = job.nodes orelse return;
         const edges = job.edges orelse return;
         if (!self.state.indexer_ready) return;
 
-        self.state.indexer.publishSynthetic(nodes, edges) catch return;
+        self.state.indexer.publishSynthetic(nodes, edges) catch |err| {
+            dvui.log.err("atlas: vault simulator publish: {any}", .{err});
+            return;
+        };
         self.applied = job.spec;
         self.applied_valid = true;
+        // A shape/scale change can be a wildly different extent than what the camera was last
+        // fitted to (islands at 300k vs. a chain at 2k) — recenter so the new graph is where the
+        // reader is actually looking, the same way the very first build already does.
+        graph.zoomExtentsFor(&self.panel);
         sdk.refresh();
     }
 
