@@ -5226,8 +5226,19 @@ pub fn wantsRepaint() bool {
     const visible = drawn_recently;
     drawn_recently = false;
     if (!visible) return false;
+    return wantsRepaintFor(&(panel orelse return false));
+}
 
-    const p = panel orelse return false;
+/// The actual "does this panel need another frame" check, parameterized — the real bottom
+/// panel's `wantsRepaint` above adds the `drawn_recently` visibility gate (specific to a
+/// registered-view panel that might not be drawn at all some frames) and calls this on the
+/// module-global `panel`; the vault simulator's window always draws while open, so it has no
+/// analogous visibility gate to add and calls this directly on its own `Panel`. Without this,
+/// the simulator only ever knew about its *own* background regen job finishing — a note-count
+/// change large enough to push the graph's own layout solve onto a worker (`p.job`, above
+/// `layout_inline_max`) never got polled to completion, since nothing kept asking for frames
+/// once the regen job itself was done and the wrapping `Sim.job` had already gone null.
+pub fn wantsRepaintFor(p: *Panel) bool {
     // A solve on a worker publishes nothing the frame loop can wait on, so keep frames coming
     // until it lands — that is also what animates the spinner drawn in its place.
     if (p.job != null) return true;

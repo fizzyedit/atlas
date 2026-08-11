@@ -384,9 +384,15 @@ fn ensureSim(gpa: std.mem.Allocator) *Sim {
 /// mouse stopped, which is exactly "regenerating shows, then nothing happens." Same role
 /// `st.synthBusy()` played in `needsContinuousRepaint` for the old settings-pane synth path.
 pub fn needsContinuousRepaint() bool {
-    const s = sim orelse return false;
+    const s = if (sim) |*sv| sv else return false;
     if (!s.open) return false;
-    return s.job != null or s.reload_frames != null;
+    if (s.job != null or s.reload_frames != null) return true;
+    // The regen job above only covers *this* file's own background work (vault_synth.generate +
+    // publishSynthetic). A large enough note count pushes the graph's own layout solve onto its
+    // own worker (Panel.job, well past layout_inline_max) — that has to be polled to completion
+    // too, or a note-count change past that threshold applies data-wise (publishSynthetic
+    // succeeds, the label updates) but the panel never actually finishes laying it out on screen.
+    return graph.wantsRepaintFor(&s.panel);
 }
 
 /// Toggle the window open — the command handler.
