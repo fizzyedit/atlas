@@ -2258,6 +2258,24 @@ const interior_ring_band: f32 = 0.85;
 /// dropped from the fields below (`parent_level`/`item_kind` walks) for the same reason they no
 /// longer feed a shared packing structure: root is drawn separately, nothing else needs to know it
 /// exists.
+/// Longest label worth trying to place for a non-heading content item — long enough to be
+/// recognizable, short enough that `updateLabels`' placer doesn't have to fight a whole paragraph
+/// for room. A heading's own `text` is already short (it's the heading itself); everything else
+/// — a paragraph, a list, a code block — has `text` set to its raw body, which could run to
+/// hundreds of characters and needs cutting down before it's usable as a label at all, the same
+/// way `.md` link text gets truncated elsewhere in this file.
+const interior_content_label_max: usize = 48;
+
+/// A short label for any content item, headings included — every content kind needs one now
+/// ("all linkable contexts", not just headings), not only the ones already short enough to use
+/// their raw text directly.
+fn interiorItemLabel(it: content_graph.Item) []const u8 {
+    if (it.kind == .heading) return it.text;
+    const nl = std.mem.indexOfScalar(u8, it.text, '\n') orelse it.text.len;
+    const line = it.text[0..nl];
+    return if (line.len > interior_content_label_max) line[0..interior_content_label_max] else line;
+}
+
 fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (st.db == null) return error.NoDb;
     const db = &st.db.?;
@@ -2318,7 +2336,6 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     const edges = edges_list.items;
 
     const n = items.len;
-    const m = n - 1; // everything but the root
 
     const item_kind = try arena.alloc(content_graph.ItemKind, n);
     for (items, 0..) |it, i| item_kind[i] = it.kind;
@@ -2344,18 +2361,39 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         }
     }
 
-    // Polar position: angle is this item's rank in document order swept clockwise around the full
-    // turn (so "next in the document" is also "next around the ring"); radius is its depth band,
-    // with a deterministic per-item jitter within that band — a belt of asteroids at roughly one
-    // radius, not a single fine line at exactly one radius. Jitter is seeded off the item's own id
-    // (`mix64`, the same hash `linkSignatures` already uses for a stable per-item value), not the
-    // rank used for angle, so it doesn't correlate with position around the ring.
+    // Polar position: angle is this item's rank in document order, swept clockwise starting from
+    // north, around the full turn; radius is its depth band, with a deterministic per-item jitter
+    // within that band — a belt of asteroids at roughly one radius, not a single fine line at
+    // exactly one radius. Jitter is seeded off the item's own id (`mix64`, the same hash
+    // `linkSignatures` already uses for a stable per-item value), not the rank used for angle, so
+    // it doesn't correlate with position around the ring.
+    //
+    // Heading rank and "everything else" rank are counted *separately*, each against its own
+    // total, rather than one shared rank across all items. A document that interleaves one
+    // heading with one paragraph, over and over, still has to give each *class* the full turn —
+    // sharing one rank space only spans the full circle when both classes happen to be counted in
+    // exactly matching proportion throughout the document, which is not guaranteed (and wasn't
+    // happening here: headings clumped into one hemisphere, content into the other, on gauntlet's
+    // giant-0.md). Both classes independently sweeping the full turn is what "headings closer in,
+    // content further out, but both wrap all the way around" actually requires.
+    var heading_total: u32 = 0;
+    var other_total: u32 = 0;
+    for (1..n) |i| {
+        if (items[i].kind == .heading) heading_total += 1 else other_total += 1;
+    }
     const local_pos = try arena.alloc(dvui.Point, n);
     local_pos[0] = .{}; // unused — the sun is pinned at `parent`, not placed in this space
     var extent: f32 = 1.0;
+    var heading_rank: u32 = 0;
+    var other_rank: u32 = 0;
     for (1..n) |i| {
-        const rank: f32 = @floatFromInt(i - 1);
-        const a = (rank / @as(f32, @floatFromInt(@max(m, 1)))) * std.math.tau;
+        const is_heading = items[i].kind == .heading;
+        const rank: f32 = @floatFromInt(if (is_heading) heading_rank else other_rank);
+        const total: f32 = @floatFromInt(@max(if (is_heading) heading_total else other_total, 1));
+        if (is_heading) heading_rank += 1 else other_rank += 1;
+        // `- tau/4` starts rank 0 at north (screen-up); increasing angle from there sweeps
+        // clockwise, same convention the rest of this file's local-space math already uses.
+        const a = (rank / total) * std.math.tau - std.math.tau / 4.0;
         const h = mix64(@bitCast(items[i].id));
         const jitter01 = @as(f32, @floatFromInt(h % 1_000_000)) / 1_000_000.0; // [0, 1)
         const jitter = (jitter01 - 0.5) * interior_ring_gap * interior_ring_band;
@@ -2407,7 +2445,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
             .line = it.line,
             .is_sun = false,
             .path = p.nodes[idx].path,
-            .title = it.text,
+            .title = interiorItemLabel(it),
             .phantom = false,
             .degree = it.weight,
             .target = p.interior.parent,
