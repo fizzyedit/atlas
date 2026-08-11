@@ -13,6 +13,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
+const core = @import("core");
 
 const Db = @import("../index/Db.zig");
 const Indexer = @import("../index/Indexer.zig");
@@ -273,10 +274,17 @@ pub const Sim = struct {
     }
 
     fn drawSidebar(self: *Sim) void {
+        // Same fill role the file explorer's own pane uses (`.content, .fill` — the app's single
+        // window-background color; every pane between it and the root just inherits it rather
+        // than setting its own), so this reads as a pane rather than a plain content area.
         var box = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .vertical,
             .min_size_content = .{ .w = 220 },
             .margin = .{ .x = 8, .y = 8, .w = 8, .h = 8 },
+            .padding = dvui.Rect.all(8),
+            .background = true,
+            .color_fill = dvui.themeGet().color(.content, .fill),
+            .corners = .round(6),
         });
         defer box.deinit();
 
@@ -333,7 +341,14 @@ fn ensureSim(gpa: std.mem.Allocator) *Sim {
 pub fn toggleOpen() void {
     const s = ensureSim(sdk.allocator());
     s.open = !s.open;
-    if (s.open) sdk.refresh();
+    if (s.open) {
+        // First open (or reopen after a close that never landed a build): nothing schedules a
+        // rebuild until a control is actually touched, so without this the window sits there
+        // forever with nothing generated — the controls only ever request a *change*, not the
+        // first graph.
+        if (!s.applied_valid and s.job == null) s.scheduleReload();
+        sdk.refresh();
+    }
 }
 
 /// Join the regen worker and the panel's own layout worker. Called from the plugin's `deinit` —
@@ -350,13 +365,22 @@ pub fn drawOverlay(_: *anyopaque) !void {
     if (!s.open) return;
     s.tick();
 
-    var float = dvui.floatingWindow(@src(), .{
+    // Same chrome every other fizzy dialog uses (`core.dvui.dialogWindow`'s own opts) — rounded
+    // corners, no border, a soft drop shadow — rather than a bare dvui.floatingWindow, which reads
+    // as a foreign widget next to the rest of the app's dialogs and tool windows.
+    var float = core.dvui.floatingWindow(@src(), .{
         .rect = &s.win_rect,
         .open_flag = &s.open,
-    }, .{ .background = true });
+        .window_avoid = .nudge_once,
+    }, .{
+        .color_fill = dvui.themeGet().color(.content, .fill).opacity(0.85),
+        .corners = .round(10),
+        .border = .all(0),
+        .box_shadow = .{ .color = .black, .alpha = 0.35, .fade = 10, .corners = .round(10) },
+    });
     defer float.deinit();
 
-    _ = dvui.windowHeader("Atlas: Vault Simulator", "", &s.open);
+    _ = core.dvui.windowHeader("Atlas: Vault Simulator", "", &s.open, .none);
 
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
     defer row.deinit();
