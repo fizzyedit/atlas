@@ -17,6 +17,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const hex = @import("hex.zig");
 const layout_full = @import("layout_full.zig");
+const content_graph = @import("content_graph");
 const testing = std.testing;
 
 const golden_angle: f32 = std.math.pi * (3.0 - @sqrt(5.0));
@@ -133,6 +134,230 @@ pub const Spec = struct {
         return std.fmt.bufPrint(buf, "synth:{d}:{s}:{d:.1}", .{ self.n, self.shape.label(), self.avg_deg }) catch "synth";
     }
 };
+
+/// Controls synthetic per-note *content* shape — headings, paragraphs, lists, code blocks,
+/// blockquotes, tables, tags, embeds — for stress-testing the interior view's document-content
+/// layout (`buildInteriorWorld`) without needing real markdown files. Produces the same
+/// `content_graph.ContentGraph` shape `query.noteContentGraph` produces from a real indexed
+/// document (see `synthContentGraph` below). Deliberately not wired into `generate`'s
+/// whole-vault loop — see that function's doc comment for why.
+///
+/// Defaults are calibrated toward "a realistic document has a few headers, a few paragraphs"
+/// (this file's own framing, carried over from the containment/interior plan) — contrast with
+/// `flatHeadingsExtreme()`, a deliberately-reachable degenerate shape at the other end.
+pub const DocSpec = struct {
+    /// Heading count range (inclusive).
+    heading_min: u32 = 2,
+    heading_max: u32 = 6,
+    /// Deepest ATX level headings may nest to. Clamped to [1, 6] (ATX only goes to h6).
+    max_depth: u32 = 3,
+    /// Paragraphs attached per heading (inclusive range).
+    para_min: u32 = 1,
+    para_max: u32 = 3,
+    /// Word count per paragraph — feeds `Item.weight` directly (weight = word count, mirroring
+    /// the real indexer's planned `blocks.weight` = word count for prose, per the schema in the
+    /// containment/interior plan).
+    words_min: u32 = 15,
+    words_max: u32 = 80,
+    /// Independent per-heading probability of attaching one list/code/blockquote/table item.
+    list_prob: f32 = 0.25,
+    code_prob: f32 = 0.15,
+    quote_prob: f32 = 0.1,
+    table_prob: f32 = 0.08,
+    /// Sizing when a list/code block is rolled, feeding `Item.weight` for those kinds. The real
+    /// indexer weights a code block by line count and a list has no natural line count, so item
+    /// count is the closest analogue — `weight` = item count for `.list`, line count for `.code`.
+    /// `.blockquote`/`.table` get a flat `weight = 1` (no natural size knob in this pass).
+    list_items_min: u32 = 2,
+    list_items_max: u32 = 8,
+    code_lines_min: u32 = 3,
+    code_lines_max: u32 = 25,
+    /// Tags scattered across the document (outline-children of randomly-chosen headings).
+    tags_min: u32 = 0,
+    tags_max: u32 = 4,
+    /// Embeds scattered across the document (outline-children of randomly-chosen headings).
+    embeds_min: u32 = 0,
+    embeds_max: u32 = 2,
+    seed: u64 = 0xC0FFEE,
+
+    /// Reproduces `gauntlet/vault/giant-docs/giant-2.md`'s exact degenerate shape: one root, N
+    /// flat (depth-1, unnested) headings, each with exactly one paragraph child and nothing
+    /// else — no lists, code, tags, or embeds. This is the edge case the interior redesign is
+    /// specifically meant to handle well (12,000 undifferentiated same-size planets on one ring,
+    /// under the old orbit layout). The real fixture is 12,000 headings; this preset uses 800 —
+    /// enough to exercise containment's coalescing at interior scale without paying the real
+    /// fixture's full cost on every test/bench run. Override `.heading_min`/`.heading_max` on
+    /// the returned value (both together, so the range stays a point) if the exact fixture size
+    /// is needed.
+    pub fn flatHeadingsExtreme() DocSpec {
+        return .{
+            .heading_min = 800,
+            .heading_max = 800,
+            .max_depth = 1,
+            .para_min = 1,
+            .para_max = 1,
+            .list_prob = 0,
+            .code_prob = 0,
+            .quote_prob = 0,
+            .table_prob = 0,
+            .tags_min = 0,
+            .tags_max = 0,
+            .embeds_min = 0,
+            .embeds_max = 0,
+        };
+    }
+};
+
+fn randRangeU32(rand: std.Random, min: u32, max: u32) u32 {
+    const hi = @max(min, max);
+    if (hi <= min) return min;
+    return min + rand.uintLessThan(u32, hi - min + 1);
+}
+
+/// Synthetic per-note content graph — the same `ContentGraph` shape `query.noteContentGraph`
+/// produces from a real indexed document, so the interior's `buildInteriorWorld` (containment/
+/// interior plan, Part 2) consumes either with zero special-casing downstream. Pure, headless: no
+/// filesystem, no db, matching this file's existing ethos.
+///
+/// Only `.outline` edges are emitted — synthetic documents in this pass have no explicit
+/// `[[same-note#links]]` between sections. That's a deliberate simplification, noted here rather
+/// than silently omitting `.link` edges from the output.
+///
+/// Algorithm: draw a heading count in `[heading_min, heading_max]`; walk each heading's depth via
+/// a bounded random walk clamped to `[1, max_depth]`, biased toward staying or going shallower;
+/// derive each heading's outline parent as the nearest *earlier* heading with a strictly smaller
+/// depth (or root), the same rule real markdown ATX nesting implies; attach paragraphs (and,
+/// per-heading independent rolls, at most one list/code/blockquote/table) as outline-children in
+/// document order; finally scatter tags/embeds as outline-children of randomly-chosen headings.
+/// Every item gets a strictly-increasing `line` in emission order and a simple incrementing `id`
+/// (synthetic, no cross-session identity concern).
+///
+/// Determinism: same `rand` state + `spec` always produces the same graph. `rand` is the caller's
+/// responsibility to seed — mirrors `Spec.seed` being consumed by `generate`'s *caller*, not
+/// hidden inside this function — so the plan's per-note use (`spec.seed ^ mix64(note_id)`) can
+/// derive a note-specific `std.Random` before calling in.
+pub fn synthContentGraph(arena: std.mem.Allocator, rand: std.Random, spec: DocSpec) !content_graph.ContentGraph {
+    const max_depth = std.math.clamp(spec.max_depth, 1, 6);
+
+    var items: std.ArrayListUnmanaged(content_graph.Item) = .empty;
+    var edges: std.ArrayListUnmanaged(content_graph.ItemEdge) = .empty;
+
+    var next_id: i64 = 0;
+    var next_line: u32 = 0;
+    const newId = struct {
+        fn go(id: *i64) i64 {
+            const v = id.*;
+            id.* += 1;
+            return v;
+        }
+    }.go;
+    const newLine = struct {
+        fn go(l: *u32) u32 {
+            const v = l.*;
+            l.* += 1;
+            return v;
+        }
+    }.go;
+
+    // Root, always item index 0.
+    try items.append(arena, .{ .id = newId(&next_id), .kind = .root, .line = newLine(&next_line) });
+    const root_idx: u32 = 0;
+
+    const heading_count = randRangeU32(rand, spec.heading_min, spec.heading_max);
+    if (heading_count == 0) {
+        return .{ .items = try items.toOwnedSlice(arena), .edges = try edges.toOwnedSlice(arena) };
+    }
+
+    // Stack of (depth, item_idx) tracks the nearest-earlier-smaller-depth parent — the same rule
+    // real markdown ATX nesting implies.
+    var stack: std.ArrayListUnmanaged(struct { depth: u32, idx: u32 }) = .empty;
+    var heading_idx: std.ArrayListUnmanaged(u32) = .empty; // item index per heading, doc order
+
+    var depth: u32 = 1;
+    var h: u32 = 0;
+    while (h < heading_count) : (h += 1) {
+        if (h > 0) {
+            // Biased random walk: mostly stay or go shallower, occasionally one deeper — "a
+            // realistic document has a few headers" implies mostly-flat-ish structure.
+            const r = rand.float(f32);
+            var step: i32 = 0;
+            if (r < 0.2) step = 1 else if (r < 0.45) step = -1;
+            const nd = @as(i32, @intCast(depth)) + step;
+            depth = @intCast(std.math.clamp(nd, 1, @as(i32, @intCast(max_depth))));
+        }
+
+        while (stack.items.len > 0 and stack.items[stack.items.len - 1].depth >= depth) {
+            stack.shrinkRetainingCapacity(stack.items.len - 1);
+        }
+        const parent_idx: u32 = if (stack.items.len > 0) stack.items[stack.items.len - 1].idx else root_idx;
+
+        const item_idx: u32 = @intCast(items.items.len);
+        try items.append(arena, .{ .id = newId(&next_id), .kind = .heading, .level = depth, .line = newLine(&next_line) });
+        try edges.append(arena, .{ .a = parent_idx, .b = item_idx, .kind = .outline });
+
+        try stack.append(arena, .{ .depth = depth, .idx = item_idx });
+        try heading_idx.append(arena, item_idx);
+
+        // Paragraphs, in document order under this heading.
+        const para_count = randRangeU32(rand, spec.para_min, spec.para_max);
+        var p: u32 = 0;
+        while (p < para_count) : (p += 1) {
+            const words = randRangeU32(rand, spec.words_min, spec.words_max);
+            const pi: u32 = @intCast(items.items.len);
+            try items.append(arena, .{ .id = newId(&next_id), .kind = .paragraph, .line = newLine(&next_line), .weight = words });
+            try edges.append(arena, .{ .a = item_idx, .b = pi, .kind = .outline });
+        }
+
+        if (rand.float(f32) < spec.list_prob) {
+            const count = randRangeU32(rand, spec.list_items_min, spec.list_items_max);
+            const li: u32 = @intCast(items.items.len);
+            try items.append(arena, .{ .id = newId(&next_id), .kind = .list, .line = newLine(&next_line), .weight = count });
+            try edges.append(arena, .{ .a = item_idx, .b = li, .kind = .outline });
+        }
+        if (rand.float(f32) < spec.code_prob) {
+            const lines = randRangeU32(rand, spec.code_lines_min, spec.code_lines_max);
+            const ci: u32 = @intCast(items.items.len);
+            try items.append(arena, .{ .id = newId(&next_id), .kind = .code, .line = newLine(&next_line), .weight = lines });
+            try edges.append(arena, .{ .a = item_idx, .b = ci, .kind = .outline });
+        }
+        if (rand.float(f32) < spec.quote_prob) {
+            const qi: u32 = @intCast(items.items.len);
+            try items.append(arena, .{ .id = newId(&next_id), .kind = .blockquote, .line = newLine(&next_line), .weight = 1 });
+            try edges.append(arena, .{ .a = item_idx, .b = qi, .kind = .outline });
+        }
+        if (rand.float(f32) < spec.table_prob) {
+            const ti: u32 = @intCast(items.items.len);
+            try items.append(arena, .{ .id = newId(&next_id), .kind = .table, .line = newLine(&next_line), .weight = 1 });
+            try edges.append(arena, .{ .a = item_idx, .b = ti, .kind = .outline });
+        }
+    }
+
+    // Tags/embeds are scattered by parentage (attached to a randomly-chosen existing heading) but
+    // appended at the end of emission order — only `kind`/`weight` reach layout today (nothing
+    // downstream renders real text yet, per the plan), so physical mid-document placement doesn't
+    // matter and this keeps the algorithm a simple two-pass build.
+    const tag_count = randRangeU32(rand, spec.tags_min, spec.tags_max);
+    var t: u32 = 0;
+    while (t < tag_count) : (t += 1) {
+        const parent = heading_idx.items[rand.uintLessThan(usize, heading_idx.items.len)];
+        const text = try std.fmt.allocPrint(arena, "tag{d}", .{t});
+        const ti: u32 = @intCast(items.items.len);
+        try items.append(arena, .{ .id = newId(&next_id), .kind = .tag, .line = newLine(&next_line), .text = text });
+        try edges.append(arena, .{ .a = parent, .b = ti, .kind = .outline });
+    }
+
+    const embed_count = randRangeU32(rand, spec.embeds_min, spec.embeds_max);
+    var e: u32 = 0;
+    while (e < embed_count) : (e += 1) {
+        const parent = heading_idx.items[rand.uintLessThan(usize, heading_idx.items.len)];
+        const text = try std.fmt.allocPrint(arena, "embed{d}", .{e});
+        const ei: u32 = @intCast(items.items.len);
+        try items.append(arena, .{ .id = newId(&next_id), .kind = .embed, .line = newLine(&next_line), .text = text });
+        try edges.append(arena, .{ .a = parent, .b = ei, .kind = .outline });
+    }
+
+    return .{ .items = try items.toOwnedSlice(arena), .edges = try edges.toOwnedSlice(arena) };
+}
 
 pub const Graph = struct {
     positions: []dvui.Point,
@@ -1353,4 +1578,117 @@ test "non-lfr shapes fill communities with the orphan sentinel" {
     var g = try generate(testing.allocator, arena_state.allocator(), spec);
     defer g.deinit(testing.allocator);
     for (g.communities) |c| try testing.expectEqual(orphan_community, c);
+}
+
+test "synthContentGraph produces a well-formed document graph" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var rng = std.Random.DefaultPrng.init(42);
+    const spec = DocSpec{ .heading_min = 5, .heading_max = 12, .max_depth = 4, .tags_max = 4, .embeds_max = 2 };
+    const g = try synthContentGraph(arena_state.allocator(), rng.random(), spec);
+
+    try testing.expect(g.items.len > 1);
+    try testing.expectEqual(content_graph.ItemKind.root, g.items[0].kind);
+
+    var counts = [_]usize{0} ** 9; // indexed by @intFromEnum(ItemKind)
+    for (g.items) |it| counts[@intFromEnum(it.kind)] += 1;
+    try testing.expect(counts[@intFromEnum(content_graph.ItemKind.heading)] > 0);
+    try testing.expect(counts[@intFromEnum(content_graph.ItemKind.paragraph)] > 0);
+
+    // Only .outline edges in this pass.
+    for (g.edges) |e| try testing.expect(e.kind == .outline);
+
+    // Every non-root item is reachable back to root via outline edges (no orphaned subtrees):
+    // walk each item's parent chain and confirm it terminates at root index 0.
+    var parent_of = try testing.allocator.alloc(?u32, g.items.len);
+    defer testing.allocator.free(parent_of);
+    @memset(parent_of, null);
+    for (g.edges) |e| parent_of[e.b] = e.a;
+
+    for (1..g.items.len) |i| {
+        var cur: u32 = @intCast(i);
+        var hops: usize = 0;
+        while (cur != 0) {
+            cur = parent_of[cur] orelse return error.OrphanedItem;
+            hops += 1;
+            try testing.expect(hops < g.items.len); // guard against a cycle
+        }
+    }
+}
+
+test "synthContentGraph is deterministic for a fixed seed" {
+    const spec = DocSpec{ .heading_min = 6, .heading_max = 20, .max_depth = 5, .tags_max = 5, .embeds_max = 3 };
+
+    var arena_a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_a.deinit();
+    var rng_a = std.Random.DefaultPrng.init(777);
+    const a = try synthContentGraph(arena_a.allocator(), rng_a.random(), spec);
+
+    var arena_b = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_b.deinit();
+    var rng_b = std.Random.DefaultPrng.init(777);
+    const b = try synthContentGraph(arena_b.allocator(), rng_b.random(), spec);
+
+    try testing.expectEqual(a.items.len, b.items.len);
+    for (a.items, b.items) |ia, ib| {
+        try testing.expectEqual(ia.id, ib.id);
+        try testing.expectEqual(ia.kind, ib.kind);
+        try testing.expectEqual(ia.level, ib.level);
+        try testing.expectEqual(ia.line, ib.line);
+        try testing.expectEqual(ia.weight, ib.weight);
+        try testing.expectEqualStrings(ia.text, ib.text);
+    }
+    try testing.expectEqual(a.edges.len, b.edges.len);
+    for (a.edges, b.edges) |ea, eb| {
+        try testing.expectEqual(ea.a, eb.a);
+        try testing.expectEqual(ea.b, eb.b);
+        try testing.expectEqual(ea.kind, eb.kind);
+    }
+}
+
+test "flatHeadingsExtreme produces exactly the giant-2.md shape" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var rng = std.Random.DefaultPrng.init(1);
+    const spec = DocSpec.flatHeadingsExtreme();
+    const g = try synthContentGraph(arena_state.allocator(), rng.random(), spec);
+
+    const n = spec.heading_min;
+    try testing.expectEqual(n, spec.heading_max);
+    try testing.expectEqual(@as(usize, 1 + n * 2), g.items.len); // root + N headings + N paragraphs
+
+    try testing.expectEqual(content_graph.ItemKind.root, g.items[0].kind);
+
+    var heading_count: usize = 0;
+    var paragraph_count: usize = 0;
+    for (g.items[1..]) |it| {
+        switch (it.kind) {
+            .heading => {
+                heading_count += 1;
+                try testing.expectEqual(@as(u32, 1), it.level);
+            },
+            .paragraph => paragraph_count += 1,
+            else => return error.UnexpectedItemKind,
+        }
+    }
+    try testing.expectEqual(@as(usize, n), heading_count);
+    try testing.expectEqual(@as(usize, n), paragraph_count);
+
+    // Every heading is a direct outline-child of root, and has exactly one paragraph child.
+    var child_count = try testing.allocator.alloc(u32, g.items.len);
+    defer testing.allocator.free(child_count);
+    @memset(child_count, 0);
+    for (g.edges) |e| {
+        try testing.expect(e.kind == .outline);
+        child_count[e.a] += 1;
+        if (g.items[e.a].kind == .heading) {
+            try testing.expectEqual(content_graph.ItemKind.paragraph, g.items[e.b].kind);
+        } else {
+            try testing.expectEqual(content_graph.ItemKind.heading, g.items[e.b].kind);
+            try testing.expectEqual(@as(u32, 0), e.a); // only root parents headings here
+        }
+    }
+    for (g.items, 0..) |it, i| {
+        if (it.kind == .heading) try testing.expectEqual(@as(u32, 1), child_count[i]);
+    }
 }

@@ -37,6 +37,20 @@ pub fn build(b: *std.Build) void {
 
     fizzy.plugin.install(b, plugin.lib, .{});
 
+    // Neutral per-note content graph shape (`ItemKind`/`Item`/`ItemEdge`/`ContentGraph`), shared
+    // by the DB-backed indexer (`src/index/query.zig`) and the synthetic generator
+    // (`src/ui/vault_synth.zig`). Registered as its own module — rather than left to relative
+    // `../index/content_graph.zig` imports — because `vault_synth.zig` also gets its own
+    // standalone unit-test module below (rooted at `src/ui/`, which Zig's module boundary won't
+    // let a relative import reach outside of); a named import works identically in both the full
+    // plugin build and that standalone test.
+    const content_graph_mod = b.createModule(.{
+        .root_source_file = b.path("src/index/content_graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    plugin.module.addImport("content_graph", content_graph_mod);
+
     // Pure-logic tests: link resolution and the note scanner take plain values in and give
     // records out, with no filesystem, no database, and no dvui, which is the whole reason
     // they're separate files from the plumbing that uses them.
@@ -96,6 +110,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     db_tests.root_module.addImport("sqlite", sqlite.module("sqlite"));
+    // query.zig (reached via db_test.zig's relative import) needs `content_graph` by name — see
+    // the comment on that import in query.zig. A distinct Module object from `content_graph_mod`
+    // above and from the vault-synth test's own copy: sharing one Module across independent
+    // artifacts' import tables is what triggered the double-attachment error in the first place.
+    const cg_for_db_test = b.createModule(.{
+        .root_source_file = b.path("src/index/content_graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    db_tests.root_module.addImport("content_graph", cg_for_db_test);
     test_step.dependOn(&b.addRunArtifact(db_tests).step);
 
     // The incremental write path end to end: scan a buffer, write the rows, relink. Everything
@@ -147,6 +171,19 @@ pub fn build(b: *std.Build) void {
         t.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         if (std.mem.eql(u8, entry[0], "atlas-galaxy-tests")) {
             t.root_module.addImport("batch2d", batch2d_mod);
+        }
+        if (std.mem.eql(u8, entry[0], "atlas-vault-synth-tests")) {
+            // A distinct module object from `content_graph_mod` above, deliberately: this test
+            // and `plugin.lib` are separate artifacts, but sharing one Module object between two
+            // artifacts' import tables made Zig's module-uniqueness check misattribute
+            // `vault_synth.zig` itself as `content_graph_mod`'s root (a confusing, wrong error).
+            // Two independently-created modules with the same root file avoids it.
+            const cg_for_test = b.createModule(.{
+                .root_source_file = b.path("src/index/content_graph.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            t.root_module.addImport("content_graph", cg_for_test);
         }
         test_step.dependOn(&b.addRunArtifact(t).step);
     }

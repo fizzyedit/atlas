@@ -7,6 +7,10 @@ const sqlite = @import("sqlite");
 const Db = @import("Db.zig");
 const schema = @import("schema.zig");
 const query = @import("query.zig");
+// Named, not relative — must match query.zig's own import mechanism for this file, or
+// content_graph.zig becomes reachable two ways within this test's module tree at once. See the
+// comment on query.zig's own `content_graph` import.
+const content_graph = @import("content_graph");
 
 const testing = std.testing;
 
@@ -55,7 +59,7 @@ test "creating an index produces every table" {
 
     // sqlite_master is the authority on what actually got created.
     const n = try countRows(&db, "SELECT count(*) FROM sqlite_master WHERE type='table'");
-    try testing.expectEqual(@as(usize, 7), n); // meta, notes, aliases, headings, links, tags, media
+    try testing.expectEqual(@as(usize, 8), n); // meta, notes, aliases, headings, links, tags, blocks, media
 }
 
 test "media rows are independent of notes" {
@@ -319,6 +323,16 @@ fn seedOutline(db: *Db) !void {
     }
 }
 
+/// Distinct neighbours of `idx` — the `Item.degree` field the old `SectionNode` had, recomputed
+/// straight from the edge list now that `content_graph.Item` doesn't carry it.
+fn degreeOf(edges: []const content_graph.ItemEdge, idx: u32) u32 {
+    var n: u32 = 0;
+    for (edges) |e| {
+        if (e.a == idx or e.b == idx) n += 1;
+    }
+    return n;
+}
+
 test "a note's interior is its outline, hung off a root" {
     const gpa = testing.allocator;
     var tmp = try TempDir.create(gpa, "sections");
@@ -329,30 +343,31 @@ test "a note's interior is its outline, hung off a root" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const snap = try query.noteSnapshot(&db, arena.allocator(), 1, "A");
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
 
     // Root plus four headings.
-    try testing.expectEqual(@as(usize, 5), snap.nodes.len);
-    try testing.expectEqual(@as(u32, 0), snap.nodes[0].level);
-    try testing.expectEqualStrings("A", snap.nodes[0].text);
-    try testing.expectEqualStrings("Alpha", snap.nodes[1].text);
+    try testing.expectEqual(@as(usize, 5), cg.items.len);
+    try testing.expectEqual(@as(u32, 0), cg.items[0].level);
+    try testing.expect(cg.items[0].kind == .root);
+    try testing.expectEqualStrings("A", cg.items[0].text);
+    try testing.expectEqualStrings("Alpha", cg.items[1].text);
 
     // Beta and Gamma are `##` under Alpha; Delta is `#` and goes back to the root.
-    try testing.expectEqual(@as(usize, 4), snap.edges.len);
-    for (snap.edges) |e| try testing.expect(e.kind == .outline);
+    try testing.expectEqual(@as(usize, 4), cg.edges.len);
+    for (cg.edges) |e| try testing.expect(e.kind == .outline);
     const parent_of = struct {
-        fn f(s: query.NoteSnapshot, child: u32) u32 {
-            for (s.edges) |e| if (e.b == child) return e.a;
+        fn f(g: content_graph.ContentGraph, child: u32) u32 {
+            for (g.edges) |e| if (e.b == child) return e.a;
             return 999;
         }
     }.f;
-    try testing.expectEqual(@as(u32, 0), parent_of(snap, 1)); // Alpha -> root
-    try testing.expectEqual(@as(u32, 1), parent_of(snap, 2)); // Beta  -> Alpha
-    try testing.expectEqual(@as(u32, 1), parent_of(snap, 3)); // Gamma -> Alpha
-    try testing.expectEqual(@as(u32, 0), parent_of(snap, 4)); // Delta -> root
+    try testing.expectEqual(@as(u32, 0), parent_of(cg, 1)); // Alpha -> root
+    try testing.expectEqual(@as(u32, 1), parent_of(cg, 2)); // Beta  -> Alpha
+    try testing.expectEqual(@as(u32, 1), parent_of(cg, 3)); // Gamma -> Alpha
+    try testing.expectEqual(@as(u32, 0), parent_of(cg, 4)); // Delta -> root
 }
 
-test "a note with no headings is still one node, not an empty cloud" {
+test "a note with no headings is still one item, not an empty graph" {
     // What makes descending into any note safe to do unconditionally.
     const gpa = testing.allocator;
     var tmp = try TempDir.create(gpa, "bare");
@@ -363,13 +378,15 @@ test "a note with no headings is still one node, not an empty cloud" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const snap = try query.noteSnapshot(&db, arena.allocator(), 1, "Bare");
-    try testing.expectEqual(@as(usize, 1), snap.nodes.len);
-    try testing.expectEqual(@as(usize, 0), snap.edges.len);
-    try testing.expectEqualStrings("Bare", snap.nodes[0].text);
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "Bare");
+    try testing.expectEqual(@as(usize, 1), cg.items.len);
+    try testing.expectEqual(@as(usize, 0), cg.edges.len);
+    try testing.expectEqualStrings("Bare", cg.items[0].text);
 }
 
-test "links are attributed to the section they were written in" {
+test "links to another note never become content-graph items or edges" {
+    // Only headings/blocks/tags/embeds of *this* note, plus this note's own self-links, belong
+    // in its content graph — an ordinary outgoing wikilink leaves the note entirely.
     const gpa = testing.allocator;
     var tmp = try TempDir.create(gpa, "attrib");
     defer tmp.destroy(gpa);
@@ -377,7 +394,6 @@ test "links are attributed to the section they were written in" {
     defer db.close(gpa);
     try seedOutline(&db);
 
-    // One before any heading (root), two inside Beta, one inside Delta.
     for ([_]i64{ 1, 10, 11, 22 }) |line| {
         try db.conn.exec(
             "INSERT INTO links(src_id, dst_id, raw, kind, line, col) VALUES(1, 2, 'b', 0, ?, 0)",
@@ -388,19 +404,15 @@ test "links are attributed to the section they were written in" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const snap = try query.noteSnapshot(&db, arena.allocator(), 1, "A");
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
 
-    try testing.expectEqual(@as(u32, 1), snap.nodes[0].links); // root
-    try testing.expectEqual(@as(u32, 0), snap.nodes[1].links); // Alpha
-    try testing.expectEqual(@as(u32, 2), snap.nodes[2].links); // Beta
-    try testing.expectEqual(@as(u32, 0), snap.nodes[3].links); // Gamma
-    try testing.expectEqual(@as(u32, 1), snap.nodes[4].links); // Delta
-
-    // All four point at another note, so none of them adds an edge inside this cloud.
-    try testing.expectEqual(@as(usize, 4), snap.edges.len);
+    // Root plus four headings only — none of the four outgoing links added an item or an edge.
+    try testing.expectEqual(@as(usize, 5), cg.items.len);
+    try testing.expectEqual(@as(usize, 4), cg.edges.len);
+    for (cg.edges) |e| try testing.expect(e.kind == .outline);
 }
 
-test "a note linking to its own heading draws an edge inside the cloud" {
+test "a note linking to its own heading draws an edge inside the graph" {
     const gpa = testing.allocator;
     var tmp = try TempDir.create(gpa, "selflink");
     defer tmp.destroy(gpa);
@@ -417,20 +429,20 @@ test "a note linking to its own heading draws an edge inside the cloud" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const snap = try query.noteSnapshot(&db, arena.allocator(), 1, "A");
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
 
     var found = false;
-    for (snap.edges) |e| {
+    for (cg.edges) |e| {
         if (e.kind != .link) continue;
         found = true;
         try testing.expectEqual(@as(u32, 4), e.a); // Delta
         try testing.expectEqual(@as(u32, 2), e.b); // Beta
     }
     try testing.expect(found);
-    // Degree counts it on both ends, so both bodies read as heavier: Beta has its outline
-    // parent plus this link, Delta has its own parent plus this link.
-    try testing.expectEqual(@as(u32, 2), snap.nodes[2].degree);
-    try testing.expectEqual(@as(u32, 2), snap.nodes[4].degree);
+    // Recomputed from edges: Beta has its outline parent plus this link, Delta has its own
+    // parent plus this link, so both read as heavier bodies.
+    try testing.expectEqual(@as(u32, 2), degreeOf(cg.edges, 2));
+    try testing.expectEqual(@as(u32, 2), degreeOf(cg.edges, 4));
 }
 
 test "a repeated heading still gets its own identity" {
@@ -451,17 +463,17 @@ test "a repeated heading still gets its own identity" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const snap = try query.noteSnapshot(&db, arena.allocator(), 1, "A");
-    try testing.expectEqual(@as(usize, 3), snap.nodes.len);
-    try testing.expect(snap.nodes[1].id != snap.nodes[2].id);
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
+    try testing.expectEqual(@as(usize, 3), cg.items.len);
+    try testing.expect(cg.items[1].id != cg.items[2].id);
     // And neither collides with the root.
-    try testing.expect(snap.nodes[1].id != 0);
-    try testing.expect(snap.nodes[2].id != 0);
+    try testing.expect(cg.items[1].id != 0);
+    try testing.expect(cg.items[2].id != 0);
 }
 
 test "section identity survives edits that only move lines" {
     // The reason ids come from heading text and not line numbers: typing above a heading
-    // renumbers it, and the cloud must not lose its animation state for that.
+    // renumbers it, and the graph must not lose its animation state for that.
     const gpa = testing.allocator;
     var tmp = try TempDir.create(gpa, "stableid");
     defer tmp.destroy(gpa);
@@ -476,13 +488,84 @@ test "section identity survives edits that only move lines" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const before = try query.noteSnapshot(&db, arena.allocator(), 1, "A");
+    const before = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
 
     // Same heading, pushed down the file.
     try db.conn.exec("UPDATE headings SET line = 17 WHERE note_id = 1", .{}, .{});
-    const after = try query.noteSnapshot(&db, arena.allocator(), 1, "A");
+    const after = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
 
-    try testing.expectEqual(before.nodes[1].id, after.nodes[1].id);
-    try testing.expectEqual(@as(u32, 3), before.nodes[1].line);
-    try testing.expectEqual(@as(u32, 17), after.nodes[1].line);
+    try testing.expectEqual(before.items[1].id, after.items[1].id);
+    try testing.expectEqual(@as(u32, 3), before.items[1].line);
+    try testing.expectEqual(@as(u32, 17), after.items[1].line);
+}
+
+test "blocks, tags, and embeds attach to the nearest enclosing heading" {
+    const gpa = testing.allocator;
+    var tmp = try TempDir.create(gpa, "content-graph");
+    defer tmp.destroy(gpa);
+    var db = try tmp.open(gpa, "/some/vault");
+    defer db.close(gpa);
+    try seedOutline(&db);
+
+    // A paragraph before any heading (belongs to root), a list under Alpha, a tag under Beta,
+    // and an embed under Delta.
+    try db.conn.exec(
+        "INSERT INTO blocks(note_id, kind, line_start, line_end, weight) VALUES(1, 0, 0, 0, 3)",
+        .{},
+        .{},
+    );
+    try db.conn.exec(
+        "INSERT INTO blocks(note_id, kind, line_start, line_end, weight) VALUES(1, 1, 5, 6, 4)",
+        .{},
+        .{},
+    );
+    try db.conn.exec(
+        "INSERT INTO tags(note_id, tag, tag_fold, line) VALUES(1, 'todo', 'todo', 10)",
+        .{},
+        .{},
+    );
+    try db.conn.exec(
+        "INSERT INTO links(src_id, dst_id, raw, alias, kind, line, col) VALUES(1, 2, 'diagram.png', '', 1, 21, 0)",
+        .{},
+        .{},
+    );
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
+
+    // Root(0) + 4 headings(1-4) + paragraph + list + tag + embed = 9.
+    try testing.expectEqual(@as(usize, 9), cg.items.len);
+
+    const parent_of = struct {
+        fn f(g: content_graph.ContentGraph, child: u32) u32 {
+            for (g.edges) |e| if (e.b == child) return e.a;
+            return 999;
+        }
+    }.f;
+
+    var paragraph_idx: ?u32 = null;
+    var list_idx: ?u32 = null;
+    var tag_idx: ?u32 = null;
+    var embed_idx: ?u32 = null;
+    for (cg.items, 0..) |it, i| {
+        switch (it.kind) {
+            .paragraph => paragraph_idx = @intCast(i),
+            .list => list_idx = @intCast(i),
+            .tag => tag_idx = @intCast(i),
+            .embed => embed_idx = @intCast(i),
+            else => {},
+        }
+    }
+    try testing.expect(paragraph_idx != null and list_idx != null and tag_idx != null and embed_idx != null);
+
+    try testing.expectEqual(@as(u32, 0), parent_of(cg, paragraph_idx.?)); // root
+    try testing.expectEqual(@as(u32, 1), parent_of(cg, list_idx.?)); // Alpha
+    try testing.expectEqual(@as(u32, 2), parent_of(cg, tag_idx.?)); // Beta
+    try testing.expectEqual(@as(u32, 4), parent_of(cg, embed_idx.?)); // Delta
+
+    try testing.expectEqualStrings("todo", cg.items[tag_idx.?].text);
+    try testing.expectEqualStrings("diagram.png", cg.items[embed_idx.?].text);
+    try testing.expectEqual(@as(u32, 3), cg.items[paragraph_idx.?].weight);
+    try testing.expectEqual(@as(u32, 4), cg.items[list_idx.?].weight);
 }

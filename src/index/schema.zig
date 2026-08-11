@@ -10,7 +10,7 @@
 const std = @import("std");
 
 /// Bump on any change to the DDL below. Anything that doesn't match is discarded.
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 
 /// Connection settings, applied on every open.
 ///
@@ -97,6 +97,21 @@ pub const ddl =
     \\);
     \\CREATE INDEX IF NOT EXISTS tags_fold ON tags(tag_fold);
     \\
+    \\-- Everything a document's body is made of, once headings are pulled out: paragraphs,
+    \\-- lists, code fences, blockquotes, tables. No `parent_heading_id` column — which heading
+    \\-- owns a block is resolved at read time (`query.noteContentGraph`), the same choice
+    \\-- already made for `links.heading`, so an edit that only moves lines around never has to
+    \\-- rewrite this table.
+    \\CREATE TABLE IF NOT EXISTS blocks (
+    \\  id          INTEGER PRIMARY KEY,
+    \\  note_id     INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    \\  kind        INTEGER NOT NULL,        -- see BlockKind
+    \\  line_start  INTEGER NOT NULL,        -- 0-based
+    \\  line_end    INTEGER NOT NULL,        -- 0-based, inclusive
+    \\  weight      INTEGER NOT NULL DEFAULT 1 -- word count (prose) or line count (code/table)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS blocks_note ON blocks(note_id, line_start);
+    \\
     \\-- Embeddable media in the vault (images), so `![[diagram.png]]` can resolve and complete.
     \\-- Deliberately *not* the `notes` table: these are attachments, not notes. They must never
     \\-- reach the graph, never become phantoms, and carry none of a note's parsed structure —
@@ -122,6 +137,16 @@ pub const LinkKind = enum(u8) {
     embed = 1,
     /// `[text](./Note.md)` — an ordinary markdown link pointing inside the vault.
     markdown = 2,
+};
+
+/// A body block's shape, as detected by `Scanner.scan`'s block accumulator. Headings keep
+/// their own `headings` table and are not a `BlockKind` — nothing downstream needs them merged.
+pub const BlockKind = enum(u8) {
+    paragraph = 0,
+    list = 1,
+    code = 2,
+    blockquote = 3,
+    table = 4,
 };
 
 const testing = std.testing;

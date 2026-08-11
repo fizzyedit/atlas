@@ -38,6 +38,7 @@ const layout_full = @import("layout_full.zig");
 const multilevel = @import("multilevel.zig");
 const galaxy = @import("galaxy.zig");
 const world_mod = @import("world.zig");
+const world_draw = @import("world_draw.zig");
 
 /// A note the frame resolved as an individual, published by `stepWorld` and consumed by the label
 /// placer, the proximity field and hit-testing. `level` is vestigial — everything drawn as itself
@@ -63,22 +64,30 @@ const open_node_r: f32 = 34;
 /// On-screen bubble radii — constant across zoom, like pixi's `/ canvas.scale` buttons.
 const base_screen_r: f32 = 9;
 
-/// Interior orbits. A document is drawn as a small solar system: the note itself is the sun, and
-/// its headings orbit at a radius set by nesting depth. Anything deeper than `interior_max_rings`
-/// shares the outermost ring rather than flying off — a document nested six levels deep is rare,
-/// and an orbit nobody can see is worse than a crowded one.
-const interior_max_rings: usize = 5;
-/// World gap between consecutive orbits, in local (pre-nest) units.
+/// Interior orbits. A document is drawn as a small solar system: the note is the sun, each `h1`
+/// is a star orbiting it, each `h2` a planet orbiting its own star, deeper headings moons of that
+/// planet — every subsystem is placed relative to *its own* parent (see `buildInterior`), so a
+/// large document's headings never end up sharing one dense, spatially meaningless ring.
+/// Fallback world gap between orbits when a subtree's real spacing is not yet known (an empty
+/// document, or a note with no headings) — see `p.interior.slot`.
 const interior_orbit_gap: f32 = 2.6;
-/// Minimum arc between two bodies on the same orbit. A heading level with fifty entries pushes its
-/// ring outward rather than packing them into an unreadable band.
-const interior_min_arc: f32 = 1.15;
 /// How far the system turns while you descend into it, in turns. The spin is what makes the rings
 /// read as *orbits* rather than as decorative circles — a static ring is just a circle.
 const interior_spin_turns: f32 = 0.35;
 /// How fast an open note's links reach out to their neighbours, in multiples of full length per
 /// second.
 const select_reach_rate: f32 = 2.6;
+
+/// Local-space body radius by outline depth: the note is the sun, h1s are stars, h2s planets,
+/// deeper are moons. Size carries the role, so the hierarchy reads without labels.
+fn interiorBodyRadius(level: u32) f32 {
+    return switch (level) {
+        0 => 1.35, // the document itself
+        1 => 0.85, // star
+        2 => 0.55, // planet
+        else => 0.36, // moon
+    };
+}
 const open_screen_r: f32 = 12;
 /// Interior document sun — larger at rest so it reads as the hub, and grows harder on approach.
 const sun_screen_r: f32 = 14;
@@ -395,9 +404,13 @@ const Interior = struct {
     nodes: []GraphNode = &.{},
     edges: []GraphEdge = &.{},
     nest: interior.Nest = .{ .steps = 0, .scale = 1, .level = 0, .clamped = false },
-    /// Local-space orbit radius per interior node (0 for the sun). Drives both the orbit rings
-    /// and the spin, so the drawn circle and the bodies on it can never disagree. Interior arena.
+    /// Local-space radius of the ring each node sits on, around its own parent. Drives the drawn
+    /// orbit and the spin together, so the circle and the bodies on it cannot disagree.
     orbit_r: []f32 = &.{},
+    /// Outline tree, as a CSR range of children per node. The document is a tree, so a subsystem
+    /// orbits its own star rather than a global ring at its depth.
+    child_start: []u32 = &.{},
+    kids: []u32 = &.{},
     /// World position of the parent note's own node — the point the cloud is centred on, so the
     /// node and its interior share an origin and the descent has nothing to slide sideways.
     parent: dvui.Point = .{},
@@ -2213,13 +2226,6 @@ fn updateInterior(p: *Panel, st: anytype) void {
     p.interior.t = t;
 }
 
-/// Which orbit a heading sits on. Level 0 is the sun; everything deeper than the outermost ring
-/// shares it rather than flying off the end.
-fn interiorRing(level: u32) usize {
-    if (level == 0) return 0;
-    return @min(@as(usize, level), interior_max_rings);
-}
-
 fn buildInterior(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (st.db == null) return error.NoDb;
     const db = &st.db.?;
@@ -2234,45 +2240,113 @@ fn buildInterior(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     const degrees = try arena.alloc(u32, n);
     for (snap.nodes, 0..) |sn, i| degrees[i] = sn.degree + sn.links + if (sn.level == 0) @as(u32, 64) else 0;
 
-    // Orbits, not a force solve. A document's headings are a *hierarchy*, not a web: a heading
-    // belongs to its parent by nesting depth, and nothing is gained by letting a solver rediscover
-    // that from edges. Depth becomes orbit radius, which reads immediately — h1s close in, h3s far
-    // out — and it costs nothing to compute, so a document with hundreds of headings places as
-    // fast as one with three.
+    // A solar system, built from the document's own outline tree.
+    //
+    // The note is the sun; each `h1` is a star orbiting it; each `h2` is a planet orbiting *its
+    // own* star; deeper headings are moons. The distinction that matters is that a subsystem
+    // belongs to its parent, not to a global depth — placing by level alone puts every `h2` in the
+    // document on one ring regardless of which `h1` it came from, which is both spatially
+    // meaningless and the reason a large document's outer bands turned into a dense unreadable
+    // belt. Here a 200-heading note is a handful of stars with their own planets, and no ring ever
+    // holds more than one parent's children.
+    //
+    // Two passes, O(n). Bottom-up sizes each subtree; top-down places it. Each child is given an
+    // angular share proportional to how much room its own subtree needs, so one enormous section
+    // does not squeeze five small ones into a corner.
     const local = try arena.alloc(dvui.Point, n);
     const orbit_r = try arena.alloc(f32, n);
-    local[0] = .{};
-    orbit_r[0] = 0;
+    const parent_of = try arena.alloc(u32, n);
+    const sys_r = try arena.alloc(f32, n);
+    const body_r = try arena.alloc(f32, n);
+    @memset(local, .{});
+    @memset(orbit_r, 0);
 
-    // How many sit on each ring, so a crowded ring can be pushed out far enough to hold them.
-    var ring_count = [_]u32{0} ** (interior_max_rings + 1);
-    for (snap.nodes[1..]) |sn| {
-        ring_count[interiorRing(sn.level)] += 1;
+    // Outline tree from level + document order: a heading's parent is the nearest heading before
+    // it with a smaller level. The synthetic root (level 0) catches everything else.
+    {
+        var stack: [8]u32 = .{0} ** 8;
+        parent_of[0] = 0;
+        for (snap.nodes[1..], 1..) |sn, i| {
+            const lvl = @min(@as(usize, sn.level), 6);
+            parent_of[i] = stack[lvl - 1];
+            stack[lvl] = @intCast(i);
+            // Deeper levels are stale once we step back out; re-seed them to this node so a jump
+            // from h1 straight to h4 still lands under the h1 rather than under a vanished h3.
+            for (lvl + 1..stack.len) |d| stack[d] = @intCast(i);
+        }
     }
 
-    var ring_radius = [_]f32{0} ** (interior_max_rings + 1);
-    for (1..interior_max_rings + 1) |ring| {
-        const base = interior_orbit_gap * @as(f32, @floatFromInt(ring));
-        // Keep a minimum arc between neighbours: a heading level with fifty entries needs a wider
-        // orbit than one with three, or they overlap into an unreadable band.
-        const cnt: f32 = @floatFromInt(@max(ring_count[ring], 1));
-        const needed = cnt * interior_min_arc / std.math.tau;
-        ring_radius[ring] = @max(base, needed);
+    // Each body's own size, before its subtree's demand is folded in below.
+    for (snap.nodes, 0..) |sn, i| {
+        const weight = 1.0 + @as(f32, @floatFromInt(sn.links)) * 0.35;
+        body_r[i] = interiorBodyRadius(sn.level) * @sqrt(weight);
+        sys_r[i] = body_r[i];
+    }
+    // Children are contiguous in neither index nor order, so gather them once.
+    const child_count = try arena.alloc(u32, n);
+    @memset(child_count, 0);
+    for (snap.nodes[1..], 1..) |_, i| child_count[parent_of[i]] += 1;
+    const child_start = try arena.alloc(u32, n + 1);
+    child_start[0] = 0;
+    for (0..n) |i| child_start[i + 1] = child_start[i] + child_count[i];
+    const child_fill = try arena.dupe(u32, child_start[0..n]);
+    const kids = try arena.alloc(u32, n - 1); // n >= 1: `snap.nodes.len == 0` returned above
+    for (snap.nodes[1..], 1..) |_, i| {
+        kids[child_fill[parent_of[i]]] = @intCast(i);
+        child_fill[parent_of[i]] += 1;
     }
 
-    var placed = [_]u32{0} ** (interior_max_rings + 1);
-    for (snap.nodes[1..], 1..) |sn, i| {
-        const ring = interiorRing(sn.level);
-        const cnt: f32 = @floatFromInt(@max(ring_count[ring], 1));
-        const k: f32 = @floatFromInt(placed[ring]);
-        placed[ring] += 1;
-        // Offset each ring by half a step so bodies never line up radially with the ring inside
-        // them — the thing that makes a set of concentric rings read as spokes instead of orbits.
-        const a = (k / cnt) * std.math.tau + @as(f32, @floatFromInt(ring)) * 0.5 * std.math.tau / cnt;
-        orbit_r[i] = ring_radius[ring];
-        local[i] = .{ .x = @cos(a) * orbit_r[i], .y = @sin(a) * orbit_r[i] };
+    // Reverse document order visits every child before its parent.
+    {
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            const cs = child_start[i];
+            const ce = child_start[i + 1];
+            if (cs == ce) continue;
+            var demand: f32 = 0;
+            var widest: f32 = 0;
+            for (kids[cs..ce]) |k| {
+                demand += sys_r[k];
+                widest = @max(widest, sys_r[k]);
+            }
+            // The ring has to be long enough to seat every child's whole system side by side.
+            const ring = @max(body_r[i] + widest * 1.25, demand / std.math.pi * 1.35);
+            orbit_r[cs] = ring; // one ring per parent; stored on the first child, read below
+            for (kids[cs..ce]) |k| orbit_r[k] = ring;
+            sys_r[i] = ring + widest;
+        }
+    }
+
+    // Top-down: hand each child an angular slice proportional to its own demand.
+    {
+        var stack: std.ArrayListUnmanaged(u32) = .empty;
+        try stack.append(arena, 0);
+        while (stack.pop()) |i| {
+            const cs = child_start[i];
+            const ce = child_start[i + 1];
+            if (cs == ce) continue;
+            var demand: f32 = 0;
+            for (kids[cs..ce]) |k| demand += sys_r[k];
+            if (demand <= 1e-6) demand = 1;
+            const ring = orbit_r[kids[cs]];
+            // Offset each generation by half a slice so a planet never hides behind its star.
+            var a: f32 = @as(f32, @floatFromInt(snap.nodes[i].level)) * 0.6;
+            for (kids[cs..ce]) |k| {
+                const share = sys_r[k] / demand * std.math.tau;
+                a += share * 0.5;
+                local[k] = .{
+                    .x = local[i].x + @cos(a) * ring,
+                    .y = local[i].y + @sin(a) * ring,
+                };
+                a += share * 0.5;
+                try stack.append(arena, k);
+            }
+        }
     }
     p.interior.orbit_r = orbit_r;
+    p.interior.child_start = child_start;
+    p.interior.kids = kids;
 
     // The sun is the nest origin: the interior hangs off the parent node's position, so the
     // note becomes the middle of its own cloud — zooming in is literal. Re-centre after snap
@@ -2297,11 +2371,17 @@ fn buildInterior(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     );
     // `slot` is "the distance between two neighbouring things", which the fit uses to decide how
     // far it may zoom in. Under the old force solve that was the hex cell the solve snapped to;
-    // orbits do not snap to a lattice, so the honest answer is the gap between adjacent orbits.
-    // Reading it off the hex level instead left `slot` far larger than anything actually on
-    // screen, and `fitInteriorSun`'s `max_gap / slot` clamp then held the camera way back — the
-    // interior opened zoomed far out.
-    p.interior.slot = interior_orbit_gap * p.interior.nest.scale;
+    // orbits do not snap to a lattice, so the honest answer is the *tightest* orbit actually
+    // placed — a document of mostly-h1s and one deeply nested aside should not have its zoom
+    // ceiling set by the aside's cramped inner rings. Reading `slot` off the hex level instead
+    // left it far larger than anything on screen, and `fitInteriorSun`'s `max_gap / slot` clamp
+    // then held the camera way back — the interior opened zoomed far out.
+    var min_ring: f32 = std.math.floatMax(f32);
+    for (orbit_r) |r| {
+        if (r > 1e-4) min_ring = @min(min_ring, r);
+    }
+    p.interior.slot = (if (min_ring == std.math.floatMax(f32)) interior_orbit_gap else min_ring) *
+        p.interior.nest.scale;
     p.interior.radius = local_radius * p.interior.nest.scale;
     p.interior.parent = p.nodes[idx].home;
 
@@ -3357,64 +3437,90 @@ fn stepWorld(p: *Panel) void {
 /// The system turns as you descend and comes to rest once you have arrived. Without it the rings
 /// are just concentric circles; with it, the bodies visibly travel along them, which is what
 /// tells you they are orbits and that depth is the thing separating them.
-fn interiorSpunPos(p: *const Panel, i: usize, rest: dvui.Point) dvui.Point {
-    if (i >= p.interior.orbit_r.len) return rest;
-    const r = p.interior.orbit_r[i];
-    if (r <= 1e-4) return rest; // the sun does not orbit anything
+/// Spin-in positions for every interior node, in one top-down pass.
+///
+/// Each node orbits its *own* parent, so unwinding the spin has to be a recursive rotation: a
+/// planet's spun position is its star's already-spun position plus its rest offset from that
+/// star, rotated. Rotating around the document sun instead — as if every body's orbit were
+/// centred on it — would swing stars into their places correctly but drag every planet and moon
+/// along a huge arc around the *sun* rather than a small arc around its own star, since their
+/// rest offset from the sun is dominated by their star's distance, not their own.
+///
+/// The same eased angle is applied at every level, so the *total* displacement still grows with
+/// depth (a moon's position compounds its planet's rotation and its star's), which reads as an
+/// outer-to-inner cascade settling into place rather than everything snapping at once.
+fn interiorSpinPositions(p: *const Panel, arena: std.mem.Allocator) []dvui.Point {
+    const n = p.interior.nodes.len;
+    const out = arena.alloc(dvui.Point, n) catch return &.{};
+    if (n == 0) return out;
+
     // Unwind from `interior_spin_turns` back to zero as the descent completes, eased so the
     // system slows into place rather than stopping dead.
     const remaining = 1 - std.math.clamp(p.interior.t, 0, 1);
     const eased = remaining * remaining;
-    const a = eased * interior_spin_turns * std.math.tau;
-    if (a <= 1e-5) return rest;
-    const c = @cos(a);
-    const s = @sin(a);
-    const local = dvui.Point{ .x = rest.x - p.interior.parent.x, .y = rest.y - p.interior.parent.y };
-    return .{
-        .x = p.interior.parent.x + local.x * c - local.y * s,
-        .y = p.interior.parent.y + local.x * s + local.y * c,
-    };
+    const angle = eased * interior_spin_turns * std.math.tau;
+
+    for (p.interior.nodes, 0..) |node, i| out[i] = node.pos;
+    if (angle <= 1e-5 or p.interior.child_start.len == 0) return out;
+
+    const c = @cos(angle);
+    const s = @sin(angle);
+    var stack: std.ArrayListUnmanaged(u32) = .empty;
+    stack.append(arena, 0) catch return out;
+    while (stack.pop()) |i| {
+        if (i + 1 >= p.interior.child_start.len) continue;
+        const cs = p.interior.child_start[i];
+        const ce = p.interior.child_start[i + 1];
+        for (p.interior.kids[cs..ce]) |k| {
+            const dx = p.interior.nodes[k].pos.x - p.interior.nodes[i].pos.x;
+            const dy = p.interior.nodes[k].pos.y - p.interior.nodes[i].pos.y;
+            out[k] = .{
+                .x = out[i].x + dx * c - dy * s,
+                .y = out[i].y + dx * s + dy * c,
+            };
+            stack.append(arena, k) catch {};
+        }
+    }
+    return out;
 }
 
-/// One faint circle per occupied orbit, drawn in the web's ink.
+/// One faint circle per occupied orbit, drawn in the web's own ink and centred on the parent that
+/// owns it — a star's planets ring the star, not the document sun, since that is the body they
+/// actually orbit. Deduped by parent index rather than by radius: two unrelated parents can
+/// legitimately have the same ring size, and drawing only one of them would silently drop a real
+/// orbit.
 fn drawOrbitRings(p: *Panel, fade: f32) void {
-    if (p.interior.orbit_r.len == 0) return;
+    if (p.interior.orbit_r.len == 0 or p.interior.child_start.len == 0) return;
     const arena = dvui.currentWindow().arena();
     const theme = dvui.themeGet();
     var ink = theme.color(.window, .text);
     ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * 0.16 * fade);
 
     var batch = galaxy.LineBatch.init(arena);
-    var seen: [interior_max_rings + 2]f32 = .{0} ** (interior_max_rings + 2);
-    var n_seen: usize = 0;
+    const n = p.interior.nodes.len;
 
-    for (p.interior.orbit_r) |r_local| {
+    for (0..n) |i| {
+        if (i + 1 >= p.interior.child_start.len) continue;
+        const cs = p.interior.child_start[i];
+        const ce = p.interior.child_start[i + 1];
+        if (cs == ce) continue; // no children ⇒ nothing orbits this body
+
+        const r_local = p.interior.orbit_r[p.interior.kids[cs]];
         if (r_local <= 1e-4) continue;
-        var dup = false;
-        for (seen[0..n_seen]) |sr| {
-            if (@abs(sr - r_local) < 1e-3) dup = true;
-        }
-        if (dup) continue;
-        if (n_seen < seen.len) {
-            seen[n_seen] = r_local;
-            n_seen += 1;
-        }
-
         const r_world = r_local * p.interior.nest.scale;
         const r_px = r_world * p.camera.zoom;
         if (r_px < 3 or r_px > 20_000) continue;
-        // Segment count follows the on-screen circumference: a small orbit does not need 96 sides,
-        // and a large one looks polygonal with 24.
+
+        const center = p.interior.nodes[i].pos;
+        // Segment count follows the on-screen circumference: a small orbit does not need 96
+        // sides, and a large one looks polygonal with 24.
         const segs: usize = @intFromFloat(std.math.clamp(r_px * 0.35, 24, 96));
-        var prev = p.camera.worldToScreen(.{
-            .x = p.interior.parent.x + r_world,
-            .y = p.interior.parent.y,
-        });
+        var prev = p.camera.worldToScreen(.{ .x = center.x + r_world, .y = center.y });
         for (1..segs + 1) |k| {
             const a = (@as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(segs))) * std.math.tau;
             const cur = p.camera.worldToScreen(.{
-                .x = p.interior.parent.x + @cos(a) * r_world,
-                .y = p.interior.parent.y + @sin(a) * r_world,
+                .x = center.x + @cos(a) * r_world,
+                .y = center.y + @sin(a) * r_world,
             });
             batch.add(prev, cur, 1.0, ink);
             prev = cur;
@@ -3440,10 +3546,11 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
     const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
     const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
     const gap_px = p.interior.slot * p.camera.zoom;
+    const spun = interiorSpinPositions(p, arena);
     var n: usize = 0;
     for (p.interior.nodes, 0..) |node, i| {
         buf[n] = .{
-            .screen = p.camera.worldToScreen(interiorSpunPos(p, i, node.pos)),
+            .screen = p.camera.worldToScreen(if (i < spun.len) spun[i] else node.pos),
             .r_px = bubbleScreenRadius(node, zoom_t, gap_px),
             .fill = nodeFill(theme, node),
             // The sun is the note you are inside — dashed, so leaving reads differently from
@@ -3458,94 +3565,53 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
 }
 
 /// Paint the living set stepped by `stepWorld`.
-fn drawWorldMarks(p: *Panel, fade: f32) void {
-    if (fade <= 0.004) return;
-    const w = if (p.world_state) |*ws| ws else return;
-    const dens = p.ensureDensity() orelse return;
-    const arena = dvui.currentWindow().arena();
+/// Identity: the overview's `World` is already in vault-world space, nothing to nest.
+fn identityToWorld(_: *anyopaque, local: dvui.Point) dvui.Point {
+    return local;
+}
+
+/// A note is drawn at exactly the radius `updateLabels` reserves for it and `nodeAtAim`
+/// hit-tests against. `world` reports a flat note size because it is headless and knows nothing
+/// about hover or open tabs; the panel does, so the panel decides. Keeping the three in sync is
+/// what lets the placer find real gaps — reserving one size and drawing another had it dodging
+/// discs that were not there — and it restores the proximity swell, so a note grows under the
+/// cursor and carries that size into the interior as a dashed ring.
+fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark, holds_open: bool) world_draw.MarkStyle {
+    const p: *Panel = @ptrCast(@alignCast(ctx));
+    _ = w;
     const theme = dvui.themeGet();
     const border_rest = theme.color(.window, .text);
     const hot = theme.color(.highlight, .fill);
-
-    // Links first so the web passes under the marks rather than over them.
-    if (w.links.items.len > 0) {
-        // One pass over the marks instead of a scan per endpoint: the web is budgeted at 900 and
-        // the marks at a few hundred, so the naive version was ~250k comparisons a frame.
-        var pos = std.AutoHashMapUnmanaged(u32, dvui.Point.Physical){};
-        defer pos.deinit(arena);
-        pos.ensureTotalCapacity(arena, @intCast(w.marks.items.len)) catch {};
-        var holds_open = std.AutoHashMapUnmanaged(u32, void){};
-        defer holds_open.deinit(arena);
-        for (w.marks.items) |m| {
-            pos.put(arena, m.cell, p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy })) catch {};
-            if (worldMarkHoldsOpen(p, w, m)) holds_open.put(arena, m.cell, {}) catch {};
-        }
-
-        var batch = galaxy.LineBatch.init(arena);
-        var ink = border_rest;
-        ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * 0.22 * fade);
-        var lit = theme.color(.highlight, .fill);
-        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * 0.95 * fade);
-
-        // An open note's links draw *out from it*, growing to full length. Reaching out is what
-        // makes the connection read as belonging to the note you just opened rather than as more
-        // of the ambient web.
-        const grow = dvui.easing.outCubic(std.math.clamp(p.select_anim, 0, 1));
-
-        for (w.links.items) |l| {
-            const a = pos.get(l.a) orelse continue;
-            const b = pos.get(l.b) orelse continue;
-            const a_open = holds_open.contains(l.a);
-            const b_open = holds_open.contains(l.b);
-            if (!a_open and !b_open) {
-                batch.add(a, b, 1.0, ink);
-                continue;
-            }
-            // grow from whichever end is open
-            const from = if (a_open) a else b;
-            const to = if (a_open) b else a;
-            const tip = dvui.Point.Physical{
-                .x = from.x + (to.x - from.x) * grow,
-                .y = from.y + (to.y - from.y) * grow,
-            };
-            batch.add(from, tip, 1.8, lit);
-        }
-        batch.flush();
-    }
-
-    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return;
-    var n: usize = 0;
-    var notes_drawn: u32 = 0;
-    var clusters_drawn: u32 = 0;
-    // A note is drawn at exactly the radius `updateLabels` reserves for it and `nodeAtAim`
-    // hit-tests against. `world` reports a flat note size because it is headless and knows
-    // nothing about hover or open tabs; the panel does, so the panel decides. Keeping the three
-    // in sync is what lets the placer find real gaps — reserving one size and drawing another had
-    // it dodging discs that were not there — and it restores the proximity swell, so a note grows
-    // under the cursor and carries that size into the interior as a dashed ring.
     const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
     const gap_px = p.layout_slot * p.camera.zoom;
+    const radius_px: f32 = if (m.is_note and m.note < p.nodes.len)
+        bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px)
+    else
+        m.r;
+    return .{
+        .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
+        .border = if (holds_open) hot else border_rest,
+        .r_px = radius_px,
+        .is_note = m.is_note,
+    };
+}
 
-    for (w.marks.items) |m| {
-        const holds_open = worldMarkHoldsOpen(p, w, m);
-        const radius_px: f32 = if (m.is_note and m.note < p.nodes.len)
-            bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px)
-        else
-            m.r;
-        buf[n] = .{
-            .screen = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy }),
-            .r_px = radius_px,
-            .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
-            .border = if (holds_open) hot else border_rest,
-            .is_note = m.is_note,
-            .dying = false,
-        };
-        n += 1;
-        if (m.is_note) notes_drawn += 1 else clusters_drawn += 1;
-    }
-    _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf[0..n]);
-    frame_profile.nodes_drawn += notes_drawn;
-    frame_profile.clusters_drawn += clusters_drawn;
+fn overviewHoldsOpen(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark) bool {
+    const p: *Panel = @ptrCast(@alignCast(ctx));
+    return worldMarkHoldsOpen(p, w, m);
+}
+
+fn drawWorldMarks(p: *Panel, fade: f32) void {
+    const w = if (p.world_state) |*ws| ws else return;
+    const dens = p.ensureDensity() orelse return;
+    const stats = world_draw.draw(w, &p.camera, dens, fade, p.select_anim, .{
+        .ctx = p,
+        .toWorld = identityToWorld,
+        .style = overviewMarkStyle,
+        .holdsOpen = overviewHoldsOpen,
+    });
+    frame_profile.nodes_drawn += stats.notes_drawn;
+    frame_profile.clusters_drawn += stats.clusters_drawn;
 }
 
 /// Publish the world's leaf poses back onto `p.nodes`, and mark which notes are drawn as
