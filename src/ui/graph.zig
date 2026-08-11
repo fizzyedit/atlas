@@ -876,9 +876,16 @@ var frame_profile: FrameProfile = .{};
 
 pub fn draw(_: ?*anyopaque) anyerror!void {
     drawn_recently = true;
-    const st = runtime.state();
-    const gpa = sdk.allocator();
-    const p = ensurePanel(gpa);
+    try drawPanel(ensurePanel(sdk.allocator()), runtime.state());
+}
+
+/// The whole panel, one frame: rebuild-if-needed, step the living world, update hover/proximity/
+/// labels, draw, handle input. Generic over `st` (duck-typed — `rebuildIfNeeded`/
+/// `buildInteriorWorld` read `db`/`generation`/`indexer`/`indexer_ready`/`vault_root`/
+/// `hasGraphSource()` off it) so a caller with its own data source and its own `Panel` — the
+/// vault simulator window — draws through the exact same pass `draw` above uses for the real
+/// bottom panel, rather than a second copy that can drift from it.
+pub fn drawPanel(p: *Panel, st: anytype) !void {
     _ = ensureWorld(p);
 
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -1011,7 +1018,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     // Before `handleInput` so the button consumes its own press rather than the graph
     // treating it as the start of a pan.
     drawFitButton(p, content);
-    handleInput(p);
+    handleInput(p, st);
 }
 
 /// Layout ease + pixi-bubble proximity: chase `home` toward the hex `target`, then chase
@@ -4723,7 +4730,7 @@ fn drawCenteredHint(msg: []const u8) void {
     });
 }
 
-fn handleInput(p: *Panel) void {
+fn handleInput(p: *Panel, st: anytype) void {
     const pane = dvui.parentGet().data();
     const rs = pane.rectScale();
     const id = pane.id;
@@ -4792,7 +4799,7 @@ fn handleInput(p: *Panel) void {
                                 if (ni < p.interior.nodes.len and p.interior.nodes[ni].is_sun) {
                                     exitInterior(p);
                                 } else {
-                                    revealInteriorSection(p, ni);
+                                    revealInteriorSection(p, st, ni);
                                 }
                             }
                         } else if (hitTestActive(p, me.p)) |ni| {
@@ -4809,11 +4816,11 @@ fn handleInput(p: *Panel) void {
                             // Camera first, file second — `revealPosition` may kick tab/focus
                             // work that would otherwise hitch the start of the flight.
                             if (revisit) {
-                                enterInterior(p, p.nodes[ni].note_id);
+                                enterInterior(p, st, p.nodes[ni].note_id);
                             } else {
                                 focusNode(p, ni);
                             }
-                            openNode(p, ni, open_side);
+                            openNode(p, st, ni, open_side);
                         } else if (hitTestClusters(p, me.p)) |ci| {
                             // Dashed coalesced mass: frame its content and open one sticky level.
                             frameCluster(p, ci);
@@ -5087,11 +5094,10 @@ fn exitInterior(p: *Panel) void {
 /// Begin descending into `note_id`. `updateInterior` runs earlier in the frame than input, so
 /// the cloud is built and the camera retargeted here — otherwise a revisit click only flipped
 /// `framing` and waited for a chase/layout gate that never opened.
-fn enterInterior(p: *Panel, note_id: i64) void {
+fn enterInterior(p: *Panel, st: anytype, note_id: i64) void {
     p.framing = .{ .interior = note_id };
     p.camera.user_driving = false;
     p.interior.note_id = note_id;
-    const st = runtime.state();
     const gen = st.generation.load(.acquire);
     if (p.interior.built_id != note_id or p.interior.built_gen != gen or
         p.interior.built_aspect != p.layout_aspect)
@@ -5110,10 +5116,11 @@ fn enterInterior(p: *Panel, note_id: i64) void {
 /// Placeholder: scroll the open editor to the heading this section node represents.
 /// Richer "focus this heading in the graph" behaviour can replace the body later; the
 /// click wiring and stored `line` are what matter now.
-fn revealInteriorSection(p: *Panel, idx: usize) void {
+fn revealInteriorSection(p: *Panel, st: anytype, idx: usize) void {
     if (idx >= p.interior.nodes.len) return;
     const n = p.interior.nodes[idx];
-    const st = runtime.state();
+    // Synthetic notes (vault simulator) have no backing file — nothing to reveal.
+    if (n.path.len == 0) return;
     const root = st.vault_root orelse return;
     const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
     const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, n.path }) catch return;
@@ -5122,10 +5129,11 @@ fn revealInteriorSection(p: *Panel, idx: usize) void {
     };
 }
 
-fn openNode(p: *Panel, idx: usize, open_side: bool) void {
-    const st = runtime.state();
+fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
     const root = st.vault_root orelse return;
     const n = p.nodes[idx];
+    // Synthetic notes (vault simulator) have no backing file — nothing to open or reveal.
+    if (n.path.len == 0 and !n.phantom) return;
     const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
 
     if (n.phantom) {
