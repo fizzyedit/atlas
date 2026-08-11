@@ -2356,13 +2356,19 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     p.interior.local_pos = local_pos;
     p.interior.item_kind = item_kind;
 
-    const interior_level = hex.layoutLevelFor(n);
-    p.interior.nest = interior.nest(
-        extent,
-        interior_level,
-        hex.layoutLevelFor(@max(p.nodes.len, 1)),
-        interior.default_footprint,
-    );
+    // Scale chosen continuously from the field's own extent, not `interior.nest()`'s hex-level
+    // quantization plus forced `min_descent_levels` floor. That floor adds shrink-steps a small
+    // field never needed — the same fixed minimum "journey" applied whether the cloud held 2
+    // items or 2,000, so a two-item note (most of gauntlet's `islands/` demo, once the sun absorbs
+    // the lone top-level heading) rendered exactly as zoomed-out as a huge one. `berth` is "how
+    // much of the parent's own hex cell this cloud may fill" — the same quantity `interior.nest()`
+    // computes it from internally — and `scale` is simply picked so the field's own `extent` fills
+    // that berth exactly: a small field sits close, a large one still fits, continuously in
+    // between rather than snapping between fixed hex levels.
+    const vault_level = hex.layoutLevelFor(@max(p.nodes.len, 1));
+    const berth = @max(hex.levelSpacing(vault_level), 1) * interior.default_footprint;
+    const scale = berth / @max(extent, 1e-3);
+    p.interior.nest = .{ .steps = 0, .scale = scale, .level = vault_level, .clamped = false };
     p.interior.slot = interior_ring_gap * p.interior.nest.scale;
     p.interior.radius = extent * p.interior.nest.scale;
     p.interior.parent = p.nodes[idx].home;
