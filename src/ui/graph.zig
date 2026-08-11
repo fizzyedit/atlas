@@ -403,17 +403,19 @@ const Interior = struct {
     nodes: []GraphNode = &.{},
     edges: []GraphEdge = &.{},
     nest: interior.Nest = .{ .steps = 0, .scale = 1, .level = 0, .clamped = false },
-    /// The note's own content (everything but the root — see `nodes[0]`/`is_sun`) as a
-    /// fold/containment/world pipeline, gpa-owned like `Panel.world_state` and deinited the same
-    /// way before being replaced or dropped. Null for a note with nothing besides its root (no
-    /// headings, no body).
-    content_world: ?world_mod.World = null,
+    /// Local (pre-`nest`/`parent`) position per node, indexed exactly like `nodes`
+    /// (`local_pos[0]` unused — the sun is pinned directly at `parent`, not placed in this space).
+    /// An "asteroid field": angle is document order swept clockwise around the full circle, radius
+    /// is outline depth — headings on inner rings, their own paragraphs/lists/tags/etc a band
+    /// further out, deeper headings further still. No containment/fold packing: that algorithm is
+    /// built for a tree with real branching, and a typical document's headings are closer to a
+    /// flat chain (weakly tied only by document order) than a tree, which packed as a long curling
+    /// spiral rather than anything resembling "shape and grouping" — see `buildInteriorWorld`.
+    /// Panel-arena owned.
+    local_pos: []dvui.Point = &.{},
     /// Content kind per node, indexed exactly like `nodes` (`item_kind[0] == .root`). Panel-arena
     /// owned — drives `contentKindRadiusMul` at draw time.
     item_kind: []content_graph.ItemKind = &.{},
-    /// Per node, whether it is drawn as itself this frame — the interior's own `at_level0`.
-    /// Panel-arena owned, sized with `nodes`.
-    at_level0: []bool = &.{},
     /// World position of the parent note's own node — the point the cloud is centred on, so the
     /// node and its interior share an origin and the descent has nothing to slide sideways.
     parent: dvui.Point = .{},
@@ -430,23 +432,20 @@ const Interior = struct {
     t_prev: f32 = 0,
 
     fn deinit(self: *Interior) void {
-        if (self.content_world) |*w| w.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
 
     /// Forget the cloud without dropping the arena's pages — descending again reuses them.
     fn clear(self: *Interior) void {
-        if (self.content_world) |*w| w.deinit();
-        self.content_world = null;
         _ = self.arena.reset(.retain_capacity);
         self.note_id = null;
         self.built_id = 0;
         self.built_gen = std.math.maxInt(u64);
         self.nodes = &.{};
         self.edges = &.{};
+        self.local_pos = &.{};
         self.item_kind = &.{};
-        self.at_level0 = &.{};
         self.t = 0;
         self.t_prev = 0;
     }
@@ -2234,63 +2233,28 @@ fn updateInterior(p: *Panel, st: anytype) void {
     p.interior.t = t;
 }
 
-/// Build a note's interior as its own fold/containment/world cloud — exactly the machinery
-/// `ensureWorld` builds for the vault, fed the note's content graph instead of the vault's notes.
+/// World-space radial gap between one outline depth and the next, in the interior's own local
+/// units — headings on inner rings, their attached content a band further out.
+const interior_ring_gap: f32 = 1.6;
+/// How far outside its own heading's ring a non-heading item (paragraph, list, tag, ...) sits.
+const interior_content_offset: f32 = 0.6;
+
+/// Build a note's interior as an "asteroid field": every content item placed directly by polar
+/// position, angle from document order (swept clockwise around the full circle) and radius from
+/// outline depth — headings inner, their own content a band further out, deeper headings further
+/// still. Not fold/containment: that pipeline packs a *tree* by disc-in-disc containment, which
+/// needs real branching to look like anything but a curling spiral — a typical document's
+/// headings are tied to each other only by document order (no `[[Note#Heading]]` cross-links most
+/// of the time), which is a flat chain topologically, and a chain packed as a tree is a spiral.
+/// Measured directly against gauntlet's giant-0.md (401 flat headings): the fold/containment
+/// version rendered as one dense curling band; this one is exactly the ring layout it now is.
 ///
-/// Item 0 (the document root) is deliberately *not* part of that cloud: it is pinned at the
-/// centre as the "sun" outside the fold hierarchy entirely, the same invariant `fitInteriorSun`
-/// already relies on (`p.interior.nodes[0]` equals `p.interior.parent` by construction). Feeding
-/// it in as an ordinary leaf would let the budget coalesce it away under a big document, losing
-/// the one fixed point the whole descent hangs off. `.outline` edges from the root to a top-level
-/// heading are dropped rather than translated for the same reason they'd otherwise pull every
-/// top-level heading into one artificial component — dropping them is what turns "a document with
-/// several unrelated top-level sections" into separate packed islands, the same island layout the
-/// vault overview already gives disconnected notes.
-/// Document order `i` as a fixed-width, zero-padded decimal string — sorts identically to
-/// numeric order, which is all `addPathChain` (see its call site below) needs from it.
-fn docOrderPath(arena: std.mem.Allocator, i: usize) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{d:0>7}", .{i});
-}
-
-/// Re-place a freshly-built content world's root islands in document order, evenly spaced
-/// clockwise around the shared origin — instead of `containment.placeRoots`'s golden-angle spiral
-/// (biggest-first, irrational angle step). The spiral is the right choice for a vault that may
-/// hold thousands of islands, where even distribution matters more than any particular order; it
-/// is the wrong one for an interior cloud small enough that a reader is meant to trace it start to
-/// finish, where "next in the document" should also mean "next around the circle." Keeps
-/// `placeRoots`'s own area-accumulation formula for radius so overall spread stays comparable —
-/// only the angular assignment changes.
-fn placeInteriorIslandsClockwise(w: *world_mod.World) void {
-    const lad = &w.lad;
-    if (lad.roots.len <= 1) return; // nothing to order
-
-    const arena = dvui.currentWindow().arena();
-    const order = arena.alloc(u32, lad.roots.len) catch return;
-    @memcpy(order, lad.roots);
-    const Ctx = struct {
-        lad: *const fold.Ladder,
-        // A root's place in the document is its first leaf in dfs order — the same "first leaf
-        // under this cell" idiom `fold.zig`'s own folder-correlation code already uses.
-        fn firstLeaf(self: @This(), r: u32) u32 {
-            const c = self.lad.cells[r];
-            return if (c.ls < c.le) self.lad.note_at[c.ls] else std.math.maxInt(u32);
-        }
-        pub fn lessThan(self: @This(), a: u32, b: u32) bool {
-            return self.firstLeaf(a) < self.firstLeaf(b);
-        }
-    };
-    std.mem.sort(u32, order, Ctx{ .lad = lad }, Ctx.lessThan);
-
-    var acc: f32 = 0;
-    for (order, 0..) |r, i| {
-        const rad = @sqrt(acc);
-        const rr = w.field.radius(lad, r);
-        acc += rr * rr * w.field.opts.pack_gap;
-        const a = (@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(order.len))) * std.math.tau;
-        w.field.pos[r] = .{ .x = @cos(a) * rad * w.field.opts.pack_aspect, .y = @sin(a) * rad };
-    }
-}
-
+/// Item 0 (the document root) is not part of this field at all: it is pinned at the centre as the
+/// "sun," the same invariant `fitInteriorSun` already relies on (`p.interior.nodes[0]` equals
+/// `p.interior.parent` by construction). `.outline` edges from the root to a top-level heading are
+/// dropped from the fields below (`parent_level`/`item_kind` walks) for the same reason they no
+/// longer feed a shared packing structure: root is drawn separately, nothing else needs to know it
+/// exists.
 fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (st.db == null) return error.NoDb;
     const db = &st.db.?;
@@ -2307,8 +2271,9 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     // top of each other: the sun, and that heading. When root has exactly one outline-child and
     // it is a heading, treat it as the document's own entry point instead of a second node: borrow
     // its line for the sun's "reveal position" and drop it from the content graph. Its own children
-    // keep their items but lose their one edge to it, which is no special case — an item with no
-    // surviving edge already becomes its own top-level island, same as any other unlinked heading.
+    // keep their items but lose their one edge to it, which needs no special handling below — an
+    // item with no resolved outline-parent just falls back to depth 0, same band as any other
+    // now-parentless top-level heading.
     var sun_line: u32 = 0;
     var skip: ?u32 = null;
     {
@@ -2355,52 +2320,42 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     const item_kind = try arena.alloc(content_graph.ItemKind, n);
     for (items, 0..) |it, i| item_kind[i] = it.kind;
 
-    var content_world: ?world_mod.World = null;
-    if (m > 0) {
-        var edge_list: std.ArrayList(fold.Edge) = .empty;
-        for (edges) |e| {
-            if (e.a == 0 or e.b == 0) continue; // root edges dropped — see doc comment above
-            const w: f32 = if (e.kind == .link) 1.4 else 1.0;
-            try edge_list.append(arena, .{ .a = e.a - 1, .b = e.b - 1, .w = w });
-        }
-        // Document-order index strings: `fold.build`'s `addPathChain` sorts `paths[]` lexically
-        // and adds a weak edge between consecutive entries, which for a fixed-width numeral
-        // string reduces exactly to document order — reusing the folder-chain mechanism as the
-        // document's weak tiebreak instead of writing a second one.
-        //
-        // Known gap, measured via `zig build bench -- --interior` (mirrors this exactly): a
-        // document with *no* real edges at all — every item chained only by this weak tiebreak,
-        // as `flatHeadingsExtreme()` deliberately is — coarsens one pairing pass (n leaves -> n/2
-        // pairs) and then stops; `coarsenLevel` finds nothing further to merge on a uniform-weight
-        // chain with no real links to break the tie. Bounded, not broken — the interior still
-        // draws a finite, monotonically-shrinking mark count on the way in, it just doesn't reach
-        // the vault's usual island-count budget at the two most-zoomed-out steps for this specific
-        // fully-disconnected shape. A real document's `.link` edges (weight 1.4) dominate the same
-        // way a vault's real links dominate its own folder chain, so this only bites a document
-        // that is *entirely* unlinked flat headings — flagged as a follow-up, not fixed here.
-        const paths = try arena.alloc([]const u8, m);
-        for (0..m) |i| paths[i] = try docOrderPath(arena, i);
-
-        content_world = try world_mod.World.init(sdk.allocator(), m, edge_list.items, paths, .{
-            .arity = .seven,
-            .folder_w = 0.2,
-        }, .{
-            .note_r = 1.0,
-            // `containment.placeRoots`'s default `pack_gap` (5.2) is calibrated for a vault that
-            // may hold thousands of islands, where even area-proportional spacing matters more
-            // than the golden-angle spiral's placement order. An interior cloud rarely holds more
-            // than a handful of top-level islands, and the full 5.2 spread them out disproportion-
-            // ately — the whole cloud measured larger than the content actually needs, forcing the
-            // fit-camera further out and making the fixed-screen-size sun look small at descent.
-            .pack_gap = 1.8,
-        });
-        if (content_world) |*cw| placeInteriorIslandsClockwise(cw);
+    // Outline depth per item — headings use their own ATX level directly; everything else takes
+    // its nearest enclosing heading's level (via the one `.outline` edge every non-root item has)
+    // and sits `interior_content_offset` further out, so a section's body reads as *its* band,
+    // one step beyond the heading that owns it.
+    var parent_level = try arena.alloc(i32, n);
+    @memset(parent_level, -1);
+    for (edges) |e| {
+        if (e.kind != .outline) continue;
+        if (e.b < n) parent_level[e.b] = @intCast(items[e.a].level);
     }
-    if (p.interior.content_world) |*old| old.deinit();
-    p.interior.content_world = content_world;
+    const depth = try arena.alloc(f32, n);
+    depth[0] = 0;
+    for (1..n) |i| {
+        if (items[i].kind == .heading) {
+            depth[i] = @floatFromInt(items[i].level);
+        } else {
+            const pl = if (parent_level[i] >= 0) parent_level[i] else 0;
+            depth[i] = @as(f32, @floatFromInt(pl)) + interior_content_offset;
+        }
+    }
+
+    // Polar position: angle is this item's rank in document order swept clockwise around the full
+    // turn (so "next in the document" is also "next around the ring"); radius is its depth band.
+    const local_pos = try arena.alloc(dvui.Point, n);
+    local_pos[0] = .{}; // unused — the sun is pinned at `parent`, not placed in this space
+    var extent: f32 = 1.0;
+    for (1..n) |i| {
+        const rank: f32 = @floatFromInt(i - 1);
+        const a = (rank / @as(f32, @floatFromInt(@max(m, 1)))) * std.math.tau;
+        const r = 1.0 + depth[i] * interior_ring_gap;
+        local_pos[i] = .{ .x = @cos(a) * r, .y = @sin(a) * r };
+        extent = @max(extent, r);
+    }
+    p.interior.local_pos = local_pos;
     p.interior.item_kind = item_kind;
 
-    const extent: f32 = if (content_world) |cw| cw.extent() else 1.0;
     const interior_level = hex.layoutLevelFor(n);
     p.interior.nest = interior.nest(
         extent,
@@ -2408,7 +2363,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         hex.layoutLevelFor(@max(p.nodes.len, 1)),
         interior.default_footprint,
     );
-    p.interior.slot = world_mod.leaf_pitch * p.interior.nest.scale;
+    p.interior.slot = interior_ring_gap * p.interior.nest.scale;
     p.interior.radius = extent * p.interior.nest.scale;
     p.interior.parent = p.nodes[idx].home;
 
@@ -2444,7 +2399,8 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
             .pos = p.interior.parent,
             .target_radius = radiusFor(it.weight, false, false),
             .radius = radiusFor(it.weight, false, false),
-            .alpha = 0,
+            // No coalescing in this layout — every item is always drawn as itself.
+            .alpha = 1,
         };
     }
 
@@ -2453,14 +2409,14 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
 
     p.interior.nodes = nodes;
     p.interior.edges = graph_edges;
-    p.interior.at_level0 = try arena.alloc(bool, n);
-    @memset(p.interior.at_level0, false);
     p.interior.built_id = id;
     p.interior.built_gen = gen;
     p.interior.built_aspect = p.layout_aspect;
 }
 
-/// Advance the interior's own content cloud for this frame, mirroring `stepWorld` one level down.
+/// Refresh the interior's world positions for this frame from `p.interior.local_pos`, mirroring
+/// `stepWorld` one level down but with no LOD to decide — every item is drawn as itself, always
+/// (see `buildInteriorWorld`'s doc comment for why there is no coalescing budget here to run).
 ///
 /// The sun (item 0) is repositioned directly from the parent note's *current* position every
 /// frame — not carried forward with a delta the way `followParent` carries the old orbit system —
@@ -2479,46 +2435,17 @@ fn stepInteriorWorld(p: *Panel) void {
 
     p.interior_visible.clearRetainingCapacity();
     p.interior_visible.append(sdk.allocator(), .{ .level = 0, .index = 0, .alpha = 1 }) catch {};
-    if (p.interior.at_level0.len == p.interior.nodes.len) {
-        @memset(p.interior.at_level0, false);
-        p.interior.at_level0[0] = true;
-    }
-    for (p.interior.nodes[1..]) |*n| n.alpha = 0;
 
-    const w = if (p.interior.content_world) |*cw| cw else return;
-    // Local (content-cloud) frame: `interior.toWorld` maps local -> vault-world as
-    // `parent + local * nest.scale`, so its inverse is what this view has to describe.
-    const scale = @max(p.interior.nest.scale, 1e-6);
-    const view: world_mod.View = .{
-        .w = p.camera.viewport.w,
-        .h = p.camera.viewport.h,
-        .zoom = p.camera.zoom * scale,
-        .cx = (p.camera.center.x - p.interior.parent.x) / scale,
-        .cy = (p.camera.center.y - p.interior.parent.y) / scale,
-    };
-    // Smaller budgets than the vault's — a note's own content is never vault-sized, and the
-    // interior only ever occupies part of the panel. Tune later against real usage.
-    const params: world_mod.Params = .{
-        .budget = 140,
-        .split_px = 22,
-        .note_r_px = 7,
-        .mass_cap_px = 34,
-        .link_budget = 300,
-    };
-    w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
-
-    for (w.marks.items) |mk| {
-        if (!mk.is_note) continue;
-        const i = mk.note + 1;
+    for (p.interior.local_pos, 0..) |local, i| {
+        if (i == 0) continue;
         if (i >= p.interior.nodes.len) continue;
         const n = &p.interior.nodes[i];
-        const world = interior.toWorld(.{ .x = mk.wx, .y = mk.wy }, p.interior.nest, p.interior.parent);
+        const world = interior.toWorld(local, p.interior.nest, p.interior.parent);
         n.home = world;
         n.target = world;
         n.pos = world;
-        n.alpha = mk.alpha;
-        if (p.interior.at_level0.len == p.interior.nodes.len) p.interior.at_level0[i] = true;
-        p.interior_visible.append(sdk.allocator(), .{ .level = 0, .index = i, .alpha = mk.alpha }) catch {};
+        n.alpha = 1;
+        p.interior_visible.append(sdk.allocator(), .{ .level = 0, .index = @intCast(i), .alpha = 1 }) catch {};
     }
 }
 
@@ -3559,82 +3486,43 @@ fn stepWorld(p: *Panel) void {
 /// Local (content-cloud) -> vault-world, closing over the panel's current `nest`/`parent` — the
 /// interior's counterpart to `identityToWorld`. The overview's `World` is already in vault-world
 /// space; the interior's is nested one level down, so this is where that nesting actually happens.
-fn interiorMarkToWorld(ctx: *anyopaque, local: dvui.Point) dvui.Point {
-    const p: *Panel = @ptrCast(@alignCast(ctx));
-    return interior.toWorld(local, p.interior.nest, p.interior.parent);
-}
-
-/// Sizes and colors a content mark the same way `overviewMarkStyle` does a note, with one more
-/// factor: `contentKindRadiusMul` layers the sun/heading/body/tag size language on top of
-/// `bubbleScreenRadius`'s base sizing, so the hierarchy still reads without labels.
-fn interiorMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark, holds_open: bool) world_draw.MarkStyle {
-    const p: *Panel = @ptrCast(@alignCast(ctx));
-    _ = w;
+/// The open document as a dashed sun with its content field around it — every item drawn
+/// directly, always, since this layout has no coalescing budget to decide who's a mass this frame
+/// (see `buildInteriorWorld`'s doc comment). Not through `world_draw.draw`: there is no `World`
+/// here, just a fixed array of positions, so a plain loop building one `StyledMark` buffer is the
+/// whole draw pass — the sun and every content item go in it together, in one
+/// `galaxy.drawStyledMarks` call, rather than the sun-then-content split the fold/containment
+/// version needed to keep the root out of its packing.
+fn drawInteriorMarks(p: *Panel, fade: f32) void {
+    if (fade <= 0.004 or p.interior.nodes.len == 0) return;
+    const dens = p.ensureDensity() orelse return;
+    const arena = dvui.currentWindow().arena();
     const theme = dvui.themeGet();
     const border_rest = theme.color(.window, .text);
     const hot = theme.color(.highlight, .fill);
     const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
     const gap_px = p.interior.slot * p.camera.zoom;
-    // `m.note` is only valid when `m.is_note` — for a mass mark it's an arbitrary/sentinel value,
-    // and `+ 1` on that (content_world excludes the root; see `buildInteriorWorld`) is exactly
-    // what overflowed here before the `is_note` check guarded it.
-    if (m.is_note) {
-        const i = m.note + 1;
-        if (i < p.interior.nodes.len) {
-            const kind_mul = if (i < p.interior.item_kind.len) contentKindRadiusMul(p.interior.item_kind[i]) else 1.0;
-            return .{
-                .fill = nodeFill(theme, p.interior.nodes[i]),
-                .border = if (holds_open) hot else border_rest,
-                .r_px = bubbleScreenRadius(p.interior.nodes[i], zoom_t, gap_px) * kind_mul,
-                .is_note = true,
-            };
-        }
+
+    const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
+    for (p.interior.nodes, 0..) |node, i| {
+        const kind_mul = if (i > 0 and i < p.interior.item_kind.len)
+            contentKindRadiusMul(p.interior.item_kind[i])
+        else
+            1.0;
+        buf[i] = .{
+            .screen = p.camera.worldToScreen(node.pos),
+            .r_px = bubbleScreenRadius(node, zoom_t, gap_px) * kind_mul,
+            .fill = nodeFill(theme, node),
+            // The sun is the note you are inside — dashed, so leaving reads differently from
+            // stepping between content items.
+            .border = if (node.is_sun) hot else border_rest,
+            .is_note = !node.is_sun,
+            .dying = false,
+        };
     }
-    return .{ .fill = border_rest, .border = border_rest, .r_px = m.r, .is_note = false };
-}
-
-/// No open/close concept for content items yet — every mark's border rests at `border_rest`.
-fn interiorHoldsOpen(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark) bool {
-    _ = ctx;
-    _ = w;
-    _ = m;
-    return false;
-}
-
-/// The open document as a dashed sun with its content cloud around it, in the same mark language
-/// the overview uses. No links are drawn inside a note: the content items *are* the document's
-/// structure, so they cluster and pack the way unlinked notes do rather than being wired to it.
-fn drawInteriorMarks(p: *Panel, fade: f32) void {
-    if (fade <= 0.004 or p.interior.nodes.len == 0) return;
-    const dens = p.ensureDensity() orelse return;
-
-    // The sun (item 0) is pinned outside `content_world` entirely (see `buildInteriorWorld`), so
-    // it is drawn as its own single mark rather than through `world_draw.draw`'s mark buffer —
-    // the one deliberate exception to "one draw path", justified by there only ever being one.
-    const theme = dvui.themeGet();
-    const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
-    const gap_px = p.interior.slot * p.camera.zoom;
-    const sun = p.interior.nodes[0];
-    const sun_mark = [1]galaxy.StyledMark{.{
-        .screen = p.camera.worldToScreen(sun.pos),
-        .r_px = bubbleScreenRadius(sun, zoom_t, gap_px),
-        .fill = nodeFill(theme, sun),
-        .border = theme.color(.highlight, .fill),
-        .is_note = false,
-        .dying = false,
-    }};
-    _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, &sun_mark);
-    frame_profile.nodes_drawn += 1;
-
-    if (p.interior.content_world) |*w| {
-        const stats = world_draw.draw(w, &p.camera, dens, fade, 0, .{
-            .ctx = p,
-            .toWorld = interiorMarkToWorld,
-            .style = interiorMarkStyle,
-            .holdsOpen = interiorHoldsOpen,
-        });
-        frame_profile.nodes_drawn += stats.notes_drawn;
-        frame_profile.clusters_drawn += stats.clusters_drawn;
+    _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf);
+    for (buf) |b| {
+        if (b.is_note) frame_profile.nodes_drawn += 1 else frame_profile.clusters_drawn += 1;
     }
 }
 
@@ -5113,11 +5001,11 @@ fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Poi
     const zoom_t = @max(detailRevealT(slot, p.camera.zoom), @as(f32, 1));
     // Only what is actually on screen as itself. A note merged into a marker is not clickable —
     // and walking the selection instead of the whole vault is also what keeps this off the
-    // per-frame O(n) list, since the selection is bounded by the viewport.
+    // per-frame O(n) list, since the selection is bounded by the viewport. The interior has no
+    // such gating: every content item is always drawn as itself (see `buildInteriorWorld`), so
+    // `nodes.ptr == p.interior.nodes.ptr` never needs an equivalent to `p.at_level0`.
     const drawn = if (nodes.ptr == p.nodes.ptr and p.at_level0.len == nodes.len)
         p.at_level0
-    else if (nodes.ptr == p.interior.nodes.ptr and p.interior.at_level0.len == nodes.len)
-        p.interior.at_level0
     else
         null;
     for (nodes, 0..) |n, i| {

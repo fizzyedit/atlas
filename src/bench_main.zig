@@ -185,10 +185,12 @@ fn worldSweep(gpa: std.mem.Allocator, n: usize, edges: []const fold.Edge, paths:
 /// reproduces the gauntlet's `giant-2.md` shape (one root, 800 flat headings, one paragraph each)
 /// that motivated this whole redesign. Confirms containment's exhaustive slot search stays cheap
 /// at the interior's smaller budget too, not just the vault's — asserted but unmeasured until now.
-fn docOrderPath(arena: std.mem.Allocator, i: usize) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{d:0>7}", .{i});
-}
-
+/// Mirrors `graph.zig`'s `buildInteriorWorld` radial placement directly (no fold/containment/world
+/// involved any more — see that function's doc comment for why the tree-packing version was
+/// dropped) against `flatHeadingsExtreme()`, the exact shape that motivated the rewrite. Every
+/// item is always drawn in this layout, so there's no LOD/budget left to sweep; what's worth
+/// checking here is just that the radial math stays well-behaved (finite, monotonic in depth,
+/// item count matches) at the scale that broke the old tree-packing version.
 fn interiorSweep(gpa: std.mem.Allocator) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -197,54 +199,35 @@ fn interiorSweep(gpa: std.mem.Allocator) !void {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     const cg = try vault_synth.synthContentGraph(arena, prng.random(), vault_synth.DocSpec.flatHeadingsExtreme());
     const n = cg.items.len;
-    const m = n - 1; // everything but the root — see `buildInteriorWorld`'s doc comment
+    const m = n - 1; // everything but the root
 
-    var edge_list: std.ArrayList(fold.Edge) = .empty;
+    var parent_level = try arena.alloc(i32, n);
+    @memset(parent_level, -1);
     for (cg.edges) |e| {
-        if (e.a == 0 or e.b == 0) continue;
-        const w: f32 = if (e.kind == .link) 1.4 else 1.0;
-        try edge_list.append(arena, .{ .a = e.a - 1, .b = e.b - 1, .w = w });
+        if (e.kind != .outline) continue;
+        if (e.b < n) parent_level[e.b] = @intCast(cg.items[e.a].level);
     }
-    const paths = try arena.alloc([]const u8, m);
-    for (0..m) |i| paths[i] = try docOrderPath(arena, i);
-
-    var w = try world_mod.World.init(gpa, m, edge_list.items, paths, .{
-        .arity = .seven,
-        .folder_w = 0.2,
-    }, .{ .note_r = 1.0, .pack_gap = 1.8 }); // mirrors buildInteriorWorld's place_opts
-    defer w.deinit();
-
-    const budget: usize = 140;
-    const params: world_mod.Params = .{
-        .budget = budget,
-        .split_px = 22,
-        .note_r_px = 7,
-        .mass_cap_px = 34,
-        .link_budget = 300,
-    };
-    const vw: f32 = 1200;
-    const vh: f32 = 700;
-    const ext = w.extent();
-    const z_fit = @min(vw, vh) * 0.44 / ext;
-
-    std.debug.print("\n==== interior: flatHeadingsExtreme ====\n", .{});
-    std.debug.print("  items={d} (root + {d} content)  edges={d}  ladder depth={d}  cells={d}  root r={d:.1}\n", .{
-        n, m, edge_list.items.len, w.lad.depth, w.lad.cells.len, ext,
-    });
-    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>6}\n", .{ "zoom", "marks", "notes", "masses", "bound" });
-
-    var zoom = z_fit;
-    var stepn: usize = 0;
-    while (stepn < 14) : (stepn += 1) {
-        for (0..120) |_| try w.step(.{ .w = vw, .h = vh, .zoom = zoom, .cx = 0, .cy = 0 }, params, 1.0 / 60.0);
-        const notes = w.noteMarks();
-        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {s:>6}\n", .{
-            zoom, w.marks.items.len, notes, w.marks.items.len - notes,
-            if (w.bound) "Y" else "",
-        });
-        if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});
-        zoom *= 2.0;
+    const ring_gap: f32 = 1.6;
+    const content_offset: f32 = 0.6;
+    var min_r: f32 = std.math.floatMax(f32);
+    var max_r: f32 = 0;
+    var by_depth: [8]u32 = @splat(0);
+    for (1..n) |i| {
+        const depth: f32 = if (cg.items[i].kind == .heading)
+            @floatFromInt(cg.items[i].level)
+        else
+            @as(f32, @floatFromInt(if (parent_level[i] >= 0) parent_level[i] else 0)) + content_offset;
+        const r = 1.0 + depth * ring_gap;
+        min_r = @min(min_r, r);
+        max_r = @max(max_r, r);
+        const band: usize = @min(@as(usize, @intFromFloat(depth)), by_depth.len - 1);
+        by_depth[band] += 1;
     }
+
+    std.debug.print("\n==== interior: flatHeadingsExtreme (radial) ====\n", .{});
+    std.debug.print("  items={d} (root + {d} content)  radius range=[{d:.2}, {d:.2}]\n", .{ n, m, min_r, max_r });
+    std.debug.print("  items per depth band: {any}\n", .{by_depth});
+    if (min_r <= 0 or !std.math.isFinite(max_r)) std.debug.print("  !! non-finite or non-positive radius\n", .{});
 }
 
 fn worldSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void {
