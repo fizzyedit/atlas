@@ -932,6 +932,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     // Still before updateBubbles/updateHover/updateLabels, all of which read what this publishes.
     stepWorld(p);
     stepInteriorWorld(p);
+    applyInteriorFramingIfNeeded(p);
     _ = profLap(&prof);
     updateBubbles(p);
     frame_profile.bubbles_ns = profLap(&prof);
@@ -2225,17 +2226,10 @@ fn updateInterior(p: *Panel, st: anytype) void {
         };
     }
 
-    // Keep retargeting until the descent has actually arrived. Gating on layout/chase alone
-    // left revisit-clicks as no-ops whenever the overview was already settled — framing flipped
-    // to `.interior` but nothing ever called `fitInteriorSun`.
-    if (p.framing == .interior and
-        (!p.layout_settled or p.camera.chasing() or p.interior.t < 0.98))
-    {
-        applyFraming(p);
-    }
-
-    // `followParent` is what carries the cloud when its note eases somewhere new; assigning
-    // `parent` here too would hide the delta from it and strand the interior behind.
+    // The actual `fitInteriorSun` call is deferred to `applyInteriorFramingIfNeeded`, run later in
+    // the frame after `stepWorld`/`stepInteriorWorld` have refreshed `p.nodes[idx].home` and
+    // `p.interior.parent` for *this* frame — see that function's doc comment for why calling it
+    // from here, before those run, pinned the camera to a one-frame-stale sun position.
     p.interior.t_prev = p.interior.t;
     p.interior.t = t;
 }
@@ -2835,6 +2829,24 @@ fn maybeFitCamera(p: *Panel) void {
 /// derived *from* has moved underneath it: the panel resized, or the index rebuilt and the
 /// layout re-solved. Idempotent — re-running it against unchanged inputs retargets to where the
 /// camera already is, and `chase` then does nothing.
+/// Re-run `applyFraming` for an in-progress descent, once this frame's positions are current.
+///
+/// Must run *after* `stepWorld`/`stepInteriorWorld`, not from inside `updateInterior` (which runs
+/// before both). `fitInteriorSun` pins the camera to `p.interior.nodes[0].target`, which is only
+/// fresh once `stepInteriorWorld` has copied this frame's `p.nodes[idx].home` into it; calling it
+/// from `updateInterior` instead pins the camera to *last* frame's sun position. Harmless while
+/// the parent note is sitting still, but a visible one-frame lag while it's still easing — and if
+/// framing happens to stop being re-applied (settled, `t` past its threshold) on exactly such a
+/// frame, that lag freezes in as a small permanent-looking offset between the sun and the node the
+/// reader actually clicked.
+fn applyInteriorFramingIfNeeded(p: *Panel) void {
+    if (p.framing == .interior and
+        (!p.layout_settled or p.camera.chasing() or p.interior.t < 0.98))
+    {
+        applyFraming(p);
+    }
+}
+
 fn applyFraming(p: *Panel) void {
     switch (p.framing) {
         .free => {},
