@@ -3546,7 +3546,17 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     const links = arena.alloc(fold.Edge, p.edges.len) catch return null;
     for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
     const paths = arena.alloc([]const u8, p.nodes.len) catch return null;
-    for (p.nodes, 0..) |n, i| paths[i] = n.path;
+    var any_path = false;
+    for (p.nodes, 0..) |n, i| {
+        paths[i] = n.path;
+        if (n.path.len > 0) any_path = true;
+    }
+    // `fold.build` only runs its folder chain when `paths.len == n_notes`, so a full-length array
+    // of *empty* paths is worse than no array at all: every path compares equal, the sort leaves
+    // arbitrary index order, and the chain wires unrelated notes together at `folder_w`. Hand it
+    // an empty slice instead so it skips the chain and coarsens on real links alone — which is
+    // exactly what `bench_main`'s `--world` sweep already does for a pathless graph.
+    const path_arg: []const []const u8 = if (any_path) paths else &.{};
 
     // World scale has to match the classic layout's, because everything downstream of the panel
     // — camera fit, zoom thresholds, `interiorWant`, label placement — is calibrated in those
@@ -3556,7 +3566,7 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     // between two classic notes: marks drew as a speck at the centre, every LOD transition
     // happened inside a sliver of the zoom range, and the interior triggered almost immediately.
     const slot = if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(@max(p.nodes.len, 1));
-    var built = world_mod.World.init(gpa, p.nodes.len, links, paths, .{}, .{
+    var built = world_mod.World.init(gpa, p.nodes.len, links, path_arg, .{}, .{
         .note_r = slot / world_mod.leaf_pitch,
     }) catch return null;
     if (p.world_state) |*old| old.deinit();

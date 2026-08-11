@@ -149,10 +149,23 @@ fn regenWorker(job: *RegenJob) void {
         return;
     };
     const label_titles = n <= 5_000;
+    // Carry the generated folder paths through, rather than publishing every node with an empty
+    // one. `fold.build` uses paths for its folder chain — the weak structural tiebreak that gives
+    // coarsening something to group on where real links don't decide it — and `vault_synth`
+    // already models a plausible folder tree per component. Publishing all-empty paths didn't
+    // merely lose that signal, it actively corrupted it: `paths.len == n_notes` still holds, so
+    // `addPathChain` runs, and with every path comparing equal the sort leaves arbitrary index
+    // order and the chain wires unrelated notes together at weight 0.25. That is why the
+    // simulator's coalescing looked flat and barely responsive to note count while the `--world`
+    // bench (which passes an *empty slice*, skipping the chain entirely) looked correct.
+    const have_paths = g.paths.len == n;
     for (nodes, 0..) |*node, i| {
         node.* = .{
             .id = @intCast(i + 1),
-            .path = "",
+            .path = if (have_paths)
+                node_arena.allocator().dupe(u8, g.paths[i]) catch ""
+            else
+                "",
             .title = if (label_titles)
                 std.fmt.allocPrint(node_arena.allocator(), "n{d}", .{i}) catch ""
             else

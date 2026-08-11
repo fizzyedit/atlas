@@ -882,3 +882,38 @@ test "chain of 1000 coarsens to log depth, not 1000" {
     const ideal = std.math.log(f64, 7.0, @as(f64, @floatFromInt(n)));
     try testing.expect(@as(f64, @floatFromInt(lad.depth)) <= ideal * 2.5 + 1);
 }
+
+test "all-empty paths do not fabricate a folder chain across unrelated notes" {
+    // A caller with no real paths (the vault simulator, before it carried `vault_synth`'s
+    // generated ones through) can still hand over a full-length array of empty strings. That
+    // satisfies `paths.len == n_notes`, so `addPathChain` runs — and with every path comparing
+    // equal, the sort leaves arbitrary index order and the chain wires unrelated notes together.
+    // Two disjoint islands must stay disjoint either way: callers pass `&.{}` when they have
+    // nothing real (see `graph.zig`'s `ensureWorld`), and components are computed before the
+    // chain is added, so the constraint has to hold even if the degenerate array gets through.
+    const gpa = testing.allocator;
+    const n: u32 = 40;
+    var edges: std.ArrayListUnmanaged(Edge) = .empty;
+    defer edges.deinit(gpa);
+    // Two cliques-ish chains, 0..19 and 20..39, with nothing between them.
+    for (0..19) |i| try edges.append(gpa, .{ .a = @intCast(i), .b = @intCast(i + 1) });
+    for (20..39) |i| try edges.append(gpa, .{ .a = @intCast(i), .b = @intCast(i + 1) });
+
+    const empty_paths = try gpa.alloc([]const u8, n);
+    defer gpa.free(empty_paths);
+    @memset(empty_paths, "");
+
+    var lad = try build(gpa, n, edges.items, empty_paths, .{ .arity = .seven });
+    defer lad.deinit(gpa);
+
+    try testing.expectEqual(n, totalCount(lad));
+    // No cell may mix the two components — the same guarantee "islands never share a cell" makes,
+    // re-checked against the degenerate-path input specifically.
+    for (lad.cells) |c| {
+        if (c.ls >= c.le) continue;
+        const first_side = lad.note_at[c.ls] < 20;
+        for (c.ls..c.le) |s| {
+            try testing.expectEqual(first_side, lad.note_at[s] < 20);
+        }
+    }
+}

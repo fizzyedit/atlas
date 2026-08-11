@@ -1187,3 +1187,48 @@ test "editing an unrelated note leaves an existing edge alone" {
     try v.write("CLAUDE.md", "# Claude\n\nmore words\n");
     try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
 }
+
+// The vault simulator's data path, minus the UI: republish at a different size and confirm the
+// next `snapshotCopy` actually reports the new size. Regression test for "changing the note count
+// slider does nothing" — this is the half of that path that can be checked headlessly, so a
+// future failure lands here instead of only as an on-screen symptom.
+test "publishSynthetic replaces the previous snapshot wholesale" {
+    const gpa = testing.allocator;
+    var busy = std.atomic.Value(bool).init(false);
+    var gen = std.atomic.Value(u64).init(0);
+    var ix = Indexer.init(gpa, &busy, &gen);
+    defer ix.deinit();
+
+    const sizes = [_]usize{ 100, 20_000, 100 };
+    for (sizes) |n| {
+        const before = gen.load(.acquire);
+
+        const nodes = try gpa.alloc(SnapNode, n);
+        defer gpa.free(nodes);
+        for (nodes, 0..) |*node, i| {
+            node.* = .{
+                .id = @intCast(i + 1),
+                .path = "",
+                .title = "",
+                .phantom = false,
+                .degree = 2,
+            };
+        }
+        // One chain edge per node pair, mirroring what a generated vault hands over.
+        const edges = try gpa.alloc(SnapEdge, n - 1);
+        defer gpa.free(edges);
+        for (edges, 0..) |*e, i| e.* = .{ .src_id = @intCast(i + 1), .dst_id = @intCast(i + 2) };
+
+        try ix.publishSynthetic(nodes, edges);
+
+        // Generation must move, or nothing downstream ever asks for a rebuild.
+        try testing.expect(gen.load(.acquire) > before);
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const snap = try ix.snapshotCopy(arena.allocator());
+        try testing.expectEqual(n, snap.nodes.len);
+        try testing.expectEqual(n, snap.note_count);
+        try testing.expectEqual(n - 1, snap.edges.len);
+    }
+}
