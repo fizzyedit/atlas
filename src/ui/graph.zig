@@ -905,7 +905,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     p.camera.viewport = vp;
 
     if (!st.hasGraphSource()) {
-        drawCenteredHint("Open a folder — or Atlas: Load Synth Graph — to see the note graph.");
+        drawCenteredHint("Open a folder to see the note graph.");
         return;
     }
 

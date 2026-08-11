@@ -185,10 +185,18 @@ pub const Sim = struct {
     win_rect: dvui.Rect = .{ .x = 80, .y = 80, .w = 900, .h = 600 },
     shape_idx: usize = 1, // .islands, matching SimSpec's default
 
+    /// Deliberately doesn't call `self.state.init(gpa)` — `Indexer.init` stores pointers to its
+    /// owner's `busy`/`generation` fields, and `Sim.init` returns by value into `ensureSim`'s
+    /// module-level `sim`, one more move after this function would return. Pointers captured
+    /// against a temporary that then gets copied elsewhere go stale the moment the copy happens:
+    /// `generation`/`busy` would keep reading/writing the original stack slot, which is exactly
+    /// why the graph never appeared — `Indexer.publishSynthetic`'s `generation.fetchAdd` landed on
+    /// dead stack memory, so `hasGraphSource`'s read of the *real* `generation` field (on the
+    /// stable copy) never saw it move. `ensureSim` calls `state.init` itself, once `sim` is at its
+    /// final address — the same reason `State.init` takes `self: *State` and is only ever called
+    /// on the already-placed `plugin_state` global, never inside a by-value constructor.
     pub fn init(gpa: std.mem.Allocator) Sim {
-        var self: Sim = .{ .gpa = gpa, .panel = graph.Panel.init(gpa) };
-        self.state.init(gpa);
-        return self;
+        return .{ .gpa = gpa, .panel = graph.Panel.init(gpa) };
     }
 
     pub fn deinit(self: *Sim) void {
@@ -333,7 +341,11 @@ pub const Sim = struct {
 var sim: ?Sim = null;
 
 fn ensureSim(gpa: std.mem.Allocator) *Sim {
-    if (sim == null) sim = Sim.init(gpa);
+    if (sim == null) {
+        sim = Sim.init(gpa);
+        // Now that `sim` is at its final, stable address: see the comment on `Sim.init`.
+        sim.?.state.init(gpa);
+    }
     return &sim.?;
 }
 
