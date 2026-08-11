@@ -85,10 +85,13 @@ fn contentKindRadiusMul(kind: content_graph.ItemKind) f32 {
     };
 }
 const open_screen_r: f32 = 12;
-/// Interior document sun — larger at rest so it reads as the hub, and grows harder on approach.
-const sun_screen_r: f32 = 14;
 /// Hard cap — high enough that full hover (~2×) isn't flattened by the clamp.
 const max_node_screen_r: f32 = 48;
+/// Interior document sun, at rest: pinned to the largest an overview node ever renders (its own
+/// hover cap), not a smaller resting size that grows on approach. The sun *is* the node you just
+/// clicked — however large it looked at the moment of the click, it should read as exactly that
+/// large the instant the descent begins, not snap down to some other resting size and grow back.
+const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
@@ -2255,6 +2258,45 @@ fn docOrderPath(arena: std.mem.Allocator, i: usize) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d:0>7}", .{i});
 }
 
+/// Re-place a freshly-built content world's root islands in document order, evenly spaced
+/// clockwise around the shared origin — instead of `containment.placeRoots`'s golden-angle spiral
+/// (biggest-first, irrational angle step). The spiral is the right choice for a vault that may
+/// hold thousands of islands, where even distribution matters more than any particular order; it
+/// is the wrong one for an interior cloud small enough that a reader is meant to trace it start to
+/// finish, where "next in the document" should also mean "next around the circle." Keeps
+/// `placeRoots`'s own area-accumulation formula for radius so overall spread stays comparable —
+/// only the angular assignment changes.
+fn placeInteriorIslandsClockwise(w: *world_mod.World) void {
+    const lad = &w.lad;
+    if (lad.roots.len <= 1) return; // nothing to order
+
+    const arena = dvui.currentWindow().arena();
+    const order = arena.alloc(u32, lad.roots.len) catch return;
+    @memcpy(order, lad.roots);
+    const Ctx = struct {
+        lad: *const fold.Ladder,
+        // A root's place in the document is its first leaf in dfs order — the same "first leaf
+        // under this cell" idiom `fold.zig`'s own folder-correlation code already uses.
+        fn firstLeaf(self: @This(), r: u32) u32 {
+            const c = self.lad.cells[r];
+            return if (c.ls < c.le) self.lad.note_at[c.ls] else std.math.maxInt(u32);
+        }
+        pub fn lessThan(self: @This(), a: u32, b: u32) bool {
+            return self.firstLeaf(a) < self.firstLeaf(b);
+        }
+    };
+    std.mem.sort(u32, order, Ctx{ .lad = lad }, Ctx.lessThan);
+
+    var acc: f32 = 0;
+    for (order, 0..) |r, i| {
+        const rad = @sqrt(acc);
+        const rr = w.field.radius(lad, r);
+        acc += rr * rr * w.field.opts.pack_gap;
+        const a = (@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(order.len))) * std.math.tau;
+        w.field.pos[r] = .{ .x = @cos(a) * rad * w.field.opts.pack_aspect, .y = @sin(a) * rad };
+    }
+}
+
 fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (st.db == null) return error.NoDb;
     const db = &st.db.?;
@@ -2264,16 +2306,65 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     const idx = p.id_index.get(id) orelse return error.NoNode;
     const cg = try query.noteContentGraph(db, arena, id, p.nodes[idx].title);
     if (cg.items.len == 0) return error.Empty;
-    const n = cg.items.len;
+
+    // Absorb a lone top-level heading into the sun. A document whose only top-level content is
+    // one heading — the mechanical "# Title" pattern, where that heading's text just repeats the
+    // note's own title — would otherwise draw two nodes carrying the same label sitting almost on
+    // top of each other: the sun, and that heading. When root has exactly one outline-child and
+    // it is a heading, treat it as the document's own entry point instead of a second node: borrow
+    // its line for the sun's "reveal position" and drop it from the content graph. Its own children
+    // keep their items but lose their one edge to it, which is no special case — an item with no
+    // surviving edge already becomes its own top-level island, same as any other unlinked heading.
+    var sun_line: u32 = 0;
+    var skip: ?u32 = null;
+    {
+        var root_child: ?u32 = null;
+        var root_children: u32 = 0;
+        for (cg.edges) |e| {
+            if (e.a != 0) continue;
+            root_children += 1;
+            root_child = e.b;
+        }
+        if (root_children == 1) if (root_child) |rc| {
+            if (rc < cg.items.len and cg.items[rc].kind == .heading) {
+                skip = rc;
+                sun_line = cg.items[rc].line;
+            }
+        };
+    }
+
+    const remap = try arena.alloc(i32, cg.items.len);
+    var out_n: usize = 0;
+    for (0..cg.items.len) |i| {
+        if (skip != null and i == skip.?) {
+            remap[i] = -1;
+        } else {
+            remap[i] = @intCast(out_n);
+            out_n += 1;
+        }
+    }
+    const items = try arena.alloc(content_graph.Item, out_n);
+    for (0..cg.items.len) |i| {
+        if (remap[i] >= 0) items[@intCast(remap[i])] = cg.items[i];
+    }
+    var edges_list: std.ArrayList(content_graph.ItemEdge) = .empty;
+    for (cg.edges) |e| {
+        if (e.a >= remap.len or e.b >= remap.len) continue;
+        if (remap[e.a] < 0 or remap[e.b] < 0) continue;
+        try edges_list.append(arena, .{ .a = @intCast(remap[e.a]), .b = @intCast(remap[e.b]), .kind = e.kind });
+    }
+    const edges = edges_list.items;
+
+    const n = items.len;
     const m = n - 1; // everything but the root
 
     const item_kind = try arena.alloc(content_graph.ItemKind, n);
-    for (cg.items, 0..) |it, i| item_kind[i] = it.kind;
+    for (items, 0..) |it, i| item_kind[i] = it.kind;
 
     var content_world: ?world_mod.World = null;
     if (m > 0) {
         var edge_list: std.ArrayList(fold.Edge) = .empty;
-        for (cg.edges) |e| {
+        for (edges) |e| {
             if (e.a == 0 or e.b == 0) continue; // root edges dropped — see doc comment above
             const w: f32 = if (e.kind == .link) 1.4 else 1.0;
             try edge_list.append(arena, .{ .a = e.a - 1, .b = e.b - 1, .w = w });
@@ -2299,7 +2390,17 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         content_world = try world_mod.World.init(sdk.allocator(), m, edge_list.items, paths, .{
             .arity = .seven,
             .folder_w = 0.2,
-        }, .{ .note_r = 1.0 });
+        }, .{
+            .note_r = 1.0,
+            // `containment.placeRoots`'s default `pack_gap` (5.2) is calibrated for a vault that
+            // may hold thousands of islands, where even area-proportional spacing matters more
+            // than the golden-angle spiral's placement order. An interior cloud rarely holds more
+            // than a handful of top-level islands, and the full 5.2 spread them out disproportion-
+            // ately — the whole cloud measured larger than the content actually needs, forcing the
+            // fit-camera further out and making the fixed-screen-size sun look small at descent.
+            .pack_gap = 1.8,
+        });
+        if (content_world) |*cw| placeInteriorIslandsClockwise(cw);
     }
     if (p.interior.content_world) |*old| old.deinit();
     p.interior.content_world = content_world;
@@ -2319,11 +2420,11 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
 
     const nodes = try arena.alloc(GraphNode, n);
     nodes[0] = .{
-        .note_id = cg.items[0].id,
-        .line = 0,
+        .note_id = items[0].id,
+        .line = sun_line,
         .is_sun = true,
         .path = p.nodes[idx].path,
-        .title = cg.items[0].text,
+        .title = items[0].text,
         .phantom = false,
         .degree = 64,
         .target = p.interior.parent,
@@ -2333,7 +2434,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         .radius = radiusFor(64, false, false),
         .alpha = 1,
     };
-    for (cg.items[1..], 1..) |it, i| {
+    for (items[1..], 1..) |it, i| {
         nodes[i] = .{
             .note_id = it.id,
             // Line for `revealPosition` on click — every content kind has one now, not just
@@ -2353,8 +2454,8 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         };
     }
 
-    const graph_edges = try arena.alloc(GraphEdge, cg.edges.len);
-    for (cg.edges, 0..) |e, i| graph_edges[i] = .{ .a = e.a, .b = e.b };
+    const graph_edges = try arena.alloc(GraphEdge, edges.len);
+    for (edges, 0..) |e, i| graph_edges[i] = .{ .a = e.a, .b = e.b };
 
     p.interior.nodes = nodes;
     p.interior.edges = graph_edges;

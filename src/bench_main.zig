@@ -211,7 +211,7 @@ fn interiorSweep(gpa: std.mem.Allocator) !void {
     var w = try world_mod.World.init(gpa, m, edge_list.items, paths, .{
         .arity = .seven,
         .folder_w = 0.2,
-    }, .{ .note_r = 1.0 });
+    }, .{ .note_r = 1.0, .pack_gap = 1.8 }); // mirrors buildInteriorWorld's place_opts
     defer w.deinit();
 
     const budget: usize = 140;
