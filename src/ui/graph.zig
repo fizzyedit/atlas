@@ -62,6 +62,23 @@ const open_node_r: f32 = 34;
 
 /// On-screen bubble radii — constant across zoom, like pixi's `/ canvas.scale` buttons.
 const base_screen_r: f32 = 9;
+
+/// Interior orbits. A document is drawn as a small solar system: the note itself is the sun, and
+/// its headings orbit at a radius set by nesting depth. Anything deeper than `interior_max_rings`
+/// shares the outermost ring rather than flying off — a document nested six levels deep is rare,
+/// and an orbit nobody can see is worse than a crowded one.
+const interior_max_rings: usize = 5;
+/// World gap between consecutive orbits, in local (pre-nest) units.
+const interior_orbit_gap: f32 = 2.6;
+/// Minimum arc between two bodies on the same orbit. A heading level with fifty entries pushes its
+/// ring outward rather than packing them into an unreadable band.
+const interior_min_arc: f32 = 1.15;
+/// How far the system turns while you descend into it, in turns. The spin is what makes the rings
+/// read as *orbits* rather than as decorative circles — a static ring is just a circle.
+const interior_spin_turns: f32 = 0.35;
+/// How fast an open note's links reach out to their neighbours, in multiples of full length per
+/// second.
+const select_reach_rate: f32 = 2.6;
 const open_screen_r: f32 = 12;
 /// Interior document sun — larger at rest so it reads as the hub, and grows harder on approach.
 const sun_screen_r: f32 = 14;
@@ -378,6 +395,9 @@ const Interior = struct {
     nodes: []GraphNode = &.{},
     edges: []GraphEdge = &.{},
     nest: interior.Nest = .{ .steps = 0, .scale = 1, .level = 0, .clamped = false },
+    /// Local-space orbit radius per interior node (0 for the sun). Drives both the orbit rings
+    /// and the spin, so the drawn circle and the bodies on it can never disagree. Interior arena.
+    orbit_r: []f32 = &.{},
     /// World position of the parent note's own node — the point the cloud is centred on, so the
     /// node and its interior share an origin and the descent has nothing to slide sideways.
     parent: dvui.Point = .{},
@@ -659,6 +679,11 @@ const Panel = struct {
     world_state: ?world_mod.World = null,
     /// `layout_epoch` the world was last built against, so it rebuilds only when the graph does.
     world_epoch: u64 = std.math.maxInt(u64),
+    /// 0→1 after the set of open notes changes, driving the open note's links growing outward.
+    select_anim: f32 = 0,
+    /// Hash of the open set the animation is currently showing, so it restarts on a real change
+    /// rather than every frame.
+    select_key: u64 = 0,
 
     /// `layout_epoch` the agent field was last reset against.
     agents_epoch: u64 = std.math.maxInt(u64),
@@ -2188,6 +2213,13 @@ fn updateInterior(p: *Panel, st: anytype) void {
     p.interior.t = t;
 }
 
+/// Which orbit a heading sits on. Level 0 is the sun; everything deeper than the outermost ring
+/// shares it rather than flying off the end.
+fn interiorRing(level: u32) usize {
+    if (level == 0) return 0;
+    return @min(@as(usize, level), interior_max_rings);
+}
+
 fn buildInterior(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (st.db == null) return error.NoDb;
     const db = &st.db.?;
@@ -2199,26 +2231,48 @@ fn buildInterior(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (snap.nodes.len == 0) return error.Empty;
 
     const n = snap.nodes.len;
-    const seeds = try arena.alloc(?dvui.Point, n);
     const degrees = try arena.alloc(u32, n);
-    const anchored = try arena.alloc(bool, n);
-    for (snap.nodes, 0..) |sn, i| {
-        // Pin the document root at the origin so the force solve and snap build the cloud
-        // *around* the sun. Translating after the fact left the sun at (0,0) in nest space
-        // but still at the edge of its own heading cluster whenever the solve parked it there.
-        seeds[i] = if (i == 0) .{} else null;
-        anchored[i] = i == 0;
-        // Heavy hub weight: claims the centre cell first and keeps sections orbiting it.
-        degrees[i] = sn.degree + sn.links + if (sn.level == 0) @as(u32, 64) else 0;
-    }
-    const edges = try arena.alloc(layout_full.Edge, snap.edges.len);
-    for (snap.edges, 0..) |e, i| edges[i] = .{ .a = e.a, .b = e.b };
+    for (snap.nodes, 0..) |sn, i| degrees[i] = sn.degree + sn.links + if (sn.level == 0) @as(u32, 64) else 0;
 
+    // Orbits, not a force solve. A document's headings are a *hierarchy*, not a web: a heading
+    // belongs to its parent by nesting depth, and nothing is gained by letting a solver rediscover
+    // that from edges. Depth becomes orbit radius, which reads immediately — h1s close in, h3s far
+    // out — and it costs nothing to compute, so a document with hundreds of headings places as
+    // fast as one with three.
     const local = try arena.alloc(dvui.Point, n);
-    try layout_full.targets(arena, n, edges, seeds, degrees, .{
-        .aspect = p.layout_aspect,
-        .anchored = anchored,
-    }, local);
+    const orbit_r = try arena.alloc(f32, n);
+    local[0] = .{};
+    orbit_r[0] = 0;
+
+    // How many sit on each ring, so a crowded ring can be pushed out far enough to hold them.
+    var ring_count = [_]u32{0} ** (interior_max_rings + 1);
+    for (snap.nodes[1..]) |sn| {
+        ring_count[interiorRing(sn.level)] += 1;
+    }
+
+    var ring_radius = [_]f32{0} ** (interior_max_rings + 1);
+    for (1..interior_max_rings + 1) |ring| {
+        const base = interior_orbit_gap * @as(f32, @floatFromInt(ring));
+        // Keep a minimum arc between neighbours: a heading level with fifty entries needs a wider
+        // orbit than one with three, or they overlap into an unreadable band.
+        const cnt: f32 = @floatFromInt(@max(ring_count[ring], 1));
+        const needed = cnt * interior_min_arc / std.math.tau;
+        ring_radius[ring] = @max(base, needed);
+    }
+
+    var placed = [_]u32{0} ** (interior_max_rings + 1);
+    for (snap.nodes[1..], 1..) |sn, i| {
+        const ring = interiorRing(sn.level);
+        const cnt: f32 = @floatFromInt(@max(ring_count[ring], 1));
+        const k: f32 = @floatFromInt(placed[ring]);
+        placed[ring] += 1;
+        // Offset each ring by half a step so bodies never line up radially with the ring inside
+        // them — the thing that makes a set of concentric rings read as spokes instead of orbits.
+        const a = (k / cnt) * std.math.tau + @as(f32, @floatFromInt(ring)) * 0.5 * std.math.tau / cnt;
+        orbit_r[i] = ring_radius[ring];
+        local[i] = .{ .x = @cos(a) * orbit_r[i], .y = @sin(a) * orbit_r[i] };
+    }
+    p.interior.orbit_r = orbit_r;
 
     // The sun is the nest origin: the interior hangs off the parent node's position, so the
     // note becomes the middle of its own cloud — zooming in is literal. Re-centre after snap
@@ -3272,9 +3326,95 @@ fn stepWorld(p: *Panel) void {
     w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
     syncNodesFromWorld(p, w);
 
+    // Restart the reach-out whenever the set of open notes actually changes; otherwise let it run
+    // to rest so a settled selection is not permanently animating.
+    var key: u64 = 1469598103934665603;
+    for (p.nodes, 0..) |node, i| {
+        if (!node.open) continue;
+        key ^= @as(u64, i +% 1);
+        key *%= 1099511628211;
+    }
+    if (key != p.select_key) {
+        p.select_key = key;
+        p.select_anim = 0;
+    } else if (p.select_anim < 1) {
+        p.select_anim = @min(1, p.select_anim + dvui.secondsSinceLastFrame() * select_reach_rate);
+    }
+
     const links = arena.alloc(fold.Edge, p.edges.len) catch return;
     for (p.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
     w.liftLinks(links, params) catch {};
+}
+
+/// Where an interior body sits right now, including the entry spin.
+///
+/// The system turns as you descend and comes to rest once you have arrived. Without it the rings
+/// are just concentric circles; with it, the bodies visibly travel along them, which is what
+/// tells you they are orbits and that depth is the thing separating them.
+fn interiorSpunPos(p: *const Panel, i: usize, rest: dvui.Point) dvui.Point {
+    if (i >= p.interior.orbit_r.len) return rest;
+    const r = p.interior.orbit_r[i];
+    if (r <= 1e-4) return rest; // the sun does not orbit anything
+    // Unwind from `interior_spin_turns` back to zero as the descent completes, eased so the
+    // system slows into place rather than stopping dead.
+    const remaining = 1 - std.math.clamp(p.interior.t, 0, 1);
+    const eased = remaining * remaining;
+    const a = eased * interior_spin_turns * std.math.tau;
+    if (a <= 1e-5) return rest;
+    const c = @cos(a);
+    const s = @sin(a);
+    const local = dvui.Point{ .x = rest.x - p.interior.parent.x, .y = rest.y - p.interior.parent.y };
+    return .{
+        .x = p.interior.parent.x + local.x * c - local.y * s,
+        .y = p.interior.parent.y + local.x * s + local.y * c,
+    };
+}
+
+/// One faint circle per occupied orbit, drawn in the web's ink.
+fn drawOrbitRings(p: *Panel, fade: f32) void {
+    if (p.interior.orbit_r.len == 0) return;
+    const arena = dvui.currentWindow().arena();
+    const theme = dvui.themeGet();
+    var ink = theme.color(.window, .text);
+    ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * 0.16 * fade);
+
+    var batch = galaxy.LineBatch.init(arena);
+    var seen: [interior_max_rings + 2]f32 = .{0} ** (interior_max_rings + 2);
+    var n_seen: usize = 0;
+
+    for (p.interior.orbit_r) |r_local| {
+        if (r_local <= 1e-4) continue;
+        var dup = false;
+        for (seen[0..n_seen]) |sr| {
+            if (@abs(sr - r_local) < 1e-3) dup = true;
+        }
+        if (dup) continue;
+        if (n_seen < seen.len) {
+            seen[n_seen] = r_local;
+            n_seen += 1;
+        }
+
+        const r_world = r_local * p.interior.nest.scale;
+        const r_px = r_world * p.camera.zoom;
+        if (r_px < 3 or r_px > 20_000) continue;
+        // Segment count follows the on-screen circumference: a small orbit does not need 96 sides,
+        // and a large one looks polygonal with 24.
+        const segs: usize = @intFromFloat(std.math.clamp(r_px * 0.35, 24, 96));
+        var prev = p.camera.worldToScreen(.{
+            .x = p.interior.parent.x + r_world,
+            .y = p.interior.parent.y,
+        });
+        for (1..segs + 1) |k| {
+            const a = (@as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(segs))) * std.math.tau;
+            const cur = p.camera.worldToScreen(.{
+                .x = p.interior.parent.x + @cos(a) * r_world,
+                .y = p.interior.parent.y + @sin(a) * r_world,
+            });
+            batch.add(prev, cur, 1.0, ink);
+            prev = cur;
+        }
+    }
+    batch.flush();
 }
 
 /// The open document as a dashed sun with its headings orbiting it, in the same mark language
@@ -3287,13 +3427,17 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
     const border_rest = theme.color(.window, .text);
     const hot = theme.color(.highlight, .fill);
 
+    // The orbits themselves, in the web's own ink — a heading belongs to its orbit the way a note
+    // belongs to a link, so they read as the same kind of relationship.
+    drawOrbitRings(p, fade);
+
     const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
     const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
     const gap_px = p.interior.slot * p.camera.zoom;
     var n: usize = 0;
-    for (p.interior.nodes) |node| {
+    for (p.interior.nodes, 0..) |node, i| {
         buf[n] = .{
-            .screen = p.camera.worldToScreen(node.pos),
+            .screen = p.camera.worldToScreen(interiorSpunPos(p, i, node.pos)),
             .r_px = bubbleScreenRadius(node, zoom_t, gap_px),
             .fill = nodeFill(theme, node),
             // The sun is the note you are inside — dashed, so leaving reads differently from
@@ -3318,18 +3462,49 @@ fn drawWorldMarks(p: *Panel, fade: f32) void {
     const hot = theme.color(.highlight, .fill);
 
     // Links first so the web passes under the marks rather than over them.
-    {
-        if (w.links.items.len > 0) {
-            var batch = galaxy.LineBatch.init(arena);
-            var ink = border_rest;
-            ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * 0.22 * fade);
-            for (w.links.items) |l| {
-                const a = markScreen(p, w, l.a) orelse continue;
-                const b = markScreen(p, w, l.b) orelse continue;
-                batch.add(a, b, 1.0, ink);
-            }
-            batch.flush();
+    if (w.links.items.len > 0) {
+        // One pass over the marks instead of a scan per endpoint: the web is budgeted at 900 and
+        // the marks at a few hundred, so the naive version was ~250k comparisons a frame.
+        var pos = std.AutoHashMapUnmanaged(u32, dvui.Point.Physical){};
+        defer pos.deinit(arena);
+        pos.ensureTotalCapacity(arena, @intCast(w.marks.items.len)) catch {};
+        var holds_open = std.AutoHashMapUnmanaged(u32, void){};
+        defer holds_open.deinit(arena);
+        for (w.marks.items) |m| {
+            pos.put(arena, m.cell, p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy })) catch {};
+            if (worldMarkHoldsOpen(p, w, m)) holds_open.put(arena, m.cell, {}) catch {};
         }
+
+        var batch = galaxy.LineBatch.init(arena);
+        var ink = border_rest;
+        ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * 0.22 * fade);
+        var lit = theme.color(.highlight, .fill);
+        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * 0.95 * fade);
+
+        // An open note's links draw *out from it*, growing to full length. Reaching out is what
+        // makes the connection read as belonging to the note you just opened rather than as more
+        // of the ambient web.
+        const grow = dvui.easing.outCubic(std.math.clamp(p.select_anim, 0, 1));
+
+        for (w.links.items) |l| {
+            const a = pos.get(l.a) orelse continue;
+            const b = pos.get(l.b) orelse continue;
+            const a_open = holds_open.contains(l.a);
+            const b_open = holds_open.contains(l.b);
+            if (!a_open and !b_open) {
+                batch.add(a, b, 1.0, ink);
+                continue;
+            }
+            // grow from whichever end is open
+            const from = if (a_open) a else b;
+            const to = if (a_open) b else a;
+            const tip = dvui.Point.Physical{
+                .x = from.x + (to.x - from.x) * grow,
+                .y = from.y + (to.y - from.y) * grow,
+            };
+            batch.add(from, tip, 1.8, lit);
+        }
+        batch.flush();
     }
 
     const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return;
@@ -4940,6 +5115,7 @@ pub fn wantsRepaint() bool {
         !p.proximity_settled or !p.layout_settled or !p.pointer_settled or !p.edges_settled or
         !p.labels_settled or p.camera.chasing() or p.aspect_waiting or p.rebuild_waiting or
         (if (p.world_state) |*w| !w.settled else false) or
+        p.select_anim < 1 or
         // Keep ticking while a descent is still *arriving*. Gating on `t < 0.98` alone never
         // stops for a note whose interior cannot fill the panel — the zoom ceiling
         // (`fitMaxGapPx`) or a clamped nest can leave the descent topping out below 0.98, and
