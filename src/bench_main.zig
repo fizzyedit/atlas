@@ -35,6 +35,7 @@ var synth_place_explicit: bool = false;
 /// correlation) instead of running layout. Fast even on a huge vault — no force solve, no Galaxy.
 var stats_mode: bool = false;
 var world_mode: bool = false;
+var interior_mode: bool = false;
 
 const Note = struct {
     path: []const u8,
@@ -66,6 +67,12 @@ pub fn main(init: std.process.Init) !void {
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--stats")) stats_mode = true;
         if (std.mem.eql(u8, a, "--world")) world_mode = true;
+        if (std.mem.eql(u8, a, "--interior")) interior_mode = true;
+    }
+
+    if (interior_mode) {
+        try interiorSweep(gpa);
+        return;
     }
 
     if (!stats_mode and !world_mode) {
@@ -164,6 +171,75 @@ fn worldSweep(gpa: std.mem.Allocator, n: usize, edges: []const fold.Edge, paths:
         const notes = w.noteMarks();
         std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6}\n", .{
             zoom, w.marks.items.len, notes, w.marks.items.len - notes, w.links.items.len,
+            if (w.bound) "Y" else "",
+        });
+        if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});
+        zoom *= 2.0;
+    }
+}
+
+/// `--interior`: the interior rewrite's own sweep. Builds a note's content cloud exactly as
+/// `graph.zig`'s `buildInteriorWorld`/`stepInteriorWorld` do — root dropped from the fold graph,
+/// `.link` edges weighted 1.4 against 1.0 for `.outline`, a zero-padded document-order path chain,
+/// arity seven, interior-scale budget — against `vault_synth.DocSpec.flatHeadingsExtreme()`, which
+/// reproduces the gauntlet's `giant-2.md` shape (one root, 800 flat headings, one paragraph each)
+/// that motivated this whole redesign. Confirms containment's exhaustive slot search stays cheap
+/// at the interior's smaller budget too, not just the vault's — asserted but unmeasured until now.
+fn docOrderPath(arena: std.mem.Allocator, i: usize) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{d:0>7}", .{i});
+}
+
+fn interiorSweep(gpa: std.mem.Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const cg = try vault_synth.synthContentGraph(arena, prng.random(), vault_synth.DocSpec.flatHeadingsExtreme());
+    const n = cg.items.len;
+    const m = n - 1; // everything but the root — see `buildInteriorWorld`'s doc comment
+
+    var edge_list: std.ArrayList(fold.Edge) = .empty;
+    for (cg.edges) |e| {
+        if (e.a == 0 or e.b == 0) continue;
+        const w: f32 = if (e.kind == .link) 1.4 else 1.0;
+        try edge_list.append(arena, .{ .a = e.a - 1, .b = e.b - 1, .w = w });
+    }
+    const paths = try arena.alloc([]const u8, m);
+    for (0..m) |i| paths[i] = try docOrderPath(arena, i);
+
+    var w = try world_mod.World.init(gpa, m, edge_list.items, paths, .{
+        .arity = .seven,
+        .folder_w = 0.2,
+    }, .{ .note_r = 1.0 });
+    defer w.deinit();
+
+    const budget: usize = 140;
+    const params: world_mod.Params = .{
+        .budget = budget,
+        .split_px = 22,
+        .note_r_px = 7,
+        .mass_cap_px = 34,
+        .link_budget = 300,
+    };
+    const vw: f32 = 1200;
+    const vh: f32 = 700;
+    const ext = w.extent();
+    const z_fit = @min(vw, vh) * 0.44 / ext;
+
+    std.debug.print("\n==== interior: flatHeadingsExtreme ====\n", .{});
+    std.debug.print("  items={d} (root + {d} content)  edges={d}  ladder depth={d}  cells={d}  root r={d:.1}\n", .{
+        n, m, edge_list.items.len, w.lad.depth, w.lad.cells.len, ext,
+    });
+    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>6}\n", .{ "zoom", "marks", "notes", "masses", "bound" });
+
+    var zoom = z_fit;
+    var stepn: usize = 0;
+    while (stepn < 14) : (stepn += 1) {
+        for (0..120) |_| try w.step(.{ .w = vw, .h = vh, .zoom = zoom, .cx = 0, .cy = 0 }, params, 1.0 / 60.0);
+        const notes = w.noteMarks();
+        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {s:>6}\n", .{
+            zoom, w.marks.items.len, notes, w.marks.items.len - notes,
             if (w.bound) "Y" else "",
         });
         if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});

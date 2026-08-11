@@ -1,7 +1,9 @@
 //! Where a note's own cloud sits inside the overview's.
 //!
 //! The graph has two levels. The overview draws one node per note; descending into a note draws
-//! one node per section of it (`query.noteSnapshot`). The two are not separate screens that swap
+//! its own fold/containment/world cloud, fed the note's content graph (`query.noteContentGraph`)
+//! instead of the vault's notes — see `graph.zig`'s `buildInteriorWorld`. The two are not separate
+//! screens that swap
 //! — the note's cloud lives *inside* its node, at a smaller scale, and the camera simply keeps
 //! zooming until it fills the panel. Backing out reverses exactly.
 //!

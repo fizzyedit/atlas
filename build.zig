@@ -205,6 +205,16 @@ pub fn build(b: *std.Build) void {
         // an immediate "file exists in modules 'resolve' and 'Scanner'".
         bench.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         bench.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
+        // A distinct module object from `content_graph_mod`/`cg_for_db_test` above, deliberately —
+        // same reasoning: sharing one `Module` object across independent build artifacts is the
+        // other half of the "file exists in modules X and Y" bug class this file already works
+        // around once.
+        const cg_for_bench = b.createModule(.{
+            .root_source_file = b.path("src/index/content_graph.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        bench.root_module.addImport("content_graph", cg_for_bench);
         const run_bench = b.addRunArtifact(bench);
         if (b.args) |a| run_bench.addArgs(a);
         b.step("bench", "Scan/resolve timings, --stats structure, --world LOD sweep").dependOn(&run_bench.step);
