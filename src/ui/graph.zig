@@ -576,7 +576,7 @@ const layout_inline_max: usize = 4000;
 /// an edit still lands in the graph while the reader is looking at it.
 const rebuild_quiet_s: f32 = 0.6;
 
-const Panel = struct {
+pub const Panel = struct {
     arena: std.heap.ArenaAllocator,
     /// Rebuild being solved on a worker, if any. See `LayoutJob`.
     job: ?*LayoutJob = null,
@@ -763,21 +763,19 @@ const Panel = struct {
     last_centroid: dvui.Point.Physical = .{},
     last_pinch: f32 = 0,
 
-    fn init(gpa: std.mem.Allocator) Panel {
+    pub fn init(gpa: std.mem.Allocator) Panel {
         return .{
             .arena = std.heap.ArenaAllocator.init(gpa),
             .interior = .{ .arena = std.heap.ArenaAllocator.init(gpa) },
         };
     }
 
-    fn deinit(self: *Panel) void {
+    pub fn deinit(self: *Panel) void {
         if (self.density) |*d| d.deinit();
         self.visible.deinit(sdk.allocator());
         self.interior_visible.deinit(sdk.allocator());
-        self.vis_edges.deinit(sdk.allocator());
         self.pointer_warm.deinit(sdk.allocator());
         self.hover_warm.deinit(sdk.allocator());
-        if (self.pyramid) |*py| py.deinit();
         self.edge_anim.deinit(sdk.allocator());
         self.id_index.deinit(sdk.allocator());
         self.interior.deinit();
@@ -805,11 +803,11 @@ fn ensurePanel(gpa: std.mem.Allocator) *Panel {
     return &panel.?;
 }
 
-/// Join any layout worker still running. Must be called before the plugin's library can be
-/// unloaded: the worker is executing code that lives in this dylib, and a solve on a large vault
-/// outlasts a plugin teardown comfortably.
-pub fn shutdown() void {
-    const p = &(panel orelse return);
+/// Join any layout worker still running and drop the living world. Must happen before a `Panel`
+/// (or the plugin library backing its worker's code) goes away — `LayoutJob` isn't exported, so
+/// this is the only place outside this file that can reach into one to join it; any other owner
+/// of a `Panel` (the vault simulator window) calls this too rather than reimplementing it.
+pub fn shutdownPanel(p: *Panel) void {
     if (p.job) |job| {
         job.deinit(sdk.allocator());
         p.job = null;
@@ -818,6 +816,13 @@ pub fn shutdown() void {
         w.deinit();
         p.world_state = null;
     }
+}
+
+/// Join any layout worker still running. Must be called before the plugin's library can be
+/// unloaded: the worker is executing code that lives in this dylib, and a solve on a large vault
+/// outlasts a plugin teardown comfortably.
+pub fn shutdown() void {
+    shutdownPanel(&(panel orelse return));
 }
 
 /// Temporary on-screen readout of everything the reshape depends on.

@@ -41,13 +41,15 @@ pub const BakeInput = struct {
 /// configuration. See the rejected table in `docs/design/galaxy-lod.md`.
 pub const Density = struct {
     soft: SoftAtlas,
+    /// `SoftAtlas` doesn't keep its own allocator, so `deinit` needs the same one back.
+    gpa: std.mem.Allocator,
 
     pub fn init(gpa: std.mem.Allocator) !Density {
-        return .{ .soft = try SoftAtlas.init(gpa) };
+        return .{ .soft = try SoftAtlas.init(gpa), .gpa = gpa };
     }
 
     pub fn deinit(self: *Density) void {
-        self.soft.deinit();
+        self.soft.deinit(self.gpa);
     }
 };
 

@@ -17,6 +17,7 @@ const runtime = @import("src/runtime.zig");
 const State = @import("src/State.zig");
 const backlinks = @import("src/ui/backlinks.zig");
 const graph = @import("src/ui/graph.zig");
+const vault_sim = @import("src/ui/vault_sim.zig");
 const wikilink_impl = @import("src/service/wikilink_impl.zig");
 const md_completion = @import("src/service/md_completion.zig");
 const query = @import("src/index/query.zig");
@@ -42,6 +43,7 @@ const vtable: sdk.Plugin.VTable = .{
     .folderPathsChanged = folderPathsChanged,
     .needsContinuousRepaint = needsContinuousRepaint,
     .endFrame = endFrame,
+    .drawOverlay = vault_sim.drawOverlay,
 };
 
 var plugin_state: State = .{};
@@ -142,6 +144,13 @@ pub fn register(host: *sdk.Host) !void {
         .isEnabled = cmdConvertWikilinksEnabled,
         .icon = icons.tvg.lucide.@"link",
     });
+    try host.registerCommand(.{
+        .id = "atlas.openVaultSimulator",
+        .owner = &plugin,
+        .title = "Atlas: Vault Simulator",
+        .run = openVaultSimulator,
+        .icon = icons.tvg.lucide.@"orbit",
+    });
 
     // A folder may already be open when a plugin is loaded mid-session (install, or re-enable
     // from the store), and `onFolderOpen` only fires on a *change*. Without this, atlas would
@@ -151,10 +160,15 @@ pub fn register(host: *sdk.Host) !void {
 
 fn pluginDeinit(state: *anyopaque) void {
     // Before anything else: the graph's layout worker runs code from this library, so it has to
-    // be joined while that library is still loaded.
+    // be joined while that library is still loaded. Same reason for the simulator's own worker.
     graph.shutdown();
+    vault_sim.shutdown();
     const st: *State = @ptrCast(@alignCast(state));
     st.deinit(sdk.allocator());
+}
+
+fn openVaultSimulator(_: *anyopaque) !void {
+    vault_sim.toggleOpen();
 }
 
 fn onFolderOpen(state: *anyopaque, allocator: std.mem.Allocator) void {
