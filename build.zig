@@ -37,6 +37,20 @@ pub fn build(b: *std.Build) void {
 
     fizzy.plugin.install(b, plugin.lib, .{});
 
+    // Neutral per-note content graph shape (`ItemKind`/`Item`/`ItemEdge`/`ContentGraph`), shared
+    // by the DB-backed indexer (`src/index/query.zig`) and the synthetic generator
+    // (`src/ui/vault_synth.zig`). Registered as its own module — rather than left to relative
+    // `../index/content_graph.zig` imports — because `vault_synth.zig` also gets its own
+    // standalone unit-test module below (rooted at `src/ui/`, which Zig's module boundary won't
+    // let a relative import reach outside of); a named import works identically in both the full
+    // plugin build and that standalone test.
+    const content_graph_mod = b.createModule(.{
+        .root_source_file = b.path("src/index/content_graph.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    plugin.module.addImport("content_graph", content_graph_mod);
+
     // Pure-logic tests: link resolution and the note scanner take plain values in and give
     // records out, with no filesystem, no database, and no dvui, which is the whole reason
     // they're separate files from the plumbing that uses them.
@@ -147,6 +161,9 @@ pub fn build(b: *std.Build) void {
         t.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         if (std.mem.eql(u8, entry[0], "atlas-galaxy-tests")) {
             t.root_module.addImport("batch2d", batch2d_mod);
+        }
+        if (std.mem.eql(u8, entry[0], "atlas-vault-synth-tests")) {
+            t.root_module.addImport("content_graph", content_graph_mod);
         }
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
