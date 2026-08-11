@@ -1244,7 +1244,15 @@ fn shovePair(
     const dst_r = @min(bubbleScreenRadius(dst.*, zoom_t, gap_px) / zoom, reach_cap);
     const need = @min(src_r + dst_r + gap_w, reach_cap);
     if (d >= need) return;
-    const amt = (need - d) * neighbor_push * src_shove;
+    // `falloff_w` (the hover reach, a fixed *screen* distance) covers a shrinking share of the
+    // field as zoom increases, so fewer sources are simultaneously swollen at once at high zoom —
+    // but at low zoom_t, a dense field (hundreds of interior content items, all close together in
+    // vault-world terms) can have many swollen sources shoving the same neighbour at once, and
+    // each pair's shove stacks additively with no normalization between them. Tapering the push
+    // itself by zoom_t keeps that far-zoom compounding gentle without touching the near-zoom feel
+    // it was tuned for, floored so it never fully disables the effect.
+    const push_scale = std.math.clamp(zoom_t, 0.2, 1.0);
+    const amt = (need - d) * neighbor_push * src_shove * push_scale;
     dst.pos.x += (dx / d) * amt;
     dst.pos.y += (dy / d) * amt;
 }
