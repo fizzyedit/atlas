@@ -5,6 +5,8 @@
 const std = @import("std");
 const Db = @import("Db.zig");
 const resolve = @import("resolve.zig");
+const schema = @import("schema.zig");
+const content_graph = @import("content_graph.zig");
 
 pub const Backlink = struct {
     /// Vault-relative path of the source note.
@@ -113,63 +115,30 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
 
 // -- note interior ----------------------------------------------------------------
 //
-// One note's own structure, as a graph — the input to the graph panel's note-level cloud, the
-// same way `Indexer.Snapshot` is the input to the overview. Deliberately the same shape of data
-// (nodes with a degree, undirected edges between indices) so the layout can be handed either.
+// One note's own structure, as a content graph — the input to the interior view's
+// coarsening/LOD pipeline, the same way `Indexer.Snapshot` is the input to the vault overview.
+// Every heading, paragraph, list, code block, blockquote, table, tag, and embed is its own
+// `content_graph.Item`, outline-nested under the nearest enclosing heading (or the root).
 
-/// A section of one document: its heading, and everything under it up to the next heading of the
-/// same or shallower depth.
-pub const SectionNode = struct {
-    /// Stable identity within the note, for carrying animation state across a reindex.
-    ///
-    /// Derived from the heading *text* and not its line, because line numbers are the one thing
-    /// that reliably changes for no reason: typing a word into the first paragraph shifts every
-    /// heading below it, and keyed on lines the whole cloud would lose its state on every
-    /// keystroke. The occurrence ordinal disambiguates a note that repeats a heading.
-    id: i64,
-    /// 0-based line of the heading, for scrolling the editor to it. The root section is line 0.
-    line: u32,
-    text: []const u8,
-    /// ATX depth 1–6, or 0 for the synthetic root that stands for the document itself.
-    level: u32,
-    /// Links leaving this section. Drives node radius the way `degree` does in the overview —
-    /// a section that reaches out to a lot of the vault should read as a heavier body.
-    links: u32,
-    /// Distinct neighbours inside this note: outline parent/children, plus self-link partners.
-    degree: u32,
-};
-
-/// Undirected, by index into `NoteSnapshot.nodes`.
-pub const SectionEdge = struct {
-    a: u32,
-    b: u32,
-    /// `.outline` is the document's own nesting; `.link` is an explicit `[[This Note#Heading]]`.
-    /// Kept apart so the panel can draw a structural edge differently from a real link.
-    kind: enum { outline, link },
-};
-
-pub const NoteSnapshot = struct {
-    nodes: []const SectionNode = &.{},
-    edges: []const SectionEdge = &.{},
-};
-
-/// The interior graph of one note: a root standing for the document, its headings nested beneath,
-/// and any link the note makes to one of its own headings.
+/// The interior graph of one note: a root standing for the document, its headings and body
+/// blocks nested beneath, and any link the note makes to one of its own headings.
 ///
 /// There is always a root, and that is what makes this safe to descend into unconditionally — a
-/// note with no headings at all is a single node rather than an empty cloud, and it doubles as
-/// the thing the outline hangs off when a document opens at `###` and never has an `#`.
-pub fn noteSnapshot(db: *Db, arena: std.mem.Allocator, note_id: i64, title: []const u8) !NoteSnapshot {
-    var nodes: std.ArrayList(SectionNode) = .empty;
-    try nodes.append(arena, .{
-        .id = 0,
-        .line = 0,
-        .text = title,
-        .level = 0,
-        .links = 0,
-        .degree = 0,
-    });
+/// note with nothing in it at all is a single item rather than an empty graph, and it doubles as
+/// the thing the outline hangs off when a document opens at `###` and never has an `#`, or has
+/// content before its first heading.
+pub fn noteContentGraph(
+    db: *Db,
+    arena: std.mem.Allocator,
+    note_id: i64,
+    title: []const u8,
+) !content_graph.ContentGraph {
+    var items: std.ArrayList(content_graph.Item) = .empty;
+    try items.append(arena, .{ .id = 0, .kind = .root, .level = 0, .line = 0, .text = title, .weight = 1 });
 
+    // -- headings, exactly as before: identity survives edits that only move lines ----------
+    const HeadingRow = struct { line: u32, level: u32 };
+    var heading_rows: std.ArrayList(HeadingRow) = .empty;
     {
         var stmt = try db.conn.prepare(
             \\SELECT text, text_fold, level, line FROM headings
@@ -190,68 +159,229 @@ pub fn noteSnapshot(db: *Db, arena: std.mem.Allocator, note_id: i64, title: []co
                 if (std.mem.eql(u8, f, row.text_fold)) seen += 1;
             }
             try folds.append(arena, row.text_fold);
-            try nodes.append(arena, .{
+            const level: u32 = @intCast(std.math.clamp(row.level, 1, 6));
+            const line: u32 = @intCast(@max(row.line, 0));
+            try items.append(arena, .{
                 .id = sectionId(row.text_fold, seen),
-                .line = @intCast(@max(row.line, 0)),
+                .kind = .heading,
+                .level = level,
+                .line = line,
                 .text = row.text,
-                .level = @intCast(std.math.clamp(row.level, 1, 6)),
-                .links = 0,
-                .degree = 0,
+                .weight = 1,
             });
+            try heading_rows.append(arena, .{ .line = line, .level = level });
+        }
+    }
+    const heading_count = heading_rows.items.len;
+
+    // -- body blocks --------------------------------------------------------------------
+    const BlockRow = struct { kind: i64, line_start: i64, line_end: i64, weight: i64 };
+    var block_rows: std.ArrayList(BlockRow) = .empty;
+    {
+        var stmt = try db.conn.prepare(
+            \\SELECT kind, line_start, line_end, weight FROM blocks
+            \\WHERE note_id = ? ORDER BY line_start
+        );
+        defer stmt.deinit();
+        var iter = try stmt.iterator(BlockRow, .{note_id});
+        while (true) {
+            const row = (try iter.nextAlloc(arena, .{})) orelse break;
+            try block_rows.append(arena, row);
         }
     }
 
-    var edges: std.ArrayList(SectionEdge) = .empty;
-
-    // Outline nesting: each heading hangs off the nearest section above it that is shallower.
-    // The root is level 0, so this always terminates — a note that opens at `###` still parents
-    // to the document rather than floating.
-    for (nodes.items[1..], 1..) |h, i| {
-        var j = i;
-        const parent = while (j > 0) {
-            j -= 1;
-            if (nodes.items[j].level < h.level) break j;
-        } else 0;
-        try edges.append(arena, .{ .a = @intCast(parent), .b = @intCast(i), .kind = .outline });
-    }
-
-    // Links leaving the note, attributed to the section they were written in — the last heading
-    // at or above the link's line. A link above the first heading belongs to the root.
+    // -- tags: captured since day one, consumed here for the first time -------------------
+    const TagRow = struct { tag: []const u8, line: i64 };
+    var tag_rows: std.ArrayList(TagRow) = .empty;
     {
-        var stmt = try db.conn.prepare(
-            \\SELECT line, dst_id, heading FROM links WHERE src_id = ? ORDER BY line
-        );
+        var stmt = try db.conn.prepare("SELECT tag, line FROM tags WHERE note_id = ? ORDER BY line");
         defer stmt.deinit();
-        var iter = try stmt.iterator(
-            struct { line: i64, dst_id: i64, heading: []const u8 },
-            .{note_id},
-        );
+        var iter = try stmt.iterator(TagRow, .{note_id});
         while (true) {
             const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            const from = sectionAtLine(nodes.items, @max(row.line, 0));
-            nodes.items[from].links += 1;
-            // Only a link back into this same note has both ends in this cloud. Everything else
-            // leaves it, and at this level there is nothing on the far end to draw to.
-            if (row.dst_id != note_id or row.heading.len == 0) continue;
-            const to = sectionByHeading(nodes.items, row.heading) orelse continue;
+            try tag_rows.append(arena, row);
+        }
+    }
+
+    // -- embeds: links of kind `.embed`, kept apart from the same-note cross-reference edges
+    // below rather than merged into them.
+    const EmbedRow = struct { raw: []const u8, alias: []const u8, line: i64 };
+    var embed_rows: std.ArrayList(EmbedRow) = .empty;
+    {
+        var stmt = try db.conn.prepare(
+            \\SELECT raw, alias, line FROM links WHERE src_id = ? AND kind = ? ORDER BY line
+        );
+        defer stmt.deinit();
+        var iter = try stmt.iterator(EmbedRow, .{ note_id, @intFromEnum(schema.LinkKind.embed) });
+        while (true) {
+            const row = (try iter.nextAlloc(arena, .{})) orelse break;
+            try embed_rows.append(arena, row);
+        }
+    }
+
+    // -- merge everything by line, and attach each non-heading item to whichever heading was
+    // last seen in that walk (the root, until the first heading). A single forward pass over
+    // the line-sorted merge gives both rules for free: a heading's own outline parent still
+    // needs the "nearest shallower heading" walk (a `##` under a `###` must skip past it), but
+    // a body item just wants whatever heading immediately contains it, at any depth — the same
+    // "last heading at or above this line" rule the old per-note cloud used for attributing a
+    // link to its section.
+    const MergeKind = enum { heading, block, tag, embed };
+    const Entry = struct { kind: MergeKind, line: u32, idx: usize };
+    var merged: std.ArrayList(Entry) = .empty;
+    for (heading_rows.items, 0..) |h, i| try merged.append(arena, .{ .kind = .heading, .line = h.line, .idx = i });
+    for (block_rows.items, 0..) |b, i| {
+        try merged.append(arena, .{ .kind = .block, .line = @intCast(@max(b.line_start, 0)), .idx = i });
+    }
+    for (tag_rows.items, 0..) |t, i| {
+        try merged.append(arena, .{ .kind = .tag, .line = @intCast(@max(t.line, 0)), .idx = i });
+    }
+    for (embed_rows.items, 0..) |e, i| {
+        try merged.append(arena, .{ .kind = .embed, .line = @intCast(@max(e.line, 0)), .idx = i });
+    }
+    std.mem.sort(Entry, merged.items, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            return a.line < b.line;
+        }
+    }.lessThan);
+
+    var edges: std.ArrayList(content_graph.ItemEdge) = .empty;
+    // A running count of items of a given kind under a given parent, so a non-heading item gets
+    // an id that survives edits that don't reorder or insert siblings under the same heading —
+    // the same imperfection the heading id already accepts for a repeated heading.
+    var ordinals: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    var last_heading_item: u32 = 0; // root, until the first heading is seen
+
+    for (merged.items) |m| switch (m.kind) {
+        .heading => {
+            const item_idx: u32 = @intCast(1 + m.idx);
+            const level = heading_rows.items[m.idx].level;
+            // Nearest earlier heading with a shallower level, else root.
+            var parent: u32 = 0;
+            var j = m.idx;
+            while (j > 0) {
+                j -= 1;
+                if (heading_rows.items[j].level < level) {
+                    parent = @intCast(1 + j);
+                    break;
+                }
+            }
+            try edges.append(arena, .{ .a = parent, .b = item_idx, .kind = .outline });
+            last_heading_item = item_idx;
+        },
+        .block => {
+            const b = block_rows.items[m.idx];
+            const kind: content_graph.ItemKind = switch (@as(schema.BlockKind, @enumFromInt(b.kind))) {
+                .paragraph => .paragraph,
+                .list => .list,
+                .code => .code,
+                .blockquote => .blockquote,
+                .table => .table,
+            };
+            try appendBodyItem(arena, &items, &edges, &ordinals, last_heading_item, .{
+                .id = 0,
+                .kind = kind,
+                .level = 0,
+                .line = @intCast(@max(b.line_start, 0)),
+                .text = "",
+                .weight = @intCast(@max(b.weight, 1)),
+            });
+        },
+        .tag => {
+            const t = tag_rows.items[m.idx];
+            try appendBodyItem(arena, &items, &edges, &ordinals, last_heading_item, .{
+                .id = 0,
+                .kind = .tag,
+                .level = 0,
+                .line = @intCast(@max(t.line, 0)),
+                .text = t.tag,
+                .weight = 1,
+            });
+        },
+        .embed => {
+            const e = embed_rows.items[m.idx];
+            try appendBodyItem(arena, &items, &edges, &ordinals, last_heading_item, .{
+                .id = 0,
+                .kind = .embed,
+                .level = 0,
+                .line = @intCast(@max(e.line, 0)),
+                .text = if (e.alias.len > 0) e.alias else e.raw,
+                .weight = 1,
+            });
+        },
+    };
+
+    // Same-note wikilinks: an explicit `[[This Note#Heading]]` connects two of this note's own
+    // headings. Only a self-link (dst_id == note_id) has both ends inside this graph.
+    {
+        var stmt = try db.conn.prepare(
+            \\SELECT line, heading FROM links
+            \\WHERE src_id = ? AND dst_id = ? AND heading <> ''
+            \\ORDER BY line
+        );
+        defer stmt.deinit();
+        var iter = try stmt.iterator(struct { line: i64, heading: []const u8 }, .{ note_id, note_id });
+        while (true) {
+            const row = (try iter.nextAlloc(arena, .{})) orelse break;
+            const from = sectionAtLine(items.items[0 .. 1 + heading_count], @max(row.line, 0));
+            const to = sectionByHeading(items.items[0 .. 1 + heading_count], row.heading) orelse continue;
             if (to == from) continue;
             try edges.append(arena, .{ .a = @intCast(from), .b = @intCast(to), .kind = .link });
         }
     }
 
-    for (edges.items) |e| {
-        nodes.items[e.a].degree += 1;
-        nodes.items[e.b].degree += 1;
-    }
-
     return .{
-        .nodes = try nodes.toOwnedSlice(arena),
+        .items = try items.toOwnedSlice(arena),
         .edges = try edges.toOwnedSlice(arena),
     };
 }
 
-/// Identity for a section, from its folded heading text plus how many identical headings precede
-/// it. Never 0 — that is reserved for the root.
+/// Appends one non-heading body item (block/tag/embed), gives it an ordinal-derived id, and
+/// wires its outline edge to `parent`. Shared by all three kinds in `noteContentGraph`'s merge
+/// loop so the id scheme and edge shape can't drift between them.
+fn appendBodyItem(
+    arena: std.mem.Allocator,
+    items: *std.ArrayList(content_graph.Item),
+    edges: *std.ArrayList(content_graph.ItemEdge),
+    ordinals: *std.AutoHashMapUnmanaged(u64, u32),
+    parent: u32,
+    item: content_graph.Item,
+) !void {
+    const parent_id = items.items[parent].id;
+    const key = ordinalKey(parent_id, item.kind);
+    const gop = try ordinals.getOrPut(arena, key);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    const ordinal = gop.value_ptr.*;
+    gop.value_ptr.* += 1;
+
+    var stamped = item;
+    stamped.id = contentItemId(item.kind, parent_id, ordinal);
+    const item_idx: u32 = @intCast(items.items.len);
+    try items.append(arena, stamped);
+    try edges.append(arena, .{ .a = parent, .b = item_idx, .kind = .outline });
+}
+
+fn ordinalKey(parent_id: i64, kind: content_graph.ItemKind) u64 {
+    return (@as(u64, @bitCast(parent_id)) *% 1099511628211) ^ @as(u64, @intFromEnum(kind));
+}
+
+/// Identity for a non-heading item: unstable across edits that reorder or insert siblings under
+/// the same heading, stable otherwise — see `content_graph.Item.id`'s doc comment.
+fn contentItemId(kind: content_graph.ItemKind, parent_id: i64, ordinal: u32) i64 {
+    var h = std.hash.Wyhash.init(ordinal);
+    h.update(std.mem.asBytes(&parent_id));
+    h.update(&[_]u8{@intFromEnum(kind)});
+    const v: i64 = @intCast(h.final() & 0x7fff_ffff_ffff_ffff);
+    return if (v == 0) 1 else v;
+}
+
+/// Identity for a heading, from its folded text plus how many identical headings precede it.
+/// Never 0 — that is reserved for the root.
+///
+/// Derived from the heading *text* and not its line, because line numbers are the one thing
+/// that reliably changes for no reason: typing a word into the first paragraph shifts every
+/// heading below it, and keyed on lines the whole graph would lose its state on every
+/// keystroke. The occurrence ordinal disambiguates a note that repeats a heading.
 fn sectionId(text_fold: []const u8, occurrence: u32) i64 {
     var h = std.hash.Wyhash.init(occurrence);
     h.update(text_fold);
@@ -260,21 +390,22 @@ fn sectionId(text_fold: []const u8, occurrence: u32) i64 {
     return if (v == 0) 1 else v;
 }
 
-/// Index of the section containing `line` — the last heading at or above it, else the root.
-fn sectionAtLine(nodes: []const SectionNode, line: i64) usize {
+/// Index, into a root+headings-only slice (`items[0 .. 1 + heading_count]`), of the heading
+/// containing `line` — the last heading at or above it, else the root (index 0).
+fn sectionAtLine(root_and_headings: []const content_graph.Item, line: i64) usize {
     var best: usize = 0;
-    for (nodes[1..], 1..) |n, i| {
+    for (root_and_headings[1..], 1..) |n, i| {
         if (@as(i64, n.line) > line) break;
         best = i;
     }
     return best;
 }
 
-fn sectionByHeading(nodes: []const SectionNode, heading: []const u8) ?usize {
+fn sectionByHeading(root_and_headings: []const content_graph.Item, heading: []const u8) ?usize {
     var buf: [512]u8 = undefined;
     if (heading.len > buf.len) return null;
     const want = foldInto(&buf, heading);
-    for (nodes[1..], 1..) |n, i| {
+    for (root_and_headings[1..], 1..) |n, i| {
         var nb: [512]u8 = undefined;
         if (n.text.len > nb.len) continue;
         if (std.mem.eql(u8, foldInto(&nb, n.text), want)) return i;

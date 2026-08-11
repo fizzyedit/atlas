@@ -628,6 +628,7 @@ fn writeNote(self: *Indexer, db: *Db, rel: []const u8, bytes: []const u8, mtime_
     try db.conn.exec("DELETE FROM headings WHERE note_id = ?", .{}, .{note_id});
     try db.conn.exec("DELETE FROM links WHERE src_id = ?", .{}, .{note_id});
     try db.conn.exec("DELETE FROM tags WHERE note_id = ?", .{}, .{note_id});
+    try db.conn.exec("DELETE FROM blocks WHERE note_id = ?", .{}, .{note_id});
 
     for (note.aliases) |a| {
         try db.conn.exec(
@@ -648,6 +649,13 @@ fn writeNote(self: *Indexer, db: *Db, rel: []const u8, bytes: []const u8, mtime_
             "INSERT INTO tags(note_id, tag, tag_fold, line) VALUES(?, ?, ?, ?)",
             .{},
             .{ note_id, t.tag, try foldOwned(arena.allocator(), t.tag), t.line },
+        );
+    }
+    for (note.blocks) |b| {
+        try db.conn.exec(
+            "INSERT INTO blocks(note_id, kind, line_start, line_end, weight) VALUES(?, ?, ?, ?, ?)",
+            .{},
+            .{ note_id, @intFromEnum(b.kind), b.line_start, b.line_end, b.weight },
         );
     }
     // Links are written with `dst_id = src_id` as a temporary stand-in; `relinkAll` rewrites

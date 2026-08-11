@@ -23,6 +23,7 @@ pub const Note = struct {
     headings: []const Heading = &.{},
     links: []const Link = &.{},
     tags: []const Tag = &.{},
+    blocks: []const Block = &.{},
 };
 
 pub const Heading = struct {
@@ -52,12 +53,68 @@ pub const Tag = struct {
     line: u32,
 };
 
+/// One paragraph/list/code/blockquote/table span. Headings are not blocks — they keep their own
+/// `Heading` record — so a document's body, once headings are pulled out, is entirely covered by
+/// these. Which heading owns a block is resolved at read time (`query.noteContentGraph`), not
+/// stored here, the same choice already made for `Link.heading`.
+pub const Block = struct {
+    kind: schema.BlockKind,
+    /// 0-based, inclusive.
+    line_start: u32,
+    /// 0-based, inclusive.
+    line_end: u32,
+    /// Word count for prose kinds, line count for `.code`.
+    weight: u32,
+};
+
+/// Accumulates the block currently being scanned, one line at a time, and flushes it into
+/// `blocks` when the scanner decides the block has ended. Kept as its own type (rather than a
+/// handful of loose locals in `scan`) because it needs to be threaded through several branches
+/// of the per-line loop without each one re-deriving the flush/weight logic.
+const BlockAcc = struct {
+    kind: ?schema.BlockKind = null,
+    line_start: u32 = 0,
+    byte_start: usize = 0,
+    last_line: u32 = 0,
+    last_line_end: usize = 0,
+
+    fn open(self: *BlockAcc, kind: schema.BlockKind, line_no: u32, byte_start: usize, byte_end: usize) void {
+        self.kind = kind;
+        self.line_start = line_no;
+        self.byte_start = byte_start;
+        self.last_line = line_no;
+        self.last_line_end = byte_end;
+    }
+
+    fn extend(self: *BlockAcc, line_no: u32, byte_end: usize) void {
+        self.last_line = line_no;
+        self.last_line_end = byte_end;
+    }
+
+    fn flush(self: *BlockAcc, arena: std.mem.Allocator, bytes: []const u8, blocks: *std.ArrayList(Block)) !void {
+        const kind = self.kind orelse return;
+        self.kind = null;
+        const weight: u32 = if (kind == .code)
+            self.last_line - self.line_start + 1
+        else
+            countWords(bytes[self.byte_start..self.last_line_end]);
+        try blocks.append(arena, .{
+            .kind = kind,
+            .line_start = self.line_start,
+            .line_end = self.last_line,
+            .weight = weight,
+        });
+    }
+};
+
 /// Scan `bytes` into records allocated from `arena`.
 pub fn scan(arena: std.mem.Allocator, bytes: []const u8) !Note {
     var aliases: std.ArrayList([]const u8) = .empty;
     var headings: std.ArrayList(Heading) = .empty;
     var links: std.ArrayList(Link) = .empty;
     var tags: std.ArrayList(Tag) = .empty;
+    var blocks: std.ArrayList(Block) = .empty;
+    var acc: BlockAcc = .{};
 
     var title: []const u8 = "";
     var body_start: usize = 0;
@@ -85,26 +142,46 @@ pub fn scan(arena: std.mem.Allocator, bytes: []const u8) !Note {
 
     var pos = body_start;
     while (pos <= bytes.len) {
+        // The loop runs one extra time past a trailing `\n` (`pos == bytes.len`) so the last
+        // real line still gets processed like any other; that pass carries no content and must
+        // not be mistaken for one more line of an unclosed fence.
+        const is_phantom_tail = pos == bytes.len;
         const line_end = std.mem.indexOfScalarPos(u8, bytes, pos, '\n') orelse bytes.len;
         const line = bytes[pos..line_end];
         // Drop a trailing `\r` so Windows-flavored notes don't put CR into contexts.
         const content = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
 
         if (in_fence) {
+            if (!is_phantom_tail) acc.extend(line_no, pos + content.len);
             if (isClosingFence(content, fence_char, fence_len)) {
                 in_fence = false;
+                try acc.flush(arena, bytes, &blocks);
             }
         } else if (openingFence(content)) |f| {
+            // A fence always starts a fresh block, whatever was open before it.
+            try acc.flush(arena, bytes, &blocks);
             in_fence = true;
             fence_char = f.char;
             fence_len = f.len;
+            acc.open(.code, line_no, pos, pos + content.len);
         } else {
             if (parseAtxHeading(content)) |h| {
+                try acc.flush(arena, bytes, &blocks);
                 try headings.append(arena, .{
                     .text = try arena.dupe(u8, h.text),
                     .level = h.level,
                     .line = line_no,
                 });
+            } else if (isBlank(content)) {
+                try acc.flush(arena, bytes, &blocks);
+            } else {
+                const kind = classifyBlockLine(content);
+                if (acc.kind != null and acc.kind.? == kind) {
+                    acc.extend(line_no, pos + content.len);
+                } else {
+                    try acc.flush(arena, bytes, &blocks);
+                    acc.open(kind, line_no, pos, pos + content.len);
+                }
             }
             try scanLine(arena, content, line_no, &links, &tags);
         }
@@ -113,6 +190,9 @@ pub fn scan(arena: std.mem.Allocator, bytes: []const u8) !Note {
         pos = line_end + 1;
         line_no += 1;
     }
+    // EOF with no trailing blank line still ends whatever block was open (a paragraph, an
+    // unclosed fence, ...).
+    try acc.flush(arena, bytes, &blocks);
 
     return .{
         .title = title,
@@ -120,6 +200,7 @@ pub fn scan(arena: std.mem.Allocator, bytes: []const u8) !Note {
         .headings = try headings.toOwnedSlice(arena),
         .links = try links.toOwnedSlice(arena),
         .tags = try tags.toOwnedSlice(arena),
+        .blocks = try blocks.toOwnedSlice(arena),
     };
 }
 
@@ -294,6 +375,76 @@ fn isClosingFence(line: []const u8, char: u8, min_len: usize) bool {
     if (len < min_len) return false;
     const rest = std.mem.trim(u8, line[i + len ..], " \t");
     return rest.len == 0;
+}
+
+// -- block classification ----------------------------------------------------------
+
+/// Classify one non-blank, non-heading, non-fence line for the block accumulator.
+fn classifyBlockLine(line: []const u8) schema.BlockKind {
+    if (isListMarker(line)) return .list;
+    if (isBlockquoteMarker(line)) return .blockquote;
+    if (isTableRow(line)) return .table;
+    return .paragraph;
+}
+
+/// `-`/`*`/`+`, or `N.`/`N)`, after at most three leading spaces — CommonMark's own indent
+/// budget, same as `openingFence`/`parseAtxHeading` use. The marker must be followed by
+/// whitespace or end-of-line so `--horizontal--` isn't mistaken for a list item.
+fn isListMarker(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i > 3 or i >= line.len) return false;
+
+    const c = line[i];
+    if (c == '-' or c == '*' or c == '+') {
+        return i + 1 >= line.len or line[i + 1] == ' ' or line[i + 1] == '\t';
+    }
+
+    var j = i;
+    while (j < line.len and std.ascii.isDigit(line[j])) : (j += 1) {}
+    if (j == i or j - i > 9) return false; // no digits, or not a plausible ordinal
+    if (j >= line.len or (line[j] != '.' and line[j] != ')')) return false;
+    return j + 1 >= line.len or line[j + 1] == ' ' or line[j + 1] == '\t';
+}
+
+/// `>` after at most three leading spaces.
+fn isBlockquoteMarker(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i > 3 or i >= line.len) return false;
+    return line[i] == '>';
+}
+
+/// A simple heuristic, not a CommonMark table parser: any unescaped `|` marks the line as a
+/// table row. Good enough to keep a GFM table's header/delimiter/body rows together as one
+/// block without building real table syntax.
+fn isTableRow(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (line[i] == '|') return true;
+    }
+    return false;
+}
+
+/// Whitespace-delimited word count over a block's whole line span (including the newlines
+/// joining its lines, which count as separators like any other whitespace).
+fn countWords(text: []const u8) u32 {
+    var n: u32 = 0;
+    var in_word = false;
+    for (text) |c| {
+        const ws = c == ' ' or c == '\t' or c == '\n' or c == '\r';
+        if (ws) {
+            in_word = false;
+        } else if (!in_word) {
+            in_word = true;
+            n += 1;
+        }
+    }
+    return n;
 }
 
 // -- in-line scan -----------------------------------------------------------------
@@ -938,6 +1089,145 @@ test "empty note is fine" {
             try testing.expectEqual(@as(usize, 0), note.links.len);
             try testing.expectEqual(@as(usize, 0), note.headings.len);
             try testing.expectEqualStrings("", note.title);
+        }
+    }.body);
+}
+
+// -- block tests --------------------------------------------------------------------
+
+test "a paragraph, a list, a fenced code block, and a blockquote each become their own block" {
+    const src =
+        \\Some words here.
+        \\
+        \\- one
+        \\- two
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+        \\
+        \\> quoted text
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 4), note.blocks.len);
+
+            try testing.expect(note.blocks[0].kind == .paragraph);
+            try testing.expectEqual(@as(u32, 0), note.blocks[0].line_start);
+            try testing.expectEqual(@as(u32, 0), note.blocks[0].line_end);
+            try testing.expectEqual(@as(u32, 3), note.blocks[0].weight); // "Some words here."
+
+            try testing.expect(note.blocks[1].kind == .list);
+            try testing.expectEqual(@as(u32, 2), note.blocks[1].line_start);
+            try testing.expectEqual(@as(u32, 3), note.blocks[1].line_end);
+            try testing.expectEqual(@as(u32, 4), note.blocks[1].weight); // "- one" "- two"
+
+            try testing.expect(note.blocks[2].kind == .code);
+            try testing.expectEqual(@as(u32, 5), note.blocks[2].line_start); // the ``` line
+            try testing.expectEqual(@as(u32, 7), note.blocks[2].line_end); // the closing ```
+            try testing.expectEqual(@as(u32, 3), note.blocks[2].weight); // 3 lines
+
+            try testing.expect(note.blocks[3].kind == .blockquote);
+            try testing.expectEqual(@as(u32, 9), note.blocks[3].line_start);
+            try testing.expectEqual(@as(u32, 9), note.blocks[3].line_end);
+        }
+    }.body);
+}
+
+test "a table is one block via the pipe heuristic" {
+    const src =
+        \\| A | B |
+        \\|---|---|
+        \\| 1 | 2 |
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 1), note.blocks.len);
+            try testing.expect(note.blocks[0].kind == .table);
+            try testing.expectEqual(@as(u32, 0), note.blocks[0].line_start);
+            try testing.expectEqual(@as(u32, 2), note.blocks[0].line_end);
+        }
+    }.body);
+}
+
+test "a heading directly followed by a paragraph still splits, no blank line needed" {
+    const src =
+        \\# Title
+        \\First paragraph right under the heading.
+        \\
+        \\## Section
+        \\Second paragraph.
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 2), note.headings.len);
+            try testing.expectEqual(@as(usize, 2), note.blocks.len);
+            try testing.expect(note.blocks[0].kind == .paragraph);
+            try testing.expectEqual(@as(u32, 1), note.blocks[0].line_start);
+            try testing.expectEqual(@as(u32, 1), note.blocks[0].line_end);
+            try testing.expect(note.blocks[1].kind == .paragraph);
+            try testing.expectEqual(@as(u32, 4), note.blocks[1].line_start);
+        }
+    }.body);
+}
+
+test "consecutive list items without a blank line stay one block; a new paragraph after them splits" {
+    const src =
+        \\- a
+        \\- b
+        \\- c
+        \\Not a list line, so this starts a new paragraph block.
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 2), note.blocks.len);
+            try testing.expect(note.blocks[0].kind == .list);
+            try testing.expectEqual(@as(u32, 0), note.blocks[0].line_start);
+            try testing.expectEqual(@as(u32, 2), note.blocks[0].line_end);
+            try testing.expect(note.blocks[1].kind == .paragraph);
+            try testing.expectEqual(@as(u32, 3), note.blocks[1].line_start);
+        }
+    }.body);
+}
+
+test "multiple paragraphs separated by blank lines are separate blocks" {
+    const src =
+        \\First paragraph.
+        \\Still first paragraph.
+        \\
+        \\Second paragraph.
+        \\
+        \\Third paragraph.
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 3), note.blocks.len);
+            for (note.blocks) |b| try testing.expect(b.kind == .paragraph);
+            try testing.expectEqual(@as(u32, 0), note.blocks[0].line_start);
+            try testing.expectEqual(@as(u32, 1), note.blocks[0].line_end);
+            try testing.expectEqual(@as(u32, 3), note.blocks[1].line_start);
+            try testing.expectEqual(@as(u32, 5), note.blocks[2].line_start);
+        }
+    }.body);
+}
+
+test "an unclosed fence still yields one code block through EOF" {
+    const src =
+        \\```
+        \\line one
+        \\line two
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 1), note.blocks.len);
+            try testing.expect(note.blocks[0].kind == .code);
+            try testing.expectEqual(@as(u32, 0), note.blocks[0].line_start);
+            try testing.expectEqual(@as(u32, 2), note.blocks[0].line_end);
         }
     }.body);
 }
