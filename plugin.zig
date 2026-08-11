@@ -201,6 +201,10 @@ fn folderPathsChanged(state: *anyopaque, changes: sdk.Plugin.PathChanges) void {
 }
 
 fn needsContinuousRepaint(_: *anyopaque) bool {
+    // The simulator window's own debounce/regen has nothing else that wakes the frame loop back
+    // up once input stops — see the doc comment on vault_sim.needsContinuousRepaint. Checked
+    // regardless of which bottom view is active: the window floats independently of it.
+    if (vault_sim.needsContinuousRepaint()) return true;
     // Graph fling/drag only — not `busy`. Indexer busy used to force the whole editor
     // (including markdown preview) to redraw every frame while a scan ran, which felt like
     // the graph was "re-parsing". Sidebar counters still update on the next natural frame /

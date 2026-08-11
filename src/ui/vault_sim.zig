@@ -196,7 +196,11 @@ pub const Sim = struct {
     /// final address — the same reason `State.init` takes `self: *State` and is only ever called
     /// on the already-placed `plugin_state` global, never inside a by-value constructor.
     pub fn init(gpa: std.mem.Allocator) Sim {
-        return .{ .gpa = gpa, .panel = graph.Panel.init(gpa) };
+        var p = graph.Panel.init(gpa);
+        // Pan/zoom must use the dialog-canvas input policy — the main-pane suppressor
+        // treats any floating subwindow as "don't touch the editor canvas".
+        p.dialog_canvas = true;
+        return .{ .gpa = gpa, .panel = p };
     }
 
     pub fn deinit(self: *Sim) void {
@@ -328,6 +332,17 @@ pub const Sim = struct {
                 .margin = .{ .y = 12 },
                 .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
             });
+        } else if (self.applied_valid) {
+            const shown = blk: {
+                for (shape_choices, 0..) |sh, i| {
+                    if (sh == self.applied.shape) break :blk shape_labels[i];
+                }
+                break :blk "?";
+            };
+            dvui.label(@src(), "Showing: {s} · {d}", .{ shown, self.applied.n }, .{
+                .margin = .{ .y = 12 },
+                .color_text = dvui.themeGet().color(.content, .text).opacity(0.55),
+            });
         }
     }
 
@@ -347,6 +362,21 @@ fn ensureSim(gpa: std.mem.Allocator) *Sim {
         sim.?.state.init(gpa);
     }
     return &sim.?;
+}
+
+/// Whether the window needs frames kept coming even with no input to react to — a debounce
+/// counting down, or a background regen the UI thread hasn't polled the result of yet. Neither
+/// one otherwise has anything that wakes the frame loop back up: the debounce only ticks inside
+/// `Sim.tick`, called from `drawOverlay`, called only when a frame actually draws, and the worker
+/// thread finishing in the background doesn't itself cause a frame — without this, a slider drag
+/// pumped enough frames to *start* a regen (dvui's own input handling keeps frames coming while
+/// the mouse is moving) but then nothing ever polled it to completion once the drag ended and the
+/// mouse stopped, which is exactly "regenerating shows, then nothing happens." Same role
+/// `st.synthBusy()` played in `needsContinuousRepaint` for the old settings-pane synth path.
+pub fn needsContinuousRepaint() bool {
+    const s = sim orelse return false;
+    if (!s.open) return false;
+    return s.job != null or s.reload_frames != null;
 }
 
 /// Toggle the window open — the command handler.
@@ -392,7 +422,10 @@ pub fn drawOverlay(_: *anyopaque) !void {
     });
     defer float.deinit();
 
-    _ = core.dvui.windowHeader("Atlas: Vault Simulator", "", &s.open, .none);
+    // Narrow the window-drag hit target to the header. Without this, FloatingWindowWidget
+    // keeps drag_area = the whole window → move cursor everywhere, and presses become
+    // window drags instead of sidebar edits / canvas pan-zoom.
+    float.dragAreaSet(core.dvui.windowHeader("Atlas: Vault Simulator", "", &s.open, .none));
 
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
     defer row.deinit();

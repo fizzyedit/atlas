@@ -578,6 +578,10 @@ const rebuild_quiet_s: f32 = 0.6;
 
 pub const Panel = struct {
     arena: std.heap.ArenaAllocator,
+    /// When true, pointer input uses the dialog-canvas policy so pan/zoom works inside a
+    /// floating window (Vault Simulator). The main bottom panel leaves this false so editor
+    /// floating tool windows still suppress the vault canvas underneath them.
+    dialog_canvas: bool = false,
     /// Rebuild being solved on a worker, if any. See `LayoutJob`.
     job: ?*LayoutJob = null,
     /// Level-of-detail hierarchy for the current arrangement, or null for a vault too small to
@@ -1377,7 +1381,7 @@ fn updateHover(p: *Panel) void {
     // highlight drops the moment a pan starts rather than a frame later.
     const pointer_ok = p.camera.viewport.contains(mouse) and
         !p.drag_active and !p.gesture_active and
-        pointerTargetsMainPane(mouse);
+        pointerTargetsPanel(p, mouse);
     const inside_interior = p.interior.t >= 0.5 and p.interior.nodes.len > 0;
     if (!pointer_ok) {
         p.hover_node = null;
@@ -4741,7 +4745,11 @@ fn handleInput(p: *Panel, st: anytype) void {
     const id = pane.id;
     const scheme = sdk.host().panZoomScheme();
 
-    if (core.dvui.canvasPointerInputSuppressed()) {
+    const suppressed = if (p.dialog_canvas)
+        core.dvui.dialogCanvasPointerInputSuppressed()
+    else
+        core.dvui.canvasPointerInputSuppressed();
+    if (suppressed) {
         if (dvui.captured(id)) {
             for (dvui.events()) |*e| {
                 if (e.evt == .mouse and e.evt.mouse.action == .release and e.evt.mouse.button.pointer()) {
@@ -4770,7 +4778,7 @@ fn handleInput(p: *Panel, st: anytype) void {
         if (e.handled) continue;
         if (e.evt != .mouse) continue;
         const me = e.evt.mouse;
-        if (!pointerTargetsMainPane(me.p)) continue;
+        if (!pointerTargetsPanel(p, me.p)) continue;
         const inside = rs.r.contains(me.p);
         if (!inside and !dvui.captured(id)) continue;
         if (p.gesture_active) continue;
@@ -5191,6 +5199,15 @@ fn pointerTargetsMainPane(pt: dvui.Point.Physical) bool {
         if (sub.modal) return false;
     }
     return true;
+}
+
+/// Same hit policy as `handleInput`: main pane vs owning dialog subwindow.
+fn pointerTargetsPanel(p: *const Panel, pt: dvui.Point.Physical) bool {
+    if (!p.dialog_canvas) return pointerTargetsMainPane(pt);
+    const cw = dvui.currentWindow();
+    const sub = cw.subwindows.current() orelse return false;
+    const target = cw.subwindows.windowFor(pt);
+    return target == sub.id;
 }
 
 /// Continuous frames while flinging/dragging, while layout / proximity / pointer-highlight /
