@@ -227,9 +227,11 @@ pub const Sim = struct {
     shape_idx: usize = 1, // .islands, matching SimSpec's default
     /// A/B for `containment.aperture7_rotation` — see the checkbox in `drawSidebar`.
     hex_lattice: bool = false,
-    /// Live `containment.Options.radius_exp`. Starts at the no-overlap value rather than 0.5 so
-    /// the fix is what you see first; drag down to 0.5 to compare against area conservation.
-    radius_exp: f32 = 0.619,
+    /// Live `containment.Options`, mirrored into `panel.place_opts` on edit. Starts at the
+    /// no-overlap `radius_exp` rather than 0.5 so the spread fix is what you see first.
+    place: containment.Options = .{ .radius_exp = 0.619 },
+    /// Collapsed by default — five more sliders is a lot of sidebar when you only want a shape.
+    show_tuning: bool = false,
 
     /// Deliberately doesn't call `self.state.init(gpa)` — `Indexer.init` stores pointers to its
     /// owner's `busy`/`generation` fields, and `Sim.init` returns by value into `ensureSim`'s
@@ -250,7 +252,7 @@ pub const Sim = struct {
         p.synthetic = true;
         // Match the sidebar's own starting value, or the first frame would draw the
         // area-conserving layout under a slider that says otherwise.
-        p.place_radius_exp = 0.619;
+        p.place_opts.radius_exp = 0.619;
         return .{ .gpa = gpa, .panel = p };
     }
 
@@ -428,22 +430,7 @@ pub const Sim = struct {
             graph.invalidateWorld(&self.panel);
         }
 
-        // 0.5 is area-conserving and forces overlap; `minRadiusExp` is where it stops. Exposed as
-        // a range rather than a checkbox because the honest value is a judgement about how much
-        // "a mass reads as its note count" is worth trading for legibility.
-        const min_exp = containment.minRadiusExp(0.9);
-        if (dvui.sliderEntry(@src(), "Spread (0.5=area): {d:.3}", .{
-            .value = &self.radius_exp,
-            .min = 0.5,
-            .max = 0.75,
-            .interval = 0.005,
-        }, .{ .expand = .horizontal, .margin = .{ .y = 8 } })) {
-            self.panel.place_radius_exp = self.radius_exp;
-            graph.invalidateWorld(&self.panel);
-        }
-        dvui.label(@src(), "no-overlap at ≥ {d:.3}", .{min_exp}, .{
-            .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
-        });
+        self.drawTuning();
 
         if (self.job != null) {
             dvui.labelNoFmt(@src(), "Regenerating…", .{}, .{
@@ -485,6 +472,45 @@ pub const Sim = struct {
         dvui.label(@src(), "view: {d:.0}x{d:.0} @ {d:.3}x", .{
             vp.w, vp.h, self.panel.camera.zoom,
         }, .{ .color_text = dim });
+    }
+
+    /// Placement knobs, all `containment.Options`. Every one is baked into the world when it is
+    /// built, so each edit invalidates it — cheap at simulator scale, and the point is to see the
+    /// effect immediately rather than to be frugal.
+    fn drawTuning(self: *Sim) void {
+        _ = dvui.checkbox(@src(), &self.show_tuning, "Placement tuning", .{ .margin = .{ .y = 8 } });
+        if (!self.show_tuning) return;
+
+        const dim = dvui.themeGet().color(.content, .text).opacity(0.5);
+        var changed = false;
+
+        // `sliderEntry` takes its format string comptime, so this is an inline loop over a
+        // comptime tuple rather than a runtime array of descriptors.
+        inline for (.{
+            .{ "Spread: {d:.3}", "radius_exp", 0.5, 0.75, 0.005, "0.5 = area-conserving (forces overlap)" },
+            .{ "Aim outward: {d:.2}", "ext_k", 0.0, 6.0, 0.1, "0 = slots ignore links leaving the cell" },
+            .{ "Fill: {d:.2}", "fill", 0.5, 1.0, 0.01, "how far the child ring may reach" },
+            .{ "Mass pull: {d:.2}", "mass_k", 0.0, 2.0, 0.05, "0 = links alone decide slots" },
+            .{ "Island gap: {d:.2}", "pack_gap", 1.0, 12.0, 0.1, "air between top-level islands" },
+            .{ "Island aspect: {d:.2}", "pack_aspect", 0.6, 2.5, 0.05, "horizontal stretch of the island pack" },
+        }) |k| {
+            if (dvui.sliderEntry(@src(), k[0], .{
+                .value = &@field(self.place, k[1]),
+                .min = k[2],
+                .max = k[3],
+                .interval = k[4],
+            }, .{ .expand = .horizontal, .margin = .{ .y = 4 } })) changed = true;
+            dvui.labelNoFmt(@src(), k[5], .{}, .{ .color_text = dim, .margin = .{ .h = 6 } });
+        }
+
+        dvui.label(@src(), "no-overlap at spread ≥ {d:.3}", .{
+            containment.minRadiusExp(self.place.fill),
+        }, .{ .color_text = dim });
+
+        if (changed) {
+            self.panel.place_opts = self.place;
+            graph.invalidateWorld(&self.panel);
+        }
     }
 
     fn drawCanvas(self: *Sim) !void {

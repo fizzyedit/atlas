@@ -40,6 +40,7 @@ const multilevel = @import("multilevel.zig");
 const galaxy = @import("galaxy.zig");
 const world_mod = @import("world.zig");
 const world_draw = @import("world_draw.zig");
+const containment = @import("containment.zig");
 
 /// A note the frame resolved as an individual, published by `stepWorld` and consumed by the label
 /// placer, the proximity field and hit-testing. `level` is vestigial — everything drawn as itself
@@ -599,10 +600,11 @@ pub const Panel = struct {
     /// global hex lattice. Baked into the world at build time, so `invalidateWorld` must follow
     /// a change.
     place_rotation: ?f32 = null,
-    /// `containment.Options.radius_exp`. 0.5 is strict area conservation, which forces sibling
-    /// overlap; `containment.minRadiusExp(fill)` is the smallest value that removes it. Baked
+    /// Placement tuning for this panel's world. `note_r` is ignored — `ensureWorld` derives it
+    /// from `layout_slot` so world scale stays calibrated to the units everything downstream
+    /// (camera fit, zoom thresholds, label placement) already assumes. Everything else is baked
     /// into the world at build time, so `invalidateWorld` must follow a change.
-    place_radius_exp: f32 = 0.5,
+    place_opts: containment.Options = .{},
     /// Rebuild being solved on a worker, if any. See `LayoutJob`.
     job: ?*LayoutJob = null,
     /// Level-of-detail hierarchy for the current arrangement, or null for a vault too small to
@@ -995,7 +997,13 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
 
     // Before anything reads or clamps zoom: how far out this vault may be pulled depends on how
     // big it is, and it just changed if a rebuild landed above.
-    p.camera.setContentExtent(p.world_radius, zoom_out_slack);
+    // Against the world that is actually drawn, not `world_radius` — that comes from the classic
+    // `layout_full` targets, which for a synthetic vault are in the generator's own coordinate
+    // space, and which know nothing about `place_opts.radius_exp` inflating the containment
+    // extent. Calibrating the zoom floor on it left large vaults unable to zoom out far enough
+    // to see themselves.
+    const content_r = if (ensureWorld(p)) |w| w.extent() else p.world_radius;
+    p.camera.setContentExtent(content_r, zoom_out_slack);
 
     updateInterior(p, st);
     maybeFitCamera(p);
@@ -3606,11 +3614,10 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     // between two classic notes: marks drew as a speck at the centre, every LOD transition
     // happened inside a sliver of the zoom range, and the interior triggered almost immediately.
     const slot = if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(@max(p.nodes.len, 1));
-    var built = world_mod.World.init(gpa, p.nodes.len, links, path_arg, .{}, .{
-        .note_r = slot / world_mod.leaf_pitch,
-        .rotation_per_level = p.place_rotation,
-        .radius_exp = p.place_radius_exp,
-    }) catch return null;
+    var place = p.place_opts;
+    place.note_r = slot / world_mod.leaf_pitch;
+    place.rotation_per_level = p.place_rotation;
+    var built = world_mod.World.init(gpa, p.nodes.len, links, path_arg, .{}, place) catch return null;
     if (p.world_state) |*old| old.deinit();
     p.world_state = built;
     p.world_epoch = p.layout_epoch;
