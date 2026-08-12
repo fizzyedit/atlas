@@ -599,6 +599,10 @@ pub const Panel = struct {
     /// global hex lattice. Baked into the world at build time, so `invalidateWorld` must follow
     /// a change.
     place_rotation: ?f32 = null,
+    /// `containment.Options.radius_exp`. 0.5 is strict area conservation, which forces sibling
+    /// overlap; `containment.minRadiusExp(fill)` is the smallest value that removes it. Baked
+    /// into the world at build time, so `invalidateWorld` must follow a change.
+    place_radius_exp: f32 = 0.5,
     /// Rebuild being solved on a worker, if any. See `LayoutJob`.
     job: ?*LayoutJob = null,
     /// Level-of-detail hierarchy for the current arrangement, or null for a vault too small to
@@ -3605,6 +3609,7 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     var built = world_mod.World.init(gpa, p.nodes.len, links, path_arg, .{}, .{
         .note_r = slot / world_mod.leaf_pitch,
         .rotation_per_level = p.place_rotation,
+        .radius_exp = p.place_radius_exp,
     }) catch return null;
     if (p.world_state) |*old| old.deinit();
     p.world_state = built;

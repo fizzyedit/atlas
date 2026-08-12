@@ -60,7 +60,36 @@ pub const Options = struct {
     /// consecutive levels so children never line up radially with their parent and the field does
     /// not band. Set `aperture7_rotation` instead to nest levels on one global hex lattice.
     rotation_per_level: ?f32 = null,
+    /// Exponent in `r = note_r · count^radius_exp`.
+    ///
+    /// 0.5 is strict area conservation, which *forces* siblings to overlap — see `minRadiusExp`.
+    /// A flat multiplier cannot fix that, because it scales parent and child alike and leaves
+    /// their ratio untouched; the ratio is `(1/arity)^radius_exp`, so only the exponent moves it.
+    ///
+    /// Deliberately keyed off `count` rather than `Cell.level`: `fold.prune` splices out
+    /// single-child chains without renumbering, so a parent's level can skip one or more of its
+    /// child's, and a per-level factor would then disagree with the actual count ratio.
+    radius_exp: f32 = 0.5,
 };
+
+/// The smallest `radius_exp` at which an arity-7 cell's uniform children stop overlapping.
+///
+/// Seven equal circles pack into a circle at radius ratio exactly 1/3 (hexagonally, 7 unit
+/// circles inside radius 3). Area conservation instead gives `1/√7 ≈ 0.378`, so children are
+/// ~13% too wide before anything else is applied — and `ensureChildren` then pulls the ring in
+/// by `fill`, which costs more. With `ratio = (1/7)^p`, solving `ring ≥ r_centre + r_ring`:
+///
+///   `fill − ratio ≥ 2·ratio`  →  `ratio ≤ fill/3`  →  `p ≥ ln(3/fill) / ln(7)`
+///
+/// The ring-to-ring constraint reduces to the same bound (six slots put adjacent children
+/// exactly `ring` apart), so this one number covers both. At `fill = 0.9` it is ≈0.619.
+///
+/// Overlap is only *forced* for uniform counts; a cell whose mass is one dominant sub-cluster
+/// still overlaps at any exponent, because its centre child is nearly parent-sized by
+/// construction.
+pub fn minRadiusExp(fill: f32) f32 {
+    return @log(3.0 / @max(fill, 0.01)) / @log(@as(f32, 7.0));
+}
 
 /// The rotation that makes consecutive levels land on a *single* hex lattice rather than each
 /// being turned an arbitrary amount from its parent — `atan(√3/5)`, 19.1066°, the aperture-7
@@ -98,8 +127,11 @@ pub const Field = struct {
     }
 
     pub fn radius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
-        const c = lad.cells[cell];
-        return self.opts.note_r * @sqrt(@as(f32, @floatFromInt(@max(1, c.count))));
+        const n: f32 = @floatFromInt(@max(1, lad.cells[cell].count));
+        // Fast path for strict area conservation — this runs per living cell per frame in the
+        // LOD's cull/split tests, and `@sqrt` is a single instruction where `pow` is not.
+        if (self.opts.radius_exp == 0.5) return self.opts.note_r * @sqrt(n);
+        return self.opts.note_r * std.math.pow(f32, n, self.opts.radius_exp);
     }
 
     /// Place `cell`'s children. Idempotent, and safe to call on a leaf.
@@ -465,4 +497,69 @@ test "aperture-7 rotation is the lattice angle, not the anti-banding half-step" 
     // exposing it would be a no-op.
     const half_step = (std.math.tau / 6.0) * 0.5;
     try testing.expect(@abs(aperture7_rotation - half_step) > 0.1);
+}
+
+test "radius_exp removes the overlap area conservation forces" {
+    // A full, uniform arity-7 ladder: 49 notes -> 7 level-1 cells -> 1 level-2 root. Uniform
+    // counts are exactly the case `minLevelSlack` solves, so this is the tight test of it.
+    const gpa = testing.allocator;
+    const n: u32 = 49;
+    // A chain inside each group of 7, so `fold` coarsens into clean 7s rather than by path order.
+    var edges: std.ArrayListUnmanaged(fold.Edge) = .empty;
+    defer edges.deinit(gpa);
+    var g: u32 = 0;
+    while (g < 7) : (g += 1) {
+        var i: u32 = 0;
+        while (i < 6) : (i += 1) {
+            try edges.append(gpa, .{ .a = g * 7 + i, .b = g * 7 + i + 1 });
+        }
+    }
+
+    const fill: f32 = 0.9;
+    for ([_]f32{ 0.5, 0 }) |probe| {
+        const exp = if (probe == 0) minRadiusExp(fill) else probe;
+        var lad = try fold.build(gpa, n, edges.items, &.{}, .{ .arity = .seven });
+        defer lad.deinit(gpa);
+        var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{
+            .fill = fill,
+            .radius_exp = exp,
+            // Links alone decide slots here; a mass pull would bias the uniform case.
+            .mass_k = 0,
+        });
+        defer f.deinit(gpa);
+        placeAll(&f, &lad);
+
+        // Worst sibling overlap anywhere in the ladder, as a fraction of the pair's summed radii.
+        var worst: f32 = 0;
+        for (0..lad.cells.len) |ci| {
+            const kids = lad.childrenOf(@intCast(ci));
+            if (kids.len < 2) continue;
+            // Only uniform cells — a dominant-child cell overlaps at any slack, by construction.
+            var uniform = true;
+            for (kids) |k| {
+                if (lad.cells[k].count != lad.cells[kids[0]].count) uniform = false;
+            }
+            if (!uniform) continue;
+            for (kids, 0..) |a, i| {
+                for (kids[i + 1 ..]) |b| {
+                    const need = f.radius(&lad, a) + f.radius(&lad, b);
+                    const got = Vec2.dist(f.pos[a], f.pos[b]);
+                    if (got < need) worst = @max(worst, (need - got) / need);
+                }
+            }
+            // Containment must hold either way — this is what `world.zig`'s exact cull rests on.
+            for (kids) |k| {
+                const reach = Vec2.dist(f.pos[@intCast(ci)], f.pos[k]) + f.radius(&lad, k);
+                try testing.expect(reach <= f.radius(&lad, @intCast(ci)) * 1.001);
+            }
+        }
+
+        if (probe == 0.5) {
+            // Strict area conservation: overlap is forced, so this must actually be violated —
+            // otherwise the test would pass vacuously and prove nothing about the fix.
+            try testing.expect(worst > 0.01);
+        } else {
+            try testing.expectApproxEqAbs(@as(f32, 0), worst, 1e-3);
+        }
+    }
 }

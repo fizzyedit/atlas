@@ -227,6 +227,9 @@ pub const Sim = struct {
     shape_idx: usize = 1, // .islands, matching SimSpec's default
     /// A/B for `containment.aperture7_rotation` — see the checkbox in `drawSidebar`.
     hex_lattice: bool = false,
+    /// Live `containment.Options.radius_exp`. Starts at the no-overlap value rather than 0.5 so
+    /// the fix is what you see first; drag down to 0.5 to compare against area conservation.
+    radius_exp: f32 = 0.619,
 
     /// Deliberately doesn't call `self.state.init(gpa)` — `Indexer.init` stores pointers to its
     /// owner's `busy`/`generation` fields, and `Sim.init` returns by value into `ensureSim`'s
@@ -245,6 +248,9 @@ pub const Sim = struct {
         p.dialog_canvas = true;
         // Nothing here is backed by a file — clicks must never reach the workbench.
         p.synthetic = true;
+        // Match the sidebar's own starting value, or the first frame would draw the
+        // area-conserving layout under a slider that says otherwise.
+        p.place_radius_exp = 0.619;
         return .{ .gpa = gpa, .panel = p };
     }
 
@@ -421,6 +427,23 @@ pub const Sim = struct {
             self.panel.place_rotation = if (self.hex_lattice) containment.aperture7_rotation else null;
             graph.invalidateWorld(&self.panel);
         }
+
+        // 0.5 is area-conserving and forces overlap; `minRadiusExp` is where it stops. Exposed as
+        // a range rather than a checkbox because the honest value is a judgement about how much
+        // "a mass reads as its note count" is worth trading for legibility.
+        const min_exp = containment.minRadiusExp(0.9);
+        if (dvui.sliderEntry(@src(), "Spread (0.5=area): {d:.3}", .{
+            .value = &self.radius_exp,
+            .min = 0.5,
+            .max = 0.75,
+            .interval = 0.005,
+        }, .{ .expand = .horizontal, .margin = .{ .y = 8 } })) {
+            self.panel.place_radius_exp = self.radius_exp;
+            graph.invalidateWorld(&self.panel);
+        }
+        dvui.label(@src(), "no-overlap at ≥ {d:.3}", .{min_exp}, .{
+            .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+        });
 
         if (self.job != null) {
             dvui.labelNoFmt(@src(), "Regenerating…", .{}, .{
