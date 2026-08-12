@@ -88,9 +88,39 @@ pub fn draw(
         // of the ambient web.
         const grow = dvui.easing.outCubic(std.math.clamp(select_anim, 0, 1));
 
+        // Where a link's endpoint is, even when that endpoint has no mark this frame.
+        //
+        // `decideTopology` culls off-screen cells but still claims their note ranges, precisely so
+        // "a link leaving the viewport keeps a target" — yet the draw dropped exactly those links,
+        // because `pos` is built from living marks only. A connection to something just past the
+        // edge simply vanished, which reads as the graph being less connected than it is.
+        //
+        // The culled cell is still *placed*: anything reaching the cull test got there through its
+        // parent's `ensureChildren`, so `field.pos` is valid. Using it draws the link running off
+        // toward where its far end actually is. Continuous, too — at rest a mark sits on its
+        // field position, so an endpoint scrolling off-screen swaps to the same coordinate rather
+        // than jumping.
+        const endpoint = struct {
+            fn f(
+                world: *const world_mod.World,
+                c: *const Camera,
+                d: DrawCtx,
+                live: std.AutoHashMapUnmanaged(u32, dvui.Point.Physical),
+                cell: u32,
+            ) ?dvui.Point.Physical {
+                if (live.get(cell)) |p| return p;
+                if (cell >= world.field.pos.len) return null;
+                const fp = world.field.pos[cell];
+                return c.worldToScreen(d.toWorld(d.ctx, .{ .x = fp.x, .y = fp.y }));
+            }
+        }.f;
+
         for (w.links.items) |l| {
-            const a = pos.get(l.a) orelse continue;
-            const b = pos.get(l.b) orelse continue;
+            // At least one end must be on screen. Both off-screen means a line drawn entirely
+            // outside the viewport — pure cost, nothing visible.
+            if (!pos.contains(l.a) and !pos.contains(l.b)) continue;
+            const a = endpoint(w, cam, dctx, pos, l.a) orelse continue;
+            const b = endpoint(w, cam, dctx, pos, l.b) orelse continue;
             const a_open = holds_open.contains(l.a);
             const b_open = holds_open.contains(l.b);
             if (!a_open and !b_open) {
