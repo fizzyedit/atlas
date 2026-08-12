@@ -493,14 +493,21 @@ pub const Sim = struct {
             .{ "Mass pull: {d:.2}", "mass_k", 0.0, 2.0, 0.05, "0 = links alone decide slots" },
             .{ "Island gap: {d:.2}", "pack_gap", 1.0, 12.0, 0.1, "air between top-level islands" },
             .{ "Island aspect: {d:.2}", "pack_aspect", 0.6, 2.5, 0.05, "horizontal stretch of the island pack" },
-        }) |k| {
+        }, 0..) |k, i| {
+            // Every iteration shares one `@src()`, so dvui would derive the same widget id for
+            // all six — `id_extra` is what separates them. The slider's own internal label is
+            // keyed off the slider, so it is covered by the same disambiguation.
             if (dvui.sliderEntry(@src(), k[0], .{
                 .value = &@field(self.place, k[1]),
                 .min = k[2],
                 .max = k[3],
                 .interval = k[4],
-            }, .{ .expand = .horizontal, .margin = .{ .y = 4 } })) changed = true;
-            dvui.labelNoFmt(@src(), k[5], .{}, .{ .color_text = dim, .margin = .{ .h = 6 } });
+            }, .{ .expand = .horizontal, .margin = .{ .y = 4 }, .id_extra = i })) changed = true;
+            dvui.labelNoFmt(@src(), k[5], .{}, .{
+                .color_text = dim,
+                .margin = .{ .h = 6 },
+                .id_extra = i,
+            });
         }
 
         dvui.label(@src(), "no-overlap at spread ≥ {d:.3}", .{
