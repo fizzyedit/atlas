@@ -594,6 +594,11 @@ pub const Panel = struct {
     /// as a live knob (raising it resolves more notes as themselves instead of coalescing them
     /// into masses) without changing what the real bottom panel is tuned to.
     mark_budget: usize = galaxy.plugin_mark_budget,
+    /// `containment.Options.rotation_per_level` for this panel's world. Null keeps the
+    /// anti-banding half-step default; `containment.aperture7_rotation` nests every level on one
+    /// global hex lattice. Baked into the world at build time, so `invalidateWorld` must follow
+    /// a change.
+    place_rotation: ?f32 = null,
     /// Rebuild being solved on a worker, if any. See `LayoutJob`.
     job: ?*LayoutJob = null,
     /// Level-of-detail hierarchy for the current arrangement, or null for a vault too small to
@@ -840,6 +845,12 @@ pub const PanelStats = struct {
     /// True when the budget refused an open this frame — i.e. raising it would show more.
     bound: bool = false,
 };
+
+/// Force `ensureWorld` to rebuild once. Needed after changing anything baked into the world at
+/// construction (`place_rotation`), as opposed to the per-frame `Params` a step already re-reads.
+pub fn invalidateWorld(p: *Panel) void {
+    p.world_epoch = p.layout_epoch -% 1;
+}
 
 pub fn panelStats(p: *const Panel) PanelStats {
     var s: PanelStats = .{
@@ -3593,6 +3604,7 @@ fn ensureWorld(p: *Panel) ?*world_mod.World {
     const slot = if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(@max(p.nodes.len, 1));
     var built = world_mod.World.init(gpa, p.nodes.len, links, path_arg, .{}, .{
         .note_r = slot / world_mod.leaf_pitch,
+        .rotation_per_level = p.place_rotation,
     }) catch return null;
     if (p.world_state) |*old| old.deinit();
     p.world_state = built;

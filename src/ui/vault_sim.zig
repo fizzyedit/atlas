@@ -19,6 +19,7 @@ const Db = @import("../index/Db.zig");
 const Indexer = @import("../index/Indexer.zig");
 const vault_synth = @import("vault_synth.zig");
 const graph = @import("graph.zig");
+const containment = @import("containment.zig");
 
 /// Live shape/scale knobs. Plain fields — the window's sliders/dropdown write to `pending`
 /// directly every frame; `Sim.tick` is what turns a settled edit into a rebuild.
@@ -224,6 +225,8 @@ pub const Sim = struct {
     job: ?*RegenJob = null,
     win_rect: dvui.Rect = .{ .x = 80, .y = 80, .w = 900, .h = 600 },
     shape_idx: usize = 1, // .islands, matching SimSpec's default
+    /// A/B for `containment.aperture7_rotation` — see the checkbox in `drawSidebar`.
+    hex_lattice: bool = false,
 
     /// Deliberately doesn't call `self.state.init(gpa)` — `Indexer.init` stores pointers to its
     /// owner's `busy`/`generation` fields, and `Sim.init` returns by value into `ensureSim`'s
@@ -410,6 +413,13 @@ pub const Sim = struct {
             .max = 4_000,
         }, .{ .expand = .horizontal, .margin = .{ .y = 8 } })) {
             self.panel.mark_budget = @intFromFloat(std.math.clamp(budget_f, 50, 4_000));
+        }
+
+        // Per-level rotation is baked into the world at construction, so this rebuilds it rather
+        // than just taking effect on the next step like the budget above.
+        if (dvui.checkbox(@src(), &self.hex_lattice, "Hex lattice nesting", .{ .margin = .{ .y = 8 } })) {
+            self.panel.place_rotation = if (self.hex_lattice) containment.aperture7_rotation else null;
+            graph.invalidateWorld(&self.panel);
         }
 
         if (self.job != null) {

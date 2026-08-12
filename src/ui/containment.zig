@@ -58,10 +58,24 @@ pub const Options = struct {
     pack_aspect: f32 = 1.35,
     /// Extra turn applied per level, in radians. Defaults to half a slot step, which staggers
     /// consecutive levels so children never line up radially with their parent and the field does
-    /// not band. (The lattice-exact aperture-7 value is 19.1066°, if a global lattice ever
-    /// returns — see `hex.zig`.)
+    /// not band. Set `aperture7_rotation` instead to nest levels on one global hex lattice.
     rotation_per_level: ?f32 = null,
 };
+
+/// The rotation that makes consecutive levels land on a *single* hex lattice rather than each
+/// being turned an arbitrary amount from its parent — `atan(√3/5)`, 19.1066°, the aperture-7
+/// angle (the same one H3 uses between resolutions).
+///
+/// Both halves of the lattice are already here at `arity = .seven`: `ensureChildren` places one
+/// child at the centre and six on a ring, which is the aperture-7 flower, and the area law
+/// `r = note_r · √count` gives a full cell `(√7)^level` — exactly the per-level scale factor
+/// aperture-7 needs. Only the per-level *turn* was off-lattice.
+///
+/// Alignment is exact only for uniformly full cells; real counts are ragged, so radii deviate
+/// from the ideal `(√7)^level` and the fit degrades with raggedness. It is a coherence gain, not
+/// a guarantee — which is why this is offered rather than forced, and why the default stays the
+/// anti-banding half-step until it has been looked at on real shapes.
+pub const aperture7_rotation: f32 = std.math.atan(@as(f32, @sqrt(3.0)) / 5.0);
 
 /// Deliberately holds no pointer back to the ladder: a struct that stores a pointer into itself
 /// (or into a sibling field of the same value) dangles the moment it is returned or moved. The
@@ -438,4 +452,17 @@ test "deterministic" {
         try testing.expectEqual(pa.x, pb.x);
         try testing.expectEqual(pa.y, pb.y);
     }
+}
+
+test "aperture-7 rotation is the lattice angle, not the anti-banding half-step" {
+    // 19.1066°, the value the Options doc comment names. Asserted rather than trusted: it is
+    // written as `atan(√3/5)`, and the whole point of the constant is that it is *exact* — an
+    // eyeballed 0.3335 would nest almost-but-not-quite and look like a subtle layout bug.
+    const deg = aperture7_rotation * 180.0 / std.math.pi;
+    try testing.expectApproxEqAbs(@as(f32, 19.1066), deg, 1e-3);
+
+    // And it must differ from the default it replaces (half of a 60° slot step), or the toggle
+    // exposing it would be a no-op.
+    const half_step = (std.math.tau / 6.0) * 0.5;
+    try testing.expect(@abs(aperture7_rotation - half_step) > 0.1);
 }
