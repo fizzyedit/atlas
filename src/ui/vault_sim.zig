@@ -217,7 +217,13 @@ pub const Sim = struct {
     }
 
     pub fn deinit(self: *Sim) void {
-        self.cancelJob();
+        // `.wait` here, never `.detach`: the worker is running `vault_synth.generate`, which lives
+        // in this dylib, and teardown is followed by the library being unloaded. A detached thread
+        // outliving that executes freed code — the exact hazard `graph.shutdown`'s own doc comment
+        // describes for the layout worker. The wait is bounded by one `generate` call (cancel is
+        // only checked between phases, so a large N cannot be cut short mid-solve), which is why
+        // the interactive path below still detaches instead.
+        self.cancelJob(.wait);
         graph.shutdownPanel(&self.panel);
         self.panel.deinit();
         self.state.deinit();
@@ -249,11 +255,16 @@ pub const Sim = struct {
         self.pollJob();
     }
 
-    fn cancelJob(self: *Sim) void {
+    /// `.detach` leaves an unfinished worker to claim and free itself — right for an interactive
+    /// re-edit, where joining a large `generate` would freeze the window. `.wait` joins instead,
+    /// and is required at teardown: see `deinit`.
+    const CancelMode = enum { detach, wait };
+
+    fn cancelJob(self: *Sim, mode: CancelMode) void {
         const job = self.job orelse return;
         self.job = null;
         job.cancel.store(true, .release);
-        if (job.done.load(.acquire)) {
+        if (job.done.load(.acquire) or mode == .wait) {
             if (job.thread) |t| t.join();
             job.thread = null;
             if (job.tryClaim()) job.destroy();
@@ -266,7 +277,7 @@ pub const Sim = struct {
     }
 
     fn startJob(self: *Sim) void {
-        self.cancelJob();
+        self.cancelJob(.detach);
         const job = self.gpa.create(RegenJob) catch return;
         job.* = .{ .gpa = self.gpa, .spec = self.pending };
         self.job = job;
@@ -397,10 +408,29 @@ pub const Sim = struct {
         dvui.label(@src(), "notes: {d} of {d}", .{ st.notes, st.total_notes }, .{ .color_text = dim });
         dvui.label(@src(), "masses: {d}", .{st.masses}, .{ .color_text = dim });
         dvui.label(@src(), "links: {d} of {d}", .{ st.links, st.total_edges }, .{ .color_text = dim });
+        // Camera/viewport, because a canvas that never got a real rect (or a camera parked
+        // somewhere the graph isn't) looks exactly like a control that did nothing, and there is
+        // otherwise no way to tell those two apart from the outside.
+        const vp = self.panel.camera.viewport;
+        dvui.label(@src(), "view: {d:.0}x{d:.0} @ {d:.3}x", .{
+            vp.w, vp.h, self.panel.camera.zoom,
+        }, .{ .color_text = dim });
     }
 
     fn drawCanvas(self: *Sim) !void {
-        var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
+        // Opaque, and distinctly darker than the window fill. The window itself is drawn at 0.85
+        // opacity (matching fizzy's dialog chrome), which left the editor — and the real bottom
+        // panel's own graph — legible straight through this area. With nothing of its own painted
+        // here it was genuinely ambiguous whether a graph on screen belonged to the simulator or
+        // to the panel behind it, which is exactly the wrong thing to be unsure about while
+        // judging whether a control did anything.
+        var box = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .both,
+            .background = true,
+            .color_fill = dvui.themeGet().color(.window, .fill),
+            .margin = .{ .y = 8, .w = 8, .h = 8 },
+            .corners = .round(6),
+        });
         defer box.deinit();
         try graph.drawPanel(&self.panel, &self.state);
     }
