@@ -57,12 +57,25 @@ pub const Edge = struct { a: u32, b: u32, w: f32 = 1.0 };
 /// fit in a `u8` for any sane arity.
 pub const SibPair = struct { i: u8, j: u8, w: f32 };
 
+/// One cell's pull toward something *outside* it: child `child` of this cell links to the subtree
+/// under `toward`, with total weight `w`.
+///
+/// `SibPair` records a link once, at its LCA, which makes it invisible from below — when
+/// `containment` places cell C's children it can see links *among* them and nothing else, so a
+/// child whose real neighbours lie one cell over has no reason to sit on that side. This is the
+/// missing half: `toward` is always a sibling of C (the other branch at the LCA), and siblings are
+/// placed together when their parent expands, so by the time C's own children are placed
+/// `field.pos[toward]` is already known. Direction only — see `containment.arrangementCost`.
+pub const ExtPull = struct { child: u8, toward: u32, w: f32 };
+
 pub const Cell = struct {
     parent: u32 = invalid,
     child_start: u32 = 0,
     child_count: u16 = 0,
     pair_start: u32 = 0,
     pair_count: u16 = 0,
+    ext_start: u32 = 0,
+    ext_count: u16 = 0,
     /// Real notes beneath this cell. Folder nodes never count.
     count: u32 = 0,
     level: u16 = 0,
@@ -85,6 +98,7 @@ pub const Ladder = struct {
     cells: []Cell = &.{},
     children: []u32 = &.{},
     pairs: []SibPair = &.{},
+    ext: []ExtPull = &.{},
     /// note id -> the leaf cell holding it (`invalid` if the note was not placed).
     leaf_cell: []u32 = &.{},
     /// dfs slot -> note id, and its inverse.
@@ -101,6 +115,7 @@ pub const Ladder = struct {
         gpa.free(self.cells);
         gpa.free(self.children);
         gpa.free(self.pairs);
+        gpa.free(self.ext);
         gpa.free(self.leaf_cell);
         gpa.free(self.note_at);
         gpa.free(self.slot_of);
@@ -116,6 +131,11 @@ pub const Ladder = struct {
     pub fn pairsOf(self: Ladder, id: u32) []const SibPair {
         const c = self.cells[id];
         return self.pairs[c.pair_start..][0..c.pair_count];
+    }
+
+    pub fn extOf(self: Ladder, id: u32) []const ExtPull {
+        const c = self.cells[id];
+        return self.ext[c.ext_start..][0..c.ext_count];
     }
 };
 
@@ -597,11 +617,18 @@ fn maxDepth(lad: Ladder, id: u32) u16 {
 fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes: usize) !void {
     var acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
     defer acc.deinit(gpa);
+    // (cell << 40) | (child << 32) | toward  ->  weight. One level below the LCA on each side:
+    // the pair above says "x links to y", this says *which child of x* does — the part
+    // `containment` needs to aim a slot, and the part the LCA-only record throws away.
+    var ext_acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
+    defer ext_acc.deinit(gpa);
 
     for (links) |e| {
         if (e.a >= n_notes or e.b >= n_notes or e.a == e.b) continue;
-        var x = lad.leaf_cell[e.a];
-        var y = lad.leaf_cell[e.b];
+        const leaf_a = lad.leaf_cell[e.a];
+        const leaf_b = lad.leaf_cell[e.b];
+        var x = leaf_a;
+        var y = leaf_b;
         if (x == invalid or y == invalid or x == y) continue;
 
         // climb to equal depth, then together until the parents meet
@@ -623,6 +650,13 @@ fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes
             if (kid == y) j = @intCast(ki);
         }
         if (i == 255 or j == 255) continue;
+
+        // Descend one level from each side of the LCA: which child of `x` actually holds this
+        // link's endpoint, and therefore wants to face `y` (and symmetrically). Recorded only
+        // when that side has children to aim — a leaf `x` has no slots of its own to arrange.
+        recordExt(gpa, &ext_acc, lad, x, leaf_a, y, e.w) catch {};
+        recordExt(gpa, &ext_acc, lad, y, leaf_b, x, e.w) catch {};
+
         const lo = @min(i, j);
         const hi = @max(i, j);
         const key = (@as(u64, p) << 16) | (@as(u64, lo) << 8) | hi;
@@ -656,6 +690,62 @@ fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes
         try pairs.appendSlice(gpa, kv.value_ptr.items);
     }
     lad.pairs = try pairs.toOwnedSlice(gpa);
+
+    var ext: std.ArrayListUnmanaged(ExtPull) = .empty;
+    errdefer ext.deinit(gpa);
+    var ext_by_cell: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(ExtPull)) = .empty;
+    defer {
+        var eit = ext_by_cell.valueIterator();
+        while (eit.next()) |v| v.deinit(gpa);
+        ext_by_cell.deinit(gpa);
+    }
+    var eit = ext_acc.iterator();
+    while (eit.next()) |kv| {
+        const cell: u32 = @intCast(kv.key_ptr.* >> 40);
+        const child: u8 = @intCast((kv.key_ptr.* >> 32) & 0xff);
+        const toward: u32 = @intCast(kv.key_ptr.* & 0xffffffff);
+        const gop = try ext_by_cell.getOrPut(gpa, cell);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(gpa, .{ .child = child, .toward = toward, .w = kv.value_ptr.* });
+    }
+    var eit2 = ext_by_cell.iterator();
+    while (eit2.next()) |kv| {
+        const cell = kv.key_ptr.*;
+        lad.cells[cell].ext_start = @intCast(ext.items.len);
+        lad.cells[cell].ext_count = std.math.cast(u16, kv.value_ptr.items.len) orelse std.math.maxInt(u16);
+        try ext.appendSlice(gpa, kv.value_ptr.items[0..lad.cells[cell].ext_count]);
+    }
+    lad.ext = try ext.toOwnedSlice(gpa);
+}
+
+/// Record that whichever child of `cell` contains `leaf` is pulled toward `toward`.
+///
+/// `cell` is one side of a link's LCA split and `toward` is the other, so `toward` is always a
+/// sibling of `cell` — already positioned by the time `cell` expands. Skipped for a leaf `cell`,
+/// which has no children to arrange.
+fn recordExt(
+    gpa: std.mem.Allocator,
+    acc: *std.AutoHashMapUnmanaged(u64, f32),
+    lad: *const Ladder,
+    cell: u32,
+    leaf: u32,
+    toward: u32,
+    w: f32,
+) !void {
+    if (lad.cells[cell].child_count == 0) return;
+    // Climb from the leaf until the node whose parent is `cell` — that is the child holding it.
+    var node = leaf;
+    while (node != invalid and lad.cells[node].parent != cell) node = lad.cells[node].parent;
+    if (node == invalid) return;
+    const kids = lad.childrenOf(cell);
+    var ci: u8 = 255;
+    for (kids, 0..) |k, k_i| {
+        if (k == node) ci = @intCast(k_i);
+    }
+    if (ci == 255) return;
+    const key = (@as(u64, cell) << 40) | (@as(u64, ci) << 32) | @as(u64, toward);
+    const gop = try acc.getOrPut(gpa, key);
+    gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + w;
 }
 
 // ---- tests ----------------------------------------------------------------------------------

@@ -70,6 +70,9 @@ pub const Options = struct {
     /// single-child chains without renumbering, so a parent's level can skip one or more of its
     /// child's, and a per-level factor would then disagree with the actual count ratio.
     radius_exp: f32 = 0.5,
+    /// Weight on facing links that leave the cell, against shortening the ones inside it. See the
+    /// `extOf` term in `arrangementCost`; 0 restores purely-local slot assignment.
+    ext_k: f32 = 1.0,
 };
 
 /// The smallest `radius_exp` at which an arity-7 cell's uniform children stop overlapping.
@@ -227,6 +230,32 @@ pub const Field = struct {
         var cost: f32 = 0;
         for (lad.pairsOf(cell)) |p| {
             cost += p.w * Vec2.dist(at[p.i], at[p.j]);
+        }
+
+        // Face the rest of the graph. Sibling pairs alone make each cell internally sensible but
+        // blind to its neighbours, so locally-ordered groups still read as random in aggregate —
+        // a child whose real neighbours are one cell over has no reason to sit on that side.
+        //
+        // Direction only, deliberately: the distance to a sibling *cell* is far larger than any
+        // intra-cell slot distance, so a positional term would swamp the sibling cost entirely and
+        // turn slot choice into "point at the neighbour" regardless of internal structure. This
+        // costs `1 − cos θ` per unit weight, bounded in [0, 2], so it breaks ties and nudges
+        // rather than dominating.
+        if (self.opts.ext_k != 0) {
+            const centre = self.pos[cell];
+            for (lad.extOf(cell)) |e| {
+                if (e.child >= at.len or is_centre[e.child]) continue; // centre has no direction
+                if (e.toward >= self.pos.len) continue;
+                const slot_v = at[e.child];
+                const slot_len = @sqrt(slot_v.x * slot_v.x + slot_v.y * slot_v.y);
+                if (slot_len < 1e-6) continue;
+                const tx = self.pos[e.toward].x - centre.x;
+                const ty = self.pos[e.toward].y - centre.y;
+                const t_len = @sqrt(tx * tx + ty * ty);
+                if (t_len < 1e-6) continue;
+                const cos = (slot_v.x * tx + slot_v.y * ty) / (slot_len * t_len);
+                cost += self.opts.ext_k * e.w * (1.0 - cos);
+            }
         }
         if (self.opts.mass_k != 0) {
             for (ring_kids, 0..) |k, i| {
@@ -562,4 +591,56 @@ test "radius_exp removes the overlap area conservation forces" {
             try testing.expectApproxEqAbs(@as(f32, 0), worst, 1e-3);
         }
     }
+}
+
+test "ext_k aims children at their out-of-cell neighbours" {
+    // Two groups of seven, each internally chained, plus one heavy cross-link between a specific
+    // leaf in each. At the cell holding a group, that link is *external* — invisible to
+    // `pairsOf`, which is exactly the gap `extOf` fills. Measured as the objective itself: total
+    // weighted (1 − cos) between each pulled child's slot direction and its target's direction.
+    const gpa = testing.allocator;
+    const n: u32 = 14;
+    var edges: std.ArrayListUnmanaged(fold.Edge) = .empty;
+    defer edges.deinit(gpa);
+    for (0..6) |i| try edges.append(gpa, .{ .a = @intCast(i), .b = @intCast(i + 1) });
+    for (7..13) |i| try edges.append(gpa, .{ .a = @intCast(i), .b = @intCast(i + 1) });
+    // One strong tie, from the *end* of each chain so it is not the obvious centre child.
+    try edges.append(gpa, .{ .a = 6, .b = 7, .w = 8.0 });
+
+    var misalign: [2]f32 = .{ 0, 0 };
+    for ([_]f32{ 0, 1 }, 0..) |ext_k, pass| {
+        var lad = try fold.build(gpa, n, edges.items, &.{}, .{ .arity = .seven });
+        defer lad.deinit(gpa);
+        var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .ext_k = ext_k });
+        defer f.deinit(gpa);
+        placeAll(&f, &lad);
+
+        var total: f32 = 0;
+        for (0..lad.cells.len) |ci| {
+            const cell: u32 = @intCast(ci);
+            const centre = f.pos[cell];
+            for (lad.extOf(cell)) |e| {
+                const kids = lad.childrenOf(cell);
+                if (e.child >= kids.len or e.toward >= f.pos.len) continue;
+                const kp = f.pos[kids[e.child]];
+                const sx = kp.x - centre.x;
+                const sy = kp.y - centre.y;
+                const tx = f.pos[e.toward].x - centre.x;
+                const ty = f.pos[e.toward].y - centre.y;
+                const sl = @sqrt(sx * sx + sy * sy);
+                const tl = @sqrt(tx * tx + ty * ty);
+                if (sl < 1e-6 or tl < 1e-6) continue;
+                total += e.w * (1.0 - (sx * tx + sy * ty) / (sl * tl));
+            }
+        }
+        misalign[pass] = total;
+    }
+
+    // The pulls must exist at all, or this proves nothing about the term.
+    try testing.expect(misalign[0] > 0.01);
+    // And turning the term on must not make aim worse. Exhaustive search means it can only pick a
+    // lower-cost arrangement, but sibling-distance still shares the objective — so the honest
+    // assertion is "no worse", with a strict improvement expected on this deliberately-tied case.
+    try testing.expect(misalign[1] <= misalign[0] + 1e-4);
+    try testing.expect(misalign[1] < misalign[0]);
 }
