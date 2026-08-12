@@ -55,15 +55,31 @@ pub const SimState = struct {
     indexer_ready: bool = false,
     db: ?Db = null,
     vault_root: ?[]const u8 = "synth://atlas-simulator",
+    /// Packed world positions from `vault_synth`, parallel to note ids `1..N` (so graph index
+    /// `i` after the id-sort). Owned; freed on replace and on `deinit`.
+    synth_pos: ?[]dvui.Point = null,
+    gpa: std.mem.Allocator = undefined,
 
     pub fn init(self: *SimState, gpa: std.mem.Allocator) void {
         self.indexer = Indexer.init(gpa, &self.busy, &self.generation);
         self.indexer_ready = true;
+        self.gpa = gpa;
     }
 
     pub fn deinit(self: *SimState) void {
         if (self.indexer_ready) self.indexer.deinit();
         self.indexer_ready = false;
+        if (self.synth_pos) |p| self.gpa.free(p);
+        self.synth_pos = null;
+    }
+
+    /// Duck-typed hook `graph.zig`'s rebuild looks for with `@hasDecl`: positions are already
+    /// known, so the force layout is skipped entirely. Without this a synthetic vault above a few
+    /// thousand notes runs a full `layout_full` solve — minutes at 450k, during which `Panel.job`
+    /// never completes and the panel keeps redrawing whatever arrangement last *finished*. The
+    /// real `State` has no such method, so that branch compiles out for the live bottom panel.
+    pub fn packedPositions(self: *const SimState) ?[]const dvui.Point {
+        return self.synth_pos;
     }
 
     pub fn hasGraphSource(self: *const SimState) bool {
@@ -85,6 +101,9 @@ const RegenJob = struct {
 
     nodes: ?[]Indexer.SnapNode = null,
     edges: ?[]Indexer.SnapEdge = null,
+    /// Packed positions from the generator — handed to the panel so it skips the force layout
+    /// entirely. Ownership moves to `SimState.synth_pos` on a successful poll.
+    positions: ?[]dvui.Point = null,
     /// `nodes[].path`/`.title` live here; freed once `publishSynthetic` has deep-copied them.
     node_arena: ?std.heap.ArenaAllocator = null,
 
@@ -94,8 +113,10 @@ const RegenJob = struct {
 
     fn discardResults(self: *RegenJob) void {
         if (self.edges) |e| self.gpa.free(e);
+        if (self.positions) |p| self.gpa.free(p);
         if (self.node_arena) |*a| a.deinit();
         self.edges = null;
+        self.positions = null;
         self.nodes = null;
         self.node_arena = null;
     }
@@ -178,6 +199,12 @@ fn regenWorker(job: *RegenJob) void {
     job.nodes = nodes;
     job.edges = edges;
     job.node_arena = node_arena;
+    // Take ownership of the packed positions out of `g` before its `deinit` frees them — this is
+    // what lets the panel skip `layout_full` for a synthetic vault of any size.
+    if (g.positions.len == n) {
+        job.positions = g.positions;
+        g.positions = &.{};
+    }
 }
 
 pub const Sim = struct {
@@ -213,6 +240,8 @@ pub const Sim = struct {
         // Pan/zoom must use the dialog-canvas input policy — the main-pane suppressor
         // treats any floating subwindow as "don't touch the editor canvas".
         p.dialog_canvas = true;
+        // Nothing here is backed by a file — clicks must never reach the workbench.
+        p.synthetic = true;
         return .{ .gpa = gpa, .panel = p };
     }
 
@@ -305,6 +334,14 @@ pub const Sim = struct {
         const nodes = job.nodes orelse return;
         const edges = job.edges orelse return;
         if (!self.state.indexer_ready) return;
+
+        // Positions before the publish: the very next `rebuildIfNeeded` reads them via
+        // `packedPositions`, and it is driven by the generation bump `publishSynthetic` does.
+        if (job.positions) |pos| {
+            if (self.state.synth_pos) |old| self.gpa.free(old);
+            self.state.synth_pos = pos;
+            job.positions = null; // ownership moved; don't let `destroy` free it
+        }
 
         self.state.indexer.publishSynthetic(nodes, edges) catch |err| {
             dvui.log.err("atlas: vault simulator publish: {any}", .{err});

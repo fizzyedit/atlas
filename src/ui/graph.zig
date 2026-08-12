@@ -582,6 +582,13 @@ pub const Panel = struct {
     /// floating window (Vault Simulator). The main bottom panel leaves this false so editor
     /// floating tool windows still suppress the vault canvas underneath them.
     dialog_canvas: bool = false,
+    /// No markdown behind these notes — a generated vault (the simulator). Clicks must never
+    /// reach the workbench: the paths are real-looking but resolve to nothing, and asking the
+    /// host to open one takes the failed-load path in the document owner. Deliberately an
+    /// explicit flag rather than inferring it from an empty `path`, which was the earlier guard
+    /// and silently stopped holding the moment the simulator started publishing the generated
+    /// folder paths its layout actually needs.
+    synthetic: bool = false,
     /// Marks this panel's overview may draw in a frame — `world_mod.Params.budget`. Per panel
     /// rather than the bare `galaxy.plugin_mark_budget` constant so the simulator can expose it
     /// as a live knob (raising it resolves more notes as themselves instead of coalescing them
@@ -1926,6 +1933,24 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     job.hist_valid = hist_valid;
     job.changed = changed;
     job.targets = targets;
+
+    // A data source that already knows where every note goes (the vault simulator, whose
+    // generator packs positions itself) hands them over here and the force layout is skipped
+    // entirely. Duck-typed on the method rather than a field, so the live `State` — which has no
+    // such method — compiles this branch out and is completely unaffected.
+    //
+    // This is load-bearing at scale, not an optimization: `layout_full` on a few hundred thousand
+    // notes takes minutes, and while it runs `p.job` never completes, `rebuildIfNeeded` returns
+    // early every frame, and the panel goes on redrawing whatever arrangement last *finished* —
+    // which reads exactly like "changing the note count does nothing."
+    const StateT = @typeInfo(@TypeOf(st)).pointer.child;
+    if (@hasDecl(StateT, "packedPositions")) {
+        if (st.packedPositions()) |pos| {
+            // Positions are keyed by note id `1..N`, which is graph index `0..N-1` after the
+            // id-sort above — so a length match is the whole validity check.
+            if (pos.len == n) job.precomputed = try arena.dupe(dvui.Point, pos);
+        }
+    }
 
     // Small vaults solve here and now: a worker would cost a frame of latency for work that is
     // already too fast to see. Everything bigger goes to a thread, and the panel draws a spinner
@@ -5196,8 +5221,8 @@ fn enterInterior(p: *Panel, st: anytype, note_id: i64) void {
 fn revealInteriorSection(p: *Panel, st: anytype, idx: usize) void {
     if (idx >= p.interior.nodes.len) return;
     const n = p.interior.nodes[idx];
-    // Synthetic notes (vault simulator) have no backing file — nothing to reveal.
-    if (n.path.len == 0) return;
+    // Generated notes have no backing file — nothing to reveal.
+    if (p.synthetic or n.path.len == 0) return;
     const root = st.vault_root orelse return;
     const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
     const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, n.path }) catch return;
@@ -5207,9 +5232,12 @@ fn revealInteriorSection(p: *Panel, st: anytype, idx: usize) void {
 }
 
 fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
+    // Generated notes have no backing file. Checked before anything else, and on the panel
+    // rather than the node: the simulator's paths look real (they have to — the fold ladder
+    // groups on them), so there is nothing about a node itself that says "don't open this."
+    if (p.synthetic) return;
     const root = st.vault_root orelse return;
     const n = p.nodes[idx];
-    // Synthetic notes (vault simulator) have no backing file — nothing to open or reveal.
     if (n.path.len == 0 and !n.phantom) return;
     const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
 
