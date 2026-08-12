@@ -3743,9 +3743,34 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     return .{
         .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
         .border = if (holds_open) hot else border_rest,
-        .r_px = radius_px,
+        .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
     };
+}
+
+/// Proximity swell for a coalesced mass, by screen distance from the cursor.
+///
+/// Notes get this from `applyProximity`, which walks `p.nodes` — masses are not notes, so at
+/// coalesced zoom (most of a large vault, most of the time) nothing on screen responded to the
+/// mouse at all and the view felt inert exactly where it is densest.
+///
+/// Computed at draw time from the cursor rather than eased through stored state like `hover_t`:
+/// a note's swell also drives the neighbour shove and label placement, so it has to be a settled
+/// value those passes can read, but this is purely visual. Cursor movement is continuous and
+/// dvui repaints on it, so a pure function of distance already reads as smooth — and it costs no
+/// per-mass state, which matters when the whole point is that there are a lot of them.
+fn massProximitySwell(p: *const Panel, m: world_mod.Mark) f32 {
+    const mouse = dvui.currentWindow().mouse_pt;
+    if (!p.camera.viewport.contains(mouse)) return 1;
+    const c = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
+    const dx = c.x - mouse.x;
+    const dy = c.y - mouse.y;
+    const d = @sqrt(dx * dx + dy * dy);
+    // Reach from the mass's own rim, not its centre: a big mass should respond when the cursor
+    // approaches the shape you can see, not only when it nears a point buried inside it.
+    const t = std.math.clamp(1.0 - @max(d - m.r, 0) / proximity_falloff_px, 0, 1);
+    if (t <= 0.001) return 1;
+    return 1 + cluster_grow_factor * dvui.easing.outBack(t);
 }
 
 fn overviewHoldsOpen(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark) bool {
