@@ -35,6 +35,15 @@ pub const SimSpec = struct {
 const shape_choices: []const vault_synth.Shape = &.{ .scale_free, .islands, .hub, .bipartite, .chain, .orphans };
 const shape_labels: []const []const u8 = &.{ "scale-free", "islands", "hub", "bipartite", "chain", "orphans" };
 
+/// Width of the numeric readout rows, in M-widths of the mono font — which is also why the rows
+/// are mono: with uniform digit widths a pinned width is exact rather than a guess, and the
+/// right-aligned columns line up. Must cover the longest row below. See `Sim.readout`.
+const readout_cols: f32 = 26;
+
+/// How often the readout resamples the panel's counters. Sampling every frame is what made the
+/// numbers unreadable *and* what kept the window awake — see `Sim.readout`.
+const readout_period_s: f32 = 0.25;
+
 /// Quantize the note-count slider so a small drag doesn't thrash a 500k-note regeneration — same
 /// idea `State.quantizedSynthNotes` used before the whole synth path moved into this file.
 pub fn quantizeNotes(raw: f32) usize {
@@ -232,6 +241,11 @@ pub const Sim = struct {
     place: containment.Options = .{ .radius_exp = 0.619 },
     /// Collapsed by default — five more sliders is a lot of sidebar when you only want a shape.
     show_tuning: bool = false,
+    /// The counters the sidebar is currently displaying, resampled every `readout_period_s`
+    /// rather than every frame. A number that changes 120 times a second is unreadable, and
+    /// re-measuring it is not why the readout exists.
+    hud: graph.PanelStats = .{},
+    hud_accum: f32 = 0,
 
     /// Deliberately doesn't call `self.state.init(gpa)` — `Indexer.init` stores pointers to its
     /// owner's `busy`/`generation` fields, and `Sim.init` returns by value into `ensureSim`'s
@@ -284,6 +298,11 @@ pub const Sim = struct {
     }
 
     fn tick(self: *Sim) void {
+        self.hud_accum += dvui.secondsSinceLastFrame();
+        if (self.hud_accum >= readout_period_s) {
+            self.hud_accum = 0;
+            self.hud = graph.panelTimings(&self.panel);
+        }
         if (self.reload_frames) |frames| {
             if (frames > 1) {
                 self.reload_frames = frames - 1;
@@ -373,7 +392,7 @@ pub const Sim = struct {
         // than setting its own), so this reads as a pane rather than a plain content area.
         var box = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .vertical,
-            .min_size_content = .{ .w = 220 },
+            .min_size_content = .{ .w = 260 },
             .margin = .{ .x = 8, .y = 8, .w = 8, .h = 8 },
             .padding = dvui.Rect.all(8),
             .background = true,
@@ -454,24 +473,62 @@ pub const Sim = struct {
         // drawing a few hundred marks is the LOD working — `notes` resolved as themselves,
         // `masses` standing in for everything else — and the gap between the two numbers is the
         // thing worth being able to see while tuning the budget above.
-        const st = graph.panelStats(&self.panel);
-        const dim = dvui.themeGet().color(.content, .text).opacity(0.55);
+        const st = self.hud;
         dvui.labelNoFmt(@src(), "Drawn", .{}, .{ .margin = .{ .y = 10 } });
-        dvui.label(@src(), "marks: {d} / {d} budget{s}", .{
+        readout(@src(), "marks: {d} / {d}{s}", .{
             st.notes + st.masses,
             st.budget,
-            if (st.bound) " (capped)" else "",
-        }, .{ .color_text = dim });
-        dvui.label(@src(), "notes: {d} of {d}", .{ st.notes, st.total_notes }, .{ .color_text = dim });
-        dvui.label(@src(), "masses: {d}", .{st.masses}, .{ .color_text = dim });
-        dvui.label(@src(), "links: {d} of {d}", .{ st.links, st.total_edges }, .{ .color_text = dim });
+            if (st.bound) " capped" else "",
+        });
+        readout(@src(), "notes: {d} of {d}", .{ st.notes, st.total_notes });
+        readout(@src(), "masses: {d}", .{st.masses});
+        readout(@src(), "links: {d} of {d}", .{ st.links, st.total_edges });
         // Camera/viewport, because a canvas that never got a real rect (or a camera parked
         // somewhere the graph isn't) looks exactly like a control that did nothing, and there is
         // otherwise no way to tell those two apart from the outside.
         const vp = self.panel.camera.viewport;
-        dvui.label(@src(), "view: {d:.0}x{d:.0} @ {d:.3}x", .{
-            vp.w, vp.h, self.panel.camera.zoom,
-        }, .{ .color_text = dim });
+        readout(@src(), "view: {d:.0}x{d:.0} @ {d:.3}x", .{ vp.w, vp.h, self.panel.camera.zoom });
+
+        // Where the frame actually went. The `per-vault` rows are paid in full whether the budget
+        // draws 50 marks or 4000; `per-drawn` is the only part that scales with what is on screen.
+        // When the first dwarfs the second, raising the budget cannot help and lowering it cannot
+        // rescue the frame rate: the cost is upstream of drawing entirely. That is precisely the
+        // reading a slider labelled "Mark budget" invites you to get wrong, which is why it is
+        // printed right underneath it.
+        dvui.labelNoFmt(@src(), "Frame (µs)", .{}, .{ .margin = .{ .y = 10 } });
+        readout(@src(), "total {d:>7}  ({d:>4} fps)", .{
+            st.us_total,
+            if (st.us_total > 0) @min(@as(u64, 9999), 1_000_000 / st.us_total) else 0,
+        });
+        readout(@src(), "per-vault  step {d:>6}", .{st.us_world_step});
+        readout(@src(), "           sync {d:>6}", .{st.us_world_sync});
+        readout(@src(), "           lift {d:>6}", .{st.us_world_lift});
+        readout(@src(), "        rebuild {d:>6}", .{st.us_rebuild});
+        readout(@src(), "           misc {d:>6}", .{st.us_misc});
+        readout(@src(), "per-drawn  bubl {d:>6}", .{st.us_bubbles});
+        readout(@src(), "          hover {d:>6}", .{st.us_hover});
+        readout(@src(), "         labels {d:>6}", .{st.us_labels});
+        readout(@src(), "           draw {d:>6}", .{st.us_draw});
+    }
+
+    /// One line of the numeric readout, at a **pinned width**.
+    ///
+    /// Every one of these carries a number that changes as the camera moves, and a plain
+    /// `dvui.label` takes its min size from its text. Two things follow, both of which this window
+    /// had: `WidgetData.minSizeSetAndRefresh` calls `dvui.refresh` whenever a widget's min size
+    /// changes and was a binding constraint, so a per-frame-varying width means the app can never
+    /// go to sleep; and the sidebar box sizes to its widest child, so the pane — and the splitter
+    /// beside it — visibly jittered as digits came and went.
+    ///
+    /// `min_sizeM`/`max_sizeM` pin the content box to a fixed number of M-widths, so the text never
+    /// reaches the layout at all. The format strings above right-align their numbers into that
+    /// width; keep them inside `readout_cols` or they will be clipped rather than resize anything.
+    fn readout(src: std.builtin.SourceLocation, comptime fmt: []const u8, args: anytype) void {
+        const opts: dvui.Options = .{
+            .color_text = dvui.themeGet().color(.content, .text).opacity(0.55),
+            .font = dvui.Font.theme(.mono),
+        };
+        dvui.label(src, fmt, args, opts.min_sizeM(readout_cols, 1).max_sizeM(readout_cols, 1));
     }
 
     /// Placement knobs, all `containment.Options`. Every one is baked into the world when it is

@@ -59,10 +59,17 @@ generation: std.atomic.Value(u64) = .init(0),
 /// True while a scan is in flight.
 busy: std.atomic.Value(bool) = .init(false),
 
-/// Candidate list for `resolve.resolve`, rebuilt on the UI thread whenever `generation` moves.
-/// Lives in `cand_arena` so a rebuild is one reset.
+/// Candidate list for `resolve.resolve`, refreshed whenever `generation` moves.
+///
+/// Normally *not* built here: the indexer builds it on its worker as part of publishing and this
+/// thread adopts the whole thing (`cand_owned`). `cand_arena` backs the fallback path only — no
+/// indexer, or a generation nobody published candidates for — which is the query this used to run
+/// on every rebuild, and the reason opening the first document in a large vault hitched.
 cand_arena: std.heap.ArenaAllocator = undefined,
 cand_ready: bool = false,
+/// The set adopted from the indexer, when the current lists came from there. Owned: dropped when
+/// the next set is adopted, when the fallback path takes over, or at teardown.
+cand_owned: ?Indexer.CandidateSet = null,
 cand_gen: u64 = std.math.maxInt(u64),
 candidates: []const resolve.Candidate = &.{},
 /// Media (image) candidates, loaded from the same arena and generation as `candidates`.
@@ -93,6 +100,8 @@ pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
     self.watcher_ready = false;
     if (self.indexer_ready) self.indexer.deinit();
     self.indexer_ready = false;
+    if (self.cand_owned) |*set| set.deinit();
+    self.cand_owned = null;
     if (self.cand_ready) self.cand_arena.deinit();
     self.cand_ready = false;
     self.clearDirty();
@@ -170,37 +179,25 @@ pub fn tickWatcher(self: *State) void {
     if (self.watcher_ready) self.watcher.tick();
 }
 
-/// Drop overlays for documents that are no longer open, and re-read those notes from disk.
+/// Drop overlays for documents that are no longer open.
 ///
-/// Closing a document *without saving* is the case this exists for, and it is invisible to every
-/// other layer. `setDirtyContent` deliberately puts unsaved bytes into the index — that is what
-/// makes a half-typed `[[Link]]` appear in the graph while you type it — but closing the tab
-/// doesn't touch the file. No mtime moves, so neither fizzy's folder watch nor the open-doc poll
-/// has anything to report, and the graph would go on drawing an edge the file on disk never had.
+/// This used to also re-read those notes from disk, because unsaved bytes went into the index and
+/// closing a tab without saving left the graph drawing an edge the file never had. The index no
+/// longer takes unsaved bytes at all (see `setDirtyContent`), so it already agrees with disk and
+/// there is nothing to repair — only the backlinks overlay to forget, which would otherwise keep
+/// showing lines from a buffer that is gone.
 ///
 /// Written as a reconciliation against the open set rather than a close event, for two reasons.
 /// atlas owns no documents, so `closeDocument` is routed to the owner and never reaches here at
 /// all. And comparing the two sets cannot *miss* a close the way a subscription can.
-///
-/// `Indexer.enqueue` is the whole repair: `indexBuffer` stamped the row `mtime_ns = 0` precisely
-/// so that the disk path's early-out can't mistake it for current, so `indexOne` re-reads the
-/// file — and if the close followed a save, the content hash matches and it quietly refreshes
-/// metadata instead of republishing.
 fn reconcileDirty(self: *State) void {
     // The overwhelmingly common case: nothing typed but unsaved, so nothing to reconcile. Worth
     // the early-out because this runs every frame rather than on the poll interval — the graph
     // should correct itself on the frame the tab closes, not up to a poll later.
     if (self.dirty.count() == 0) return;
-    const root = self.vault_root orelse return;
-
     // Removing while iterating a hash map isn't safe, and `dirty` is at most a tab bar's worth
     // of unsaved markdown, so take one stale entry per pass rather than allocating a list.
     while (self.firstClosedDirty()) |abs| {
-        // `rel` borrows `abs`, which is the map's own key memory — enqueue (which copies) before
-        // freeing it.
-        if (query.vaultRelative(root, abs)) |rel| {
-            if (self.indexer_ready) self.indexer.enqueue(rel);
-        }
         if (self.dirty.fetchRemove(abs)) |kv| {
             self.dirty_gpa.free(kv.key);
             self.dirty_gpa.free(kv.value);
@@ -262,26 +259,68 @@ pub fn registerSettings(self: *State, host: *sdk.Host, plugin: *sdk.Plugin) !voi
 pub fn convertWikilinks(self: *State, arena: std.mem.Allocator, path: []const u8, bytes: []const u8) !?[]const u8 {
     const root = self.vault_root orelse return null;
     const rel = query.vaultRelative(root, path) orelse return null;
-    const candidates = try self.ensureCandidates();
+    // One refresh, then read both lists. Calling the two `ensure` helpers in sequence would leave a
+    // window where the second one adopts a new set and frees the arena the first one's slice still
+    // points into — the lists are refreshed together precisely so nobody has to hold one across a
+    // rebuild of the other.
     const media = try self.ensureMediaCandidates();
+    const candidates = self.candidates;
     if (candidates.len == 0 and media.len == 0) return null;
     return Scanner.convertWikilinks(arena, bytes, rel, candidates, media);
 }
 
+/// The candidates for the current generation. Cheap once warm, and cheap to *become* warm — the
+/// lists are built on the indexer's worker and claimed here, so this is a pointer swap rather than
+/// the multi-second walk of every note it used to be.
 pub fn ensureCandidates(self: *State) ![]const resolve.Candidate {
+    // Loaded before the take, never after. The worker parks a set and *then* bumps the
+    // generation, so reading first can only under-claim — we adopt a set newer than `gen` and
+    // stamp it with `gen`, costing one redundant refresh later. Reading after the take could
+    // stamp a generation the adopted set doesn't cover, which is stale data flying as fresh.
     const gen = self.generation.load(.acquire);
     if (self.cand_gen == gen) return self.candidates;
     if (!self.cand_ready) return &.{};
+
+    if (self.indexer_ready) {
+        if (self.indexer.takeCandidates()) |set| {
+            self.releaseCandidates();
+            self.cand_owned = set;
+            self.candidates = set.notes;
+            self.media_candidates = set.media;
+            self.cand_gen = gen;
+            return self.candidates;
+        }
+    }
+
+    // A set is on its way. Keep what we have — empty on a freshly opened vault — and ask again
+    // next call rather than racing the worker to run the same multi-second query on this thread.
+    // That race is the original hitch: the first document opens while the first scan is still
+    // running, so the handoff is legitimately empty and a fallback here would fire every time.
+    if (self.indexer_ready and self.indexer.candidatesPending()) return self.candidates;
+
+    // Fallback. Nothing published candidates for this generation and none is coming: no vault
+    // indexer (headless tests, a synthetic vault), a publish whose candidate build failed, or a
+    // generation bumped by something other than `commitAndPublish`.
     const db = if (self.db) |*d| d else {
-        self.candidates = &.{};
+        self.releaseCandidates();
         self.cand_gen = gen;
         return &.{};
     };
-    _ = self.cand_arena.reset(.free_all);
+    self.releaseCandidates();
     self.candidates = try query.loadCandidates(db, self.cand_arena.allocator());
     self.media_candidates = try query.loadMediaCandidates(db, self.cand_arena.allocator());
     self.cand_gen = gen;
     return self.candidates;
+}
+
+/// Drop whatever backs the current lists — the adopted set, the fallback arena, or neither — and
+/// leave both empty. Does not touch `cand_gen`; every caller sets it to what it means next.
+fn releaseCandidates(self: *State) void {
+    if (self.cand_owned) |*set| set.deinit();
+    self.cand_owned = null;
+    if (self.cand_ready) _ = self.cand_arena.reset(.free_all);
+    self.candidates = &.{};
+    self.media_candidates = &.{};
 }
 
 /// Media candidates for the current generation. Goes through `ensureCandidates` so both lists
@@ -292,29 +331,45 @@ pub fn ensureMediaCandidates(self: *State) ![]const resolve.Candidate {
 }
 
 fn invalidateCandidates(self: *State) void {
-    if (self.cand_ready) _ = self.cand_arena.reset(.free_all);
-    self.candidates = &.{};
-    self.media_candidates = &.{};
+    self.releaseCandidates();
     self.cand_gen = std.math.maxInt(u64);
 }
 
 /// Record (or clear) an unsaved buffer. `bytes` is copied; empty `path` is ignored.
 ///
-/// Two consumers. The `dirty` overlay is read by the backlinks panel directly. The indexer
-/// gets the same bytes queued for a reindex, which is what puts the change in the *graph* —
-/// the graph only ever reads the indexed snapshot, so before this it had no route to an edit
-/// at all except `Watcher`'s 2s poll, which is driven from `endFrame` and therefore stops
-/// happening entirely once the app idles.
+/// One consumer: the `dirty` overlay the backlinks panel reads, so a row can show the line as it
+/// currently stands rather than as it was last saved.
+///
+/// **The index is deliberately not fed from here.** These bytes arrive on a typing lull, and a
+/// half-typed document is not a document — `[[Paris]]` is preceded by `[[P]]`, `[[Pa]]`, `[[Par]]`,
+/// and every one of those resolves to nothing and *materialises a phantom note* for a page that
+/// will never exist. Those are real rows in `notes` and real nodes in the graph, so indexing as you
+/// type does not merely cost a rebuild per lull — it fills the vault with debris and then draws it.
+///
+/// A save is the moment the document means something. This *does* nudge the indexer — but with the
+/// **path only**, never the bytes, so the index still reads nothing but what is on disk.
+///
+/// That distinction is the whole design. Fizzy fires this both on a typing lull and on a save, and
+/// cannot say which; `indexOne` can, because it stats the file. A lull finds the same mtime and
+/// size as last time and early-outs before reading a byte, publishing nothing and creating no
+/// phantoms. A save finds a new stat and re-reads from disk. So the ambiguous signal is resolved by
+/// the filesystem rather than guessed at, and it costs one `stat` per typing lull.
+///
+/// Without this, a save waits on `Watcher` — layer 1's host-coalesced filesystem event, or worst
+/// case layer 2's 2s poll. On a small vault that wait *is* the latency: the index and rebuild are
+/// tens of milliseconds, and the reader is left watching a stale graph for up to two seconds.
 pub fn setDirtyContent(self: *State, path: []const u8, bytes: []const u8) void {
     const gpa = self.dirty_gpa;
+    // No vault means nothing to overlay onto, and no path means an unsaved buffer with no identity
+    // for the panel to match against.
     const root = self.vault_root orelse return;
     if (path.len == 0) return;
-    const rel = query.vaultRelative(root, path) orelse return;
     if (!query.isMarkdownPath(path)) return;
 
-    // The indexer wakes the app itself once it publishes, so the graph repaints without
-    // waiting on the next input event.
-    if (self.indexer_ready) self.indexer.enqueueContent(rel, bytes);
+    // Path only — see above. `indexOne` stats it and does nothing if the file has not moved.
+    if (self.indexer_ready) {
+        if (query.vaultRelative(root, path)) |rel| self.indexer.enqueue(rel);
+    }
 
     const gop = self.dirty.getOrPut(gpa, path) catch return;
     if (!gop.found_existing) {

@@ -142,8 +142,8 @@ const testing = std.testing;
 
 test "same directory" {
     var buf: [128]u8 = undefined;
-    const r = try relative("readme.md", "claude.md", &buf);
-    try testing.expectEqualStrings("claude.md", r);
+    const r = try relative("readme.md", "physics.md", &buf);
+    try testing.expectEqualStrings("physics.md", r);
 }
 
 test "into subdirectory" {
@@ -177,7 +177,7 @@ test "encode spaces" {
 }
 
 test "formatLink" {
-    const s = try formatLink(testing.allocator, "Claude", "notes/claude.md");
+    const s = try formatLink(testing.allocator, "Physics", "notes/physics.md");
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("[Claude](notes/claude.md)", s);
+    try testing.expectEqualStrings("[Physics](notes/physics.md)", s);
 }

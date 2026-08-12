@@ -144,21 +144,23 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "atlas-camera-tests", "src/ui/camera.zig" },
         .{ "atlas-layout-full-tests", "src/ui/layout_full.zig" },
-        // Point-region quadtree spine + thin present layer (Stable v1 organic LOD).
+        // Point-region quadtree spine + thin present layer.
         .{ "atlas-galaxy-tests", "src/ui/galaxy.zig" },
         .{ "atlas-vault-synth-tests", "src/ui/vault_synth.zig" },
         .{ "atlas-hex-tests", "src/ui/hex.zig" },
+        // The shared radix sort behind `fold`'s edge lift and `cellweb`'s dedupe. Its stability
+        // and its uniform-digit skip are both load-bearing and both silent when wrong.
+        .{ "atlas-radix-tests", "src/ui/radix.zig" },
         // Only `dotgrid`'s LOD math and buffer sizing — the draw path needs a live window.
         .{ "atlas-dotgrid-tests", "src/ui/dotgrid.zig" },
         // Label slot geometry and the greedy placer — the "no two names overlap" guarantee
         // the graph's draw pass leans on.
         .{ "atlas-labels-tests", "src/ui/labels.zig" },
-        // How much of the web a focus flight frames — the percentile that keeps one far-flung
-        // link from undoing the zoom.
-        .{ "atlas-focus-tests", "src/ui/focus.zig" },
         // Where a note's own cloud sits inside the overview's — the power-of-two nesting that
         // lets the interior be a finer level of the same hex lattice rather than a second one.
         .{ "atlas-interior-tests", "src/ui/interior.zig" },
+        // Which line of a markdown block becomes its label, and where that label is cut.
+        .{ "atlas-excerpt-tests", "src/ui/excerpt.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],
@@ -205,6 +207,9 @@ pub fn build(b: *std.Build) void {
         // an immediate "file exists in modules 'resolve' and 'Scanner'".
         bench.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         bench.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
+        // `--index` drives the real `Indexer` against a real database, which is the only way to
+        // time the scan the rest of this harness skips.
+        bench.root_module.addImport("sqlite", sqlite.module("sqlite"));
         // A distinct module object from `content_graph_mod`/`cg_for_db_test` above, deliberately —
         // same reasoning: sharing one `Module` object across independent build artifacts is the
         // other half of the "file exists in modules X and Y" bug class this file already works
@@ -218,6 +223,23 @@ pub fn build(b: *std.Build) void {
         const run_bench = b.addRunArtifact(bench);
         if (b.args) |a| run_bench.addArgs(a);
         b.step("bench", "Scan/resolve timings, --stats structure, --world LOD sweep").dependOn(&run_bench.step);
+    }
+
+    // MediaWiki dump -> a vault of markdown notes with the wikilinks intact. Standalone: it needs
+    // no dvui and nothing from the plugin, because the only contract it has to honour is the link
+    // syntax `src/index/resolve.zig` already reads off disk.
+    {
+        const wiki = b.addExecutable(.{
+            .name = "atlas-wiki-import",
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path("src/wiki_import.zig"),
+            }),
+        });
+        const run_wiki = b.addRunArtifact(wiki);
+        if (b.args) |a| run_wiki.addArgs(a);
+        b.step("wiki-import", "MediaWiki XML dump -> markdown vault").dependOn(&run_wiki.step);
     }
 
     // markworld demos (rings / coalesce) — package owns sources + zflecs; brain thin-wraps.

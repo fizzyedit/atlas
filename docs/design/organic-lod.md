@@ -1,5 +1,7 @@
 # Organic LOD: Stable v1 (topology spine)
 
+> **Superseded.** The quadtree/agent LOD described here was replaced by `fold` + `containment` + `world`; `quadlod.zig`, `quad_agents.zig` and `lod.zig` no longer exist. Kept for the rejected-approach tables, which still hold. For how the system works now see [`scale-architecture.md`](scale-architecture.md).
+
 Budgeted keep-alive masses over a **point-region quadtree**. Topology + agent presentation for
 the overview; **drawing** is now Galaxy LOD soft sprites — see [`galaxy-lod.md`](galaxy-lod.md).
 

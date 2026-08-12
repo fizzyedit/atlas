@@ -1,21 +1,32 @@
-//! Headless timing harness for the expensive half of Atlas: turning a folder of markdown into
-//! a node/edge graph, and turning that graph into positions — plus an in-memory **scale
-//! simulator** for 100k–1M note vaults (no million files on disk).
+//! Headless timing harness for the expensive half of Atlas — everything between a folder of
+//! markdown and a drawn frame — plus an in-memory generator for 100k–1M note vaults, so the
+//! scale cases can be measured without that many files on disk.
 //!
-//!     zig build bench -Doptimize=ReleaseFast -- <vault-dir> [more-dirs...]
-//!     zig build bench -Doptimize=ReleaseFast -- --galaxy <vault-dir> ...
-//!     zig build bench -Doptimize=ReleaseFast -- --galaxy --place pack \
-//!         synth:100000:islands:4 synth:500000:islands:3 synth:1000000:scale-free:2
+//!     zig build bench -Doptimize=ReleaseFast -- [mode] <target>...
 //!
-//! Spec: `synth:N[:shape[:avg_deg]]` — shapes `scale-free|islands|hub|bipartite|chain|orphans|lfr`.
-//! `--place pack` (default for synth) packs components; `--place layout` runs full force layout.
-//! Slide connection density via `avg_deg` (target mean undirected degree ≈ 2|E|/N).
+//! A target is a vault directory or a `synth:N[:shape[:avg_deg]]` spec; shapes are
+//! `scale-free|islands|hub|bipartite|chain|orphans|lfr`, and `avg_deg` sets the mean undirected
+//! degree. Each target is timed separately.
 //!
-//! Every directory / synth is timed separately. `--galaxy` runs the plugin overview LOD path
-//! headlessly (quadtree → sticky agents → lifted edges) at overview and dive zooms.
+//! | mode | what it measures |
+//! |---|---|
+//! | *(none)* | read → scan → resolve → place, the classic per-stage table |
+//! | `--index` | building the SQLite index from scratch, phase by phase |
+//! | `--index-warm` | re-opening an already-built index |
+//! | `--index-edit` | one edit against a built index — the path a save takes |
+//! | `--refold` | `fold.build` + `cellweb.build`, what a republish costs |
+//! | `--world` | the level-of-detail sweep across a zoom range |
+//! | `--interior` | the same sweep for a single note's content cloud |
+//! | `--stats` | graph structure (degree, components, hub fragility) — no layout |
+//!
+//! Tuning flags: `--place pack|layout`, `--budget=N`, `--link-budget=N`, `--scan-cap=N`,
+//! `--reps=N`, `--svg <dir>`.
 
 const std = @import("std");
 const dvui = @import("dvui");
+const sdk = @import("fizzy_sdk");
+const Db = @import("index/Db.zig");
+const Indexer = @import("index/Indexer.zig");
 const Scanner = @import("index/Scanner.zig");
 const resolve = @import("index/resolve.zig");
 const layout_full = @import("ui/layout_full.zig");
@@ -24,6 +35,7 @@ const vault_synth = @import("ui/vault_synth.zig");
 const bench_stats = @import("bench_stats.zig");
 const world_mod = @import("ui/world.zig");
 const fold = @import("ui/fold.zig");
+const cellweb = @import("ui/cellweb.zig");
 
 /// When set (via `--svg <dir>`), every solved layout is also written there as an SVG.
 var svg_dir: ?[]const u8 = null;
@@ -35,7 +47,37 @@ var synth_place_explicit: bool = false;
 /// correlation) instead of running layout. Fast even on a huge vault — no force solve, no Galaxy.
 var stats_mode: bool = false;
 var world_mode: bool = false;
+/// `--budget=N`: the mark budget the `--world` sweep runs at. The panel's own slider goes to
+/// 4000, and several per-frame costs scale with it rather than with note count, so a sweep pinned
+/// at the 280 default cannot see them.
+var world_budget: usize = 280;
+/// `--scan-cap=N`: `Params.link_scan_cap`, so a sweep can show what the cap is costing.
+var world_scan_cap: usize = 256;
+/// `--split-px=N`: `Params.split_px`, the on-screen radius at which a cell opens. The panel scales
+/// this by `motion_bias` while the camera moves (`graph.motionSplitMax`), so sweeping it is how you
+/// measure what a frame costs *during* a pan rather than at rest.
+var world_split_px: f32 = 30;
+/// `--link-budget=N`: `Params.link_budget`. Zero means "derive from the mark budget exactly as the
+/// panel does" (`Params.ambientLinkBudget`), which is the default so a sweep left alone measures
+/// what the panel draws. An explicit value is how you find out what a denser web would cost.
+var world_link_budget: usize = 0;
 var interior_mode: bool = false;
+/// `--index`: build the real SQLite index from scratch and report where the time went.
+var index_mode: bool = false;
+/// `--index-warm`: keep whatever index the previous run left behind, so the same command
+/// measures a re-open (the path that is supposed to skip the relink) instead of a cold build.
+var index_warm: bool = false;
+/// `--index-edit`: time one live-buffer edit against an already-built index — the path a
+/// keystroke takes, which is the one the app is judged on and the one no other mode covers.
+var index_edit: bool = false;
+/// `--refold`: run `fold.build` + `cellweb.build` repeatedly over a real vault and report each.
+///
+/// Its own mode because these two are what a *republish* costs — the layout job rebuilds the whole
+/// `World` whenever the index bumps the generation, including for a one-note edit — and `--world`
+/// buries them under a scan and a zoom sweep, which is both slow to iterate on and far too short a
+/// window to sample. Looping gives a stable number and a profile long enough to read.
+var refold_mode: bool = false;
+var refold_reps: usize = 5;
 
 const Note = struct {
     path: []const u8,
@@ -53,10 +95,12 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         std.debug.print(
-            \\usage: atlas-bench [--galaxy] [--place pack|layout] [--svg <dir>] [--stats] <target>...
+            \\usage: atlas-bench [mode] [flags] <target>...
             \\  target = <vault-dir> | synth:N[:shape[:avg_deg]]
             \\  shapes = scale-free | islands | hub | bipartite | chain | orphans | lfr
-            \\  --stats: report graph structure instead of running layout (fast on any vault size)
+            \\  modes  = --index | --index-warm | --index-edit | --refold
+            \\           --world | --interior | --stats   (default: scan/resolve/place table)
+            \\  flags  = --place pack|layout  --budget=N  --scan-cap=N  --reps=N  --svg <dir>
             \\
         , .{});
         return error.MissingArgument;
@@ -67,7 +111,33 @@ pub fn main(init: std.process.Init) !void {
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--stats")) stats_mode = true;
         if (std.mem.eql(u8, a, "--world")) world_mode = true;
+        if (std.mem.startsWith(u8, a, "--split-px=")) {
+            world_split_px = try std.fmt.parseFloat(f32, a["--split-px=".len..]);
+        }
+        if (std.mem.startsWith(u8, a, "--link-budget=")) {
+            world_link_budget = try std.fmt.parseInt(usize, a["--link-budget=".len..], 10);
+        }
         if (std.mem.eql(u8, a, "--interior")) interior_mode = true;
+        if (std.mem.eql(u8, a, "--index")) index_mode = true;
+        if (std.mem.eql(u8, a, "--index-warm")) {
+            index_mode = true;
+            index_warm = true;
+        }
+        if (std.mem.eql(u8, a, "--refold")) refold_mode = true;
+        if (std.mem.startsWith(u8, a, "--reps=")) {
+            refold_reps = std.fmt.parseInt(usize, a["--reps=".len..], 10) catch refold_reps;
+        }
+        if (std.mem.eql(u8, a, "--index-edit")) {
+            index_mode = true;
+            index_warm = true;
+            index_edit = true;
+        }
+        if (std.mem.startsWith(u8, a, "--budget=")) {
+            world_budget = std.fmt.parseInt(usize, a["--budget=".len..], 10) catch world_budget;
+        }
+        if (std.mem.startsWith(u8, a, "--scan-cap=")) {
+            world_scan_cap = std.fmt.parseInt(usize, a["--scan-cap=".len..], 10) catch world_scan_cap;
+        }
     }
 
     if (interior_mode) {
@@ -75,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (!stats_mode and !world_mode) {
+    if (!stats_mode and !world_mode and !index_mode and !refold_mode) {
         std.debug.print(
             "{s:<22}{s:>7}{s:>8}{s:>9}{s:>8}{s:>10}{s:>8}{s:>9}{s:>8}{s:>8}{s:>9}{s:>11}\n",
             .{ "vault", "notes", "edges", "read", "scan", "resolve", "hop2", "force", "pack", "relax", "snap+ref", "LAYOUT" },
@@ -87,6 +157,13 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--world")) continue;
+        if (std.mem.eql(u8, a, "--index")) continue;
+        if (std.mem.eql(u8, a, "--index-warm")) continue;
+        if (std.mem.eql(u8, a, "--index-edit")) continue;
+        if (std.mem.eql(u8, a, "--refold")) continue;
+        if (std.mem.startsWith(u8, a, "--reps=")) continue;
+        if (std.mem.startsWith(u8, a, "--budget=")) continue;
+        if (std.mem.startsWith(u8, a, "--scan-cap=")) continue;
         if (std.mem.eql(u8, a, "--stats")) {
             continue; // handled in the pre-pass above
         }
@@ -129,6 +206,10 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 try benchSynth(gpa, io, spec);
             }
+        } else if (refold_mode) {
+            try refoldVault(gpa, io, a);
+        } else if (index_mode) {
+            try indexVault(gpa, io, a);
         } else if (world_mode) {
             try worldVault(gpa, io, a);
         } else if (stats_mode) {
@@ -139,18 +220,174 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// `--index`: build the real SQLite index over a real vault and report where the time went.
+///
+/// The scan is the one expensive stage the rest of this harness skips: `benchVault` reads and
+/// parses the same files, but never opens a database, so nothing here could see the cost that
+/// actually dominates opening a large vault for the first time. Every guess about that cost has
+/// been wrong so far, which is what `Indexer.Timings` exists for — this just runs the scan on the
+/// calling thread and prints the breakdown, in `ReleaseFast`, with no window and no UI thread
+/// competing for the connection.
+///
+/// The database goes in a scratch directory that is wiped first, so the default is a **cold**
+/// build. `--index-warm` keeps it, which measures the re-open path instead.
+fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+    // `Indexer.walk` asks the host whether a path is ignored, and `sdk.refresh` pokes the event
+    // loop. Both are null-checked against `fizzy_api`, so a bare Host answers "not ignored" and
+    // "no loop to wake" — which is exactly what a headless scan wants.
+    var host: sdk.Host = .{ .allocator = gpa };
+    var gpa_copy = gpa;
+    sdk.installRuntime(&gpa_copy, &host, null);
+
+    // Under the build cache rather than the vault: the index is derived data, it can be
+    // gigabytes, and putting it next to the notes is exactly what `Db`'s file comment forbids.
+    const cache_dir = ".zig-cache/atlas-index-bench";
+    if (!index_warm) std.Io.Dir.cwd().deleteTree(io, cache_dir) catch {};
+
+    var db = try Db.openIn(gpa, io, cache_dir, dir);
+    defer db.close(gpa);
+
+    var busy: std.atomic.Value(bool) = .init(false);
+    var generation: std.atomic.Value(u64) = .init(0);
+    var indexer = Indexer.init(gpa, &busy, &generation);
+    defer indexer.deinit();
+    indexer.db = &db;
+    indexer.vault_root = dir;
+
+    const t0 = std.Io.Clock.boot.now(io).nanoseconds;
+    try indexer.runFullScan(io, .always);
+    const total_ns = std.Io.Clock.boot.now(io).nanoseconds - t0;
+
+    if (index_edit) {
+        try timeOneEdit(gpa, io, &db, &indexer);
+        return;
+    }
+
+    const t = indexer.timings;
+    const s = struct {
+        fn f(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e9;
+        }
+    }.f;
+    const c = indexer.counts();
+    std.debug.print(
+        \\{s}{s}
+        \\  notes {d}  links {d}  phantoms {d}   ({d} files read, {d} unchanged)
+        \\  prepass   {d:>7.2}s
+        \\  walk      {d:>7.2}s   stat {d:.2}s  read {d:.2}s  parse {d:.2}s  db {d:.2}s
+        \\  drop      {d:>7.2}s
+        \\  relink    {d:>7.2}s
+        \\  publish   {d:>7.2}s
+        \\  TOTAL     {d:>7.2}s
+        \\
+    , .{
+        dir,
+        if (index_warm) " (warm)" else " (cold)",
+        c.note_count,
+        c.link_count,
+        c.phantom_count,
+        t.files_read,
+        t.files_skipped,
+        s(t.prepass_ns),
+        s(t.walk_ns),
+        s(t.stat_ns),
+        s(t.read_ns),
+        s(t.parse_ns),
+        s(t.write_ns),
+        s(t.drop_ns),
+        s(t.relink_ns),
+        s(t.publish_ns),
+        s(@intCast(total_ns)),
+    });
+}
+
+/// Time the three steps a single edited buffer costs: writing the note's rows, resolving links,
+/// and republishing the snapshot. This is the interactive path — `documentContentChanged` fires on
+/// a typing lull, and everything it triggers happens before the graph can show the edit.
+fn timeOneEdit(gpa: std.mem.Allocator, io: std.Io, db: *Db, indexer: *Indexer) !void {
+    // A real note, edited the way a reader edits one: same file, different body. The content must
+    // actually differ or `indexBuffer` short-circuits on the hash and measures nothing.
+    var stmt = try db.conn.prepare("SELECT path FROM notes WHERE phantom = 0 ORDER BY id LIMIT 1");
+    defer stmt.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const row = (try stmt.oneAlloc([]const u8, arena.allocator(), .{}, .{})) orelse {
+        std.debug.print("no notes to edit\n", .{});
+        return;
+    };
+
+    var buf: [256]u8 = undefined;
+    const body = try std.fmt.bufPrint(&buf, "# edited\n\nnow links to [[Paris]] and nothing else.\n", .{});
+
+    // Twice, and the second one is the number that matters. Resolution's whole-vault inputs are
+    // cached across edits (`Indexer.ResolveCache`), so a fresh process pays to build them on its
+    // first edit and nothing thereafter — and in the app that build has already happened during the
+    // opening scan. Reporting only the first edit would describe a cost the reader never pays twice.
+    var body_first: [256]u8 = undefined;
+    const first = try std.fmt.bufPrint(&body_first, "# warm\n\nlinks to [[Paris]].\n", .{});
+    const t_cold0 = std.Io.Clock.boot.now(io).nanoseconds;
+    switch (try indexer.indexBuffer(row, first)) {
+        .rewrote => |id| _ = try indexer.relinkNote(id),
+        else => try indexer.relinkAll(),
+    }
+    const cold_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - t_cold0);
+
+    const t0 = std.Io.Clock.boot.now(io).nanoseconds;
+    const wrote = try indexer.indexBuffer(row, body);
+    const t1 = std.Io.Clock.boot.now(io).nanoseconds;
+    // Exactly what the worker does for a live buffer edit of a note it already had.
+    switch (wrote) {
+        .rewrote => |id| _ = try indexer.relinkNote(id),
+        else => try indexer.relinkAll(),
+    }
+    const t2 = std.Io.Clock.boot.now(io).nanoseconds;
+    try indexer.commitAndPublish();
+    const t3 = std.Io.Clock.boot.now(io).nanoseconds;
+    const write_ns: u64 = @intCast(t1 - t0);
+    const relink_ns: u64 = @intCast(t2 - t1);
+    const publish_ns: u64 = @intCast(t3 - t2);
+
+    std.debug.print(
+        \\one edit to {s} ({s})
+        \\  first edit        {d:>9.1} ms   (builds the resolve cache)
+        \\  --- steady state ---
+        \\  writeNote         {d:>9.1} ms
+        \\  relinkAll         {d:>9.1} ms
+        \\  commitAndPublish  {d:>9.1} ms
+        \\  TOTAL             {d:>9.1} ms
+        \\
+    , .{ row, @tagName(wrote), ms(cold_ns), ms(write_ns), ms(relink_ns), ms(publish_ns), ms(write_ns + relink_ns + publish_ns) });
+}
+
 /// `--world`: sweep the containment path (fold ladder → containment placement → budgeted select)
 /// across a zoom range and report what each zoom actually draws.
 ///
 /// This exists because the budget cannot be judged from a live window: a bug that only shows at
 /// zooms you do not happen to stop at looks fine by eye. The sweep prints estimate against actual
 /// at every step, which is how two separate bounds bugs were caught in the classic path.
-fn worldSweep(gpa: std.mem.Allocator, n: usize, edges: []const fold.Edge, paths: []const []const u8, label: []const u8) !void {
+fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.Edge, paths: []const []const u8, label: []const u8) !void {
+    // Timed, because this is what every republish costs: the layout job rebuilds the whole World
+    // — `fold.build` over every note, `cellweb` over every link — each time the index bumps the
+    // generation, including for a one-note edit.
+    const build_t0 = std.Io.Clock.boot.now(io).nanoseconds;
     var w = try world_mod.World.init(gpa, n, edges, paths, .{}, .{});
     defer w.deinit();
+    const build_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
 
-    const budget: usize = 280;
-    const params: world_mod.Params = .{ .budget = budget };
+    const budget: usize = world_budget;
+    // Mirror the panel exactly, through the same function it calls — see
+    // `Params.ambientLinkBudget`. Hardcoding a number here is how this sweep once came to report
+    // 10,000 links at every coarse zoom while the app drew 900. A bench that quietly measures
+    // different parameters than the thing it stands in for is worse than no bench.
+    const params: world_mod.Params = .{
+        .budget = budget,
+        .link_budget = if (world_link_budget > 0)
+            world_link_budget
+        else
+            world_mod.Params.ambientLinkBudget(budget),
+        .link_scan_cap = world_scan_cap,
+        .split_px = world_split_px,
+    };
     const vw: f32 = 1200;
     const vh: f32 = 700;
     const ext = w.extent();
@@ -160,18 +397,82 @@ fn worldSweep(gpa: std.mem.Allocator, n: usize, edges: []const fold.Edge, paths:
     std.debug.print("  notes={d}  links={d}  ladder depth={d}  cells={d}  root r={d:.1}\n", .{
         n, edges.len, w.lad.depth, w.lad.cells.len, ext,
     });
-    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6}\n", .{ "zoom", "marks", "notes", "masses", "links", "bound" });
+    // Split the two halves by building them once more on their own. Costs one extra build in the
+    // bench and tells us which stage a rebuild is actually spending its seconds in.
+    var fold_ns: u64 = 0;
+    var web_ns: u64 = 0;
+    {
+        const f0 = std.Io.Clock.boot.now(io).nanoseconds;
+        var lad2 = try fold.build(gpa, n, edges, paths, .{});
+        defer lad2.deinit(gpa);
+        const f1 = std.Io.Clock.boot.now(io).nanoseconds;
+        var web2 = try cellweb.build(gpa, &lad2, edges);
+        defer web2.deinit(gpa);
+        const f2 = std.Io.Clock.boot.now(io).nanoseconds;
+        fold_ns = @intCast(f1 - f0);
+        web_ns = @intCast(f2 - f1);
+    }
+    std.debug.print(
+        "  World.init (per republish) = {d:.0} ms   [fold.build {d:.0} ms  cellweb {d:.0} ms]\n",
+        .{
+            @as(f64, @floatFromInt(build_ns)) / 1e6,
+            @as(f64, @floatFromInt(fold_ns)) / 1e6,
+            @as(f64, @floatFromInt(web_ns)) / 1e6,
+        },
+    );
+    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6}   {s:>7} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{
+        "zoom",  "marks",  "notes",   "masses",  "links",   "drawn",
+        "bound", "clr ms", "topo ms", "pres ms", "lift ms", "frame ms",
+    });
 
     var zoom = z_fit;
     var stepn: usize = 0;
     while (stepn < 14) : (stepn += 1) {
         // settle, so what is printed is the resting set rather than a mid-crossfade frame
-        for (0..120) |_| try w.step(.{ .w = vw, .h = vh, .zoom = zoom, .cx = 0, .cy = 0 }, params, 1.0 / 60.0);
-        try w.liftLinks(edges, params);
+        const view: world_mod.View = .{ .w = vw, .h = vh, .zoom = zoom, .cx = 0, .cy = 0 };
+        for (0..120) |_| try w.step(view, params, 1.0 / 60.0);
+
+        // One more frame, phase by phase. Timings are of the *settled* frame — the steady state a
+        // parked camera pays forever, which is what the frame rate is actually made of.
+        var t0 = now(io);
+        w.clearFrame();
+        const clr_ns = elapsed(io, t0);
+        t0 = now(io);
+        try w.decideTopology(view, params);
+        const topo_ns = elapsed(io, t0);
+        t0 = now(io);
+        try w.present(view, params, 1.0 / 60.0);
+        const pres_ns = elapsed(io, t0);
+        t0 = now(io);
+        try w.liftLinks(params, 1.0);
+        const lift_ns = elapsed(io, t0);
         const notes = w.noteMarks();
-        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6}\n", .{
-            zoom, w.marks.items.len, notes, w.marks.items.len - notes, w.links.items.len,
+        // What the *draw* would keep, not what the lift produced. `world_draw` requires at least
+        // one endpoint to have a living mark, and the two numbers diverge hard: the lift fills its
+        // budget at every zoom while the drawn count collapses as the camera closes in. That gap
+        // is what `world_draw.ambientAlpha` reads, so a sweep that only reports `links` cannot
+        // tell you what the web will actually look like.
+        var have: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer have.deinit(gpa);
+        for (w.marks.items) |m| try have.put(gpa, m.cell, {});
+        var drawn: usize = 0;
+        for (w.links.items) |l| {
+            if (l.focus) continue;
+            if (have.contains(l.a) or have.contains(l.b)) drawn += 1;
+        }
+        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6}   {d:>7.2} {d:>7.2} {d:>7.2} {d:>7.2} {d:>8.2}\n", .{
+            zoom,
+            w.marks.items.len,
+            notes,
+            w.marks.items.len - notes,
+            w.links.items.len,
+            drawn,
             if (w.bound) "Y" else "",
+            ms(clr_ns),
+            ms(topo_ns),
+            ms(pres_ns),
+            ms(lift_ns),
+            ms(clr_ns + topo_ns + pres_ns + lift_ns),
         });
         if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});
         zoom *= 2.0;
@@ -231,7 +532,6 @@ fn interiorSweep(gpa: std.mem.Allocator) !void {
 }
 
 fn worldSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void {
-    _ = io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -243,7 +543,75 @@ fn worldSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void 
     for (graph.edges, edges) |e, *fe| fe.* = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
     const have_paths = graph.paths.len == spec.n and (spec.n == 0 or graph.paths[0].len > 0);
     const paths: []const []const u8 = if (have_paths) graph.paths else &.{};
-    try worldSweep(gpa, spec.n, edges, paths, label);
+    try worldSweep(gpa, io, spec.n, edges, paths, label);
+}
+
+/// `--refold`: time the two stages a republish pays for, repeatedly.
+fn refoldVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var notes: std.ArrayList(Note) = .empty;
+    var read_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    try collect(gpa, arena, io, dir_path, dir_path, &notes, &read_ns, &scan_ns);
+    if (notes.items.len == 0) return;
+    const n = notes.items.len;
+
+    const candidates = try arena.alloc(resolve.Candidate, n);
+    for (notes.items, candidates) |note, *c| c.* = .{ .path = note.path, .stem = note.stem };
+
+    var edges: std.ArrayList(fold.Edge) = .empty;
+    var buf: [resolve.max_path_len]u8 = undefined;
+    var cand_index = try resolve.Index.init(gpa, candidates);
+    defer cand_index.deinit();
+    for (notes.items, 0..) |note, i| {
+        for (note.links) |raw| {
+            if (!resolve.isNoteLikeTarget(raw)) continue;
+            const m = resolve.resolveIndexed(raw, note.path, candidates, &cand_index, &buf) orelse continue;
+            if (m.index == i) continue;
+            try edges.append(arena, .{ .a = @intCast(i), .b = @intCast(m.index), .w = 1 });
+        }
+    }
+    const paths = try arena.alloc([]const u8, n);
+    for (notes.items, paths) |note, *p| p.* = note.path;
+
+    std.debug.print("\n==== refold: {s} ====\n  notes={d}  links={d}  reps={d}\n", .{
+        std.fs.path.basename(dir_path), n, edges.items.len, refold_reps,
+    });
+    std.debug.print("  {s:>4}  {s:>10}  {s:>10}  {s:>10}\n", .{ "rep", "fold ms", "cellweb ms", "total ms" });
+
+    var best_fold: u64 = std.math.maxInt(u64);
+    var best_web: u64 = std.math.maxInt(u64);
+    for (0..refold_reps) |rep| {
+        const t0 = std.Io.Clock.boot.now(io).nanoseconds;
+        var lad = try fold.build(gpa, n, edges.items, paths, .{});
+        defer lad.deinit(gpa);
+        const t1 = std.Io.Clock.boot.now(io).nanoseconds;
+        var web = try cellweb.build(gpa, &lad, edges.items);
+        defer web.deinit(gpa);
+        const t2 = std.Io.Clock.boot.now(io).nanoseconds;
+
+        const f: u64 = @intCast(t1 - t0);
+        const w: u64 = @intCast(t2 - t1);
+        best_fold = @min(best_fold, f);
+        best_web = @min(best_web, w);
+        std.debug.print("  {d:>4}  {d:>10.0}  {d:>10.0}  {d:>10.0}\n", .{
+            rep,
+            @as(f64, @floatFromInt(f)) / 1e6,
+            @as(f64, @floatFromInt(w)) / 1e6,
+            @as(f64, @floatFromInt(f + w)) / 1e6,
+        });
+    }
+    // Best-of, not mean: the thing being measured is deterministic, so a slower run is noise from
+    // the machine and never information about the code.
+    std.debug.print("  best  {d:>10.0}  {d:>10.0}  {d:>10.0}   cells={d}\n", .{
+        @as(f64, @floatFromInt(best_fold)) / 1e6,
+        @as(f64, @floatFromInt(best_web)) / 1e6,
+        @as(f64, @floatFromInt(best_fold + best_web)) / 1e6,
+        0,
+    });
 }
 
 fn worldVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
@@ -276,7 +644,7 @@ fn worldVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
     const paths = try arena.alloc([]const u8, n);
     for (notes.items, paths) |note, *p| p.* = note.path;
 
-    try worldSweep(gpa, n, edges.items, paths, std.fs.path.basename(dir_path));
+    try worldSweep(gpa, io, n, edges.items, paths, std.fs.path.basename(dir_path));
 }
 
 /// `--stats` over a synth spec: build the same graph a normal synth bench would (pack placement,

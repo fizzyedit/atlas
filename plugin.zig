@@ -5,9 +5,13 @@
 //! bottom panel.
 //!
 //! **Owns no documents.** The `text` plugin owns `.md` and keeps owning it; atlas contributes
-//! the link layer around it and reaches live buffer contents through the SDK's
-//! `documentContentChanged` broadcast rather than by claiming the file type. That's what lets
-//! it index markdown it never renders, and why the vtable here is a *utility* vtable.
+//! the link layer around it rather than claiming the file type. That's what lets it index
+//! markdown it never renders, and why the vtable here is a *utility* vtable.
+//!
+//! The index is built from **saved files only**. `documentContentChanged` is taken as a hint to
+//! go and stat the file, never as content to index — see `State.setDirtyContent` for why a
+//! half-typed document must not reach the graph. Unsaved bytes are kept as an overlay for the
+//! backlinks pane and nothing else.
 const std = @import("std");
 const dvui = @import("dvui");
 const icons = @import("icons");
@@ -162,6 +166,7 @@ fn pluginDeinit(state: *anyopaque) void {
     // Before anything else: the graph's layout worker runs code from this library, so it has to
     // be joined while that library is still loaded. Same reason for the simulator's own worker.
     graph.shutdown();
+    backlinks.shutdown();
     vault_sim.shutdown();
     const st: *State = @ptrCast(@alignCast(state));
     st.deinit(sdk.allocator());

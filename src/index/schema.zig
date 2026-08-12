@@ -10,7 +10,14 @@
 const std = @import("std");
 
 /// Bump on any change to the DDL below. Anything that doesn't match is discarded.
-pub const version: u32 = 3;
+/// 4: dropped `links.context`. It stored the source line of every link, which on a 283,878-note
+/// vault with 3.3M links was ~900 MB — over 90% of the index, and more than twice the 346 MB of
+/// markdown it was derived from. The backlinks pane reads the line from the file when it draws a
+/// row instead; it already has the path and line number.
+/// 5: added `tags_note`. See the index's own comment — its absence made the per-note tag delete a
+/// full table scan, which a CPU sample of a cold Simple-English-Wikipedia build found in **66% of
+/// all samples**, inside `sqlite3BtreeNext`.
+pub const version: u32 = 5;
 
 /// Connection settings, applied on every open.
 ///
@@ -81,8 +88,7 @@ pub const ddl =
     \\  kind      INTEGER NOT NULL,       -- see LinkKind
     \\  ambiguous INTEGER NOT NULL DEFAULT 0,
     \\  line      INTEGER NOT NULL,       -- 0-based, in src
-    \\  col       INTEGER NOT NULL,       -- 0-based byte column
-    \\  context   TEXT NOT NULL DEFAULT ''-- the source line, for the backlinks list
+    \\  col       INTEGER NOT NULL        -- 0-based byte column
     \\);
     \\CREATE INDEX IF NOT EXISTS links_src ON links(src_id);
     \\CREATE INDEX IF NOT EXISTS links_dst ON links(dst_id);
@@ -96,6 +102,13 @@ pub const ddl =
     \\  line     INTEGER NOT NULL
     \\);
     \\CREATE INDEX IF NOT EXISTS tags_fold ON tags(tag_fold);
+    \\-- Not optional, and not symmetric with `tags_fold`: every one of `writeNote`'s five
+    \\-- "replace this note's derived rows" deletes is `WHERE note_id = ?`, and this was the only
+    \\-- one of the five tables without an index to serve it. `DELETE FROM tags WHERE note_id = ?`
+    \\-- planned as `SCAN tags` — a full scan of a table that grows all scan long, once per note.
+    \\-- That is a quadratic term in the middle of the cold build, and it cost more than everything
+    \\-- else the walk does put together (see the note on `version`).
+    \\CREATE INDEX IF NOT EXISTS tags_note ON tags(note_id);
     \\
     \\-- Everything a document's body is made of, once headings are pulled out: paragraphs,
     \\-- lists, code fences, blockquotes, tables. No `parent_heading_id` column — which heading

@@ -7,7 +7,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const batch2d = @import("batch2d");
-const Camera = @import("camera.zig");
+const Camera = @import("Camera.zig");
 
 pub const SoftAtlas = batch2d.SoftAtlas;
 pub const SpriteBatch = batch2d.SpriteBatch;
@@ -18,19 +18,6 @@ pub const HitIndex = batch2d.HitIndex;
 /// interior all draw on top of this.
 pub const plugin_mark_budget: usize = 360;
 
-/// Bump when density mark/link bake changes so warm atlases discard the old fog picture.
-
-/// Topology-aware far-field bake: positions + degrees + note edges.
-pub const BakeInput = struct {
-    live: []const dvui.Point,
-    /// Parallel to `live`. Missing / short → treat as degree 1.
-    degrees: []const u32 = &.{},
-    edge_a: []const u32 = &.{},
-    edge_b: []const u32 = &.{},
-};
-
-/// Zoom at which density tiles *would* hand off to live agents (world → screen).
-/// Kept for bake math / parked path; product overview does not use density mips.
 // ---- Density atlas (soft-sprite bake) ------------------------------------------
 
 /// The soft-sprite atlas the graph draws marks through.
@@ -38,7 +25,7 @@ pub const BakeInput = struct {
 /// This used to also own world-tile *density mips* — a far-field underlay baked from leaf
 /// positions. They are gone with the rest of the classic path: the bake came from leaf positions
 /// while the marks came from agent centroids, so the dissolve always landed on a different
-/// configuration. See the rejected table in `docs/design/galaxy-lod.md`.
+/// configuration.
 pub const Density = struct {
     soft: SoftAtlas,
     /// `SoftAtlas` doesn't keep its own allocator, so `deinit` needs the same one back.
@@ -88,6 +75,10 @@ pub fn drawStyledMarks(
     const glow_uv = soft.uv(.glow);
     const ring_uv = soft.uv(.ring);
     const dash_uv = soft.uv(.dash_ring);
+    const dash_thin_uv = soft.uv(.dash_ring_thin);
+    // Radius past which the narrow dash cell keeps the stroke near two screen pixels. A sprite's
+    // stroke scales with the quad, so one cell cannot serve the whole mass radius range.
+    const dash_thin_from: f32 = 24;
     const vp = cam.viewport;
     // Select keeps off-screen siblings alive for LOD stability — do not pay to paint them.
     const pad: f32 = 40;
@@ -151,14 +142,27 @@ pub fn drawStyledMarks(
                 .uv = disc_uv,
             });
             const rim = m.border.opacity(0.9 * alpha * dying_a);
-            if (r >= 14) {
+            // `!cheap` is load-bearing, not a nicety.
+            //
+            // The vector path allocates a ~90-point polyline per ring and strokes each dash as its
+            // own path, so a screen full of large masses is tens of thousands of path strokes a
+            // frame — 4,000 masses at a 4,000 mark budget measured out at ~8 fps with a *parked*
+            // camera. This is the "path-stroked dashed rings at scale" cliff the design notes
+            // already list as rejected; it survived here because `cheap` gated the shadow and the
+            // glow but never this.
+            //
+            // Above the threshold the atlas dash sprite carries every mass instead: one batched
+            // quad each, no draw call of its own. It is slightly softer on a very large ring, which
+            // is a trade worth making the moment there are hundreds of them — nobody is examining
+            // the roundness of one rim in a field of four thousand.
+            if (r >= 14 and !cheap) {
                 vector_dashes.append(arena, .{ .c = screen, .r = r, .col = rim }) catch {};
             } else if (r > 2) {
                 sprites.add(.{
                     .center = screen,
                     .half_size = r,
                     .color = rim,
-                    .uv = dash_uv,
+                    .uv = if (r >= dash_thin_from) dash_thin_uv else dash_uv,
                 });
             }
         }
@@ -269,4 +273,3 @@ fn appendDashedSpan(
     const dy = end_pt.y - last.y;
     if (dx * dx + dy * dy > 1e-8) try out.append(arena, end_pt);
 }
-

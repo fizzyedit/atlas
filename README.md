@@ -4,41 +4,33 @@ Wiki-style notes for [fizzy](https://github.com/fizzyedit/fizzy). Indexes the ma
 your open folder, resolves `[[wikilinks]]` between notes, and shows you how they connect.
 
 The open project folder is the vault. Nothing is stored in it — the index is a derived cache
-kept in the OS cache directory, and the files on disk are always the source of truth.
+kept in the OS cache directory, and the files on disk are always the source of truth. Delete the
+cache and the next open rebuilds it.
 
-## Status
+## What it does
 
-Milestone 1 + Milestone 2 (graph) working. Overview rendering is **Galaxy LOD** (soft-sprite
-`batch2d` + budgeted sticky `quadlod` agents; density mips parked) — see
-`docs/design/galaxy-lod.md`.
+- **Backlinks sidebar** — every note that points at the one you're reading, grouped by source,
+  with a filter box. Click to reveal the line.
+- **Graph panel** — the whole vault as a note web in the bottom panel. Pan, zoom, click to open,
+  zoom into a note to see its own structure. What a frame draws is bounded by a budget rather
+  than by vault size, so a ten-note folder and a three-hundred-thousand-note one cost the same
+  to display.
+- **`[[` completion** — type `[[` in a markdown buffer, pick a note, and get a portable
+  CommonMark link back.
+- **Wikilink resolution** for fizzy's markdown preview, through the SDK's `wikilink` service:
+  `[[Note]]`, `[[Note|alias]]`, `[[Note#Heading]]`, and front-matter aliases.
+- **Convert wikilinks** — a command that rewrites every resolvable `[[link]]` in the open
+  document to a markdown link.
 
-Milestone 1 + 2 details:
-
-- SDK `"wikilink"` service — markdown preview resolves `[[Note]]`, aliases, headings.
-- Obsidian-compatible link resolution (`src/index/resolve.zig`).
-- Line-scanner note parser (`src/index/Scanner.zig`).
-- SQLite index (WAL, rebuild-don't-migrate) in the app cache dir.
-- Background indexer fed by fizzy's recursive folder watch (`folderPathsChanged`), an open-doc
-  mtime poll, and a periodic quiet sweep as a backstop; snapshot ring publishes node/edge arrays.
-- `Atlas: Rebuild Index` / `Atlas: Open Graph` commands.
-- Backlinks sidebar: grouped by source note, filter box, click / middle-click to reveal.
-- Dirty-buffer overlay from `documentContentChanged` (unsaved `[[links]]` can appear in
-  backlinks before save).
-- Graph bottom panel: full vault note web (sunflower layout), open docs drawn larger,
-  pan/zoom/pinch/fling, click to open, double-click a node to focus it, double-click empty
-  space to zoom extents. Drawn from `pos`/`radius` (= `target` in M2) for the M3 seam.
-- `[[` trigger in `.md` buffers: type `[[`, pick a note, get a portable CommonMark link
-  `[Title](relative/path.md)` (path relative to the source file's directory). Preview opens
-  those relative destinations in the editor.
-
-Not yet: unlinked mentions, graph animation (M3), heading/`|alias` completion modes.
+Atlas owns no documents. The `text` plugin keeps owning `.md`; Atlas contributes the link layer
+around it, which is why it can index markdown it never renders.
 
 ## Link format
 
-Atlas writes ordinary markdown links so notes stay portable:
+Atlas writes ordinary markdown links so notes stay portable outside fizzy:
 
 ```md
-[Claude](claude.md)
+[Physics](physics.md)
 [Daily](../notes/daily.md)
 [My Note](my%20note.md)
 ```
@@ -52,8 +44,18 @@ Atlas writes ordinary markdown links so notes stay portable:
 | Spaces | Percent-encoded (`%20`) |
 | Display text | Front-matter title, else stem |
 
-`[[…]]` remains recognized when present (preview + index), but the editor gesture converts it
-on accept so new links are CommonMark by default.
+`[[…]]` stays recognized wherever it appears — the index and the preview both resolve it — but
+the completion gesture writes CommonMark, so new links are portable by default.
+
+## When the index updates
+
+On **save**, and on any change to the folder that fizzy's watcher reports (an agent writing
+files, a `git checkout`, another editor). A periodic sweep re-walks the vault as a backstop for
+platforms where the watcher is unreliable.
+
+Deliberately **not** on every keystroke: a half-typed `[[Par` resolves to nothing and would
+create a placeholder note for a page that will never exist. Unsaved edits still show up in the
+backlinks pane, which reads the live buffer directly.
 
 ## Building
 
@@ -67,6 +69,20 @@ zig build test       # unit tests
 switch it to the `fizzy-sdk-v*.tar.gz` **release asset** URL — CI needs a URL+hash pin, and it
 must be the asset, not the git archive of the tag (that one is fizzy's monorepo root, which
 pulls in the whole app's dependencies).
+
+### Developer tools
+
+The **Atlas: Vault Simulator** command is in every build — synthetic vaults of 100k–1M notes with
+live controls over the layout constants, for working on the graph without needing a corpus that
+size on disk. The rest below are separate build steps, not part of the plugin.
+
+- `zig build bench -Doptimize=ReleaseFast -- <flags> <vault>` is a headless timing harness:
+  `--index` builds the SQLite index and reports where the time went, `--index-edit` times one
+  edit against a built index, `--refold` times the layout rebuild, `--world` sweeps the level of
+  detail across a zoom range, and `--stats` reports graph structure. Run it against a real folder
+  of markdown or a `synth:N:shape` spec.
+- `zig build wiki-import -- <dump.xml> <out-dir>` turns a MediaWiki XML dump into a vault, which
+  is where the reference corpus in `docs/design/scale-architecture.md` comes from.
 
 ## Releasing
 

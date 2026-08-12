@@ -5,7 +5,7 @@
 //! whole wikilink** with a CommonMark link:
 //!
 //! ```
-//! [[cla|]]  + accept "Claude"  →  [Claude](claude.md)
+//! [[phy|]]  + accept "Physics"  →  [Physics](physics.md)
 //! ```
 //!
 //! An embed (`![[…]]`) offers indexed media instead. `replace_start` begins at `[[`, so the

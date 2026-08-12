@@ -3,6 +3,7 @@
 //! All of these are UI-thread / caller-thread SELECTs. The indexer is the only writer; WAL +
 //! sqlite's Serialized threading mode make concurrent reads safe against in-flight commits.
 const std = @import("std");
+const sqlite = @import("sqlite");
 const Db = @import("Db.zig");
 const resolve = @import("resolve.zig");
 const schema = @import("schema.zig");
@@ -19,15 +20,36 @@ pub const Backlink = struct {
     title: []const u8,
     line: u32,
     col: u32,
-    context: []const u8,
+    /// Filled by the *view* when a row is drawn, not by the query — see `backlinks.contextFor`.
+    /// Empty until then.
+    context: []const u8 = "",
 };
 
-/// Load every real note (+ one Candidate per alias) for `resolve.resolve`.
+/// Load every real note (+ one Candidate per alias) for `resolve.resolve`, over the UI thread's
+/// read connection.
+///
+/// Prefer *not* calling this on a hot UI path: on a 286,547-note vault it is a multi-second walk
+/// of every note and alias. The indexer builds the same list on its worker as part of publishing
+/// and hands it over (`Indexer.takeCandidates`); this remains the fallback for callers with no
+/// indexer behind them (tests, a synthetic vault, a publish that never happened).
 pub fn loadCandidates(db: *Db, arena: std.mem.Allocator) ![]resolve.Candidate {
+    return loadCandidatesOn(db.reader(), arena);
+}
+
+/// `loadCandidates` against an explicit connection, so the indexer's worker can build the list on
+/// the *writer* handle it already owns. It must not touch `Db.reader()`: that connection is opened
+/// lazily on first use, and two threads racing that one null check is a data race on `Db` itself,
+/// whatever SQLite's own threading mode guarantees about the handles.
+pub fn loadCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]resolve.Candidate {
     var list: std.ArrayList(resolve.Candidate) = .empty;
+    // Reserve up front: growing an empty list to that length reallocates and copies it a couple of
+    // dozen times on the way, and one count is far cheaper than the copies.
+    if (conn.one(usize, "SELECT count(*) FROM notes WHERE phantom = 0", .{}, .{}) catch null) |n| {
+        try list.ensureTotalCapacity(arena, n);
+    }
 
     {
-        var stmt = try db.conn.prepare("SELECT path, stem FROM notes WHERE phantom = 0");
+        var stmt = try conn.prepare("SELECT path, stem FROM notes WHERE phantom = 0");
         defer stmt.deinit();
         var iter = try stmt.iterator(struct { path: []const u8, stem: []const u8 }, .{});
         while (true) {
@@ -36,7 +58,7 @@ pub fn loadCandidates(db: *Db, arena: std.mem.Allocator) ![]resolve.Candidate {
         }
     }
     {
-        var stmt = try db.conn.prepare(
+        var stmt = try conn.prepare(
             \\SELECT n.path, n.stem, a.alias
             \\FROM aliases a JOIN notes n ON n.id = a.note_id
             \\WHERE n.phantom = 0
@@ -51,12 +73,19 @@ pub fn loadCandidates(db: *Db, arena: std.mem.Allocator) ![]resolve.Candidate {
     return list.toOwnedSlice(arena);
 }
 
+/// Prepares its own statement every call, on purpose.
+///
+/// This is a **UI-thread** helper (`backlinksFor` and friends run it during a frame) while the
+/// indexer's worker is writing on the same connection. `Db.cached()` hands out one shared set of
+/// `sqlite3_stmt`s, and two threads resetting and stepping the same statement is undefined
+/// behaviour — not a race that shows up under load, one that corrupts whenever it interleaves.
+/// The indexer has `cachedNoteId` for the hot relink path, which is worker-only.
 pub fn noteIdForPath(db: *Db, path: []const u8) !?i64 {
-    return db.conn.one(i64, "SELECT id FROM notes WHERE path = ? AND phantom = 0", .{}, .{path});
+    return db.reader().one(i64, "SELECT id FROM notes WHERE path = ? AND phantom = 0", .{}, .{path});
 }
 
 pub fn noteTitle(db: *Db, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const row = try db.conn.oneAlloc(
+    const row = try db.reader().oneAlloc(
         struct { title: []const u8, stem: []const u8 },
         arena,
         "SELECT title, stem FROM notes WHERE path = ? AND phantom = 0",
@@ -74,7 +103,7 @@ pub fn headingLine(db: *Db, path: []const u8, heading: []const u8) !u32 {
     var fold_buf: [512]u8 = undefined;
     if (heading.len > fold_buf.len) return 0;
     const folded = foldInto(&fold_buf, heading);
-    const line = try db.conn.one(
+    const line = try db.reader().one(
         i64,
         "SELECT line FROM headings WHERE note_id = ? AND text_fold = ? LIMIT 1",
         .{},
@@ -86,8 +115,8 @@ pub fn headingLine(db: *Db, path: []const u8, heading: []const u8) !u32 {
 /// Inbound edges for `dst_path`, ordered by source path then line — ready to group in the UI.
 pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]Backlink {
     const id = (try noteIdForPath(db, dst_path)) orelse return &.{};
-    var stmt = try db.conn.prepare(
-        \\SELECT n.path, n.title, n.stem, l.line, l.col, l.context
+    var stmt = try db.reader().prepare(
+        \\SELECT n.path, n.title, n.stem, l.line, l.col
         \\FROM links l
         \\JOIN notes n ON n.id = l.src_id
         \\WHERE l.dst_id = ? AND n.phantom = 0
@@ -102,7 +131,6 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
         stem: []const u8,
         line: i64,
         col: i64,
-        context: []const u8,
     }, .{id});
     while (true) {
         const row = (try iter.nextAlloc(arena, .{})) orelse break;
@@ -112,7 +140,6 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
             .title = title,
             .line = @intCast(row.line),
             .col = @intCast(row.col),
-            .context = row.context,
         });
     }
     return list.toOwnedSlice(arena);
@@ -145,7 +172,7 @@ pub fn noteContentGraph(
     const HeadingRow = struct { line: u32, level: u32 };
     var heading_rows: std.ArrayList(HeadingRow) = .empty;
     {
-        var stmt = try db.conn.prepare(
+        var stmt = try db.reader().prepare(
             \\SELECT text, text_fold, level, line FROM headings
             \\WHERE note_id = ? ORDER BY line
         );
@@ -183,7 +210,7 @@ pub fn noteContentGraph(
     const BlockRow = struct { kind: i64, line_start: i64, line_end: i64, weight: i64 };
     var block_rows: std.ArrayList(BlockRow) = .empty;
     {
-        var stmt = try db.conn.prepare(
+        var stmt = try db.reader().prepare(
             \\SELECT kind, line_start, line_end, weight FROM blocks
             \\WHERE note_id = ? ORDER BY line_start
         );
@@ -199,7 +226,7 @@ pub fn noteContentGraph(
     const TagRow = struct { tag: []const u8, line: i64 };
     var tag_rows: std.ArrayList(TagRow) = .empty;
     {
-        var stmt = try db.conn.prepare("SELECT tag, line FROM tags WHERE note_id = ? ORDER BY line");
+        var stmt = try db.reader().prepare("SELECT tag, line FROM tags WHERE note_id = ? ORDER BY line");
         defer stmt.deinit();
         var iter = try stmt.iterator(TagRow, .{note_id});
         while (true) {
@@ -213,7 +240,7 @@ pub fn noteContentGraph(
     const EmbedRow = struct { raw: []const u8, alias: []const u8, line: i64 };
     var embed_rows: std.ArrayList(EmbedRow) = .empty;
     {
-        var stmt = try db.conn.prepare(
+        var stmt = try db.reader().prepare(
             \\SELECT raw, alias, line FROM links WHERE src_id = ? AND kind = ? ORDER BY line
         );
         defer stmt.deinit();
@@ -319,7 +346,7 @@ pub fn noteContentGraph(
     // Same-note wikilinks: an explicit `[[This Note#Heading]]` connects two of this note's own
     // headings. Only a self-link (dst_id == note_id) has both ends inside this graph.
     {
-        var stmt = try db.conn.prepare(
+        var stmt = try db.reader().prepare(
             \\SELECT line, heading FROM links
             \\WHERE src_id = ? AND dst_id = ? AND heading <> ''
             \\ORDER BY line
@@ -441,7 +468,7 @@ pub fn complete(
     var list: std.ArrayList(CompleteRow) = .empty;
 
     {
-        var stmt = try db.conn.prepare(
+        var stmt = try db.reader().prepare(
             \\SELECT stem, path, title FROM notes
             \\WHERE phantom = 0 AND stem_fold LIKE ?
             \\ORDER BY stem LIMIT ?
@@ -461,7 +488,7 @@ pub fn complete(
         }
     }
     if (list.items.len < limit) {
-        var stmt = try db.conn.prepare(
+        var stmt = try db.reader().prepare(
             \\SELECT a.alias, n.path, n.title, n.stem FROM aliases a
             \\JOIN notes n ON n.id = a.note_id
             \\WHERE n.phantom = 0 AND a.alias_fold LIKE ?
@@ -498,6 +525,8 @@ pub fn complete(
 /// `NOT EXISTS` rather than `NOT IN` only as insurance: `links.dst_id` is `NOT NULL` today, so
 /// both forms behave identically, but `NOT IN` would silently match nothing (purging none of
 /// them) if that constraint were ever relaxed.
+/// The one writer in this file, so `db.conn` rather than `db.reader()` — the read-only handle
+/// would reject it. Called from the indexer's worker at the end of a relink.
 pub fn purgeOrphanPhantoms(db: *Db) !void {
     try db.conn.exec(
         \\DELETE FROM notes WHERE phantom = 1
@@ -543,7 +572,7 @@ pub fn completeMedia(db: *Db, arena: std.mem.Allocator, prefix: []const u8, limi
     const pattern = try std.fmt.allocPrint(arena, "{s}%", .{folded});
 
     var list: std.ArrayList(CompleteRow) = .empty;
-    var stmt = try db.conn.prepare(
+    var stmt = try db.reader().prepare(
         \\SELECT path, name_fold FROM media
         \\WHERE name_fold LIKE ? OR stem_fold LIKE ?
         \\ORDER BY name_fold LIMIT ?
@@ -568,8 +597,13 @@ pub fn completeMedia(db: *Db, arena: std.mem.Allocator, prefix: []const u8, limi
 /// notes, so two lists means no precedence rule to get wrong (and `[[Target]]` can never
 /// silently land on `Target.png` instead of `Target.md`).
 pub fn loadMediaCandidates(db: *Db, arena: std.mem.Allocator) ![]resolve.Candidate {
+    return loadMediaCandidatesOn(db.reader(), arena);
+}
+
+/// `loadMediaCandidates` against an explicit connection — see `loadCandidatesOn`.
+pub fn loadMediaCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]resolve.Candidate {
     var list: std.ArrayList(resolve.Candidate) = .empty;
-    var stmt = try db.conn.prepare("SELECT path, stem FROM media");
+    var stmt = try conn.prepare("SELECT path, stem FROM media");
     defer stmt.deinit();
     var iter = try stmt.iterator(struct { path: []const u8, stem: []const u8 }, .{});
     while (true) {

@@ -84,7 +84,19 @@ test "media rows are independent of notes" {
     try testing.expectEqual(@as(usize, 0), try countRows(&db, "SELECT count(*) FROM notes"));
 }
 
-test "a media path is unique" {
+test "media has the unique index its upsert depends on" {
+    // Asserted through the *upsert*, not by provoking the violation.
+    //
+    // `Indexer.upsertMedia` writes `ON CONFLICT(path) DO UPDATE`, and sqlite only accepts a
+    // conflict target that a unique index actually covers — so "is `media.path` unique" and "does
+    // re-indexing an attachment update instead of duplicating it" are the same question, and this
+    // asks the one the app depends on.
+    //
+    // The older version inserted twice and expected `error.SQLiteConstraint`. It passed, but the
+    // wrapper logs at error level whenever a statement finalizes non-OK, and Zig's test runner
+    // fails any test that logs an error — so a correct build exited nonzero. There is no way to
+    // trip a constraint through this wrapper quietly: `reset` reports the same code that `deinit`
+    // does.
     const gpa = testing.allocator;
     var tmp = try TempDir.create(gpa, "media-unique");
     defer tmp.destroy(gpa);
@@ -92,9 +104,31 @@ test "a media path is unique" {
     var db = try tmp.open(gpa, "/some/vault");
     defer db.close(gpa);
 
-    const insert = "INSERT INTO media(path, stem, stem_fold, name_fold) VALUES('a.png','a','a','a.png')";
-    try db.conn.exec(insert, .{}, .{});
-    try testing.expectError(error.SQLiteConstraint, db.conn.exec(insert, .{}, .{}));
+    const unique_on_path = (try db.conn.one(
+        i64,
+        \\SELECT count(*) FROM pragma_index_list('media') li
+        \\JOIN pragma_index_info(li.name) ii
+        \\WHERE li."unique" = 1 AND ii.name = 'path'
+    ,
+        .{},
+        .{},
+    )) orelse 0;
+    try testing.expect(unique_on_path >= 1);
+
+    const upsert =
+        \\INSERT INTO media(path, stem, stem_fold, name_fold) VALUES('a.png', ?, ?, 'a.png')
+        \\ON CONFLICT(path) DO UPDATE SET stem = excluded.stem, stem_fold = excluded.stem_fold
+    ;
+    try db.conn.exec(upsert, .{}, .{ "first", "first" });
+    try db.conn.exec(upsert, .{}, .{ "second", "second" });
+
+    const rows = (try db.conn.one(i64, "SELECT count(*) FROM media", .{}, .{})) orelse 0;
+    try testing.expectEqual(@as(i64, 1), rows);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const stem = try db.conn.oneAlloc([]const u8, arena.allocator(), "SELECT stem FROM media", .{}, .{});
+    try testing.expectEqualStrings("second", stem orelse "");
 }
 
 test "the schema version is stamped" {

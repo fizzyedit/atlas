@@ -1,5 +1,7 @@
 # Galaxy LOD v1
 
+> **Superseded.** The quadtree/agent LOD described here was replaced by `fold` + `containment` + `world`; `quadlod.zig`, `quad_agents.zig` and `lod.zig` no longer exist. Kept for the rejected-approach tables, which still hold. For how the system works now see [`scale-architecture.md`](scale-architecture.md).
+
 Product overview path for Atlas’s note map. One visual language of **soft textured sprites**
 (`batch2d`) over discrete sticky topology (`quadlod.selectSticky`); motion is presentation-only
 (`quad_agents`). Split/join of living cells is the LOD language end-to-end.

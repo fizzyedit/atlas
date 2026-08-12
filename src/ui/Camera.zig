@@ -1,11 +1,11 @@
 //! Hand-rolled 2D camera for the graph panel.
 //!
 //! Deliberately **not** `CanvasWidget`: that widget couples the camera to a ScrollArea's
-//! viewport, which fights animated retargets (M3) and a content rect that changes every frame.
+//! viewport, which fights animated retargets and a content rect that changes every frame.
 //! One `center`/`zoom` pair plus `worldToScreen`/`screenToWorld` is the whole model.
 //!
-//! M2 draws from `center`/`zoom` directly. M3 adds `center_target`/`zoom_target` and chases;
-//! the conversion math here stays unchanged.
+//! Drawing reads `center`/`zoom`; `center_target`/`zoom_target` are where the camera is heading
+//! and `chase` eases toward them. The conversion math is the same either way.
 const std = @import("std");
 const dvui = @import("dvui");
 
@@ -27,10 +27,10 @@ center: dvui.Point = .{},
 /// World units → screen pixels. 1.0 means one world unit is one screen pixel.
 zoom: f32 = 1.0,
 
-/// M3 seam: where the camera is heading. M2 keeps these equal to `center`/`zoom`.
+/// Where the camera is heading. Equal to `center`/`zoom` unless something retargeted.
 center_target: dvui.Point = .{},
 zoom_target: f32 = 1.0,
-/// Set while the user is dragging/pinching/wheeling; suppresses auto-retarget in M3.
+/// Set while the user is dragging/pinching/wheeling; suppresses the automatic chase.
 user_driving: bool = false,
 
 /// Viewport rectangle in screen (physical) coordinates — set each frame before converting.
@@ -143,11 +143,30 @@ pub fn poseForBounds(self: *const Camera, bounds: dvui.Rect, padding: f32) Pose 
 }
 
 /// Snap `center`/`zoom` so `bounds` (world AABB) fills the viewport with `padding` screen pixels.
+/// Abandon any arc. Called wherever the user takes the camera by hand — a drag or a wheel mid-
+/// flight must win immediately, not fight a path it cannot see.
+
 pub fn fitBounds(self: *Camera, bounds: dvui.Rect, padding: f32) void {
     const pose = self.poseForBounds(bounds, padding);
     self.zoom = pose.zoom;
     self.center = pose.center;
     self.syncTargets();
+}
+
+/// Point the camera at `pose`.
+///
+/// The single entry point for every retarget, which exists for the epsilon no-op as much as for
+/// the assignment: `applyFraming` re-derives the same pose on every frame of a pane drag, and
+/// re-assigning an identical target mid-flight restarts the ease and hitches. Comparing first
+/// makes that free.
+pub fn retarget(self: *Camera, pose: Pose) void {
+    const same_c = @abs(pose.center.x - self.center_target.x) < 0.01 and
+        @abs(pose.center.y - self.center_target.y) < 0.01;
+    const same_z = @abs(pose.zoom - self.zoom_target) < @max(pose.zoom, 0.01) * 1e-3;
+    if (same_c and same_z) return;
+
+    self.center_target = pose.center;
+    self.zoom_target = pose.zoom;
 }
 
 /// True while `center`/`zoom` have not caught up to their targets.

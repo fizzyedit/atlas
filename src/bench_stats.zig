@@ -815,24 +815,29 @@ fn leadingSegOf(p: []const u8) []const u8 {
     return p;
 }
 
-fn printFolderCorrelation(n: usize, comp: Components, paths: []const []const u8) !void {
-    std.debug.print("-- folder correlation --\n", .{});
-    if (n < 2) {
-        std.debug.print("  (too few notes)\n", .{});
-        return;
-    }
+/// How strongly co-located notes are also co-connected, sampled over note pairs.
+///
+/// Split out from the printing so it can be asserted rather than eyeballed — the folder prior in
+/// `fold.build` is calibrated against exactly this number, and a test that only checks the report
+/// runs is a test of `std.debug.print`.
+pub const FolderCorrelation = struct {
+    same_total: u64 = 0,
+    same_dir: u64 = 0,
+    same_seg: u64 = 0,
+    diff_total: u64 = 0,
+    diff_dir: u64 = 0,
+    diff_seg: u64 = 0,
+};
+
+pub fn folderCorrelation(n: usize, comp: Components, paths: []const []const u8) FolderCorrelation {
+    if (n < 2) return .{};
 
     var rng = std.Random.DefaultPrng.init(0xC0FFEE_D15EA5E);
     const rand = rng.random();
     const max_pairs: u64 = @as(u64, n) * (@as(u64, n) - 1) / 2;
     const trials: u64 = @min(@as(u64, 200_000), max_pairs);
 
-    var same_total: u64 = 0;
-    var same_dir: u64 = 0;
-    var same_seg: u64 = 0;
-    var diff_total: u64 = 0;
-    var diff_dir: u64 = 0;
-    var diff_seg: u64 = 0;
+    var out: FolderCorrelation = .{};
 
     var t: u64 = 0;
     while (t < trials) : (t += 1) {
@@ -843,23 +848,33 @@ fn printFolderCorrelation(n: usize, comp: Components, paths: []const []const u8)
         const dir_match = std.mem.eql(u8, dirnameOf(paths[i]), dirnameOf(paths[j]));
         const seg_match = std.mem.eql(u8, leadingSegOf(paths[i]), leadingSegOf(paths[j]));
         if (same_comp) {
-            same_total += 1;
-            if (dir_match) same_dir += 1;
-            if (seg_match) same_seg += 1;
+            out.same_total += 1;
+            if (dir_match) out.same_dir += 1;
+            if (seg_match) out.same_seg += 1;
         } else {
-            diff_total += 1;
-            if (dir_match) diff_dir += 1;
-            if (seg_match) diff_seg += 1;
+            out.diff_total += 1;
+            if (dir_match) out.diff_dir += 1;
+            if (seg_match) out.diff_seg += 1;
         }
     }
 
+    return out;
+}
+
+fn printFolderCorrelation(n: usize, comp: Components, paths: []const []const u8) !void {
+    std.debug.print("-- folder correlation --\n", .{});
+    if (n < 2) {
+        std.debug.print("  (too few notes)\n", .{});
+        return;
+    }
+    const c = folderCorrelation(n, comp, paths);
     std.debug.print(
         "  same-component pairs:  n={d}  same-dir={d:.2}%  same-top-segment={d:.2}%\n",
-        .{ same_total, pctU(same_dir, same_total), pctU(same_seg, same_total) },
+        .{ c.same_total, pctU(c.same_dir, c.same_total), pctU(c.same_seg, c.same_total) },
     );
     std.debug.print(
         "  diff-component pairs:  n={d}  same-dir={d:.2}%  same-top-segment={d:.2}%\n",
-        .{ diff_total, pctU(diff_dir, diff_total), pctU(diff_seg, diff_total) },
+        .{ c.diff_total, pctU(c.diff_dir, c.diff_total), pctU(c.diff_seg, c.diff_total) },
     );
 }
 
@@ -1053,7 +1068,13 @@ test "folder correlation: same-directory notes trend toward same component" {
 
     const comp = try Components.compute(arena, n, edges.items);
     try testing.expectEqual(@as(usize, 2), comp.count);
-    // Just make sure it runs without error and prints something sane; correctness of the
-    // sampling math is covered by the aggregate counts being internally consistent.
-    try printFolderCorrelation(n, comp, &paths);
+
+    // The property in the title, asserted: with each component confined to its own directory,
+    // every same-component pair shares a directory and no cross-component pair does. Anything
+    // between those extremes on a real vault is the folder prior `fold.build` weighs.
+    const c = folderCorrelation(n, comp, &paths);
+    try testing.expect(c.same_total > 0);
+    try testing.expect(c.diff_total > 0);
+    try testing.expectEqual(c.same_total, c.same_dir);
+    try testing.expectEqual(@as(u64, 0), c.diff_dir);
 }

@@ -54,8 +54,25 @@ pub const Options = struct {
     /// Air between packed island discs, as a multiple of their area. Above 1 so islands read as
     /// separate chunks rather than a tiled surface.
     pack_gap: f32 = 5.2,
-    /// Horizontal stretch of the island pack, to suit a wide panel.
-    pack_aspect: f32 = 1.35,
+    /// Horizontal stretch of the island pack. 1 is a disc, and the default for a reason.
+    ///
+    /// The obvious improvement here is to set this from the pane's real proportions, and it is the
+    /// wrong thing to do: the arrangement is the reader's map, and a map that reshapes when you
+    /// drag a splitter moves every landmark out from under them. Losing your place is a far worse
+    /// cost than a pair of empty gutters on a wide panel, and it is paid at exactly the moment
+    /// someone is arranging their workspace around something they were looking at. `graph.zig`'s
+    /// reshape path leans on this: it deliberately leaves the camera alone, on the grounds that
+    /// containment does not read the pane, so a re-solve lands on the same arrangement.
+    ///
+    /// A disc is also the shape everything downstream already assumes — `World.extent` measures a
+    /// radius and the framing fits a circle — so 1 is the value at which the layout and the camera
+    /// finally agree, rather than the stretch buying horizontal fill and the disc-shaped fit giving
+    /// it straight back as vertical padding.
+    ///
+    /// Only ever raise this. `placeRoots` scales x alone, so a factor below 1 shortens horizontal
+    /// gaps the packing radius just established and can overlap islands; the vault simulator's
+    /// slider goes down to 0.6 and will show exactly that.
+    pack_aspect: f32 = 1.0,
     /// Extra turn applied per level, in radians. Defaults to half a slot step, which staggers
     /// consecutive levels so children never line up radially with their parent and the field does
     /// not band. Set `aperture7_rotation` instead to nest levels on one global hex lattice.
@@ -135,6 +152,35 @@ pub const Field = struct {
         // LOD's cull/split tests, and `@sqrt` is a single instruction where `pow` is not.
         if (self.opts.radius_exp == 0.5) return self.opts.note_r * @sqrt(n);
         return self.opts.note_r * std.math.pow(f32, n, self.opts.radius_exp);
+    }
+
+    /// Place `cell` itself, expanding whatever ancestors it takes to get there. Idempotent.
+    ///
+    /// Placement is otherwise driven entirely by the LOD, which only expands what it opens — so a
+    /// cell inside a branch the camera never looked at has no position at all. That is the right
+    /// default and the wrong one for the focused note's own links, which must be drawable at leaf
+    /// precision no matter where the camera is standing (see `World.focus_links`).
+    ///
+    /// Root-down, because `ensureChildren` places children relative to their parent's already-known
+    /// centre: walking the chain the other way would place a child against a parent that has not
+    /// been positioned yet. Bounded by the ladder's depth — six levels at a million notes — and
+    /// memoized in `expanded`, so a leaf costs this once and never again.
+    pub fn ensurePlaced(self: *Field, lad: *const fold.Ladder, cell: u32) void {
+        var chain: [64]u32 = undefined;
+        var n: usize = 0;
+        var c = cell;
+        while (n < chain.len) {
+            chain[n] = c;
+            n += 1;
+            const parent = lad.cells[c].parent;
+            if (parent == fold.invalid) break;
+            c = parent;
+        }
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            self.ensureChildren(lad, chain[i]);
+        }
     }
 
     /// Place `cell`'s children. Idempotent, and safe to call on a leaf.
@@ -352,9 +398,20 @@ pub fn placeRoots(f: *Field, lad: *const fold.Ladder) void {
     const golden = std.math.pi * (3.0 - @sqrt(5.0));
     var acc: f32 = 0;
     for (order, 0..) |r, i| {
-        const rad = @sqrt(acc);
         const rr = f.radius(lad, r);
-        acc += rr * rr * f.opts.pack_gap;
+        // `+ rr` places this island's *edge* on the packed disc rather than its centre, which is
+        // what actually prevents overlap. It is a constant offset, not a cumulative one, so a
+        // vault of many similar islands still packs as a disc rather than unwinding into a line.
+        const rad = if (i == 0) 0 else @sqrt(acc) + rr;
+        // The anchor contributes its bare area; everything after it pays `pack_gap`.
+        //
+        // `pack_gap` separates *peers*. Charging it to the first island as well means every other
+        // island is pushed out by the square root of it — and when one component dominates, as it
+        // does on any real wiki (Simple English is 98.99% one component), that scales the entire
+        // vault's extent by √5.2 ≈ 2.3. The 2,816 orphans ended up more than two radii from a blob
+        // they are not attached to, and "fit to extents" then had to frame all that emptiness.
+        // Nothing needs clearance from the anchor beyond touching it.
+        acc += rr * rr * (if (i == 0) 1 else f.opts.pack_gap);
         const a = @as(f32, @floatFromInt(i)) * golden;
         f.pos[r] = .{ .x = @cos(a) * rad * f.opts.pack_aspect, .y = @sin(a) * rad };
     }

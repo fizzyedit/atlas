@@ -36,6 +36,7 @@
 //! be tested headlessly and eventually lifted into its own package.
 
 const std = @import("std");
+const radix = @import("radix.zig");
 
 pub const invalid: u32 = std.math.maxInt(u32);
 
@@ -145,6 +146,13 @@ pub const Options = struct {
     folder_w: f32 = 0.25,
     /// Safety stop. A correct run terminates in ~log_arity(n) levels.
     max_levels: u16 = 40,
+    /// Checked between coarsening levels so a caller running this on a worker can abandon it.
+    ///
+    /// Coarsening a 283,878-note vault is a double-digit number of seconds, and the one caller
+    /// that has to *wait* for it is application shutdown — which joins the worker because the code
+    /// it is running lives in a dylib that is about to be unloaded. Without a check in here that
+    /// join is the whole build, and closing the editor mid-build looks like a hang.
+    cancel: ?*std.atomic.Value(bool) = null,
 };
 
 /// Build the ladder. `paths` may be empty (no folder nodes); otherwise `paths[i]` is note `i`'s
@@ -178,7 +186,13 @@ pub fn build(
 
     const total: u32 = @intCast(n_notes);
     if (paths.len == n_notes and opts.folder_w > 0) {
-        try addPathChain(arena, &edges, paths, opts.folder_w);
+        if (hasFolders(paths)) {
+            try addPathChain(arena, &edges, paths, opts.folder_w);
+        } else {
+            // Flat vault: no folder tree to express, but the notes with *no links at all* still
+            // need something to group on, and their titles are the only information there is.
+            try addOrphanChain(arena, &edges, paths, links, n_notes, opts.folder_w);
+        }
     }
 
     // ---- coarsen ---------------------------------------------------------------------------
@@ -202,6 +216,9 @@ pub fn build(
 
     var depth: u16 = 0;
     while (depth < opts.max_levels and cur.len > n_comps) {
+        if (opts.cancel) |c| {
+            if (c.load(.acquire)) return error.Cancelled;
+        }
         const res = try coarsenLevel(arena, gpa, &cells, &children, cur, level_edges, opts.arity, depth);
         if (res.cells.len >= cur.len) break; // no progress
         cur = res.cells;
@@ -298,6 +315,76 @@ fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_
     return next;
 }
 
+/// A title-ordered chain over notes that have **no links whatsoever**.
+///
+/// This is the other half of `hasFolders`. The module's premise is "group by links, and by folder
+/// when there are no links" — and it needs no orphan special case *because* the folder chain
+/// supplies those edges. On a flat vault that chain is suppressed (it would group the entire vault
+/// alphabetically, drowning real links), which leaves orphans with nothing at all: they pool into
+/// one component and coarsen in note-id order, i.e. at random. On a Wikipedia import that is 2,816
+/// notes bundled into arbitrary sevens.
+///
+/// The distinction that makes this safe is exactly the one that made the full chain unsafe. A
+/// chain over *every* note adds edges that compete with real links and win often enough to decide
+/// the layout. A chain over notes that have no links competes with nothing — it is the only signal
+/// available for them, and it makes a coalesced orphan group mean something ("titles around Ka…")
+/// instead of nothing.
+fn addOrphanChain(
+    arena: std.mem.Allocator,
+    edges: *std.ArrayListUnmanaged(Edge),
+    paths: []const []const u8,
+    links: []const Edge,
+    n_notes: usize,
+    w: f32,
+) !void {
+    const linked = try arena.alloc(bool, n_notes);
+    @memset(linked, false);
+    for (links) |e| {
+        if (e.a < n_notes) linked[e.a] = true;
+        if (e.b < n_notes) linked[e.b] = true;
+    }
+
+    var orphans: std.ArrayListUnmanaged(u32) = .empty;
+    for (0..n_notes) |i| {
+        if (!linked[i]) try orphans.append(arena, @intCast(i));
+    }
+    if (orphans.items.len < 2) return;
+
+    const ByPath = struct {
+        paths: []const []const u8,
+        pub fn lessThan(self: @This(), a: u32, b: u32) bool {
+            return std.mem.lessThan(u8, self.paths[a], self.paths[b]);
+        }
+    };
+    std.mem.sortUnstable(u32, orphans.items, ByPath{ .paths = paths }, ByPath.lessThan);
+
+    for (orphans.items[1..], 0..) |b, i| {
+        try edges.append(arena, .{ .a = orphans.items[i], .b = b, .w = w });
+    }
+}
+
+/// Whether these paths describe a folder tree at all.
+///
+/// `addPathChain` leans entirely on lexicographic order being a depth-first walk of the folder
+/// hierarchy. In a **flat** vault there is no hierarchy for it to walk, and the chain stops
+/// expressing folder structure and starts inventing an *alphabetical* one: 286,000 edges at
+/// `folder_w` joining notes whose only relationship is that their titles sort next to each other.
+/// On a Simple English Wikipedia import that is exactly what happened — the map clustered
+/// `Mitsuhiro Toda` with `Mitsuhiro Kawamoto`, and `Zoe Kazan` with `Zoe Konstantopoulou`, while
+/// the notes they actually link to ended up on the other side of the vault.
+///
+/// One separator anywhere is enough to mean the caller has real structure to contribute. A vault
+/// with none has nothing to say about grouping, and saying nothing is strictly better than saying
+/// something false — links then decide alone, which is what `folder_w`'s "folders only decide
+/// where links don't" was always meant to degrade to.
+fn hasFolders(paths: []const []const u8) bool {
+    for (paths) |path| {
+        if (std.mem.indexOfScalar(u8, path, '/') != null) return true;
+        if (std.mem.indexOfScalar(u8, path, '\\') != null) return true;
+    }
+    return false;
+}
+
 /// One edge per note, between path-order neighbours. Lexicographic order on vault-relative paths
 /// is a depth-first walk of the folder tree, so this single chain expresses the whole hierarchy:
 /// same-directory notes are contiguous, sibling directories abut, and a directory sits next to its
@@ -317,7 +404,7 @@ fn addPathChain(
             return std.mem.lessThan(u8, self.paths[a], self.paths[b]);
         }
     };
-    std.mem.sort(u32, order, Ctx{ .paths = paths }, Ctx.lessThan);
+    std.mem.sortUnstable(u32, order, Ctx{ .paths = paths }, Ctx.lessThan);
 
     var i: usize = 1;
     while (i < order.len) : (i += 1) {
@@ -328,6 +415,13 @@ fn addPathChain(
 // ---- one coarsening level -------------------------------------------------------------------
 
 const LevelResult = struct { cells: []u32, edges: []Edge };
+
+/// Pack an edge's endpoints into the key the radix sort orders by. Canonicalised `a <= b` by the
+/// caller, so this orders by source then destination.
+fn edgeKey(e: Edge) u64 {
+    return (@as(u64, e.a) << 32) | @as(u64, e.b);
+}
+
 
 fn coarsenLevel(
     arena: std.mem.Allocator,
@@ -342,16 +436,36 @@ fn coarsenLevel(
     const k = arity.n();
 
     // Dense index over the current cells so adjacency can be a flat CSR.
-    var idx = std.AutoHashMapUnmanaged(u32, u32).empty;
-    try idx.ensureTotalCapacity(arena, @intCast(cur.len));
-    for (cur, 0..) |c, i| idx.putAssumeCapacity(c, @intCast(i));
+    //
+    // A flat array rather than a hash map, because this is looked up **six times per edge**: twice
+    // to count degrees, twice to fill the CSR, and twice again to lift the edges to their parents.
+    // On the reference corpus's first level that is 3.35M edges × 6 = ~20 million probes, each one
+    // a wyhash of a `u32` followed by a random walk of the map's metadata — and a profile of a
+    // rebuild found them, not the sorting the symbol names first suggested. Cell ids are dense
+    // integers, so the map was only ever a slow way to index an array.
+    //
+    // Sized from the cell count *before* this level appends its parents: every id these edges can
+    // name already exists, and the parents appended below are ids no `level_edges` entry holds.
+    const dense_of = try arena.alloc(u32, cells.items.len);
+    @memset(dense_of, invalid);
+    for (cur, 0..) |c, i| dense_of[c] = @intCast(i);
+    // Cell ids come from `cur` and from `level_edges`, which is this level's own edge list — but
+    // bound the read anyway rather than trusting that, since the cost is one compare against a
+    // value already in a register.
+    const denseOf = struct {
+        fn f(map: []const u32, id: u32) ?u32 {
+            if (id >= map.len) return null;
+            const d = map[id];
+            return if (d == invalid) null else d;
+        }
+    }.f;
 
     const m = cur.len;
     const deg = try arena.alloc(u32, m);
     @memset(deg, 0);
     for (level_edges) |e| {
-        const ia = idx.get(e.a) orelse continue;
-        const ib = idx.get(e.b) orelse continue;
+        const ia = denseOf(dense_of, e.a) orelse continue;
+        const ib = denseOf(dense_of, e.b) orelse continue;
         if (ia == ib) continue;
         deg[ia] += 1;
         deg[ib] += 1;
@@ -363,8 +477,8 @@ fn coarsenLevel(
     const adj = try arena.alloc(u32, off[m]);
     const adjw = try arena.alloc(f32, off[m]);
     for (level_edges) |e| {
-        const ia = idx.get(e.a) orelse continue;
-        const ib = idx.get(e.b) orelse continue;
+        const ia = denseOf(dense_of, e.a) orelse continue;
+        const ib = denseOf(dense_of, e.b) orelse continue;
         if (ia == ib) continue;
         adj[fill[ia]] = ib;
         adjw[fill[ia]] = e.w;
@@ -385,7 +499,7 @@ fn coarsenLevel(
             return a < b;
         }
     };
-    std.mem.sort(u32, order, Ctx{ .cells = cells.items }, Ctx.lessThan);
+    std.mem.sortUnstable(u32, order, Ctx{ .cells = cells.items }, Ctx.lessThan);
 
     const taken = try arena.alloc(bool, m);
     @memset(taken, false);
@@ -398,7 +512,7 @@ fn coarsenLevel(
     var buf = try arena.alloc(u32, k);
 
     for (order) |cell_id| {
-        const u = idx.get(cell_id).?;
+        const u = denseOf(dense_of, cell_id).?;
         if (taken[u]) continue;
         taken[u] = true;
         var len: usize = 1;
@@ -439,7 +553,7 @@ fn coarsenLevel(
                 return a < b;
             }
         };
-        std.mem.sort(u32, leftovers.items, ByComp{ .cells = cells.items, .cur = cur }, ByComp.lessThan);
+        std.mem.sortUnstable(u32, leftovers.items, ByComp{ .cells = cells.items, .cur = cur }, ByComp.lessThan);
         var i: usize = 0;
         while (i < leftovers.items.len) {
             const this_comp = cells.items[cur[leftovers.items[i]]].comp;
@@ -488,8 +602,8 @@ fn coarsenLevel(
     var lifted: std.ArrayListUnmanaged(Edge) = .empty;
     try lifted.ensureTotalCapacity(arena, level_edges.len);
     for (level_edges) |e| {
-        const ia = idx.get(e.a) orelse continue;
-        const ib = idx.get(e.b) orelse continue;
+        const ia = denseOf(dense_of, e.a) orelse continue;
+        const ib = denseOf(dense_of, e.b) orelse continue;
         const pa = parent_of[ia];
         const pb = parent_of[ib];
         if (pa == pb) continue;
@@ -499,16 +613,11 @@ fn coarsenLevel(
             .w = e.w,
         });
     }
-    const S = struct {
-        pub fn lessThan(_: void, x: Edge, y: Edge) bool {
-            if (x.a != y.a) return x.a < y.a;
-            return x.b < y.b;
-        }
-    };
-    std.mem.sort(Edge, lifted.items, {}, S.lessThan);
+    const radix_scratch = try arena.alloc(Edge, lifted.items.len);
+    const sorted = radix.sortByKey(Edge, edgeKey, lifted.items, radix_scratch);
     var merged: std.ArrayListUnmanaged(Edge) = .empty;
     try merged.ensureTotalCapacity(arena, lifted.items.len);
-    for (lifted.items) |e| {
+    for (sorted) |e| {
         if (merged.items.len > 0) {
             const last = &merged.items[merged.items.len - 1];
             if (last.a == e.a and last.b == e.b) {
@@ -608,6 +717,36 @@ fn maxDepth(lad: Ladder, id: u32) u16 {
     return m + 1;
 }
 
+/// Hash context for the `u64`-keyed weight accumulators in `buildPairs`.
+///
+/// `AutoContext(u64)` runs wyhash over the eight bytes, and `buildPairs` does three `getOrPut`s per
+/// link — ~10M hashes on the reference corpus, which makes it the most expensive part of
+/// `fold.build`. These keys are packed cell/child ids: dense, structured, and entirely under our own
+/// control, never attacker-supplied, so a cheaper mixer than a general-purpose byte hash is enough.
+///
+/// splitmix64's finalizer, **not** a bare multiply. A single `k *% golden` is a bijection but leaves
+/// the low bits determined by the low bits of the input, and this table indexes buckets with the low
+/// bits — the packed keys share their low half across whole runs of entries, so every one of them
+/// collided into the same bucket. That version ran `buildPairs` at 5,130 ms against 168 ms for
+/// wyhash: a 30x regression from a hash that looked obviously faster.
+const PackedKeyContext = struct {
+    pub fn hash(_: PackedKeyContext, k: u64) u64 {
+        var x = k;
+        x ^= x >> 30;
+        x *%= 0xbf58476d1ce4e5b9;
+        x ^= x >> 27;
+        x *%= 0x94d049bb133111eb;
+        x ^= x >> 31;
+        return x;
+    }
+    pub fn eql(_: PackedKeyContext, a: u64, b: u64) bool {
+        return a == b;
+    }
+};
+
+/// A `u64 -> weight` accumulator keyed on packed ids. See `PackedKeyContext`.
+const WeightAcc = std.HashMapUnmanaged(u64, f32, PackedKeyContext, std.hash_map.default_max_load_percentage);
+
 // ---- sibling pair weights -------------------------------------------------------------------
 
 /// For every original link, find the lowest cell that contains both ends and record the weight
@@ -615,12 +754,12 @@ fn maxDepth(lad: Ladder, id: u32) u16 {
 /// which child gets which hex slot — turning what would be a global force solve into an
 /// exhaustive search over at most `arity!` arrangements per cell.
 fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes: usize) !void {
-    var acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
+    var acc: WeightAcc = .empty;
     defer acc.deinit(gpa);
     // (cell << 40) | (child << 32) | toward  ->  weight. One level below the LCA on each side:
     // the pair above says "x links to y", this says *which child of x* does — the part
     // `containment` needs to aim a slot, and the part the LCA-only record throws away.
-    var ext_acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
+    var ext_acc: WeightAcc = .empty;
     defer ext_acc.deinit(gpa);
 
     for (links) |e| {
@@ -631,12 +770,29 @@ fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes
         var y = leaf_b;
         if (x == invalid or y == invalid or x == y) continue;
 
-        // climb to equal depth, then together until the parents meet
-        while (lad.cells[x].level > lad.cells[y].level) x = lad.cells[x].parent;
-        while (lad.cells[y].level > lad.cells[x].level) y = lad.cells[y].parent;
+        // Climb to equal depth, then together until the parents meet — tracking the node each
+        // side came *from*.
+        //
+        // That node is what `recordExt` needs: the child of `x` holding this link's endpoint. It
+        // used to re-derive it by climbing from the leaf a second time, and a third time for `y`,
+        // so the same path through `lad.cells` was walked three times per link. On a vault whose
+        // cell array is far larger than L2 those climbs are pointer-chasing cache misses, which is
+        // most of what this loop costs at 3.35M links. The climb already passes through the answer.
+        var x_from: u32 = invalid;
+        var y_from: u32 = invalid;
+        while (lad.cells[x].level > lad.cells[y].level) {
+            x_from = x;
+            x = lad.cells[x].parent;
+        }
+        while (lad.cells[y].level > lad.cells[x].level) {
+            y_from = y;
+            y = lad.cells[y].parent;
+        }
         while (lad.cells[x].parent != lad.cells[y].parent) {
             if (lad.cells[x].parent == invalid or lad.cells[y].parent == invalid) break;
+            x_from = x;
             x = lad.cells[x].parent;
+            y_from = y;
             y = lad.cells[y].parent;
         }
         const p = lad.cells[x].parent;
@@ -654,8 +810,8 @@ fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes
         // Descend one level from each side of the LCA: which child of `x` actually holds this
         // link's endpoint, and therefore wants to face `y` (and symmetrically). Recorded only
         // when that side has children to aim — a leaf `x` has no slots of its own to arrange.
-        recordExt(gpa, &ext_acc, lad, x, leaf_a, y, e.w) catch {};
-        recordExt(gpa, &ext_acc, lad, y, leaf_b, x, e.w) catch {};
+        recordExt(gpa, &ext_acc, lad, x, x_from, y, e.w) catch {};
+        recordExt(gpa, &ext_acc, lad, y, y_from, x, e.w) catch {};
 
         const lo = @min(i, j);
         const hi = @max(i, j);
@@ -723,20 +879,22 @@ fn buildPairs(gpa: std.mem.Allocator, lad: *Ladder, links: []const Edge, n_notes
 /// `cell` is one side of a link's LCA split and `toward` is the other, so `toward` is always a
 /// sibling of `cell` — already positioned by the time `cell` expands. Skipped for a leaf `cell`,
 /// which has no children to arrange.
+/// `child` is the node the LCA climb came up through — already known to be a child of `cell`, so
+/// there is nothing to search for. `invalid` when the climb never moved, which means `cell` is the
+/// leaf itself and has no slots of its own to arrange.
 fn recordExt(
     gpa: std.mem.Allocator,
-    acc: *std.AutoHashMapUnmanaged(u64, f32),
+    acc: *WeightAcc,
     lad: *const Ladder,
     cell: u32,
-    leaf: u32,
+    child: u32,
     toward: u32,
     w: f32,
 ) !void {
     if (lad.cells[cell].child_count == 0) return;
-    // Climb from the leaf until the node whose parent is `cell` — that is the child holding it.
-    var node = leaf;
-    while (node != invalid and lad.cells[node].parent != cell) node = lad.cells[node].parent;
+    const node = child;
     if (node == invalid) return;
+    std.debug.assert(lad.cells[node].parent == cell);
     const kids = lad.childrenOf(cell);
     var ci: u8 = 255;
     for (kids, 0..) |k, k_i| {
@@ -751,6 +909,69 @@ fn recordExt(
 // ---- tests ----------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "a flat vault gets no folder chain" {
+    // The chain encodes a folder hierarchy by exploiting lexicographic order. With no folders
+    // there is no hierarchy, and the chain would instead wire alphabetical neighbours together —
+    // which on a real Wikipedia import dominated the coarsening and grouped notes purely by title.
+    const gpa = testing.allocator;
+
+    // Two linked pairs, deliberately arranged so that alphabetical order and link structure
+    // disagree: A links to C, B links to D.
+    const edges = [_]Edge{ .{ .a = 0, .b = 2 }, .{ .a = 1, .b = 3 } };
+    const flat: []const []const u8 = &.{ "Aa.md", "Ab.md", "Zy.md", "Zz.md" };
+
+    var lad = try build(gpa, 4, &edges, flat, .{ .arity = .seven });
+    defer lad.deinit(gpa);
+
+    // With no chain the only edges are the real ones, so the two link components survive as such.
+    // A chain would have joined Aa-Ab and Zy-Zz — alphabetical neighbours — into one component.
+    const comp_of = struct {
+        fn f(l: Ladder, note: u32) u32 {
+            return l.cells[l.leaf_cell[note]].comp;
+        }
+    }.f;
+    try testing.expectEqual(comp_of(lad, 0), comp_of(lad, 2)); // linked
+    try testing.expectEqual(comp_of(lad, 1), comp_of(lad, 3)); // linked
+    try testing.expect(comp_of(lad, 0) != comp_of(lad, 1)); // only alphabetically adjacent
+}
+
+test "orphans on a flat vault group by title, not by note id" {
+    // The folder chain is suppressed on a flat vault (it would group everything alphabetically),
+    // which leaves unlinked notes with no signal at all. `addOrphanChain` restores exactly the
+    // ordering the folder chain used to supply, scoped to notes that have nothing to compete with.
+    const gpa = testing.allocator;
+
+    // Six orphans whose id order and title order disagree completely, plus one linked pair so the
+    // orphan pool is not the whole vault.
+    const edges = [_]Edge{.{ .a = 0, .b = 1 }};
+    const flat: []const []const u8 = &.{
+        "linked-a.md", "linked-b.md",
+        "Zz.md",       "Aa.md",
+        "Zy.md",       "Ab.md",
+        "Za.md",       "Ac.md",
+    };
+
+    var lad = try build(gpa, 8, &edges, flat, .{ .arity = .seven });
+    defer lad.deinit(gpa);
+
+    // The `A*` orphans should share a leaf cell with each other rather than with the `Z*` ones.
+    const cell_of = struct {
+        fn f(l: Ladder, note: u32) u32 {
+            return l.cells[l.leaf_cell[note]].parent;
+        }
+    }.f;
+    // Aa(3), Ab(5), Ac(7) are title-adjacent; Zz(2), Zy(4), Za(6) are the other run.
+    try testing.expectEqual(cell_of(lad, 3), cell_of(lad, 5));
+    try testing.expectEqual(cell_of(lad, 5), cell_of(lad, 7));
+}
+
+test "hasFolders distinguishes a flat vault from a nested one" {
+    try testing.expect(!hasFolders(&.{ "A.md", "B.md", "C.md" }));
+    try testing.expect(hasFolders(&.{ "A.md", "notes/B.md" }));
+    try testing.expect(!hasFolders(&.{}));
+}
+
 
 fn totalCount(lad: Ladder) u32 {
     var n: u32 = 0;

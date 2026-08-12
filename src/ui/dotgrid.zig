@@ -14,7 +14,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 
 const hex = @import("hex.zig");
-const Camera = @import("camera.zig");
+const Camera = @import("Camera.zig");
 
 /// Desired on-screen distance between the opaque dots, in natural (unscaled) pixels.
 const target_spacing: f32 = hex.target_screen_spacing;
