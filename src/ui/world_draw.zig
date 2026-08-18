@@ -103,30 +103,32 @@ fn clipToRect(
     return .{ .a = .{ .x = c[0], .y = c[1] }, .b = .{ .x = c[2], .y = c[3] } };
 }
 
-/// Whether `cell` should light its links up as an open note's own.
+/// Where a focused link's two ends are drawn once a note has coalesced.
 ///
-/// Only ever true for a **leaf**, and that restriction is the point. `holdsOpen` walks a cell's
-/// whole note range, so on a coalesced mass it answers "does this mass contain an open note" —
-/// and treating that as "these are the note's links" paints every link the mass touches, which at
-/// a far zoom is a starburst across the panel with almost nothing to do with the document. On a
-/// leaf the range is one note, so the question and the answer finally mean the same thing.
+/// The ends are doing different jobs, and the right answer is not the same for both.
 ///
-/// The focused note is handled separately and better, at leaf precision, by `World.focus_links`.
-/// This clause is what still lights up a *second* open tab that happens to be drawn as itself.
-fn endpointLit(
-    w: *const world_mod.World,
-    holds_open: std.AutoHashMapUnmanaged(u32, void),
-    cell: u32,
-) bool {
-    return cell < w.lad.cells.len and
-        w.lad.cells[cell].child_count == 0 and
-        holds_open.contains(cell);
-}
-
-/// TEMPORARY: is anything other than the focus pass drawing the focused note's links, and at what
-/// extension does the focus pass start? Logs only when the answer changes.
-const debug_dupe = true;
-var dbg_sig: u64 = std.math.maxInt(u64);
+/// The **source** is the note being looked at. Its web has to stay rooted in whatever is drawn for
+/// it, or zooming out leaves the highlighted lines radiating from a point inside a mass that is no
+/// longer on screen — the web comes adrift from the node it belongs to.
+///
+/// The **far end** is a destination. Snapping it to the mass standing in for it costs the one thing
+/// this whole highlight exists for: following a link flies the camera along that edge, and the
+/// illusion only holds while the line ends where the camera is actually going. A line into a mass
+/// centroid, which then jumps as the mass opens, breaks the ride.
+///
+/// So: anchor the source, tell the truth about the far end. `.stand_in` and `.true_position` are
+/// kept because both are defensible in isolation and the difference is only visible on a coalesced
+/// graph — worth being able to look at each.
+const FocusEndpoints = enum {
+    /// Both ends at the notes' own positions. Sharpest about destinations; the source can come
+    /// adrift from its own mark.
+    true_position,
+    /// Both ends at the mark standing in for them. Always attached, never precise.
+    stand_in,
+    /// Source anchored to its stand-in, far end left true.
+    anchor_source,
+};
+const focus_endpoints: FocusEndpoints = .anchor_source;
 
 pub fn draw(
     w: *const world_mod.World,
@@ -155,14 +157,10 @@ pub fn draw(
         var pos = std.AutoHashMapUnmanaged(u32, dvui.Point.Physical){};
         defer pos.deinit(arena);
         pos.ensureTotalCapacity(arena, @intCast(w.marks.items.len)) catch {};
-        var holds_open = std.AutoHashMapUnmanaged(u32, void){};
-        defer holds_open.deinit(arena);
         for (w.marks.items) |m| {
             pos.put(arena, m.cell, toScreen(cam, dctx, m)) catch {};
-            if (dctx.holdsOpen(dctx.ctx, w, m)) holds_open.put(arena, m.cell, {}) catch {};
         }
 
-        var dupe: usize = 0;
         var batch = galaxy.LineBatch.init(arena);
         // Ambient segments are collected before any are emitted, because their opacity depends on
         // how many of them there turn out to be — and that is knowable only *after* culling. What
@@ -189,6 +187,30 @@ pub fn draw(
         // toward where its far end actually is. Continuous, too — at rest a mark sits on its
         // field position, so an endpoint scrolling off-screen swaps to the same coordinate rather
         // than jumping.
+        // The deepest *drawn* ancestor of `cell` — the thing currently standing in for it.
+        //
+        // Walks the ladder rather than asking the cut: at most a handful of steps (six levels at a
+        // million notes), and it answers with what is actually on screen this frame, including
+        // while a closing cell and its children are still crossfading past each other. That is what
+        // keeps the endpoint continuous through a coalesce instead of jumping when the leaf's own
+        // mark stops being drawn.
+        const standIn = struct {
+            fn f(
+                world: *const world_mod.World,
+                live: std.AutoHashMapUnmanaged(u32, dvui.Point.Physical),
+                cell: u32,
+            ) ?dvui.Point.Physical {
+                var c = cell;
+                var guard: u8 = 0;
+                while (c != world_mod.fold.invalid and guard < 64) : (guard += 1) {
+                    if (live.get(c)) |pt| return pt;
+                    if (c >= world.lad.cells.len) return null;
+                    c = world.lad.cells[c].parent;
+                }
+                return null;
+            }
+        }.f;
+
         const endpoint = struct {
             fn f(
                 world: *const world_mod.World,
@@ -208,15 +230,19 @@ pub fn draw(
         const clip_rect = cam.viewport.outsetAll(link_clip_pad);
 
         for (w.links.items) |l| {
-            // `l.focus` is set by the lift, and means "this is one of the focused note's own
-            // links" — not "touches the cell the focused note is inside", which when that note is
-            // coalesced is a mass with hundreds of unrelated members.
+            // Ambient web only. **Every** link belonging to an open note — focused or not — is
+            // drawn by the leaf-precision pass below, and by nothing else.
             //
-            // Focus links are drawn by the leaf-precision pass below, at the note's own position
-            // rather than its stand-in cell's. Drawing them here as well would double the line and
-            // — once the cut coarsens — draw it from the wrong place.
+            // There used to be a second drawer here: a branch that painted an open note's *lifted*
+            // links in the highlight colour at full length. Two passes drawing the same connections
+            // is what made the reveal unreliable, and the failure was not a timing bug that could be
+            // nudged. The lift is cached, and held outright while the camera moves, so `l.focus` —
+            // set when the lift last ran — goes stale exactly when a click opens a note and flies
+            // there. For those frames the note was already "open" but its links were not yet marked
+            // focus, so the second drawer painted the whole web at full highlight; when the lift
+            // caught up the links became focus links and restarted from zero. Flash, vanish,
+            // re-animate. One drawer cannot disagree with itself.
             if (l.focus) continue;
-            if (debug_dupe and (l.a == w.focus_cut or l.b == w.focus_cut)) dupe += 1;
             // No "at least one end has a living mark" test here, deliberately.
             //
             // That guard was a cheap stand-in for "is any of this on screen", and it is wrong at
@@ -234,26 +260,8 @@ pub fn draw(
             // of clipping rather than culling by endpoint.
             const a = endpoint(w, cam, dctx, pos, l.a) orelse continue;
             const b = endpoint(w, cam, dctx, pos, l.b) orelse continue;
-            const a_open = endpointLit(w, holds_open, l.a);
-            const b_open = endpointLit(w, holds_open, l.b);
-            if (!a_open and !b_open) {
-                const seg = clipToRect(a, b, clip_rect) orelse continue;
-                segs.append(arena, .{ .a = seg.a, .b = seg.b, .alpha = l.alpha }) catch {};
-                continue;
-            }
-            // Drawn at full length, with no reach-out of its own.
-            //
-            // This branch lights up a *second* open tab that happens to be drawn as itself — never
-            // the note the reader just selected, which `focus_links` handles below at leaf
-            // precision with per-link timing. It used to share one animation scalar with that set,
-            // so every change of focus replayed the reach for every other open tab too: with two or
-            // more documents open, clicking a node sent a second wave of lines out from an
-            // unrelated note. Those links are established context, not the answer to the click.
-            const from = if (a_open) a else b;
-            const to = if (a_open) b else a;
-            const seg = clipToRect(from, to, clip_rect) orelse continue;
-            batch.add(seg.a, seg.b, 1.8, withAlpha(lit, l.alpha));
-            stats.links_drawn += 1;
+            const seg = clipToRect(a, b, clip_rect) orelse continue;
+            segs.append(arena, .{ .a = seg.a, .b = seg.b, .alpha = l.alpha }) catch {};
         }
 
         // Now the count is known, so the ink can be mixed and the ambient web emitted.
@@ -272,8 +280,12 @@ pub fn draw(
         // whose far end is on screen stays glued to the animated position rather than jumping to
         // the static field coordinate.
         for (w.focus_links.items) |fl| {
-            const a = endpoint(w, cam, dctx, pos, fl.a) orelse continue;
-            const b = endpoint(w, cam, dctx, pos, fl.b) orelse continue;
+            const a_snap = focus_endpoints != .true_position;
+            const b_snap = focus_endpoints == .stand_in;
+            const a = (if (a_snap) standIn(w, pos, fl.a) else null) orelse
+                endpoint(w, cam, dctx, pos, fl.a) orelse continue;
+            const b = (if (b_snap) standIn(w, pos, fl.b) else null) orelse
+                endpoint(w, cam, dctx, pos, fl.b) orelse continue;
             // This link's own reach, not the frame's: `World.stepFocusGrow` advances one value per
             // link, so clicking a new node leaves an already-extended connection where it is and
             // only the newly focused ones travel.
@@ -299,23 +311,6 @@ pub fn draw(
             const seg = clipToRect(a, tip, clip_rect) orelse continue;
             batch.add(seg.a, seg.b, 1.8, lit);
             stats.links_drawn += 1;
-        }
-        if (debug_dupe) {
-            var g_min: f32 = 1;
-            var g_max: f32 = 0;
-            for (w.focus_links.items) |fl| {
-                g_min = @min(g_min, fl.grow);
-                g_max = @max(g_max, fl.grow);
-            }
-            const sig = (@as(u64, @intCast(dupe)) << 32) |
-                (@as(u64, @intFromFloat(g_min * 100)) << 16) |
-                @as(u64, @intCast(w.focus_links.items.len));
-            if (sig != dbg_sig) {
-                dbg_sig = sig;
-                dvui.log.info("draw focus_links={d} grow={d:.2}..{d:.2} dupe={d} focus_cut={d}", .{
-                    w.focus_links.items.len, g_min, g_max, dupe, w.focus_cut,
-                });
-            }
         }
         batch.flush();
     }

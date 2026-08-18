@@ -3043,14 +3043,6 @@ fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
     var framed_still_open = false;
     for (p.nodes, 0..) |n, idx| {
         if (n.open != n.was_open) changed = true;
-        if (n.was_open and !n.open) {
-            // Closed. Forget that its web was ever revealed, so opening it again animates: the
-            // reach belongs to the act of opening a note, not to having ever looked at it. Tabs
-            // that stay open and are merely swapped between keep their webs standing.
-            if (p.world_state) |*w| {
-                if (idx < w.lad.leaf_cell.len) w.forgetFocusSeen(w.lad.leaf_cell[idx]);
-            }
-        }
         if (!n.open) continue;
         is_any = true;
         if (first_open == null) first_open = idx;
@@ -4182,40 +4174,13 @@ fn activeNodeIndex(p: *Panel) ?u32 {
     if (p.synthetic) return null;
     const st = runtime.state();
     const vault = st.vault_root orelse return null;
-    const doc = sdk.host().activeDoc() orelse {
-        dbgFocus(p, "no-active-doc", "", null);
-        return null;
-    };
+    const doc = sdk.host().activeDoc() orelse return null;
     const path = doc.owner.documentPath(doc);
-    if (path.len == 0 or !query.isMarkdownPath(path)) {
-        dbgFocus(p, "not-markdown", path, null);
-        return null;
-    }
-    const rel = query.vaultRelative(vault, path) orelse {
-        dbgFocus(p, "not-in-vault", path, null);
-        return null;
-    };
-    const hit = p.path_index.get(rel);
-    dbgFocus(p, if (hit == null) "no-node-for-path" else "ok", rel, hit);
-    return hit;
+    if (path.len == 0 or !query.isMarkdownPath(path)) return null;
+    const rel = query.vaultRelative(vault, path) orelse return null;
+    return p.path_index.get(rel);
 }
 
-/// TEMPORARY: report every *change* in how the active document resolves to a graph node.
-const debug_focus_resolve = true;
-var dbg_focus_state: u64 = std.math.maxInt(u64);
-
-fn dbgFocus(p: *Panel, why: []const u8, path: []const u8, hit: ?u32) void {
-    if (!debug_focus_resolve) return;
-    var h: u64 = std.hash.Wyhash.hash(0, why);
-    h ^= std.hash.Wyhash.hash(0, path);
-    h = (h << 1) ^ @as(u64, hit orelse std.math.maxInt(u32));
-    h ^= @as(u64, p.focus_node) << 3;
-    if (h == dbg_focus_state) return;
-    dbg_focus_state = h;
-    dvui.log.info("focus-resolve {s} path='{s}' hit={?d} held={d} nodes={d} index={d}", .{
-        why, path, hit, p.focus_node, p.nodes.len, p.path_index.count(),
-    });
-}
 
 /// How long a click's claim on the focus outlives the workbench disagreeing with it. Two frames
 /// is the observed lag; this is loose enough to cover a slow open and short enough that a claim
@@ -4327,6 +4292,8 @@ fn worldParams(p: *Panel) world_mod.Params {
     return .{
         .budget = p.mark_budget,
         .link_budget = ambientLinkBudget(p.mark_budget),
+        // Highlighted lines get the same allowance as the ambient web, spent focused-note-first.
+        .focus_link_budget = ambientLinkBudget(p.mark_budget),
         .focus_leaf = focus_leaf,
         .open_leaves = open_leaves.items,
         .lift_hold = hold,

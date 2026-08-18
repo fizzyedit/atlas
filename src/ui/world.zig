@@ -35,7 +35,7 @@
 //! Screen-space out, no dvui in: marks are plain numbers so this stays headless-testable.
 
 const std = @import("std");
-const fold = @import("fold.zig");
+pub const fold = @import("fold.zig");
 const containment = @import("containment.zig");
 const cellweb = @import("cellweb.zig");
 
@@ -198,7 +198,8 @@ pub const Params = struct {
     /// Ceiling on that stretch. A Wikipedia-scale vault has links spanning most of its extent, and
     /// pacing those at a constant speed would take tens of seconds; the cap keeps the longest reach
     /// deliberate rather than interminable.
-    focus_reach_max: f32 = 7.0,
+    focus_reach_max: f32 = 2.5,
+
     /// Pad the cull test so a cell just off-screen still animates rather than popping in.
     cull_pad_px: f32 = 48,
     /// Neighbours of one cut cell that `liftLinks` will look at, heaviest first.
@@ -238,6 +239,19 @@ pub const Params = struct {
     /// panel exists to answer, and answering it approximately is worse than not answering it. The
     /// exemption is bounded: one cell, so the extra scan is `O(degree)` once per frame.
     focus_leaf: u32 = fold.invalid,
+    /// How many *highlighted* lines the frame may draw, across every open note.
+    ///
+    /// Spent focused-note-first. The flat `link_scan_cap` per note was the wrong shape twice over:
+    /// it truncated the one note the reader is actually asking about at 256 however much room the
+    /// frame had, while placing no limit at all on the total, since every open tab got its own 256.
+    /// A budget spent in priority order says what is actually meant — the selected note draws as
+    /// much of its web as the frame can afford, and everything else fills what is left.
+    ///
+    /// A cap is still needed: the vault's worst hub has 29,448 neighbours, and a starburst of that
+    /// many highlighted lines is neither legible nor cheap. Sized from the same quality slider the
+    /// ambient budget uses, so "more detail" means more of both.
+    focus_link_budget: usize = 900,
+
     /// Links the frame may draw, kept by descending weight.
     ///
     /// Marks and links need separate budgets: n living cells admit up to n(n-1)/2 lifted pairs,
@@ -318,13 +332,14 @@ pub const World = struct {
     /// same pair either way means the line the reader is following simply stays drawn until they
     /// arrive.
     focus_grow: std.AutoHashMapUnmanaged(u64, f32) = .empty,
-    /// Leaves whose links have already reached out once this session.
+    /// Whether the focused note is actually on screen, recomputed every `step`.
     ///
-    /// The reach is a *reveal* — it says "here is what this note connects to" — and a reveal is
-    /// only interesting the first time. Returning to a note you have already opened should find its
-    /// web already there, the way going back to a room does not replay the lights coming on. One
-    /// `u32` per visited note, so it costs nothing worth measuring.
-    focus_seen: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// The reveal is something the reader watches, so it must not run while its note is off screen:
+    /// a reach growing from an off-screen point is clipped away entirely, so it played out unseen
+    /// during the flight and the reader met a finished web on arrival. "Is it visible" is the
+    /// honest test — "has the camera stopped" is not the same question, and gating on it stalled
+    /// reveals for as long as the camera kept easing.
+    focus_visible: bool = true,
     /// The cut cell holding `Params.focus_leaf`, resolved during `liftLinks`. `fold.invalid` when
     /// there is no focus or its branch was culled. The draw reads it to decide which links are the
     /// focused note's, so the panel does not have to re-derive the same walk.
@@ -391,7 +406,6 @@ pub const World = struct {
         self.links.deinit(self.gpa);
         self.link_fade.deinit(self.gpa);
         self.focus_grow.deinit(self.gpa);
-        self.focus_seen.deinit(self.gpa);
         self.cut.deinit(self.gpa);
         self.web.deinit(self.gpa);
         self.gpa.free(self.anim);
@@ -435,6 +449,7 @@ pub const World = struct {
     /// output cannot be stable. Keeping the passes apart is what makes "parked camera ⇒ nothing
     /// changes" true by construction rather than by luck.
     pub fn step(self: *World, view: View, p: Params, dt: f32) !void {
+        self.focus_visible = self.leafOnScreen(p.focus_leaf, view);
         self.clearFrame();
         if (self.lad.roots.len == 0) return;
         try self.decideTopology(view, p);
@@ -769,17 +784,15 @@ pub const World = struct {
         return std.math.clamp(len / @max(1, p.focus_reach_ref), 1, p.focus_reach_max);
     }
 
-    /// Forget that `leaf`'s web has been revealed, so opening it again reaches out again.
-    ///
-    /// Called when a document is *closed*. The reveal belongs to the act of opening a note, not to
-    /// having ever looked at it: swapping between tabs that are already open should find their webs
-    /// standing, but closing a note and opening it later is a fresh arrival and animates like one.
-    pub fn forgetFocusSeen(self: *World, leaf: u32) void {
-        _ = self.focus_seen.remove(leaf);
+    /// Is `leaf` inside the viewport right now? Read from the placement field rather than from the
+    /// marks, so it answers the same whether the note is drawn as itself or standing in a mass.
+    fn leafOnScreen(self: *World, leaf: u32, view: View) bool {
+        if (leaf == fold.invalid or leaf >= self.field.pos.len) return false;
+        const fp = self.field.pos[leaf];
+        const sx = view.w * 0.5 + (fp.x - view.cx) * view.zoom;
+        const sy = view.h * 0.5 + (fp.y - view.cy) * view.zoom;
+        return sx >= 0 and sx <= view.w and sy >= 0 and sy <= view.h;
     }
-
-    /// TEMPORARY: report when the reach map is emptied, which is what makes an animation replay.
-    const debug_focus_grow = true;
 
     /// Advance each focused link's own reach-out, and forget the ones that are no longer focused.
     ///
@@ -796,39 +809,34 @@ pub const World = struct {
         var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer live.deinit(self.gpa);
         try live.ensureTotalCapacity(self.gpa, @intCast(self.focus_links.items.len));
-        if (debug_focus_grow and self.focus_links.items.len == 0 and self.focus_grow.count() > 0) {
-            std.log.scoped(.dvui).info("grow WIPE: {d} keys dropped, focus_cut={d}", .{
-                self.focus_grow.count(),
-                self.focus_cut,
-            });
-        }
-        var created: usize = 0;
-        var leaf: u32 = fold.invalid;
         for (self.focus_links.items) |*fl| {
             const key = (@as(u64, @min(fl.a, fl.b)) << 32) | @as(u64, @max(fl.a, fl.b));
             live.putAssumeCapacity(key, {});
             const gop = try self.focus_grow.getOrPut(self.gpa, key);
             const prev: f32 = if (gop.found_existing) gop.value_ptr.* else blk: {
-                created += 1;
-                leaf = fl.a;
-                // A note seen before shows its web already extended; only a first reveal travels.
-                // Asked per link because `focus_links` now spans every open note: the one just
-                // opened animates while the tabs already standing beside it do not.
-                break :blk if (self.focus_seen.contains(fl.a)) 1 else 0;
+                // Zero, always: a key that does not exist is an edge that is not currently
+                // highlighted, so it has something to reveal. An edge already in the set — the one
+                // the reader just travelled along, or one belonging to another open note — keeps
+                // the extension it has and never restarts. The key's existence *is* the memory,
+                // which is why there is no "have I revealed this note before" bookkeeping: that
+                // question was always a proxy for this one, and every bug in it came from the two
+                // disagreeing.
+                break :blk 0;
             };
-            // Longer links take longer, so the reach reads as a line *travelling* at a speed rather
-            // than every link finishing at once regardless of how far it had to go.
-            gop.value_ptr.* = @min(1, prev + base / self.reachStretch(p, fl.*));
+            if (fl.a != p.focus_leaf) {
+                // Not the focused note: its web stands. Advancing it instead is what made a reveal
+                // appear to play one click late — the previous note was the only one still held, so
+                // selecting something else released it and the reader watched the *last* note
+                // animate while the new one sat finished.
+                gop.value_ptr.* = 1;
+            } else if (self.focus_visible) {
+                // Longer links take longer, so the reach reads as a line travelling at a speed
+                // rather than every link finishing at once regardless of how far it had to go.
+                gop.value_ptr.* = @min(1, prev + base / self.reachStretch(p, fl.*));
+            }
             fl.grow = gop.value_ptr.*;
             if (fl.grow < 1) self.settled = false;
         }
-        if (debug_focus_grow and created > 0) {
-            std.log.scoped(.dvui).info(
-                "grow START created={d} of {d} links, leaf={d} focus_cut={d} map={d}",
-                .{ created, self.focus_links.items.len, leaf, self.focus_cut, self.focus_grow.count() },
-            );
-        }
-        for (self.focus_links.items) |fl| try self.focus_seen.put(self.gpa, fl.a, {});
 
         // Drop what is no longer focused. The edge just traversed survives this: it is in the new
         // focus note's own link set too, under the same unordered key, so it stays live and keeps
@@ -985,30 +993,51 @@ pub const World = struct {
         // right places, instead of the mass's entire incident set being painted as the document's.
         var focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer focus_pairs.deinit(self.gpa);
+        // One entry per *edge*, not per (note, neighbour).
+        //
+        // The highlighted web is a set of edges: `A—B` and `B—A` are the same line. With both notes
+        // open it was in the list twice and drawn twice — and worse, the two copies carried
+        // different reveal state, so the edge the reader had just travelled along could sweep again
+        // from its far end. Claimed first-come, and the focused note is processed first, so an edge
+        // belongs to the note being looked at and is drawn outward from it.
+        var edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer edge_seen.deinit(self.gpa);
         self.focus_links.clearRetainingCapacity();
         // The focused leaf first and always, then every other open note. `focus_leaf` is not
         // required to appear in `open_leaves` — a caller may set only the focus, and the pinned
         // test "the focused note keeps every link however far the camera travels" does exactly
         // that. Treating the open set as the only source silently emptied its link set.
+        var focus_spent: usize = 0;
         var leaf_i: usize = 0;
         while (leaf_i <= p.open_leaves.len) : (leaf_i += 1) {
             const leaf = if (leaf_i == 0) p.focus_leaf else p.open_leaves[leaf_i - 1];
             if (leaf_i > 0 and leaf == p.focus_leaf) continue; // already done as the focus
             if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
+            if (focus_spent >= p.focus_link_budget) break;
             const leaf_cut = self.cutOf(leaf) orelse continue;
             const flo, const fhi = self.web.range(leaf);
             // The leaf-precision set is capped where the lifted one does not need to be: lifting
             // collapses a hub's thousands of neighbours onto a handful of cells, and not lifting
             // means every one of them is its own line. `link_scan_cap` is already the number that
             // exists to bound exactly this — a 29,448-degree note resolving as a single visible one.
-            const fcap = @min(fhi, flo +| p.link_scan_cap);
+            // The focused note is limited only by what is left of the budget; every other open note
+            // still answers to `link_scan_cap`, so one hub sitting in a background tab cannot spend
+            // the frame on itself.
+            const room = p.focus_link_budget -| focus_spent;
+            const leaf_cap = if (leaf == p.focus_leaf) room else @min(room, p.link_scan_cap);
+            const fcap = @min(fhi, flo +| leaf_cap);
             self.field.ensurePlaced(&self.lad, leaf);
             for (self.web.nbr[flo..fhi], flo..) |v, i| {
                 if (i < fcap and v != leaf) {
-                    // Both ends placed on demand: a neighbour in a branch the camera never opened
-                    // has no position until asked for one.
-                    self.field.ensurePlaced(&self.lad, v);
-                    try self.focus_links.append(self.gpa, .{ .a = leaf, .b = v });
+                    const ekey = (@as(u64, @min(leaf, v)) << 32) | @as(u64, @max(leaf, v));
+                    const eg = try edge_seen.getOrPut(self.gpa, ekey);
+                    if (!eg.found_existing) {
+                        // Both ends placed on demand: a neighbour in a branch the camera never
+                        // opened has no position until asked for one.
+                        self.field.ensurePlaced(&self.lad, v);
+                        try self.focus_links.append(self.gpa, .{ .a = leaf, .b = v });
+                        focus_spent += 1;
+                    }
                 }
                 const cv = self.cutOf(v) orelse continue;
                 if (cv == leaf_cut) continue;
