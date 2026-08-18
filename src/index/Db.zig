@@ -249,7 +249,7 @@ fn verifyIntegrity(conn: *sqlite.Db) !void {
     defer arena.deinit();
 
     if (bytes > integrity_check_max_bytes) {
-        std.log.scoped(.atlas).info(
+        std.log.scoped(.atlas).debug(
             "index is {d} MB; skipping the open-time integrity check (see integrity_check_max_bytes)",
             .{bytes >> 20},
         );

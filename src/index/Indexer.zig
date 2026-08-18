@@ -857,6 +857,7 @@ fn walk(
     };
     defer dir.close(io);
 
+    var rel_buf: [query.max_rel_path]u8 = undefined;
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
         if (self.quit.load(.acquire)) return;
@@ -877,7 +878,7 @@ fn walk(
                     // Attachments are recorded by path only — never opened, never parsed, and
                     // never linked into the note graph. All the index needs is enough to
                     // resolve and complete `![[diagram.png]]`.
-                    const mrel = query.vaultRelative(self.vault_root, abs) orelse continue;
+                    const mrel = query.vaultRelative(self.vault_root, abs, &rel_buf) orelse continue;
                     const mrel_owned = try self.gpa.dupe(u8, mrel);
                     errdefer self.gpa.free(mrel_owned);
                     try media_seen.put(self.gpa, mrel_owned, {});
@@ -887,7 +888,7 @@ fn walk(
                     continue;
                 }
                 if (!query.isMarkdownPath(entry.name)) continue;
-                const rel = query.vaultRelative(self.vault_root, abs) orelse continue;
+                const rel = query.vaultRelative(self.vault_root, abs, &rel_buf) orelse continue;
                 const rel_owned = try self.gpa.dupe(u8, rel);
                 errdefer self.gpa.free(rel_owned);
                 try seen.put(self.gpa, rel_owned, {});
@@ -1112,7 +1113,7 @@ fn logTimings(self: *const Indexer) void {
             return @as(f64, @floatFromInt(ns)) / 1e6;
         }
     }.f;
-    log.info(
+    log.debug(
         "scan: {d} read, {d} unchanged | prepass {d:.0}ms  walk {d:.0}ms " ++
             "(stat {d:.0}  read {d:.0}  parse {d:.0}  db {d:.0})  drop {d:.0}ms  " ++
             "relink {d:.0}ms  publish {d:.0}ms",

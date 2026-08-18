@@ -17,58 +17,28 @@
 //! root, so those links break outside fizzy.
 const std = @import("std");
 
-/// Write the POSIX relative path from `from_file` to `to_file` into `buf`.
-/// Both arguments are vault-relative (`/`-separated, with extension). Returns the written slice.
-pub fn relative(from_file: []const u8, to_file: []const u8, buf: []u8) error{NoSpaceLeft}![]u8 {
-    const from_dir = dirname(from_file);
-    var from_parts: [64][]const u8 = undefined;
-    var to_parts: [64][]const u8 = undefined;
-    const from_n = split(from_dir, &from_parts);
-    const to_n = split(to_file, &to_parts);
-
-    var common: usize = 0;
-    while (common < from_n and common < to_n and std.mem.eql(u8, from_parts[common], to_parts[common])) : (common += 1) {}
-
-    var out_len: usize = 0;
-    var i = common;
-    while (i < from_n) : (i += 1) {
-        if (out_len + 3 > buf.len) return error.NoSpaceLeft;
-        if (out_len > 0) {
-            // `../` already ends with slash from previous; just append
-        }
-        @memcpy(buf[out_len..][0..3], "../");
-        out_len += 3;
-    }
-
-    var j = common;
-    while (j < to_n) : (j += 1) {
-        const seg = to_parts[j];
-        const need = seg.len + @intFromBool(out_len > 0 and buf[out_len - 1] != '/');
-        // When we already end with `/` from `../`, don't add another.
-        const add_slash = out_len > 0 and buf[out_len - 1] != '/';
-        const total = seg.len + @as(usize, if (add_slash) 1 else 0);
-        _ = need;
-        if (out_len + total > buf.len) return error.NoSpaceLeft;
-        if (add_slash) {
-            buf[out_len] = '/';
-            out_len += 1;
-        }
-        @memcpy(buf[out_len..][0..seg.len], seg);
-        out_len += seg.len;
-    }
-
-    if (out_len == 0) {
-        // Same path — rare (linking a note to itself); keep the basename.
-        const base = basename(to_file);
-        if (base.len > buf.len) return error.NoSpaceLeft;
-        @memcpy(buf[0..base.len], base);
-        return buf[0..base.len];
-    }
-    return buf[0..out_len];
+/// The POSIX relative path from `from_file` to `to_file`, allocated in `allocator`.
+/// Both arguments are vault-relative (`/`-separated, with extension).
+///
+/// `std.fs.path.relativePosix` is the whole implementation. Anchoring both sides at `/` makes the
+/// vault root the filesystem root for the duration of the call, so the result can never climb out
+/// of the vault, and the POSIX variant is used explicitly rather than the native one because a
+/// vault-relative path is always `/`-separated (see `query.vaultRelative`) — the link we write has
+/// to read the same on every platform.
+///
+/// A note linking to itself falls out correctly without a special case: `from_dir` is the note's
+/// own directory, so the relative path to the note is just its basename.
+pub fn relative(allocator: std.mem.Allocator, from_file: []const u8, to_file: []const u8) ![]u8 {
+    const from_dir = std.fs.path.dirnamePosix(from_file) orelse "";
+    return std.fs.path.relativePosix(allocator, "/", from_dir, to_file);
 }
 
 /// Percent-encode a relative path for use inside `(...)`. Unreserved + `/-._~` pass through;
 /// everything else (space, parens, non-ASCII bytes) becomes `%HH`.
+///
+/// Deliberately not `std.Uri.percentEncode` with `Uri.isPathChar`: a URI path may legally contain
+/// `(` and `)`, so std leaves them alone — and an unescaped paren inside `[text](path)` ends the
+/// markdown link early. The set here is the markdown-safe one, which is narrower than the URI one.
 pub fn encodeUrlPath(path: []const u8, buf: []u8) error{NoSpaceLeft}![]u8 {
     var out: usize = 0;
     for (path) |c| {
@@ -113,61 +83,38 @@ fn isUnreserved(c: u8) bool {
     return std.ascii.isAlphanumeric(c);
 }
 
-pub fn dirname(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[0..i];
-    return "";
-}
-
-pub fn basename(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[i + 1 ..];
-    return path;
-}
-
-fn split(path: []const u8, out: [][]const u8) usize {
-    if (path.len == 0) return 0;
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| {
-        if (part.len == 0) continue;
-        if (n >= out.len) break;
-        out[n] = part;
-        n += 1;
-    }
-    return n;
-}
-
 // -- tests ------------------------------------------------------------------------
 
 const testing = std.testing;
 
+fn expectRelative(expected: []const u8, from_file: []const u8, to_file: []const u8) !void {
+    const r = try relative(testing.allocator, from_file, to_file);
+    defer testing.allocator.free(r);
+    try testing.expectEqualStrings(expected, r);
+}
+
 test "same directory" {
-    var buf: [128]u8 = undefined;
-    const r = try relative("readme.md", "physics.md", &buf);
-    try testing.expectEqualStrings("physics.md", r);
+    try expectRelative("physics.md", "readme.md", "physics.md");
 }
 
 test "into subdirectory" {
-    var buf: [128]u8 = undefined;
-    const r = try relative("readme.md", "notes/daily.md", &buf);
-    try testing.expectEqualStrings("notes/daily.md", r);
+    try expectRelative("notes/daily.md", "readme.md", "notes/daily.md");
 }
 
 test "up one level" {
-    var buf: [128]u8 = undefined;
-    const r = try relative("notes/daily.md", "readme.md", &buf);
-    try testing.expectEqualStrings("../readme.md", r);
+    try expectRelative("../readme.md", "notes/daily.md", "readme.md");
 }
 
 test "cousin directories" {
-    var buf: [128]u8 = undefined;
-    const r = try relative("a/x.md", "b/y.md", &buf);
-    try testing.expectEqualStrings("../b/y.md", r);
+    try expectRelative("../b/y.md", "a/x.md", "b/y.md");
 }
 
 test "deeper nesting" {
-    var buf: [128]u8 = undefined;
-    const r = try relative("docs/guide/intro.md", "docs/api/ref.md", &buf);
-    try testing.expectEqualStrings("../api/ref.md", r);
+    try expectRelative("../api/ref.md", "docs/guide/intro.md", "docs/api/ref.md");
+}
+
+test "a note linking to itself keeps its own name" {
+    try expectRelative("daily.md", "notes/daily.md", "notes/daily.md");
 }
 
 test "encode spaces" {

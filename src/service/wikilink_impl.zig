@@ -37,7 +37,8 @@ fn resolveFn(
     }
 
     const cands = try st.ensureCandidates();
-    const src_rel = query.vaultRelative(root, source_path) orelse
+    var rel_buf: [query.max_rel_path]u8 = undefined;
+    const src_rel = query.vaultRelative(root, source_path, &rel_buf) orelse
         (if (source_path.len == 0) "" else source_path);
 
     var buf: [resolve.max_path_len]u8 = undefined;

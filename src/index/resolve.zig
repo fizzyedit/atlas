@@ -50,18 +50,14 @@ pub const Normalized = struct {
 pub fn normalize(target: []const u8) Normalized {
     var text = std.mem.trim(u8, target, " \t");
     // A trailing separator is meaningless on a note name and would break `is_path` reasoning.
-    while (text.len > 0 and (text[text.len - 1] == '/' or text[text.len - 1] == '\\')) {
-        text = text[0 .. text.len - 1];
-    }
+    text = std.mem.trimEnd(u8, text, "/\\");
     text = stripMarkdownExtension(text);
 
     const is_relative = std.mem.startsWith(u8, text, "./") or
         std.mem.startsWith(u8, text, "../") or
         std.mem.eql(u8, text, "..");
     // `\` counts as a separator so a Windows-flavored link still reads as a path.
-    const is_path = is_relative or
-        std.mem.indexOfScalar(u8, text, '/') != null or
-        std.mem.indexOfScalar(u8, text, '\\') != null;
+    const is_path = is_relative or std.mem.indexOfAny(u8, text, "/\\") != null;
 
     return .{ .text = text, .is_path = is_path, .is_relative = is_relative };
 }
@@ -352,9 +348,13 @@ fn preferred(a: []const u8, b: []const u8, source_path: []const u8) bool {
 }
 
 /// Directory part of a vault-relative path, `""` for a file at the root.
+/// Directory of a vault-relative note path. `""` for a note at the vault root.
+///
+/// The POSIX variant explicitly: a vault-relative path is always `/`-separated whatever the host
+/// filesystem does (see `query.vaultRelative`), and the native `dirname` on Windows would also
+/// split on `\`, which here can only be a literal character in a name.
 fn dirOf(path: []const u8) []const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
-    return path[0..slash];
+    return std.fs.path.dirnamePosix(path) orelse "";
 }
 
 /// Number of directories above the file.
@@ -396,6 +396,13 @@ pub fn foldEql(a: []const u8, b: []const u8) bool {
 
 /// Join `base` and `rel` and resolve `.`/`..` segments, writing into `buf`. Returns null when
 /// the result would escape the vault root or overrun the buffer.
+///
+/// Not `std.fs.path.resolvePosix`, for two reasons. It allocates, and this runs once per link —
+/// millions of times on a Wikipedia-scale import, which is why the whole path here is a caller's
+/// buffer. And it *clamps* `..` at the root rather than refusing it, so `../../etc/passwd` would
+/// come back as a plausible-looking vault path instead of the null that keeps resolution inside
+/// the vault. Both separators are accepted on the way in so a link written on Windows still
+/// parses; the output is always `/`, matching the stored paths it will be compared against.
 pub fn joinAndClean(base: []const u8, rel: []const u8, buf: []u8) ?[]const u8 {
     var b: PathBuilder = .{ .buf = buf };
     for ([_][]const u8{ base, rel }) |part| {

@@ -97,7 +97,8 @@ pub fn tick(self: *Watcher) void {
         const doc = host.docByIndex(i) orelse continue;
         const path = doc.owner.documentPath(doc);
         if (path.len == 0 or !query.isMarkdownPath(path)) continue;
-        const rel = query.vaultRelative(self.vault_root, path) orelse continue;
+        var rel_buf: [query.max_rel_path]u8 = undefined;
+        const rel = query.vaultRelative(self.vault_root, path, &rel_buf) orelse continue;
 
         const st = std.Io.Dir.cwd().statFile(dvui.io, path, .{}) catch {
             // Gone from disk — tell the indexer so the note row can drop.
@@ -162,7 +163,8 @@ pub fn onPathsChanged(self: *Watcher, changes: sdk.Plugin.PathChanges) void {
 }
 
 fn route(self: *Watcher, abs: []const u8, want_sweep: *bool) void {
-    const rel = query.vaultRelative(self.vault_root, abs) orelse return;
+    var rel_buf: [query.max_rel_path]u8 = undefined;
+    const rel = query.vaultRelative(self.vault_root, abs, &rel_buf) orelse return;
     // Create, modify and delete are all "re-read this path": the worker treats missing-on-disk
     // as the delete, so there is nothing here to branch on.
     if (query.isMarkdownPath(rel)) {

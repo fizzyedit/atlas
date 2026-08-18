@@ -68,7 +68,8 @@ pub fn completion(
         query.complete(db, a, ctx.prefix, max_items) catch return null;
     if (rows.len == 0) return null;
 
-    const src_rel = query.vaultRelative(root, path) orelse "";
+    var rel_buf: [query.max_rel_path]u8 = undefined;
+    const src_rel = query.vaultRelative(root, path, &rel_buf) orelse "";
     return buildItems(a, rows, src_rel, ctx) catch null;
 }
 
@@ -79,13 +80,12 @@ fn buildItems(
     ctx: wikilink_context.Context,
 ) ![]const CompletionItem {
     var out: std.ArrayList(CompletionItem) = .empty;
-    var rel_buf: [512]u8 = undefined;
 
     for (rows) |r| {
         const rel = if (src_rel.len == 0)
             r.path
         else
-            relpath.relative(src_rel, r.path, &rel_buf) catch r.path;
+            relpath.relative(a, src_rel, r.path) catch r.path;
 
         // Same `[text](path)` for notes and embeds: the `!` sits outside `replace_start`, so
         // an embed accept becomes `![alt](path)` without a separate image formatter.

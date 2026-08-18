@@ -1399,8 +1399,7 @@ test "folder paths correlate with components" {
 
     const dirOf = struct {
         fn go(path: []const u8) []const u8 {
-            if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[0..i];
-            return path;
+            return std.fs.path.dirnamePosix(path) orelse path;
         }
     }.go;
 

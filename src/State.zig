@@ -258,7 +258,8 @@ pub fn registerSettings(self: *State, host: *sdk.Host, plugin: *sdk.Plugin) !voi
 /// `LanguageSupport.format` hook and the explicit command so the two can't diverge.
 pub fn convertWikilinks(self: *State, arena: std.mem.Allocator, path: []const u8, bytes: []const u8) !?[]const u8 {
     const root = self.vault_root orelse return null;
-    const rel = query.vaultRelative(root, path) orelse return null;
+    var rel_buf: [query.max_rel_path]u8 = undefined;
+    const rel = query.vaultRelative(root, path, &rel_buf) orelse return null;
     // One refresh, then read both lists. Calling the two `ensure` helpers in sequence would leave a
     // window where the second one adopts a new set and frees the arena the first one's slice still
     // points into — the lists are refreshed together precisely so nobody has to hold one across a
@@ -368,7 +369,8 @@ pub fn setDirtyContent(self: *State, path: []const u8, bytes: []const u8) void {
 
     // Path only — see above. `indexOne` stats it and does nothing if the file has not moved.
     if (self.indexer_ready) {
-        if (query.vaultRelative(root, path)) |rel| self.indexer.enqueue(rel);
+        var rel_buf: [query.max_rel_path]u8 = undefined;
+        if (query.vaultRelative(root, path, &rel_buf)) |rel| self.indexer.enqueue(rel);
     }
 
     const gop = self.dirty.getOrPut(gpa, path) catch return;
@@ -410,11 +412,12 @@ pub fn dirtyBacklinks(
     const root = self.vault_root orelse return &.{};
     var list: std.ArrayList(query.Backlink) = .empty;
     var path_buf: [resolve.max_path_len]u8 = undefined;
+    var rel_buf: [query.max_rel_path]u8 = undefined;
 
     var it = self.dirty.iterator();
     while (it.next()) |e| {
         const abs = e.key_ptr.*;
-        const src_rel = query.vaultRelative(root, abs) orelse continue;
+        const src_rel = query.vaultRelative(root, abs, &rel_buf) orelse continue;
         // Already covered by the DB result for this source?
         if (sourceAlreadyListed(existing, src_rel)) continue;
 

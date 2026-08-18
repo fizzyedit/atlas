@@ -242,7 +242,8 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
         return;
     }
 
-    const active_rel = activeNoteRel(st.vault_root.?) orelse {
+    var active_rel_buf: [query.max_rel_path]u8 = undefined;
+    const active_rel = activeNoteRel(st.vault_root.?, &active_rel_buf) orelse {
         dvui.labelNoFmt(@src(), "Open a markdown note to see its backlinks.", .{}, .{
             .font = dvui.Font.theme(.body).larger(-1),
             .color_text = dvui.themeGet().color(.content, .text).opacity(0.6),
@@ -597,16 +598,18 @@ fn resetContext(c: *Cache, arena: std.mem.Allocator) !void {
     c.last_bytes = "";
 }
 
-fn activeNoteRel(vault: []const u8) ?[]const u8 {
+/// `buf` holds the returned slice — `vaultRelative` normalizes separators, so the result is a
+/// copy rather than a view into the document's own path.
+fn activeNoteRel(vault: []const u8, buf: []u8) ?[]const u8 {
     const doc = sdk.host().activeDoc() orelse return null;
     const path = doc.owner.documentPath(doc);
     if (path.len == 0) return null;
     if (!query.isMarkdownPath(path)) return null;
-    return query.vaultRelative(vault, path);
+    return query.vaultRelative(vault, path, buf);
 }
 
 fn displayTitle(rel: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |s| rel[s + 1 ..] else rel;
+    const base = std.fs.path.basenamePosix(rel);
     if (std.ascii.endsWithIgnoreCase(base, ".md")) return base[0 .. base.len - 3];
     if (std.ascii.endsWithIgnoreCase(base, ".markdown")) return base[0 .. base.len - 9];
     return base;

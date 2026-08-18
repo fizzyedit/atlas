@@ -1524,9 +1524,7 @@ fn relaxLocal(
 
 /// Directory portion of a vault-relative note path (`a/b/Note.md` → `a/b`). Empty = vault root.
 fn dirOf(path: []const u8) []const u8 {
-    if (path.len == 0) return path;
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[0..i];
-    return &.{};
+    return std.fs.path.dirnamePosix(path) orelse "";
 }
 
 /// Count shared leading path segments between two directories (`a/b` vs `a/c` → 1).

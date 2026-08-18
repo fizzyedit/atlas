@@ -379,8 +379,7 @@ fn addOrphanChain(
 /// where links don't" was always meant to degrade to.
 fn hasFolders(paths: []const []const u8) bool {
     for (paths) |path| {
-        if (std.mem.indexOfScalar(u8, path, '/') != null) return true;
-        if (std.mem.indexOfScalar(u8, path, '\\') != null) return true;
+        if (std.mem.indexOfAny(u8, path, "/\\") != null) return true;
     }
     return false;
 }

@@ -4,6 +4,7 @@
 //! All of the SELECTs are UI-thread / caller-thread. The indexer is the only writer; WAL +
 //! sqlite's Serialized threading mode make concurrent reads safe against in-flight commits.
 const std = @import("std");
+const builtin = @import("builtin");
 const sqlite = @import("sqlite");
 const Db = @import("Db.zig");
 const resolve = @import("resolve.zig");
@@ -535,12 +536,55 @@ pub fn purgeOrphanPhantoms(db: *Db) !void {
     , .{}, .{});
 }
 
-pub fn vaultRelative(vault: []const u8, abs: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, abs, vault)) return null;
-    var rest = abs[vault.len..];
-    while (rest.len > 0 and (rest[0] == '/' or rest[0] == '\\')) rest = rest[1..];
-    if (rest.len == 0) return null;
-    return rest;
+/// Longest vault-relative path the index carries. Matches `resolve.max_path_len`: a path longer
+/// than that could not be named by a link anyway.
+pub const max_rel_path: usize = resolve.max_path_len;
+
+/// Vault-relative form of `abs`, written into `buf` and normalized to `/` separators.
+///
+/// The normalization is why this copies instead of returning a slice of `abs`. Every consumer of
+/// a vault-relative path assumes `/`: `stemOf` and `resolve.dirOf` split on it, `resolve`'s
+/// `by_path` index is keyed on it, `relpath` writes links with it, and `fold`'s folder chain
+/// reads it. On Windows `std.fs.path.join` produces `\`, so leaving the separator alone stored
+/// `notes\Setup.md` in the `path` column — whose stem is then the whole string `notes\Setup`.
+/// `[[Setup]]` matched nothing, every link into a subfolder materialized a phantom instead of
+/// resolving, and clicking that phantom in the graph created a new empty note rather than opening
+/// the one that was already there.
+///
+/// `\` is only translated on Windows: on a POSIX filesystem it is an ordinary filename byte, and
+/// rewriting it would invent a directory that isn't there.
+///
+/// The prefix match is case- and separator-insensitive on Windows, because the paths being
+/// compared arrive from three places that do not agree on either — the host's open documents, the
+/// filesystem watcher, and our own directory walk.
+pub fn vaultRelative(vault: []const u8, abs: []const u8, buf: []u8) ?[]const u8 {
+    if (!hasPathPrefix(abs, vault)) return null;
+    const rest = std.mem.trimStart(u8, abs[vault.len..], sep_any);
+    if (rest.len == 0 or rest.len > buf.len) return null;
+    const out = buf[0..rest.len];
+    @memcpy(out, rest);
+    if (builtin.os.tag == .windows) {
+        std.mem.replaceScalar(u8, out, std.fs.path.sep_windows, std.fs.path.sep_posix);
+    }
+    return out;
+}
+
+/// Both separators, for the trims and scans that have to accept a path as the OS spelled it.
+/// `std.fs.path.isSep` is the native-only form of the same question and is wrong for us in both
+/// directions: it rejects `\` on POSIX (right) but also on a Windows path we were handed by the
+/// host, and there is no `isSepWindows` to ask instead.
+const sep_any = &[_]u8{ std.fs.path.sep_posix, std.fs.path.sep_windows };
+
+fn hasPathPrefix(abs: []const u8, vault: []const u8) bool {
+    if (abs.len < vault.len) return false;
+    if (std.mem.eql(u8, abs[0..vault.len], vault)) return true;
+    if (builtin.os.tag != .windows) return false;
+    for (abs[0..vault.len], vault) |a, v| {
+        const an = if (a == std.fs.path.sep_windows) std.fs.path.sep_posix else std.ascii.toLower(a);
+        const vn = if (v == std.fs.path.sep_windows) std.fs.path.sep_posix else std.ascii.toLower(v);
+        if (an != vn) return false;
+    }
+    return true;
 }
 
 pub fn isMarkdownPath(name: []const u8) bool {
@@ -550,7 +594,10 @@ pub fn isMarkdownPath(name: []const u8) bool {
 
 /// Basename with `.md` / `.markdown` stripped. Anything else is returned as the basename.
 pub fn stemOf(path: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+    // Not `std.fs.path.stem`: that strips whatever follows the last dot, so `foo.zig` would come
+    // back as `foo` and a link to a source file would look like a note name. Only the two
+    // markdown extensions are an extension as far as the index is concerned.
+    const base = std.fs.path.basenamePosix(path);
     if (std.ascii.endsWithIgnoreCase(base, ".markdown")) return base[0 .. base.len - ".markdown".len];
     if (std.ascii.endsWithIgnoreCase(base, ".md")) return base[0 .. base.len - ".md".len];
     return base;
@@ -599,7 +646,7 @@ pub fn completeMedia(db: *Db, arena: std.mem.Allocator, prefix: []const u8, limi
     );
     while (true) {
         const row = (try iter.nextAlloc(arena, .{})) orelse break;
-        const name = if (std.mem.lastIndexOfScalar(u8, row.path, '/')) |s| row.path[s + 1 ..] else row.path;
+        const name = std.fs.path.basenamePosix(row.path);
         // Basename (with extension) is both the typed target and the image alt text — same
         // default the converter uses when an embed has no `|alias`.
         try list.append(arena, .{ .target = name, .path = row.path, .title = name });
@@ -628,7 +675,7 @@ pub fn loadMediaCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]reso
         // `![[diagram.png]]` should find the image (unlike a note, the extension is not
         // stripped from a media target, so the bare stem would never match on its own).
         try list.append(arena, .{ .path = row.path, .stem = row.stem });
-        const name = if (std.mem.lastIndexOfScalar(u8, row.path, '/')) |s| row.path[s + 1 ..] else row.path;
+        const name = std.fs.path.basenamePosix(row.path);
         if (!std.mem.eql(u8, name, row.stem)) {
             try list.append(arena, .{ .path = row.path, .stem = name });
         }
@@ -639,10 +686,17 @@ pub fn loadMediaCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]reso
 const testing = std.testing;
 
 test "vaultRelative strips the vault prefix" {
-    try testing.expectEqualStrings("a/b.md", vaultRelative("/vault", "/vault/a/b.md").?);
-    try testing.expectEqualStrings("a/b.md", vaultRelative("/vault/", "/vault/a/b.md").?);
-    try testing.expect(vaultRelative("/vault", "/other/a.md") == null);
-    try testing.expect(vaultRelative("/vault", "/vault") == null);
+    var buf: [max_rel_path]u8 = undefined;
+    try testing.expectEqualStrings("a/b.md", vaultRelative("/vault", "/vault/a/b.md", &buf).?);
+    try testing.expectEqualStrings("a/b.md", vaultRelative("/vault/", "/vault/a/b.md", &buf).?);
+    try testing.expect(vaultRelative("/vault", "/other/a.md", &buf) == null);
+    try testing.expect(vaultRelative("/vault", "/vault", &buf) == null);
+    // The result is a copy, not a view into `abs` — that is what lets Windows rewrite `\`.
+    const rel = vaultRelative("/vault", "/vault/a/b.md", &buf).?;
+    try testing.expect(rel.ptr == &buf);
+    // Longer than the buffer is refused rather than truncated into a different note's path.
+    var tiny: [4]u8 = undefined;
+    try testing.expect(vaultRelative("/vault", "/vault/a/b.md", &tiny) == null);
 }
 
 test "isMarkdownPath accepts md and markdown, case-insensitive" {

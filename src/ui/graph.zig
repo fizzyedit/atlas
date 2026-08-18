@@ -62,7 +62,27 @@ const min_node_r: f32 = 14;
 const max_node_r: f32 = 36;
 const open_node_r: f32 = 34;
 
+/// The display scale every `_px` / `_screen_r` constant below is written in.
+///
+/// They are **physical** pixels on a 2x (hidpi) screen, because that is the machine they were
+/// dialled in on and the numbers worth keeping are the ones that were actually looked at.
+const tuned_scale: f32 = 2;
+
+/// Converts a tuned constant to the reader's screen. 1 on a hidpi display, 0.5 on an ordinary one.
+///
+/// The camera converts world units straight to `Point.Physical`, so a constant compared against,
+/// added to, or divided into a camera result lands in physical pixels — and a physical pixel is
+/// half the size on a hidpi screen. Text never had this problem: `renderText` takes a `RectScale`
+/// and the label pass multiplies its gaps by `natural_scale`, so labels have always sized
+/// themselves to the display. The bubbles, the hover falloff and the world LOD thresholds did
+/// not, so they drew at their tuned size on a 2x screen and at twice that everywhere else — a
+/// 1x monitor showed nodes twice as large as intended, against labels that were the right size.
+fn dpiScale() f32 {
+    return dvui.currentWindow().natural_scale / tuned_scale;
+}
+
 /// On-screen bubble radii — constant across zoom, like pixi's `/ canvas.scale` buttons.
+/// See `tuned_scale` for the unit.
 const base_screen_r: f32 = 9;
 
 /// Interior content. A document is its own fold/containment/world cloud — the same machinery the
@@ -1351,7 +1371,8 @@ fn applyProximity(
     const zoom = @max(p.camera.zoom, 0.001);
     const zoom_t = detailRevealT(slot, zoom);
     // Wider screen falloff when zoomed in — close-up hover feels more sensitive.
-    const falloff_px = proximity_falloff_px * std.math.lerp(1.0, proximity_falloff_zoom_boost, zoom_t);
+    const falloff_px = proximity_falloff_px * dpiScale() *
+        std.math.lerp(1.0, proximity_falloff_zoom_boost, zoom_t);
     const falloff_w = falloff_px / zoom;
     // Fades proximity out once the whole cloud is no bigger than the falloff itself.
     const strength = proximity.strength(cloud_radius * 2 * zoom, falloff_px);
@@ -1410,7 +1431,7 @@ fn applyProximity(
     //     in between, a large share of the cloud is swollen and the whole thing is quadratic.
     //     That band is exactly where the frame rate fell off a cliff.
     if (any_shove and strength > 0.001) {
-        const gap_w = neighbor_gap_px / zoom;
+        const gap_w = neighbor_gap_px * dpiScale() / zoom;
         const reach_cap = slot * max_shove_slots;
 
         var grid = ShoveGrid.init(arena, nodes, active.items, reach_cap) catch null;
@@ -1559,7 +1580,10 @@ fn shoveHover(n: GraphNode) f32 {
 fn detailRevealT(layout_slot: f32, zoom: f32) f32 {
     const slot = if (layout_slot > 1) layout_slot else hex.layoutSpacingFor(1);
     const gap = slot * zoom; // physical px between adjacent layout cells
-    const t = std.math.clamp((gap - detail_gap_lo) / (detail_gap_hi - detail_gap_lo), 0, 1);
+    const s = dpiScale();
+    const lo = detail_gap_lo * s;
+    const hi = detail_gap_hi * s;
+    const t = std.math.clamp((gap - lo) / (hi - lo), 0, 1);
     return t * t * (3.0 - 2.0 * t);
 }
 
@@ -3006,11 +3030,12 @@ fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
             by_path.put(arena, node.path, @intCast(gi)) catch {};
         }
 
+        var rel_buf: [query.max_rel_path]u8 = undefined;
         var i: usize = 0;
         while (i < n_open) : (i += 1) {
             const abs = wb.openPathAt(i) orelse continue;
             if (!query.isMarkdownPath(abs)) continue;
-            const rel = query.vaultRelative(vault, abs) orelse continue;
+            const rel = query.vaultRelative(vault, abs, &rel_buf) orelse continue;
             const gi = by_path.get(rel) orelse continue;
             const node = &p.nodes[gi];
             node.open = true;
@@ -3186,7 +3211,7 @@ fn focusNode(p: *Panel, idx: usize) void {
         // come to rest, and at rest the bias is 1. Using the in-flight value would inflate the
         // floor by however fast the camera happened to be moving when the flight began, and land
         // closer than asked for.
-        z_floor = w.noteResolveZoom(note, .{ .split_px = base_split_px });
+        z_floor = w.noteResolveZoom(note, .{ .split_px = base_split_px * dpiScale() });
     }
 
     // A few slots of room around the note, so it lands in a neighbourhood rather than filling the
@@ -3198,13 +3223,13 @@ fn focusNode(p: *Panel, idx: usize) void {
         .w = half * 2,
         .h = half * 2,
     };
-    const pad = @min(focus_padding_px, vp.h * 0.15);
+    const pad = @min(focus_padding_px * dpiScale(), vp.h * 0.15);
     var pose = p.camera.poseForBounds(bounds, pad);
     pose.center = centre;
 
     // The dinner-plate stop, unchanged: never so close that neighbouring lattice slots are further
     // apart than `focus_max_gap_px`.
-    pose.zoom = @min(pose.zoom, focus_max_gap_px / slot);
+    pose.zoom = @min(pose.zoom, focus_max_gap_px * dpiScale() / slot);
 
     // The whole-vault fit is a **floor**, never a ceiling: a focus flight never pulls further back
     // than the recentre button would, and is otherwise free to go as close as the rules above ask.
@@ -3251,11 +3276,12 @@ fn hashOpenNotes(vault: []const u8) u64 {
     var h: u64 = 14695981039346656037;
     const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return 0;
     const n = wb.openCount();
+    var rel_buf: [query.max_rel_path]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const abs = wb.openPathAt(i) orelse continue;
         if (!query.isMarkdownPath(abs)) continue;
-        const rel = query.vaultRelative(vault, abs) orelse continue;
+        const rel = query.vaultRelative(vault, abs, &rel_buf) orelse continue;
         for (rel) |c| {
             h ^= c;
             h *%= 1099511628211;
@@ -3389,10 +3415,11 @@ const FitMode = struct { animate: bool };
 /// bubble+label and huge panes don't grow an ocean of empty grid.
 fn fitPadPx(vp: dvui.Rect.Physical) f32 {
     const short = @min(vp.w, vp.h);
+    const s = dpiScale();
     const px = short * fit_pad_frac;
     // Let the margin track the pane; only clamp the extremes so tiny panes still clear a
     // bubble+label and enormous ones don't become empty oceans.
-    return std.math.clamp(px, fit_edge_px, fit_label_px * 4.0);
+    return std.math.clamp(px, fit_edge_px * s, fit_label_px * s * 4.0);
 }
 
 /// Neighbour-gap ceiling for fit-to-extents. Scales with the pane so a small cloud on a large
@@ -3400,7 +3427,7 @@ fn fitPadPx(vp: dvui.Rect.Physical) f32 {
 /// turning three notes into dinner plates.
 fn fitMaxGapPx(vp: dvui.Rect.Physical) f32 {
     const short = @min(vp.w, vp.h);
-    return @max(fit_max_gap_px, short * fit_max_gap_frac);
+    return @max(fit_max_gap_px * dpiScale(), short * fit_max_gap_frac);
 }
 
 /// Zoom to the open note's interior while keeping the sun (parent doc node) fixed on screen.
@@ -3872,7 +3899,8 @@ fn updateActiveDoc(p: *Panel, st: anytype) void {
     const path = doc.owner.documentPath(doc);
     if (path.len == 0) return;
     if (!query.isMarkdownPath(path)) return;
-    const rel = query.vaultRelative(vault, path) orelse return;
+    var rel_buf: [query.max_rel_path]u8 = undefined;
+    const rel = query.vaultRelative(vault, path, &rel_buf) orelse return;
     const gi = p.path_index.get(rel) orelse return;
 
     // Already framing this note — a graph click focuses before the tab list catches up, and
@@ -3900,7 +3928,8 @@ fn activeNodeIndex(p: *Panel) ?u32 {
     const doc = sdk.host().activeDoc() orelse return null;
     const path = doc.owner.documentPath(doc);
     if (path.len == 0 or !query.isMarkdownPath(path)) return null;
-    const rel = query.vaultRelative(vault, path) orelse return null;
+    var rel_buf: [query.max_rel_path]u8 = undefined;
+    const rel = query.vaultRelative(vault, path, &rel_buf) orelse return null;
     return p.path_index.get(rel);
 }
 
@@ -4012,6 +4041,8 @@ fn worldParams(p: *Panel) world_mod.Params {
         p.lift_held = 0;
     }
 
+    const s = dpiScale();
+    const defaults: world_mod.Params = .{};
     return .{
         .budget = p.mark_budget,
         .link_budget = ambientLinkBudget(p.mark_budget),
@@ -4020,7 +4051,15 @@ fn worldParams(p: *Panel) world_mod.Params {
         .focus_leaf = focus_leaf,
         .open_leaves = open_leaves.items,
         .lift_hold = hold,
-        .split_px = base_split_px * p.motion_bias,
+        // The LOD ladder's thresholds are screen sizes too, so they get the same treatment as
+        // the bubbles — otherwise cells open at twice the apparent density on a 1x monitor and
+        // the mark radii they hand back are twice as large. Scaled here rather than in
+        // `world.Params`' own defaults so `bench --world`, which has no window to ask, keeps
+        // reading the same numbers it always has.
+        .split_px = base_split_px * s * p.motion_bias,
+        .note_r_px = defaults.note_r_px * s,
+        .mass_cap_px = defaults.mass_cap_px * s,
+        .cull_pad_px = defaults.cull_pad_px * s,
     };
 }
 
@@ -4200,7 +4239,7 @@ fn massProximitySwell(p: *const Panel, m: world_mod.Mark) f32 {
     const d = @sqrt(dx * dx + dy * dy);
     // Reach from the mass's own rim, not its centre: a big mass should respond when the cursor
     // approaches the shape you can see, not only when it nears a point buried inside it.
-    const t = std.math.clamp(1.0 - @max(d - m.r, 0) / proximity_falloff_px, 0, 1);
+    const t = std.math.clamp(1.0 - @max(d - m.r, 0) / (proximity_falloff_px * dpiScale()), 0, 1);
     if (t <= 0.001) return 1;
     return 1 + cluster_grow_factor * dvui.easing.outBack(t);
 }
@@ -4771,7 +4810,7 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
         .rs = .{
             .r = .{
                 .x = centre.x - size.w * 0.5,
-                .y = centre.y + below + label_gap_px,
+                .y = centre.y + below + label_gap_px * dpiScale(),
                 .w = size.w,
                 .h = size.h,
             },
@@ -4838,11 +4877,13 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const hover = std.math.clamp(n.hover_t, 0, 1);
     const grow = if (n.is_sun) sun_grow_factor else grow_factor;
     const hover_boost = grow * dvui.easing.outBack(hover);
-    const cap = if (n.is_sun) max_sun_screen_r else max_node_screen_r;
-    const want = @min(base * (1.0 + zoom_boost + hover_boost), cap);
+    // `gap_px` comes from the camera and is already physical, so the tuned sizes join it there.
+    const s = dpiScale();
+    const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s;
+    const want = @min(base * s * (1.0 + zoom_boost + hover_boost), cap);
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
-    const floor: f32 = if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6;
+    const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
     return @max(@min(want, gap_px * gap_radius_frac), floor);
 }
 
@@ -5513,7 +5554,7 @@ fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Poi
         const dx = s.x - screen.x;
         const dy = s.y - screen.y;
         const d = @sqrt(dx * dx + dy * dy);
-        const hit_r = bubbleScreenRadius(n, zoom_t, slot * p.camera.zoom) + 6;
+        const hit_r = bubbleScreenRadius(n, zoom_t, slot * p.camera.zoom) + 6 * dpiScale();
         if (d <= hit_r and d < best_d) {
             best_d = d;
             best = i;
@@ -5611,7 +5652,8 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
         // to change; the wikilink resolves because its target now exists. Without this the
         // node just sits there looking phantom until the poll happens to catch up.
         if (st.indexer_ready) {
-            if (query.vaultRelative(root, path)) |rel| st.indexer.enqueue(rel);
+            var rel_buf: [query.max_rel_path]u8 = undefined;
+            if (query.vaultRelative(root, path, &rel_buf)) |rel| st.indexer.enqueue(rel);
         }
         _ = wb.revealPosition(path, 0, 0, open_side) catch {};
         return;
