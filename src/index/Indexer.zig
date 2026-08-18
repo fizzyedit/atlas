@@ -393,7 +393,7 @@ pub fn enqueue(self: *Indexer, rel_path: []const u8) void {
 }
 
 fn enqueuePending(self: *Indexer, rel_path: []const u8) void {
-    if (!isMarkdownPath(rel_path)) return;
+    if (!query.isMarkdownPath(rel_path)) return;
     const owned = self.gpa.dupe(u8, rel_path) catch return;
     const item: Pending = .{ .rel = owned };
 
@@ -825,7 +825,7 @@ fn countMarkdown(self: *Indexer, io: std.Io, directory: []const u8) !u32 {
         if (sdk.host().isPathIgnored(self.vault_root, abs, entry.name, entry.kind)) continue;
         switch (entry.kind) {
             .directory => n += self.countMarkdown(io, abs) catch 0,
-            .file => if (isMarkdownPath(entry.name)) {
+            .file => if (query.isMarkdownPath(entry.name)) {
                 n += 1;
             },
             else => {},
@@ -877,7 +877,7 @@ fn walk(
                     // Attachments are recorded by path only — never opened, never parsed, and
                     // never linked into the note graph. All the index needs is enough to
                     // resolve and complete `![[diagram.png]]`.
-                    const mrel = vaultRelative(self.vault_root, abs) orelse continue;
+                    const mrel = query.vaultRelative(self.vault_root, abs) orelse continue;
                     const mrel_owned = try self.gpa.dupe(u8, mrel);
                     errdefer self.gpa.free(mrel_owned);
                     try media_seen.put(self.gpa, mrel_owned, {});
@@ -886,8 +886,8 @@ fn walk(
                     };
                     continue;
                 }
-                if (!isMarkdownPath(entry.name)) continue;
-                const rel = vaultRelative(self.vault_root, abs) orelse continue;
+                if (!query.isMarkdownPath(entry.name)) continue;
+                const rel = query.vaultRelative(self.vault_root, abs) orelse continue;
                 const rel_owned = try self.gpa.dupe(u8, rel);
                 errdefer self.gpa.free(rel_owned);
                 try seen.put(self.gpa, rel_owned, {});
@@ -1052,7 +1052,7 @@ fn writeNote(self: *Indexer, db: *Db, rel: []const u8, bytes: []const u8, mtime_
     const write_start = self.markNs();
     defer self.timings.write_ns += self.sinceNs(write_start);
 
-    const stem = stemOf(rel);
+    const stem = query.stemOf(rel);
     const note_id = try upsertNote(db, rel, stem, note.title, mtime_ns, size, hash);
 
     // Replace derived rows for this note. Every statement below is prepared once and reset per
@@ -1855,7 +1855,7 @@ fn ensurePhantom(db: *Db, raw_target: []const u8, created: *bool) !i64 {
     };
     var fold_buf: [resolve.max_path_len]u8 = undefined;
     if (stem.len > fold_buf.len) return error.PathTooLong;
-    const stem_fold = foldInto(&fold_buf, stem);
+    const stem_fold = query.foldInto(&fold_buf, stem);
 
     if (try db.conn.one(
         i64,
@@ -1907,35 +1907,9 @@ fn countOf(db: *Db, comptime sql: []const u8) !u32 {
 
 // -- path helpers -----------------------------------------------------------------
 
-fn isMarkdownPath(name: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(name, ".md") or
-        std.ascii.endsWithIgnoreCase(name, ".markdown");
-}
-
-fn stemOf(path: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
-    if (std.ascii.endsWithIgnoreCase(base, ".markdown")) return base[0 .. base.len - ".markdown".len];
-    if (std.ascii.endsWithIgnoreCase(base, ".md")) return base[0 .. base.len - ".md".len];
-    return base;
-}
-
-fn vaultRelative(vault: []const u8, abs: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, abs, vault)) return null;
-    var rest = abs[vault.len..];
-    while (rest.len > 0 and (rest[0] == '/' or rest[0] == '\\')) rest = rest[1..];
-    if (rest.len == 0) return null;
-    return rest;
-}
-
-fn foldInto(buf: []u8, s: []const u8) []const u8 {
-    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf[0..s.len];
-}
-
 fn foldOwned(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     const out = try arena.alloc(u8, s.len);
-    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
-    return out;
+    return query.foldInto(out, s);
 }
 
 // -- tests ------------------------------------------------------------------------

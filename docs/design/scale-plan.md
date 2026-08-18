@@ -4,6 +4,11 @@
 > [`galaxy-lod.md`](galaxy-lod.md) and [`organic-lod.md`](organic-lod.md) first — especially the
 > rejected tables. This document does not overturn them; it explains *why* they failed in one
 > sentence and builds on it.
+>
+> Update: the central proposal in Part 1 has since shipped, as `fold.zig` + `containment.zig` +
+> `world.zig` in this repo rather than in `markworld`. See
+> [`scale-architecture.md`](scale-architecture.md) for what actually runs; the status table in
+> Part 6 is historical and understates what is built.
 
 ---
 

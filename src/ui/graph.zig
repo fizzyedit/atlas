@@ -1042,15 +1042,6 @@ const FrameProfile = struct {
     nodes_drawn: u32 = 0,
     nodes_pathed: u32 = 0,
     clusters_drawn: u32 = 0,
-    /// Tile quads submitted this frame, and how many of them were rendered into the atlas rather
-    /// than read from it. Baking should fall to zero within a frame or two of any camera move —
-    /// a picture outlives every pan and zoom — so a HUD showing it constantly non-zero means
-    /// something is invalidating the atlas every frame.
-    tiles_drawn: u32 = 0,
-    tiles_baked: u32 = 0,
-    /// Tiles with no picture yet, drawn straight to the screen this frame. Should fall to zero
-    /// within a frame or two of any camera move that reveals new ground.
-    tiles_direct: u32 = 0,
 
     fn total(self: FrameProfile) u64 {
         return self.rebuild_ns + self.world_step_ns + self.world_sync_ns + self.world_lift_ns +
@@ -3656,134 +3647,6 @@ fn animateCamera(p: *Panel) void {
     }
 }
 
-fn drawEdgeSegment(
-    batch: *LineBatch,
-    sa: dvui.Point.Physical,
-    sb: dvui.Point.Physical,
-    t: f32,
-    thickness: f32,
-    color: dvui.Color,
-    view: dvui.Rect.Physical,
-    agent_web: bool,
-) void {
-    if (t <= 0.002) return;
-    // Accelerate out of the node and settle into the far end. `outCubic` spends most of the
-    // travel in the first few frames, which is right for something that should be over before
-    // you notice it and wrong for something meant to be watched — at these durations it reads
-    // as the line simply appearing, then creeping the last few pixels.
-    const grow = dvui.easing.inOutCubic(std.math.clamp(t, 0, 1));
-    const tip: dvui.Point.Physical = .{
-        .x = sa.x + (sb.x - sa.x) * grow,
-        .y = sa.y + (sb.y - sa.y) * grow,
-    };
-    // Cheap reject: both endpoints outside and on the same side.
-    if (!segmentMaybeInView(sa, tip, view)) return;
-    // Too short on screen to say anything — see `edgeLengthFade`.
-    const len = @sqrt((tip.x - sa.x) * (tip.x - sa.x) + (tip.y - sa.y) * (tip.y - sa.y));
-    const short = edgeLengthFade(len, agent_web);
-    if (short <= 0.004) return;
-    frame_profile.edges_drawn += 1;
-    // Fade alongside the extension so a short stub reads as forming, not as a stray tick.
-    batch.add(sa, tip, thickness, color.opacity((0.35 + 0.65 * grow) * short));
-}
-
-/// The web in one draw call. Same reasoning as `DiscBatch`, and it matters more here: there are
-/// several links per note, and a stroke is a longer tessellation than a fill.
-///
-/// A link is a quad — two triangles across the segment's width. No caps and no join, which a
-/// two-point polyline does not need anyway, and no antialiasing along the edge; at the widths
-/// the web is drawn at, against a fill this faint, the difference is not visible.
-const LineBatch = struct {
-    arena: std.mem.Allocator,
-    b: ?dvui.Triangles.Builder = null,
-
-    const verts_per: usize = 4;
-    const idx_per: usize = 6;
-    const max_lines: usize = std.math.maxInt(u16) / verts_per;
-
-    fn init(arena: std.mem.Allocator) LineBatch {
-        return .{ .arena = arena };
-    }
-
-    fn add(
-        self: *LineBatch,
-        a: dvui.Point.Physical,
-        b_pt: dvui.Point.Physical,
-        thickness: f32,
-        color: dvui.Color,
-    ) void {
-        const dx = b_pt.x - a.x;
-        const dy = b_pt.y - a.y;
-        const len = @sqrt(dx * dx + dy * dy);
-        if (len < 1e-3) return;
-        // Half-width normal to the segment, which is what turns the line into a quad.
-        const h = @max(thickness, 0.75) * 0.5;
-        const nx = -dy / len * h;
-        const ny = dx / len * h;
-
-        if (self.b) |*bb| {
-            if (bb.vertexes.items.len / verts_per >= max_lines) self.flush();
-        }
-        if (self.b == null) {
-            self.b = dvui.Triangles.Builder.init(
-                self.arena,
-                max_lines * verts_per,
-                max_lines * idx_per,
-            ) catch return;
-        }
-        const bb = &(self.b.?);
-
-        const base: u16 = @intCast(bb.vertexes.items.len);
-        const col: dvui.Color.PMA = .fromColor(color);
-        bb.appendVertex(.{ .pos = .{ .x = a.x + nx, .y = a.y + ny }, .col = col });
-        bb.appendVertex(.{ .pos = .{ .x = a.x - nx, .y = a.y - ny }, .col = col });
-        bb.appendVertex(.{ .pos = .{ .x = b_pt.x - nx, .y = b_pt.y - ny }, .col = col });
-        bb.appendVertex(.{ .pos = .{ .x = b_pt.x + nx, .y = b_pt.y + ny }, .col = col });
-        bb.appendTriangles(&.{ base, base + 1, base + 2, base, base + 2, base + 3 });
-    }
-
-    fn flush(self: *LineBatch) void {
-        var b = self.b orelse return;
-        self.b = null;
-        if (b.vertexes.items.len == 0) return;
-        dvui.renderTriangles(b.build_unowned(), null) catch {};
-    }
-};
-
-/// World radius of the mark standing for one level, matching what `emitMarks` draws.
-fn markWorldRadius(p: *const Panel, level: u32) f32 {
-    if (level == 0) return 0;
-    const py = p.pyramid orelse return 0;
-    if (level >= py.spacing.len) return 0;
-    return gap_radius_frac * py.spacing[level];
-}
-
-/// Pull a segment's ends in by `ra` and `rb`, or null if there is nothing left of it.
-///
-/// What is left is the part of the link that runs *between* the two things it joins, which is the
-/// only part that says anything: the stretch inside a region is hidden behind that region's own
-/// drawing everywhere except where it is drawn as a picture, and there it is a line across the
-/// middle of a cluster going nowhere.
-fn trimToEnds(
-    a: dvui.Point.Physical,
-    b: dvui.Point.Physical,
-    ra: f32,
-    rb: f32,
-) ?[2]dvui.Point.Physical {
-    if (ra <= 0 and rb <= 0) return .{ a, b };
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const len = @sqrt(dx * dx + dy * dy);
-    // Nothing between them: one region contains the other's centre, so there is no link to see.
-    if (len <= ra + rb + 1e-3) return null;
-    const ux = dx / len;
-    const uy = dy / len;
-    return .{
-        .{ .x = a.x + ux * ra, .y = a.y + uy * ra },
-        .{ .x = b.x - ux * rb, .y = b.y - uy * rb },
-    };
-}
-
 fn segmentMaybeInView(a: dvui.Point.Physical, b: dvui.Point.Physical, view: dvui.Rect.Physical) bool {
     if (view.contains(a) or view.contains(b)) return true;
     // Bounding-box overlap.
@@ -3794,152 +3657,12 @@ fn segmentMaybeInView(a: dvui.Point.Physical, b: dvui.Point.Physical, view: dvui
     return !(max_x < view.x or min_x > view.x + view.w or max_y < view.y or min_y > view.y + view.h);
 }
 
-const DrawNodesOpts = struct {
-    /// Interior root (index 0 / `note_id == 0`): dashed outline marking the exit sun.
-    dashed_sun: bool = false,
-    /// Draw only these nodes, at these alphas — the level-0 entries of `Panel.visible`. When
-    /// null every node in the slice is drawn, which is what the interior cloud wants: it has no
-    /// hierarchy and is small enough not to need one.
-    selection: ?[]const Visible = null,
-};
-
-/// Screen length under which a link stops being drawn (non-agent / note-dense web).
-const edge_min_len_px: f32 = 14.0;
-/// Agent overview masses sit closer on screen — a 14px floor erased most of the lifted web.
-const agent_edge_min_len_px: f32 = 4.0;
 /// How much further than a tight fit the camera may be pulled back — 2 puts the whole vault in
 /// half the panel. See `Camera.setContentExtent`.
 const zoom_out_slack: f32 = 2.0;
 /// Screen-pixel margin when a cluster click frames its region. Generous, so the notes inside
 /// arrive with their surroundings rather than pressed against the panel edge.
 const cluster_frame_pad_px: f32 = 60.0;
-
-fn worldViewPadded(p: *const Panel, pad_px: f32) dvui.Rect {
-    const vp = p.camera.viewport;
-    const tl = p.camera.screenToWorld(.{ .x = vp.x, .y = vp.y });
-    const br = p.camera.screenToWorld(.{ .x = vp.x + vp.w, .y = vp.y + vp.h });
-    const margin = pad_px / @max(p.camera.zoom, 1e-6);
-    return .{
-        .x = tl.x - margin,
-        .y = tl.y - margin,
-        .w = (br.x - tl.x) + margin * 2,
-        .h = (br.y - tl.y) + margin * 2,
-    };
-}
-
-fn worldView(p: *const Panel) dvui.Rect {
-    return worldViewPadded(p, 48);
-}
-
-fn edgeLengthFade(len_px: f32, agent_web: bool) f32 {
-    const min_len = if (agent_web) agent_edge_min_len_px else edge_min_len_px;
-    return std.math.clamp((len_px - min_len) / min_len, 0, 1);
-}
-
-/// Tiles baked in one frame while settled. Raised while catching up to a new zoom level — a
-/// screenful of 128px tiles is around a hundred and a half, and finishing them in one or two
-/// frames is what keeps the hold short enough to feel like the camera is leading rather than
-/// waiting.
-const bake_per_frame: usize = 48;
-
-/// Which drawing scales the field is shown at this frame, and how much each one shows.
-///
-/// Levels are an octave apart and the nearest is chosen, so a tile is drawn within √2 of the size
-/// it was baked at — near enough to 1:1 that it is neither blurred nor aliased. Only near a
-/// boundary is a second level mixed in, and there both are within √2 as well, so the cross-fade is
-/// between two sharp pictures rather than a sharp one and a soft one.
-const TileView = struct {
-    levels: [2]i32 = .{ 0, 0 },
-    weights: [2]f32 = .{ 0, 0 },
-    n: usize = 0,
-    /// Weight of drawing real notes instead. 1 when zoomed in past the finest tile level, where a
-    /// note is a fixed size on screen and no fixed-scale picture can follow it.
-    node_weight: f32 = 1,
-
-    fn active(self: TileView) bool {
-        return self.n > 0;
-    }
-
-    fn maxWeight(self: TileView) f32 {
-        var m: f32 = 0;
-        for (0..self.n) |i| m = @max(m, self.weights[i]);
-        return m;
-    }
-};
-
-/// Zoom at which the field stops being drawn from tiles and becomes real notes.
-///
-/// The gap at which a resting note stops shrinking with the lattice — where the two branches of
-/// `bubbleScreenRadius` cross. Below it a note is proportional to the world and a fixed-scale
-/// picture can hold it; above it a note is a fixed size on screen and no picture can, since a
-/// picture is scaled by whatever the camera is doing. So that crossing is exactly where tiles have
-/// to hand over.
-fn tileSwitchZoom(p: *const Panel) f32 {
-    const settled_gap = base_screen_r * (1.0 + zoom_rest_swell) / gap_radius_frac;
-    return settled_gap / @max(p.layout_slot, 1e-6);
-}
-
-/// Pixels per world unit at a tile level. Level 0 is the handover scale; each level out halves it.
-fn tileDensity(p: *const Panel, level: i32) f32 {
-    return tileSwitchZoom(p) * std.math.pow(f32, 2, -@as(f32, @floatFromInt(level)));
-}
-
-fn tileLayersForDraw(tv: TileView, hold: ?i32) struct {
-    levels: [6]i32,
-    weights: [6]f32,
-    n: usize,
-} {
-    var levels: [6]i32 = undefined;
-    var weights: [6]f32 = undefined;
-    var n: usize = 0;
-
-    const append = struct {
-        fn f(levels_mut: *[6]i32, weights_mut: *[6]f32, n_mut: *usize, level: i32, weight: f32) void {
-            if (level < 0 or n_mut.* >= levels_mut.len) return;
-            for (levels_mut.*[0..n_mut.*], weights_mut.*[0..n_mut.*]) |l, *ww| {
-                if (l == level) {
-                    ww.* = @max(ww.*, weight);
-                    return;
-                }
-            }
-            levels_mut.*[n_mut.*] = level;
-            weights_mut.*[n_mut.*] = weight;
-            n_mut.* += 1;
-        }
-    }.f;
-
-    for (0..tv.n) |i| {
-        if (tv.weights[i] <= 0.004) continue;
-        append(&levels, &weights, &n, tv.levels[i], tv.weights[i]);
-    }
-    if (hold) |h| append(&levels, &weights, &n, h, 0);
-    if (tv.n > 0) {
-        append(&levels, &weights, &n, tv.levels[0] - 1, 0);
-        append(&levels, &weights, &n, tv.levels[0] + 1, 0);
-    }
-    return .{ .levels = levels, .weights = weights, .n = n };
-}
-
-fn unionRect(a: dvui.Rect, b: dvui.Rect) dvui.Rect {
-    const x0 = @min(a.x, b.x);
-    const y0 = @min(a.y, b.y);
-    const x1 = @max(a.x + a.w, b.x + b.w);
-    const y1 = @max(a.y + a.h, b.y + b.h);
-    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
-}
-
-fn clusterHoverSwell(p: *const Panel, v: Visible) f32 {
-    const h = p.hover_cluster orelse return 1;
-    if (h.level != v.level or h.index != v.index) return 1;
-    return 1 + cluster_grow_factor * dvui.easing.outBack(std.math.clamp(p.hover_cluster_t, 0, 1));
-}
-
-fn restingNodeRadiusPx(p: *Panel) f32 {
-    const gap = p.layout_slot * p.camera.zoom;
-    const zoom_t = detailRevealT(p.layout_slot, p.camera.zoom);
-    const want = base_screen_r * (1.0 + zoom_rest_swell * std.math.clamp(zoom_t, 0, 1));
-    return @max(@min(want, gap * gap_radius_frac), 0.6);
-}
 
 /// The coalesced mass under `screen_pt`, if any. Among overlapping masses prefer the **tightest**
 /// (fewest notes / highest depth) — nearest-centre picked a tiny mass sitting inside a large
@@ -4567,14 +4290,6 @@ fn markWorldPos(w: *const world_mod.World, cell: u32) ?dvui.Point {
     return null;
 }
 
-/// Screen position of a living cell, or null when it is not currently drawn.
-fn markScreen(p: *const Panel, w: *const world_mod.World, cell: u32) ?dvui.Point.Physical {
-    for (w.marks.items) |m| {
-        if (m.cell == cell) return p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
-    }
-    return null;
-}
-
 /// True when this mark covers at least one open document, at any level — so a coalesced mass
 /// holding an open note reads as highlight before it has split out as a leaf.
 fn worldMarkHoldsOpen(p: *const Panel, w: *const world_mod.World, m: world_mod.Mark) bool {
@@ -4588,240 +4303,36 @@ fn worldMarkHoldsOpen(p: *const Panel, w: *const world_mod.World, m: world_mod.M
 
 fn frameCluster(p: *Panel, target: Visible) void {
     if (target.level == 0) return;
-
-    {
-        const w = if (p.world_state) |*ws| ws else return;
-        if (target.index >= w.lad.cells.len) return;
-        if (w.lad.cells[target.index].child_count == 0) return;
-        const pos = markWorldPos(w, target.index) orelse blk: {
-            const fp = w.field.pos[target.index];
-            break :blk dvui.Point{ .x = fp.x, .y = fp.y };
-        };
-        const rad = w.field.radius(&w.lad, target.index);
-        const content = dvui.Rect{
-            .x = pos.x - rad,
-            .y = pos.y - rad,
-            .w = rad * 2,
-            .h = rad * 2,
-        };
-        // Framing the cell's own disc puts its radius at roughly half the viewport, which is well
-        // past `split_px` — so the mass actually unfolds rather than sitting there framed and shut.
-        const pose = p.camera.poseForBounds(content, cluster_frame_pad_px);
-        // `.free`, not `.extents`. Framing is what the camera is *holding onto*, and after this it
-        // is holding a cluster — but `.extents` means "the whole vault", so the next thing to call
-        // `applyFraming` (a pane resize, a rebuild) re-fits to the entire graph and throws the
-        // cluster away. That reads as "clicking a mass zooms out", which is the opposite of what
-        // the click asked for. The classic path below has always set `.free` here; only the
-        // containment branch drifted.
-        p.framing = .free;
-        p.camera.retarget(pose);
-        p.camera.user_driving = false;
-        // Input is handled at the *end* of the frame, after the host has already asked whether
-        // more frames are wanted — so setting a camera target here is invisible until some other
-        // event wakes the app. Ask explicitly, exactly as the old path did.
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-        return;
-    }
-
-    const py = p.pyramid orelse return;
-    if (target.level >= py.levels.len) return;
-    if (target.index >= py.levels[target.level].len) return;
-    const c = py.levels[target.level][target.index];
-    const r = @max(c.radius, p.layout_slot);
-    const pose = p.camera.poseForBounds(.{
-        .x = c.pos.x - r,
-        .y = c.pos.y - r,
-        .w = r * 2,
-        .h = r * 2,
-    }, cluster_frame_pad_px);
-    p.camera.center_target = pose.center;
-    p.camera.zoom_target = pose.zoom;
+    const w = if (p.world_state) |*ws| ws else return;
+    if (target.index >= w.lad.cells.len) return;
+    if (w.lad.cells[target.index].child_count == 0) return;
+    const pos = markWorldPos(w, target.index) orelse blk: {
+        const fp = w.field.pos[target.index];
+        break :blk dvui.Point{ .x = fp.x, .y = fp.y };
+    };
+    const rad = w.field.radius(&w.lad, target.index);
+    const content = dvui.Rect{
+        .x = pos.x - rad,
+        .y = pos.y - rad,
+        .w = rad * 2,
+        .h = rad * 2,
+    };
+    // Framing the cell's own disc puts its radius at roughly half the viewport, which is well
+    // past `split_px` — so the mass actually unfolds rather than sitting there framed and shut.
+    const pose = p.camera.poseForBounds(content, cluster_frame_pad_px);
+    // `.free`, not `.extents`. Framing is what the camera is *holding onto*, and after this it
+    // is holding a cluster — but `.extents` means "the whole vault", so the next thing to call
+    // `applyFraming` (a pane resize, a rebuild) re-fits to the entire graph and throws the
+    // cluster away. That reads as "clicking a mass zooms out", which is the opposite of what
+    // the click asked for.
     p.framing = .free;
+    p.camera.retarget(pose);
     p.camera.user_driving = false;
+    // Input is handled at the *end* of the frame, after the host has already asked whether
+    // more frames are wanted — so setting a camera target here is invisible until some other
+    // event wakes the app. Ask explicitly.
     dvui.refresh(null, @src(), dvui.parentGet().data().id);
 }
-
-/// Max sides on a batched disc. Scaled down for tiny marks; large masses need this many or they
-/// read as polygons. ~3px chords at r≈30.
-const batch_sides: usize = 64;
-/// Sides on a disc baked into an impostor cell. A cell is often magnified on its way to the
-/// screen, which magnifies the flat sides with it, and unlike the on-screen batch a bake happens
-/// once — so the extra vertices buy smoothness at every zoom the picture is later drawn at.
-const bake_disc_sides: usize = 48;
-/// Width of the transparent skirt on a baked disc, in cell pixels. About a pixel: enough for the
-/// edge to resolve smoothly once the cell is resampled onto the screen, and not so much that a
-/// small mark is mostly skirt.
-const bake_disc_feather: f32 = 0.9;
-
-/// Many small discs in one draw call.
-///
-/// dvui has no batching of its own: every `fillConvex` and every `stroke` tessellates and calls
-/// `renderTriangles`, which is one `drawClippedTriangles` on the backend. That is fine for a UI
-/// made of a few hundred rects and disastrous here — a vault of ten thousand notes was ten
-/// thousand draw calls per frame for the discs alone, before the shadows and the web, and no
-/// amount of making each one cheaper changes an order of magnitude of driver overhead.
-///
-/// The nodes small enough to matter are also the ones that need the least from the drawing:
-/// a flat-shaded octagon a few pixels across is indistinguishable from a faded arc. So they go
-/// into one shared vertex buffer and out in a single call. Anything larger keeps the pretty
-/// path, where quality is visible and the count is bounded by the screen.
-const DiscBatch = struct {
-    arena: std.mem.Allocator,
-    /// Corners on each disc. Eight for the on-screen pass, where discs are a few pixels across
-    /// and there may be thousands; more when baking, where a cell can be magnified on its way to
-    /// the screen and the cost is paid once.
-    sides: usize = batch_sides,
-    /// Width of a transparent skirt around each disc, in the units being drawn in. Zero for the
-    /// on-screen pass, where a disc is a handful of pixels and lands on the framebuffer at 1:1.
-    ///
-    /// A baked disc does not. It goes into a cell that is then stretched to wherever its region
-    /// falls, so its edge is resampled — and a hard edge that is magnified stays a hard edge with
-    /// bigger steps in it, since linear filtering can only blur an aliased edge, never undo it.
-    /// The skirt is the antialiasing the batch otherwise has none of: a ring of vertices at zero
-    /// alpha, so the hardware interpolates the disc out to nothing across it.
-    feather: f32 = 0,
-    b: ?dvui.Triangles.Builder = null,
-
-    /// A centre plus one vertex per side, and one triangle per side. Sized for the coarsest
-    /// setting so one allocation serves every batch.
-    const verts_per: usize = batch_sides + 1;
-    const idx_per: usize = batch_sides * 3;
-    /// Indices are `u16` in this build of dvui, so a buffer cannot address past 65535 vertices.
-    /// Full batches are flushed and a fresh one started, which still leaves thousands of nodes
-    /// to a call.
-    const max_discs: usize = std.math.maxInt(u16) / verts_per;
-    const vtx_cap: usize = max_discs * verts_per;
-    const idx_cap: usize = max_discs * idx_per;
-
-    fn init(arena: std.mem.Allocator) DiscBatch {
-        return .{ .arena = arena };
-    }
-
-    fn initBake(arena: std.mem.Allocator) DiscBatch {
-        return .{ .arena = arena, .sides = bake_disc_sides, .feather = bake_disc_feather };
-    }
-
-    fn ensure(self: *DiscBatch, need_vtx: usize, need_idx: usize) ?*dvui.Triangles.Builder {
-        if (self.b) |*b| {
-            // Both buffers, not just one. The allocation is sized for a plain `batch_sides` disc,
-            // and a finer or feathered one spends indices faster than vertices — checking
-            // vertices alone let it run past the end of the index buffer, which is appended to
-            // without bounds checks.
-            if (b.vertexes.items.len + need_vtx > vtx_cap or b.indices.items.len + need_idx > idx_cap) {
-                self.flush();
-            }
-        }
-        if (self.b == null) {
-            self.b = dvui.Triangles.Builder.init(
-                self.arena,
-                max_discs * verts_per,
-                max_discs * idx_per,
-            ) catch return null;
-        }
-        return &(self.b.?);
-    }
-
-    fn sideCount(self: DiscBatch, rad: f32) usize {
-        // Border ring and fill must share a side count or they fail to nest. Scale with radius so
-        // chord length stays ~2–3 px: tiny marks stay cheap; overview masses need the full cap.
-        const want = @as(usize, @intFromFloat(@max(rad, 1.5) * 2.5));
-        const lo: usize = if (self.feather > 0) 8 else 12;
-        return std.math.clamp(want, lo, self.sides);
-    }
-
-    fn add(self: *DiscBatch, center: dvui.Point.Physical, r: f32, color: dvui.Color) void {
-        // Never smaller than half a pixel: below that the polygon collapses to nothing and the
-        // note vanishes rather than fading, which reads as the graph losing notes as you zoom.
-        const rad = @max(r, 0.5);
-        const n = self.sideCount(rad);
-        const soft = self.feather > 0;
-        // A centre, a rim, and a second rim at zero alpha when feathered. Triangles: the fan,
-        // plus two per side to span the skirt.
-        const need_vtx = 1 + n * (if (soft) @as(usize, 2) else 1);
-        const need_idx = n * 3 * (if (soft) @as(usize, 3) else 1);
-        const b = self.ensure(need_vtx, need_idx) orelse return;
-
-        const base: u16 = @intCast(b.vertexes.items.len);
-        const col: dvui.Color.PMA = .fromColor(color);
-        const clear: dvui.Color.PMA = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
-        b.appendVertex(.{ .pos = center, .col = col });
-        for (0..n) |s| {
-            const a = std.math.tau * @as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(n));
-            b.appendVertex(.{
-                .pos = .{ .x = center.x + @cos(a) * rad, .y = center.y + @sin(a) * rad },
-                .col = col,
-            });
-        }
-        if (soft) {
-            const outer = rad + self.feather;
-            for (0..n) |s| {
-                const a = std.math.tau * @as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(n));
-                b.appendVertex(.{
-                    .pos = .{ .x = center.x + @cos(a) * outer, .y = center.y + @sin(a) * outer },
-                    .col = clear,
-                });
-            }
-        }
-        for (0..n) |s| {
-            const cur: u16 = @intCast(base + 1 + s);
-            const nxt: u16 = @intCast(base + 1 + (s + 1) % n);
-            b.appendTriangles(&.{ base, cur, nxt });
-            if (soft) {
-                const ocur: u16 = @intCast(base + 1 + n + s);
-                const onxt: u16 = @intCast(base + 1 + n + (s + 1) % n);
-                b.appendTriangles(&.{ cur, ocur, onxt, cur, onxt, nxt });
-            }
-        }
-    }
-
-    /// A closed annular border — outer rim to inner rim, no centre fill.
-    ///
-    /// Prefer this over "full disc of the border colour, then the fill on top": the two-disc trick
-    /// nests only when both polygons share a side count and orientation, and any mismatch reads as
-    /// a thicker/thinner stretch. A ring is one closed loop of quads, so the seam that would sit
-    /// where a stroke begins and ends does not exist.
-    fn addRing(self: *DiscBatch, center: dvui.Point.Physical, outer_r: f32, inner_r: f32, color: dvui.Color) void {
-        const outer = @max(outer_r, 0.5);
-        const inner = @min(@max(inner_r, 0.0), outer - 0.25);
-        if (inner <= 0.01) {
-            self.add(center, outer, color);
-            return;
-        }
-        const n = self.sideCount(outer);
-        const need_vtx = n * 2;
-        const need_idx = n * 6;
-        const b = self.ensure(need_vtx, need_idx) orelse return;
-
-        const base: u16 = @intCast(b.vertexes.items.len);
-        const col: dvui.Color.PMA = .fromColor(color);
-        for (0..n) |s| {
-            const a = std.math.tau * @as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(n));
-            const c = @cos(a);
-            const sn = @sin(a);
-            b.appendVertex(.{ .pos = .{ .x = center.x + c * outer, .y = center.y + sn * outer }, .col = col });
-        }
-        for (0..n) |s| {
-            const a = std.math.tau * @as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(n));
-            const c = @cos(a);
-            const sn = @sin(a);
-            b.appendVertex(.{ .pos = .{ .x = center.x + c * inner, .y = center.y + sn * inner }, .col = col });
-        }
-        for (0..n) |s| {
-            const o0: u16 = @intCast(base + s);
-            const o1: u16 = @intCast(base + (s + 1) % n);
-            const r0: u16 = @intCast(base + n + s);
-            const r1: u16 = @intCast(base + n + (s + 1) % n);
-            b.appendTriangles(&.{ o0, o1, r1, o0, r1, r0 });
-        }
-    }
-
-    fn flush(self: *DiscBatch) void {
-        var b = self.b orelse return;
-        self.b = null;
-        if (b.vertexes.items.len == 0) return;
-        dvui.renderTriangles(b.build_unowned(), null) catch {};
-    }
-};
 
 /// Walk either a selection's level-0 entries or a whole node slice, so `drawNodes` has one loop
 /// instead of two copies of its body.
@@ -4851,104 +4362,6 @@ const NodeIter = struct {
         return .{ .index = self.i, .alpha = 1 };
     }
 };
-
-fn strokeCircleDashed(center: dvui.Point.Physical, radius: f32, stroke: dvui.Path.StrokeOptions) void {
-    if (radius < 2) return;
-    const arena = dvui.currentWindow().arena();
-    // Dense enough that short dashes still look curved; scale mildly with size.
-    const samples: usize = @max(@as(usize, 36), @as(usize, @intFromFloat(radius * 1.8)));
-    const pts = arena.alloc(dvui.Point.Physical, samples + 1) catch return;
-    var i: usize = 0;
-    while (i < samples) : (i += 1) {
-        const a = std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(samples));
-        pts[i] = .{
-            .x = center.x + @cos(a) * radius,
-            .y = center.y + @sin(a) * radius,
-        };
-    }
-    pts[samples] = pts[0];
-
-    const dash = std.math.clamp(radius * 0.45, 4, 10);
-    const gap = std.math.clamp(radius * 0.28, 3, 7);
-    strokePolylineDashed(pts, dash, gap, stroke);
-}
-
-fn strokePolylineDashed(
-    points: []const dvui.Point.Physical,
-    dash_len: f32,
-    gap_len: f32,
-    stroke: dvui.Path.StrokeOptions,
-) void {
-    const n = points.len;
-    if (n < 2 or dash_len <= 0) return;
-    const gap = @max(0.0, gap_len);
-    const pattern = dash_len + gap;
-    if (pattern < 1e-5) return;
-
-    const arena = dvui.currentWindow().arena();
-    const cum = arena.alloc(f32, n) catch return;
-    cum[0] = 0;
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        cum[i] = cum[i - 1] + dvui.Point.Physical.diff(points[i], points[i - 1]).length();
-    }
-    const total = cum[n - 1];
-    if (total < 1e-4) return;
-
-    var buf: std.ArrayList(dvui.Point.Physical) = .empty;
-    const edge_eps: f32 = 1e-5;
-    var s: f32 = 0;
-    while (s < total - edge_eps) {
-        const dash_end = @min(s + dash_len, total);
-        if (dash_end <= s + edge_eps) break;
-        buf.clearRetainingCapacity();
-        appendDashedSpan(points, cum, s, dash_end, &buf) catch return;
-        if (buf.items.len != 0) {
-            dvui.Path.stroke(.{ .points = buf.items }, stroke);
-        }
-        s = dash_end + gap;
-    }
-}
-
-fn pointAtArcLength(points: []const dvui.Point.Physical, cum: []const f32, dist: f32) dvui.Point.Physical {
-    const n = points.len;
-    if (n == 0) return .{};
-    if (n == 1 or dist <= 0) return points[0];
-    if (dist >= cum[n - 1]) return points[n - 1];
-    var seg: usize = 1;
-    while (seg < n and cum[seg] < dist) : (seg += 1) {}
-    const seg_len = cum[seg] - cum[seg - 1];
-    const t = if (seg_len < 1e-6) 0 else (dist - cum[seg - 1]) / seg_len;
-    return .{
-        .x = points[seg - 1].x + (points[seg].x - points[seg - 1].x) * t,
-        .y = points[seg - 1].y + (points[seg].y - points[seg - 1].y) * t,
-    };
-}
-
-fn appendDashedSpan(
-    points: []const dvui.Point.Physical,
-    cum: []const f32,
-    s0: f32,
-    s1: f32,
-    out: *std.ArrayList(dvui.Point.Physical),
-) !void {
-    const arena = dvui.currentWindow().arena();
-    const eps: f32 = 1e-4;
-    if (s1 <= s0 + eps) return;
-    try out.append(arena, pointAtArcLength(points, cum, s0));
-    var k: usize = 1;
-    while (k < points.len) : (k += 1) {
-        const d = cum[k];
-        if (d <= s0 + eps) continue;
-        if (d >= s1 - eps) break;
-        try out.append(arena, points[k]);
-    }
-    const end_pt = pointAtArcLength(points, cum, s1);
-    const last = out.items[out.items.len - 1];
-    const dx = end_pt.x - last.x;
-    const dy = end_pt.y - last.y;
-    if (dx * dx + dy * dy > 1e-8) try out.append(arena, end_pt);
-}
 
 /// How much the reader wants to see this name at all — proximity, zoom detail reveal, or the
 /// standing nudge an open doc gets. Independent of whether the placer can find room for it.

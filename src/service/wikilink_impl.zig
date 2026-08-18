@@ -52,7 +52,7 @@ fn resolveFn(
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const title_src = query.noteTitle(&st.db.?, arena.allocator(), rel) catch "";
-    const title = try gpa.dupe(u8, if (title_src.len > 0) title_src else stemOf(rel));
+    const title = try gpa.dupe(u8, if (title_src.len > 0) title_src else query.stemOf(rel));
 
     const line: u32 = if (heading.len > 0)
         (query.headingLine(&st.db.?, rel, heading) catch 0)
@@ -113,11 +113,4 @@ fn complete(
 fn indexing(ctx: *anyopaque) bool {
     const st: *State = @ptrCast(@alignCast(ctx));
     return st.busy.load(.acquire);
-}
-
-fn stemOf(path: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
-    if (std.ascii.endsWithIgnoreCase(base, ".markdown")) return base[0 .. base.len - ".markdown".len];
-    if (std.ascii.endsWithIgnoreCase(base, ".md")) return base[0 .. base.len - ".md".len];
-    return base;
 }

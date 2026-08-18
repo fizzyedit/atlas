@@ -1,6 +1,7 @@
-//! Read-side helpers over the index DB — shared by the wikilink service and the backlinks UI.
+//! Read-side helpers over the index DB, plus the shared path helpers (`vaultRelative`,
+//! `isMarkdownPath`, `stemOf`, `foldInto`) used by the indexer, watcher, and services.
 //!
-//! All of these are UI-thread / caller-thread SELECTs. The indexer is the only writer; WAL +
+//! All of the SELECTs are UI-thread / caller-thread. The indexer is the only writer; WAL +
 //! sqlite's Serialized threading mode make concurrent reads safe against in-flight commits.
 const std = @import("std");
 const sqlite = @import("sqlite");
@@ -547,6 +548,20 @@ pub fn isMarkdownPath(name: []const u8) bool {
         std.ascii.endsWithIgnoreCase(name, ".markdown");
 }
 
+/// Basename with `.md` / `.markdown` stripped. Anything else is returned as the basename.
+pub fn stemOf(path: []const u8) []const u8 {
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+    if (std.ascii.endsWithIgnoreCase(base, ".markdown")) return base[0 .. base.len - ".markdown".len];
+    if (std.ascii.endsWithIgnoreCase(base, ".md")) return base[0 .. base.len - ".md".len];
+    return base;
+}
+
+/// Lowercase `s` into `buf`. Caller must pass `buf.len >= s.len`.
+pub fn foldInto(buf: []u8, s: []const u8) []const u8 {
+    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..s.len];
+}
+
 /// Extensions the index tracks as embeddable media, so `![[diagram.png]]` can resolve to a
 /// file and the completer can offer it. Scoped to what a markdown preview can actually render
 /// inline — an index of *every* non-note file would be most of a source repo, and a completion
@@ -621,7 +636,36 @@ pub fn loadMediaCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]reso
     return list.toOwnedSlice(arena);
 }
 
-fn foldInto(buf: []u8, s: []const u8) []const u8 {
-    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf[0..s.len];
+const testing = std.testing;
+
+test "vaultRelative strips the vault prefix" {
+    try testing.expectEqualStrings("a/b.md", vaultRelative("/vault", "/vault/a/b.md").?);
+    try testing.expectEqualStrings("a/b.md", vaultRelative("/vault/", "/vault/a/b.md").?);
+    try testing.expect(vaultRelative("/vault", "/other/a.md") == null);
+    try testing.expect(vaultRelative("/vault", "/vault") == null);
+}
+
+test "isMarkdownPath accepts md and markdown, case-insensitive" {
+    try testing.expect(isMarkdownPath("Note.md"));
+    try testing.expect(isMarkdownPath("Note.markdown"));
+    try testing.expect(isMarkdownPath("Note.MD"));
+    try testing.expect(!isMarkdownPath("Note.png"));
+    try testing.expect(!isMarkdownPath("Note.mdx"));
+}
+
+test "stemOf drops the markdown extension" {
+    try testing.expectEqualStrings("Note", stemOf("a/Note.md"));
+    try testing.expectEqualStrings("Note", stemOf("Note.markdown"));
+    try testing.expectEqualStrings("Note", stemOf("Note"));
+}
+
+test "isMediaPath is the embeddable-image set, not notes" {
+    try testing.expect(isMediaPath("diagram.png"));
+    try testing.expect(isMediaPath("Photo.JPEG"));
+    try testing.expect(!isMediaPath("Note.md"));
+}
+
+test "foldInto lowercases in place" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("heading", foldInto(&buf, "Heading"));
 }

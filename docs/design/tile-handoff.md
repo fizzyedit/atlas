@@ -1,12 +1,13 @@
 # Tile ↔ live handoff (historical)
 
-**Superseded by Galaxy LOD** ([`galaxy-lod.md`](galaxy-lod.md)). Product overview is sticky
-soft-sprite agents end-to-end. Density mips and impostor N-gon tiles are **parked** — both were
-dual-system handoffs that popped or mismatched configuration on dive.
+**Superseded.** Product overview is `fold` + `containment` + `world` with `batch2d` sprites.
+Density mips and impostor N-gon tiles were dual-system handoffs that popped or mismatched
+configuration on dive; the `TileView` / `tileSwitchZoom` helpers were later removed from
+`graph.zig` as unused.
 
-This note remains as investigation of the earlier impostor bake/fade / `tileSwitchZoom` path —
-useful failure modes (PMA double-ink, hold-under-bake, complementary dissolve). Do not treat
-the call chain below as the active overview path.
+This note remains as investigation of the earlier impostor bake/fade path — useful failure
+modes (PMA double-ink, hold-under-bake, complementary dissolve). The call chain below does
+not exist in the current sources.
 
 ## Call chain (one overview frame)
 

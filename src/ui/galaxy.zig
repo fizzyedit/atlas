@@ -12,7 +12,6 @@ const Camera = @import("Camera.zig");
 pub const SoftAtlas = batch2d.SoftAtlas;
 pub const SpriteBatch = batch2d.SpriteBatch;
 pub const LineBatch = batch2d.LineBatch;
-pub const HitIndex = batch2d.HitIndex;
 
 /// Marks the overview may draw in a frame. Headroom is deliberate: labels, proximity and the
 /// interior all draw on top of this.

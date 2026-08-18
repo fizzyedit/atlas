@@ -1,14 +1,13 @@
 # Galaxy LOD v1
 
 > **Superseded.** The quadtree/agent LOD described here was replaced by `fold` + `containment` + `world`; `quadlod.zig`, `quad_agents.zig` and `lod.zig` no longer exist. Kept for the rejected-approach tables, which still hold. For how the system works now see [`scale-architecture.md`](scale-architecture.md).
+>
+> The harness commands, build steps and file paths below no longer resolve either; read this for the rejected mechanisms, not for anything runnable.
 
 Product overview path for Atlas’s note map. One visual language of **soft textured sprites**
 (`batch2d`) over discrete sticky topology (`quadlod.selectSticky`); motion is presentation-only
 (`quad_agents`). Split/join of living cells is the LOD language end-to-end.
 
-Harness: `zig build render-gpu -Doptimize=ReleaseFast -- [N] --mode=galaxy [--tour]`  
-Plugin: Fizzy → open vault folder → Atlas: Open Graph (overview is always Galaxy when a
-`quad_tree` exists).
 
 ## Contract
 
@@ -53,11 +52,10 @@ underlay. They failed the same way as the old impostor path:
 
 Code remains behind `density_enabled` for experiments; product overview does not draw it.
 
-## Package: `fizzyedit/batch2d`
+## Batching layer
 
-Reusable DVUI/`SDL_Renderer` batching: `SoftAtlas`, `SpriteBatch`, `LineBatch`, `Camera`,
-`HitIndex`. Brain attaches the consumer’s `dvui` module at build time (plugin proxy vs sdl3
-harness). See [`batch2d/README.md`](../../../batch2d/README.md).
+`SoftAtlas`, `SpriteBatch`, `LineBatch`, `Camera`, `HitIndex` — vendored in-tree at
+`src/batch2d/`, built against whichever `dvui` module the consumer supplies.
 
 ## Rejected (still)
 
@@ -115,9 +113,8 @@ writing markdown.
 
 **In Fizzy (preferred for interactive LOD work):**
 
-1. Settings → Atlas → set **Synth note count**, **Synth shape**, **Synth avg degree**
-2. Command palette → **Atlas: Load Synth Graph** (opens Atlas panel; pack placement, no force layout)
-3. **Atlas: Clear Synth Graph** (or Rebuild Index / open a folder) restores a real vault index
+1. Command palette → **Atlas: Vault Simulator** — a floating window with live controls for note
+   count, shape, and average degree; changes apply immediately, with no rebuild.
 
 Raise N toward 1 000 000 and slide avg degree to thin/thicken links. Galaxy must stay within
 `plugin_mark_budget` and settle under pan/zoom.

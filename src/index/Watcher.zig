@@ -96,8 +96,8 @@ pub fn tick(self: *Watcher) void {
     while (i < n) : (i += 1) {
         const doc = host.docByIndex(i) orelse continue;
         const path = doc.owner.documentPath(doc);
-        if (path.len == 0 or !isMarkdownAbs(path)) continue;
-        const rel = vaultRelative(self.vault_root, path) orelse continue;
+        if (path.len == 0 or !query.isMarkdownPath(path)) continue;
+        const rel = query.vaultRelative(self.vault_root, path) orelse continue;
 
         const st = std.Io.Dir.cwd().statFile(dvui.io, path, .{}) catch {
             // Gone from disk — tell the indexer so the note row can drop.
@@ -162,7 +162,7 @@ pub fn onPathsChanged(self: *Watcher, changes: sdk.Plugin.PathChanges) void {
 }
 
 fn route(self: *Watcher, abs: []const u8, want_sweep: *bool) void {
-    const rel = vaultRelative(self.vault_root, abs) orelse return;
+    const rel = query.vaultRelative(self.vault_root, abs) orelse return;
     // Create, modify and delete are all "re-read this path": the worker treats missing-on-disk
     // as the delete, so there is nothing here to branch on.
     if (query.isMarkdownPath(rel)) {
@@ -170,17 +170,4 @@ fn route(self: *Watcher, abs: []const u8, want_sweep: *bool) void {
         return;
     }
     if (query.isMediaPath(rel)) want_sweep.* = true;
-}
-
-fn isMarkdownAbs(path: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(path, ".md") or
-        std.ascii.endsWithIgnoreCase(path, ".markdown");
-}
-
-fn vaultRelative(vault: []const u8, abs: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, abs, vault)) return null;
-    var rest = abs[vault.len..];
-    while (rest.len > 0 and (rest[0] == '/' or rest[0] == '\\')) rest = rest[1..];
-    if (rest.len == 0) return null;
-    return rest;
 }

@@ -13,8 +13,6 @@ pub fn build(b: *std.Build) void {
         plugin.module.addImport("icons", dep.module("icons"));
     }
 
-    const batch2d_dep = b.dependency("batch2d", .{ .target = target, .optimize = optimize });
-
     // FTS5 is compiled in now, before anything uses it: turning it on later would mean
     // re-pinning and re-verifying the C build for all six release targets, and full-text search
     // over note bodies is the obvious way to make "unlinked mentions" cheap.
@@ -25,10 +23,9 @@ pub fn build(b: *std.Build) void {
     });
     plugin.module.addImport("sqlite", sqlite.module("sqlite"));
 
-    // batch2d must share the consumer's dvui module object (plugin proxy vs sdl3 harness).
     const fizzy_dep = b.dependency("fizzy", .{ .target = target, .optimize = optimize });
     const batch2d_mod = b.createModule(.{
-        .root_source_file = batch2d_dep.path("src/root.zig"),
+        .root_source_file = b.path("src/batch2d/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -142,7 +139,7 @@ pub fn build(b: *std.Build) void {
     // The round-trip / angle-stability tests are the ones that catch zoom-around-cursor
     // bugs and the "adding a note spins the whole graph" failure mode.
     inline for (.{
-        .{ "atlas-camera-tests", "src/ui/camera.zig" },
+        .{ "atlas-camera-tests", "src/ui/Camera.zig" },
         .{ "atlas-layout-full-tests", "src/ui/layout_full.zig" },
         // Point-region quadtree spine + thin present layer.
         .{ "atlas-galaxy-tests", "src/ui/galaxy.zig" },
@@ -242,78 +239,17 @@ pub fn build(b: *std.Build) void {
         b.step("wiki-import", "MediaWiki XML dump -> markdown vault").dependOn(&run_wiki.step);
     }
 
-    // markworld demos (rings / coalesce) — package owns sources + zflecs; brain thin-wraps.
-    {
-        const dvui_sdl3_dep = fizzy_dep.builder.dependency("dvui", .{
-            .target = target,
-            .optimize = optimize,
-            .backend = .sdl3,
-            .accesskit = .off,
-        });
-        const gpu_dvui = dvui_sdl3_dep.module("dvui_sdl3");
-        // batch2d must share the consumer's dvui module object — here the sdl3 one, not the
-        // plugin proxy the panel builds against.
-        const batch2d_gpu = b.createModule(.{
-            .root_source_file = batch2d_dep.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        batch2d_gpu.addImport("dvui", gpu_dvui);
-
-
-        // markworld demos (rings / coalesce) — package owns sources + zflecs; brain thin-wraps.
-        const markworld_dep = b.dependency("markworld", .{ .target = target, .optimize = optimize });
-        const zflecs_dep = markworld_dep.builder.dependency("zflecs", .{
-            .optimize = optimize,
-            .debug_mode = .depends_on_build,
-        });
-        const markworld_gpu = b.createModule(.{
-            .root_source_file = markworld_dep.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        markworld_gpu.addImport("dvui", gpu_dvui);
-        markworld_gpu.addImport("batch2d", batch2d_gpu);
-        markworld_gpu.addImport("zflecs", zflecs_dep.module("root"));
-        markworld_gpu.linkLibrary(zflecs_dep.artifact("flecs"));
-
-        inline for (.{
-            .{ "rings", "examples/rings.zig", "markworld particle flecs rings stress demo" },
-            .{ "coalesce", "examples/coalesce.zig", "markworld sticky LOD + flecs living agents demo" },
-        }) |ex| {
-            const exe = b.addExecutable(.{
-                .name = "atlas-markworld-" ++ ex[0],
-                .root_module = b.createModule(.{
-                    .target = target,
-                    .optimize = optimize,
-                    .root_source_file = markworld_dep.path(ex[1]),
-                }),
-            });
-            exe.root_module.addImport("dvui", gpu_dvui);
-            exe.root_module.addImport("batch2d", batch2d_gpu);
-            exe.root_module.addImport("markworld", markworld_gpu);
-            exe.root_module.addImport("zflecs", zflecs_dep.module("root"));
-            exe.root_module.linkLibrary(zflecs_dep.artifact("flecs"));
-            const run = b.addRunArtifact(exe);
-            if (b.args) |a| run.addArgs(a);
-            b.step(ex[0], ex[2]).dependOn(&run.step);
-            // Back-compat alias for the old local flecs-rings harness.
-            if (comptime std.mem.eql(u8, ex[0], "rings")) {
-                b.step("flecs-rings", "alias: zig build rings (markworld)").dependOn(&run.step);
-            }
-        }
-    }
-
     // Headless organic LOD zoom tour — CSV + diagnostic PPM frames (no window).
 
-    // batch2d package tests (soft atlas / sprite+line batches / camera / hit).
+    // batch2d tests (soft atlas / sprite+line batches / camera / hit) — same in-tree module the
+    // plugin imports, exercised as its own artifact.
     {
         const b2d_tests = b.addTest(.{
             .name = "atlas-batch2d-tests",
             .root_module = b.createModule(.{
                 .target = target,
                 .optimize = optimize,
-                .root_source_file = batch2d_dep.path("src/root.zig"),
+                .root_source_file = b.path("src/batch2d/root.zig"),
             }),
         });
         b2d_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));

@@ -65,10 +65,13 @@ zig build install    # also installs into fizzy's plugins dir
 zig build test       # unit tests
 ```
 
-`build.zig.zon` pins the fizzy SDK by local path for development. Before tagging a release,
-switch it to the `fizzy-sdk-v*.tar.gz` **release asset** URL — CI needs a URL+hash pin, and it
-must be the asset, not the git archive of the tag (that one is fizzy's monorepo root, which
-pulls in the whole app's dependencies).
+`build.zig.zon` pins the fizzy SDK by its `fizzy-sdk-v*.tar.gz` **release asset** URL. It has to
+be the asset, not the git archive of the tag — that one is fizzy's monorepo root and pulls in the
+whole app's dependencies. Bump the `sdk-vX.Y.Z` URL and hash together when moving to a newer SDK,
+and keep `min_sdk_version` in `plugin.zig.zon` in step with it.
+
+`batch2d` (the sprite/line batching under the graph) is vendored in `src/batch2d/` rather than
+pinned as a package, so a release build needs no dependency outside the three pins above.
 
 ### Developer tools
 

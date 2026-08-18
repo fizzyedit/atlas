@@ -12,21 +12,9 @@
     },
     .fingerprint = 0x720ad60ff03945c1,
     .dependencies = .{
-        // Local path during development; swap to the release-asset URL before tagging — CI
-        // requires a URL+hash pin, and it must be the `fizzy-sdk-v*.tar.gz` **asset**, never the
-        // git archive of the tag (that's the monorepo root zon, which drags in Velopack).
         .fizzy = .{
-            //.url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.49/fizzy-sdk-v0.1.49.tar.gz",
-            //.hash = "",
-            .path = "../../fizzy/sdk/",
-        },
-        // Textured-quad 2D batching (soft discs / lines) for the galaxy node map.
-        .batch2d = .{
-            .path = "../batch2d",
-        },
-        // Flecs living marks + sticky LOD (examples: rings / coalesce). Owns zflecs.
-        .markworld = .{
-            .path = "../markworld",
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.49/fizzy-sdk-v0.1.49.tar.gz",
+            .hash = "fizzy-0.1.49-SGBwYyv8DABBKJCCuRB3fvmr8ikfv9kcrGA8mwzPO7su",
         },
         // SQLite, as a hash-pinned package rather than a vendored amalgamation. This one wraps
         // the official sqlite.org amalgamation zip in its own hash-pinned dependency and adds

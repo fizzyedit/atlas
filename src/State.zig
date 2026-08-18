@@ -426,7 +426,7 @@ pub fn dirtyBacklinks(
         for (note.links) |l| {
             const match = resolve.resolve(l.raw, src_rel, cands, &path_buf) orelse continue;
             if (!std.mem.eql(u8, cands[match.index].path, dst_rel)) continue;
-            const title = stemOf(src_rel);
+            const title = query.stemOf(src_rel);
             try list.append(arena, .{
                 .path = try arena.dupe(u8, src_rel),
                 .title = try arena.dupe(u8, title),
@@ -444,11 +444,4 @@ fn sourceAlreadyListed(existing: []const query.Backlink, src_rel: []const u8) bo
         if (std.mem.eql(u8, b.path, src_rel)) return true;
     }
     return false;
-}
-
-fn stemOf(path: []const u8) []const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
-    if (std.ascii.endsWithIgnoreCase(base, ".markdown")) return base[0 .. base.len - ".markdown".len];
-    if (std.ascii.endsWithIgnoreCase(base, ".md")) return base[0 .. base.len - ".md".len];
-    return base;
 }
