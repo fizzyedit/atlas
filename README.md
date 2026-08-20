@@ -1,5 +1,7 @@
 # Atlas
 
+<img width="1800" height="1169" alt="Screenshot 2026-08-18 at 1 05 24 PM" src="https://github.com/user-attachments/assets/030ee0c9-5a0b-4ece-9213-ca95a9f36ab6" />
+
 Wiki-style notes for [fizzy](https://github.com/fizzyedit/fizzy). Indexes the markdown under
 your open folder, resolves `[[wikilinks]]` between notes, and shows you how they connect.
 
