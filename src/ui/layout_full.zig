@@ -212,7 +212,8 @@ pub const Opts = struct {
     ///
     /// The caller is expected to fire this once when the pane *settles*, not on every splitter
     /// tick — a fresh ellipse park is discontinuous, and doing it live is what produced the
-    /// A↔B juggling. See `graph.updateAspectSettle`.
+    /// A↔B juggling. (The panel no longer reshapes on a resize at all: containment ignores the
+    /// pane's proportions, so the re-solve only replayed the arrival animation.)
     reshape_only: bool = false,
     /// Vault-relative paths aligned with node indices, used for folder-cohort cohesion. Notes in
     /// the same directory (and, more weakly, parent/child folders) get a soft pull even when no

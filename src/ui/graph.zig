@@ -92,7 +92,6 @@ const base_screen_r: f32 = 9;
 /// The reach-out rate now lives on `world.Params.focus_reach_rate`, because the animation is per
 /// link and advanced by `World.stepFocusGrow` rather than by a panel-wide scalar. Kept as a note
 /// rather than a constant so nobody reintroduces a second source of truth for the same timing.
-
 /// Draw-time size multiplier by content kind, layered on top of `bubbleScreenRadius`'s base
 /// sizing. Carries the same role-by-size language the old orbit system used (sun > heading >
 /// body > tag/embed) without feeding layout — see `content_graph.Item.weight`'s doc comment.
@@ -504,7 +503,6 @@ const LayoutJob = struct {
     gen: u64,
     open_hash: u64,
     first_build: bool,
-    reshape: bool,
     aspect: f32,
     prior_slot: ?f32,
 
@@ -723,11 +721,6 @@ pub const Panel = struct {
     layout_aspect: f32 = 0,
     /// Time-averaged raw panel ratio the bucket above is derived from. See `layoutAspect`.
     aspect_smooth: f32 = 0,
-    /// Viewport size the settle counter is watching. Reshape waits until this stops moving.
-    settle_vp_w: f32 = 0,
-    settle_vp_h: f32 = 0,
-    /// Frames the viewport has been unchanged. Reshape commits only after `aspect_settle_frames`.
-    settle_frames: u16 = 0,
     /// Connected-component count from the last layout — HUD / "why didn't span move?" diagnosis.
     island_count: u32 = 0,
     camera: Camera = .{},
@@ -758,9 +751,6 @@ pub const Panel = struct {
     labels_center: dvui.Point = .{},
     labels_zoom: f32 = 0,
     labels_vp: dvui.Rect.Physical = .{},
-    /// Pane aspect changed and we're waiting for the splitter to hold still before reshaping.
-    /// Drives `wantsRepaint` instead of a per-frame `dvui.refresh`, which could not sleep.
-    aspect_waiting: bool = false,
     /// Index generation a coalesced rebuild is waiting on, and how long it has held still. See
     /// `rebuild_quiet_s`.
     pending_gen: u64 = std.math.maxInt(u64),
@@ -774,7 +764,7 @@ pub const Panel = struct {
     /// 0 → 1 across `morph_s` after a rebuild. 1 means settled and `morph_from` is empty.
     morph_t: f32 = 1,
     /// True while a rebuild is being deliberately deferred — keeps frames coming so the quiet
-    /// timer can actually run out, the same way `aspect_waiting` does.
+    /// timer can actually run out.
     rebuild_waiting: bool = false,
     /// The one node directly under the cursor, if any. Drives the hand cursor and highlight.
     hover_node: ?usize = null,
@@ -1749,9 +1739,8 @@ fn cameraTakenOver(p: *Panel) void {
 
 /// The panel's proportions, coarsely bucketed, for `layout_full.Opts.aspect`.
 ///
-/// Only the *committed* pack uses this. Live mid-drag reshapes are gated separately (see
-/// `updateAspectSettle`) because a splitter chatters and discrete re-parks produce two attractors
-/// for homes to lerp between.
+/// Recorded on whatever rebuild happens to run; a pane resize on its own no longer starts one
+/// (see `rebuildIfNeeded`), so this never re-packs a graph out from under the reader.
 fn layoutAspect(vp: dvui.Rect.Physical, current: f32, smooth: *f32) f32 {
     if (vp.w < 32 or vp.h < 32) return if (current > 0) current else 1;
     // Clamped to the layout's own limit, never a separate number — see `layout_full.aspect_limit`.
@@ -1767,29 +1756,6 @@ fn layoutAspect(vp: dvui.Rect.Physical, current: f32, smooth: *f32) f32 {
 const aspect_smooth_k: f32 = 0.22;
 const aspect_buckets_per_unit: f32 = 4;
 const aspect_hysteresis: f32 = 0.18;
-/// Frames the pane must hold still before a reshape commits. ~120ms at 60fps — long enough that
-/// a splitter's end-of-drag chatter dies, short enough that release still feels immediate.
-const aspect_settle_frames: u16 = 8;
-
-/// Watch the viewport. While it is moving, only the camera refits; once it has been unchanged
-/// for `aspect_settle_frames`, a pending aspect change is allowed to rebuild the cloud.
-fn updateAspectSettle(p: *Panel) void {
-    const vp = p.camera.viewport;
-    if (vp.w < 32 or vp.h < 32) return;
-    // 2px — sub-pixel layout chatter used to reset the counter every frame and, with the
-    // refresh below, pin the app awake.
-    const moved = p.settle_vp_w <= 0 or
-        @abs(vp.w - p.settle_vp_w) > 2.0 or
-        @abs(vp.h - p.settle_vp_h) > 2.0;
-    if (moved) {
-        p.settle_vp_w = vp.w;
-        p.settle_vp_h = vp.h;
-        p.settle_frames = 0;
-    } else if (p.settle_frames < aspect_settle_frames) {
-        p.settle_frames += 1;
-    }
-}
-
 fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     // A different vault is a different graph, not a newer version of this one.
     //
@@ -1829,14 +1795,7 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
 
     const gen = st.generation.load(.acquire);
     const open_hash = if (st.vault_root) |root| hashOpenNotes(root) else 0;
-    updateAspectSettle(p);
     const desired = layoutAspect(p.camera.viewport, p.layout_aspect, &p.aspect_smooth);
-    const pane_settled = p.settle_frames >= aspect_settle_frames;
-    const aspect_dirty = desired != p.layout_aspect;
-    const same_graph = p.gen == gen and p.nodes.len > 0;
-    // Index/gen changes rebuild immediately. Aspect changes wait until the pane stops moving —
-    // packing on every splitter tick is what produced the A↔B juggling.
-    const reshape = same_graph and aspect_dirty and pane_settled;
 
     // A solve already running owns this rebuild. Collect it the frame it lands; until then the
     // previous arrangement keeps drawing, so a reindex never blanks a graph that was on screen.
@@ -1848,12 +1807,11 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
             try finishRebuild(p, st, job);
         }
         // Whether or not it landed, nothing else may start one this frame.
-        p.aspect_waiting = false;
         p.rebuild_waiting = false;
         return;
     }
 
-    var need_rebuild = p.gen != gen or p.nodes.len == 0 or reshape or p.force_rebuild;
+    var need_rebuild = p.gen != gen or p.nodes.len == 0 or p.force_rebuild;
 
     // Coalesce a burst of index commits into one solve.
     //
@@ -1868,7 +1826,7 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     // — showing a partial graph immediately is the whole point of solving off-thread.
     p.rebuild_waiting = false;
     p.since_rebuild_s += @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
-    if (need_rebuild and !reshape and p.nodes.len > layout_inline_max) {
+    if (need_rebuild and p.nodes.len > layout_inline_max) {
         if (gen != p.pending_gen) {
             p.pending_gen = gen;
             p.pending_quiet_s = 0;
@@ -1908,21 +1866,16 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     // produced them. That feedback loop is why a large vault appeared never to finish loading.
     //
     // `note_count` still tracks the partial snapshot, so the spinner counts up while this waits.
-    if (need_rebuild and !reshape and st.indexer_ready) {
+    if (need_rebuild and st.indexer_ready) {
         const c = st.indexer.counts();
         if (!c.complete) {
             p.note_count = c.note_count;
             p.scan_total = c.scan_total;
             p.scan_phase = c.phase;
             p.rebuild_waiting = true;
-            p.aspect_waiting = false;
             return;
         }
     }
-
-    // `wantsRepaint` reads this — do not `dvui.refresh` every frame while waiting, or the
-    // editor cannot sleep even after the pane has stopped moving.
-    p.aspect_waiting = same_graph and aspect_dirty and !pane_settled;
 
     if (!need_rebuild) {
         if (p.open_hash != open_hash) {
@@ -1932,10 +1885,8 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         }
         return;
     }
-    p.aspect_waiting = false;
 
-    // Always pack to the pane we have now. Aspect-only rebuilds are settle-gated above; index
-    // rebuilds take the current bucket immediately.
+    // Whatever prompted this rebuild, record the pane we have now.
     const aspect = desired;
     p.layout_aspect = aspect;
 
@@ -1973,7 +1924,6 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         .gen = gen,
         .open_hash = open_hash,
         .first_build = first_build,
-        .reshape = reshape,
         .aspect = aspect,
         .prior_slot = if (p.layout_slot > 1) p.layout_slot else null,
         .snap = .{},
@@ -2100,9 +2050,7 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
             changed[gi] = true;
             continue;
         };
-        // A reshape re-lays out everything, so nothing is "unchanged" through one. (`finishRebuild`
-        // ignores `changed` entirely on a reshape; this keeps the array honest regardless.)
-        changed[gi] = reshape or prev.link_sig != sigs[gi];
+        changed[gi] = prev.link_sig != sigs[gi];
     }
 
     const paths = try arena.alloc([][]const u8, 1);
@@ -2169,7 +2117,6 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     const snap = job.snap;
     const n = job.n;
     const first_build = job.first_build;
-    const reshape = job.reshape;
 
     // Same carry the prep pass took — `p.nodes` has not moved since, because the panel's arena
     // is only recycled on the line below.
@@ -2420,7 +2367,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     //
     // Not while descended. `.interior` means the reader is inside the note; re-framing would
     // eject them to the overview for what is, from in there, a change to the surroundings.
-    if (!first_build and !reshape and p.framing != .interior) {
+    if (!first_build and p.framing != .interior) {
         const framed: ?i64 = switch (p.framing) {
             .note => |id| id,
             else => null,
@@ -3933,7 +3880,6 @@ fn activeNodeIndex(p: *Panel) ?u32 {
     return p.path_index.get(rel);
 }
 
-
 /// How long a click's claim on the focus outlives the workbench disagreeing with it. Two frames
 /// is the observed lag; this is loose enough to cover a slow open and short enough that a claim
 /// which never lands is gone within a blink.
@@ -5041,10 +4987,9 @@ fn drawDebugHud(p: *Panel) void {
     else
         0;
 
-    const settle_n = @min(p.settle_frames, aspect_settle_frames);
     // Exactly what `wantsRepaint` reads, in the same order — when the app won't sleep, this line
     // names the reason instead of leaving it to be guessed at.
-    const awake = std.fmt.allocPrint(cw.arena(), "{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
+    const awake = std.fmt.allocPrint(cw.arena(), "{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
         if (p.job != null) "job " else "",
         if (p.fling_x.coasting or p.fling_y.coasting) "fling " else "",
         if (p.drag_active) "drag " else "",
@@ -5054,7 +4999,6 @@ fn drawDebugHud(p: *Panel) void {
         if (!p.pointer_settled) "pointer " else "",
         if (!p.labels_settled) "labels " else "",
         if (p.camera.chasing()) "camera " else "",
-        if (p.aspect_waiting) "aspect " else "",
         if (p.rebuild_waiting) "rebuild " else "",
         if (if (p.world_state) |*w| !w.settled else false) "world " else "",
     }) catch "?";
@@ -5071,7 +5015,7 @@ fn drawDebugHud(p: *Panel) void {
         cw.arena(),
         "pane {d:.0}x{d:.0}  raw {d:.2}  smooth {d:.2}  aspect {d:.2}\n" ++
             "nodes {d}  edges {d}  slot {d:.0}  zoom {d:.3}  span {d:.2}  islands {d}\n" ++
-            "settle {d}/{d}  framing {s}  interior t {d:.2}\n" ++
+            "framing {s}  interior t {d:.2}\n" ++
             "awake: {s}",
         .{
             vp.w,                             vp.h,
@@ -5079,8 +5023,7 @@ fn drawDebugHud(p: *Panel) void {
             p.layout_aspect,                  p.nodes.len,
             p.edges.len,                      p.layout_slot,
             p.camera.zoom,                    span,
-            p.island_count,                   settle_n,
-            aspect_settle_frames,             @tagName(p.framing),
+            p.island_count,                   @tagName(p.framing),
             p.interior.t,                     if (awake.len == 0) "(asleep)" else awake,
         },
     ) catch return;
@@ -5719,7 +5662,7 @@ pub fn wantsRepaintFor(p: *Panel) bool {
     if (p.job != null) return true;
     return p.fling_x.coasting or p.fling_y.coasting or p.drag_active or p.gesture_active or
         !p.proximity_settled or !p.layout_settled or !p.pointer_settled or
-        !p.labels_settled or p.camera.chasing() or p.aspect_waiting or p.rebuild_waiting or
+        !p.labels_settled or p.camera.chasing() or p.rebuild_waiting or
         (if (p.world_state) |*w| !w.settled else false) or
         // Keep ticking while a descent is still *arriving*. Gating on `t < 0.98` alone never
         // stops for a note whose interior cannot fill the panel — the zoom ceiling
