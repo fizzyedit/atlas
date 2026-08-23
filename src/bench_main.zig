@@ -51,6 +51,10 @@ var world_mode: bool = false;
 /// 4000, and several per-frame costs scale with it rather than with note count, so a sweep pinned
 /// at the 280 default cannot see them.
 var world_budget: usize = 280;
+/// `--pan`: after settling each zoom, keep stepping with the camera *moving*, and report what a
+/// frame costs then. The settled numbers below it are the parked-camera steady state; a pan is the
+/// case the reader actually complains about, because it invalidates the lift cache every frame.
+var world_pan: bool = false;
 /// `--scan-cap=N`: `Params.link_scan_cap`, so a sweep can show what the cap is costing.
 var world_scan_cap: usize = 256;
 /// `--split-px=N`: `Params.split_px`, the on-screen radius at which a cell opens. The panel scales
@@ -111,6 +115,10 @@ pub fn main(init: std.process.Init) !void {
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--stats")) stats_mode = true;
         if (std.mem.eql(u8, a, "--world")) world_mode = true;
+        if (std.mem.eql(u8, a, "--pan")) {
+            world_pan = true;
+            world_mode = true;
+        }
         if (std.mem.startsWith(u8, a, "--split-px=")) {
             world_split_px = try std.fmt.parseFloat(f32, a["--split-px=".len..]);
         }
@@ -157,6 +165,7 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--world")) continue;
+        if (std.mem.eql(u8, a, "--pan")) continue;
         if (std.mem.eql(u8, a, "--index")) continue;
         if (std.mem.eql(u8, a, "--index-warm")) continue;
         if (std.mem.eql(u8, a, "--index-edit")) continue;
@@ -475,6 +484,10 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             ms(clr_ns + topo_ns + pres_ns + lift_ns),
         });
         if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});
+        if (world_pan) {
+            try panProbe(io, &w, view, params, 0);
+            try panProbe(io, &w, view, params, 13);
+        }
         zoom *= 2.0;
     }
 }
@@ -529,6 +542,60 @@ fn interiorSweep(gpa: std.mem.Allocator) !void {
     std.debug.print("  items={d} (root + {d} content)  radius range=[{d:.2}, {d:.2}]\n", .{ n, m, min_r, max_r });
     std.debug.print("  items per depth band: {any}\n", .{by_depth});
     if (min_r <= 0 or !std.math.isFinite(max_r)) std.debug.print("  !! non-finite or non-positive radius\n", .{});
+}
+
+/// What a frame costs while the camera is *moving*, which is the only case anyone complains about.
+///
+/// The settled row above this is the parked steady state, and the parked state is exactly the one
+/// the lift cache makes free — `lift_key` matches, so all the work the row reports is crossfade
+/// bookkeeping. A pan changes the cut nearly every frame, so the whole lift is recomputed at frame
+/// rate, and none of that shows up in a sweep that only measures settled frames. Two separate
+/// performance investigations have measured the parked case and concluded the panel was fine.
+fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world_mod.Params, px_per_frame: f32) !void {
+    const frames = 120;
+    // A hand pan runs about 800 screen px/s, so ~13 px a frame at 60. Converting through the zoom
+    // keeps that constant in *screen* terms: a fixed world-space step would sweep the entire vault
+    // at overview and stand still at full zoom, which is the opposite of what a hand does.
+    const dx: f32 = px_per_frame / view.zoom;
+
+    world_mod.prof = .{};
+    world_mod.prof_io = io;
+    defer world_mod.prof_io = null;
+
+    var samples: [frames]f64 = undefined;
+    var v = view;
+    for (0..frames) |i| {
+        v.cx = view.cx + dx * @as(f32, @floatFromInt(i));
+        const t0 = now(io);
+        try w.step(v, params, 1.0 / 60.0);
+        try w.liftLinks(params, 1.0 / 60.0);
+        samples[i] = ms(elapsed(io, t0));
+    }
+
+    var sorted = samples;
+    std.mem.sort(f64, &sorted, {}, std.sort.asc(f64));
+    var sum: f64 = 0;
+    for (samples) |x| sum += x;
+
+    const pr = world_mod.prof;
+    const per = struct {
+        fn f(ns: u64) f64 {
+            return ms(ns) / @as(f64, frames);
+        }
+    }.f;
+    std.debug.print(
+        "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}\n" ++
+            "         lift ms/frame: focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n",
+        .{
+            if (px_per_frame == 0) "park" else "pan ",
+            sum / @as(f64, frames), sorted[frames / 2], sorted[frames * 95 / 100], sorted[frames - 1],
+            pr.recomputes,          pr.calls,
+            per(pr.focus_ns),       per(pr.scan_ns),
+            per(pr.build_ns),       per(pr.sort_ns),
+            per(pr.fade_ns),
+            w.links.items.len,
+        },
+    );
 }
 
 fn worldSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void {

@@ -162,6 +162,40 @@ pub fn clipSegment(
     return .{ ax + dx * t0, ay + dy * t0, ax + dx * t1, ay + dy * t1 };
 }
 
+/// Bench-only per-phase counters for `liftLinks`.
+///
+/// The `--world --pan` sweep is the only caller that sets `prof_io`; with it null every helper
+/// below compiles down to a null test, so the panel pays nothing. It lives at module scope rather
+/// than on `World` because the sweep wants totals across frames, not a per-frame snapshot.
+pub const Prof = struct {
+    calls: u64 = 0,
+    recomputes: u64 = 0,
+    /// Crossfade bookkeeping, paid on *every* call including the cached one.
+    fade_ns: u64 = 0,
+    /// Leaf-precision links of the focused and open notes.
+    focus_ns: u64 = 0,
+    /// The per-cut-cell neighbour scan that produces `lifted`.
+    scan_ns: u64 = 0,
+    /// Materialising `lifted` out of `acc`.
+    build_ns: u64 = 0,
+    /// The budget sort, when `lifted` is over `keep`.
+    sort_ns: u64 = 0,
+};
+pub var prof: Prof = .{};
+pub var prof_io: ?std.Io = null;
+
+fn pnow() i96 {
+    const io = prof_io orelse return 0;
+    return std.Io.Clock.boot.now(io).nanoseconds;
+}
+
+fn plap(mark: *i96) u64 {
+    if (prof_io == null) return 0;
+    const n = pnow();
+    defer mark.* = n;
+    return @intCast(n - mark.*);
+}
+
 pub const View = struct {
     w: f32,
     h: f32,
@@ -906,6 +940,8 @@ pub const World = struct {
     pub fn liftLinks(self: *World, p: Params, dt: f32) !void {
         self.links.clearRetainingCapacity();
         if (self.lad.roots.len == 0) return;
+        prof.calls += 1;
+        var pt = pnow();
 
         // Skip the whole lift when nothing that decides it has changed.
         //
@@ -934,11 +970,14 @@ pub const World = struct {
         fp *%= 0x100000001b3;
 
         if (self.lift_valid and (fp == self.lift_key or p.lift_hold)) {
+            pt = pnow();
             try self.fadeLinks(p, dt);
+            prof.fade_ns += plap(&pt);
             return;
         }
         self.lift_key = fp;
         self.lift_valid = true;
+        prof.recomputes += 1;
 
         // Two maps, because a pair's weight has to be *summed* within one side and *maxed* across
         // the two.
@@ -1047,6 +1086,8 @@ pub const World = struct {
             }
         }
 
+        prof.focus_ns += plap(&pt);
+
         for (self.cut.items) |u| {
             const lo, const hi = self.web.range(u);
             // Saturating: a caller that wants the cap off passes `maxInt`, and `lo + cap` would
@@ -1087,6 +1128,7 @@ pub const World = struct {
                 gop.value_ptr.* = @max(prev, kv.value_ptr.*);
             }
         }
+        prof.scan_ns += plap(&pt);
         self.lifted.clearRetainingCapacity();
         var it = acc.iterator();
         while (it.next()) |kv| {
@@ -1102,6 +1144,7 @@ pub const World = struct {
                     self.lad.cells[lb].child_count == 0,
             });
         }
+        prof.build_ns += plap(&pt);
         // Count what may not be dropped before deciding whether to drop anything.
         var essential_n: usize = 0;
         for (self.lifted.items) |l| {
@@ -1134,8 +1177,10 @@ pub const World = struct {
             std.mem.sort(LiftedLink, self.lifted.items, {}, S.heavier);
             self.lifted.shrinkRetainingCapacity(keep);
         }
+        prof.sort_ns += plap(&pt);
 
         try self.fadeLinks(p, dt);
+        prof.fade_ns += plap(&pt);
     }
 
     pub fn noteMarks(self: World) usize {

@@ -5033,7 +5033,8 @@ fn drawDebugHud(p: *Panel) void {
         "visible {d} ({d} notes)  drawn {d} batched + {d} pathed, {d}/{d} links, {d} markers\n" ++
             "marks {d}  world cells {d}  bound {}  panel edges {d}\n" ++
             "gpu {d} calls  {d} tris\n" ++
-            "us total {d:.0} | rebuild {d:.0}  bubbles {d:.0}  hover {d:.0}  labels {d:.0}  anim {d:.0}\n" ++
+            "us total {d:.0} | rebuild {d:.0}  misc {d:.0}  bubbles {d:.0}  hover {d:.0}  labels {d:.0}  anim {d:.0}\n" ++
+            "   world step {d:.0}  sync {d:.0}  lift {d:.0}\n" ++
             "   edges {d:.0}  nodes {d:.0}  clusters {d:.0}  names {d:.0}",
         .{
             p.visible.items.len,                            p.notes_at_level0,
@@ -5046,9 +5047,14 @@ fn drawDebugHud(p: *Panel) void {
             if (p.world_state) |*w| w.lad.cells.len else 0, if (p.world_state) |*w| w.bound else false,
             p.edges.len,                                    rs.draw_calls,
             rs.triangles,                                   us(fp.total()),
-            us(fp.rebuild_ns),                              us(fp.bubbles_ns),
-            us(fp.hover_ns),                                us(fp.labels_ns),
-            us(fp.edge_anim_ns),                            us(fp.draw_edges_ns),
+            us(fp.rebuild_ns),                              us(fp.misc_ns),
+            us(fp.bubbles_ns),                              us(fp.hover_ns),
+            us(fp.labels_ns),                               us(fp.edge_anim_ns),
+            // The three buckets that were computed every frame and never printed. `world_lift_ns`
+            // is the one the `--world --pan` sweep names as the pan-time ceiling, so leaving it
+            // out of the only live readout there is meant the hot path could not be seen at all.
+            us(fp.world_step_ns),                           us(fp.world_sync_ns),
+            us(fp.world_lift_ns),                           us(fp.draw_edges_ns),
             us(fp.draw_nodes_ns),                           us(fp.draw_clusters_ns),
             us(fp.draw_labels_ns),
         },
@@ -5061,7 +5067,7 @@ fn drawDebugHud(p: *Panel) void {
         .x = vp.x + 8 * scale,
         .y = vp.y + 8 * scale,
         .w = vp.w - 16 * scale,
-        .h = 132 * scale,
+        .h = 146 * scale,
     };
     rect.fill(.{}, .{ .color = dvui.Color.black.opacity(0.55), .fade = 1 });
     dvui.renderText(.{
