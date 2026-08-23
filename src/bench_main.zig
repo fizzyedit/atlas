@@ -55,6 +55,10 @@ var world_budget: usize = 280;
 /// frame costs then. The settled numbers below it are the parked-camera steady state; a pan is the
 /// case the reader actually complains about, because it invalidates the lift cache every frame.
 var world_pan: bool = false;
+/// `--pan-px=N`: screen pixels the `--pan` probe moves the camera per frame. 13 is a normal hand
+/// pan at 60 fps (~800 px/s); a flick is several times that, and the interesting failures are all
+/// at the fast end.
+var world_pan_px: f32 = 13;
 /// `--scan-cap=N`: `Params.link_scan_cap`, so a sweep can show what the cap is costing.
 var world_scan_cap: usize = 256;
 /// `--split-px=N`: `Params.split_px`, the on-screen radius at which a cell opens. The panel scales
@@ -119,6 +123,11 @@ pub fn main(init: std.process.Init) !void {
             world_pan = true;
             world_mode = true;
         }
+        if (std.mem.startsWith(u8, a, "--pan-px=")) {
+            world_pan_px = try std.fmt.parseFloat(f32, a["--pan-px=".len..]);
+            world_pan = true;
+            world_mode = true;
+        }
         if (std.mem.startsWith(u8, a, "--split-px=")) {
             world_split_px = try std.fmt.parseFloat(f32, a["--split-px=".len..]);
         }
@@ -166,6 +175,7 @@ pub fn main(init: std.process.Init) !void {
         const a = args[i];
         if (std.mem.eql(u8, a, "--world")) continue;
         if (std.mem.eql(u8, a, "--pan")) continue;
+        if (std.mem.startsWith(u8, a, "--pan-px=")) continue;
         if (std.mem.eql(u8, a, "--index")) continue;
         if (std.mem.eql(u8, a, "--index-warm")) continue;
         if (std.mem.eql(u8, a, "--index-edit")) continue;
@@ -487,7 +497,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
         if (w.marks.items.len > budget * 2) std.debug.print("    ^^ OVER BUDGET\n", .{});
         if (world_pan) {
             try panProbe(io, &w, view, params, 0);
-            try panProbe(io, &w, view, params, 13);
+            try panProbe(io, &w, view, params, world_pan_px);
         }
         zoom *= 2.0;
     }
@@ -574,16 +584,51 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     defer prev_cut.deinit(gpa_for_probe);
 
     var samples: [frames]f64 = undefined;
+    // Per-frame detail, so the worst frames can be named rather than inferred from a percentile.
+    var detail: [frames]struct {
+        step: f64,
+        topo: f64,
+        pres: f64,
+        scan: f64,
+        build: f64,
+        sort: f64,
+        fade: f64,
+        churn: f64,
+        lifted: usize,
+        cut: usize,
+        marks: usize,
+    } = undefined;
     var step_ns: u64 = 0;
     var v = view;
     for (0..frames) |i| {
+        const before = world_mod.prof;
         v.cx = view.cx + dx * @as(f32, @floatFromInt(i));
         const t0 = now(io);
-        try w.step(v, params, 1.0 / 60.0);
+        // Phase by phase rather than through `step`, so a spike can be attributed to the topology
+        // decision or to lazy placement instead of to "the world".
+        w.clearFrame();
+        const ta = now(io);
+        try w.decideTopology(v, params);
+        const tb = now(io);
+        try w.present(v, params, 1.0 / 60.0);
         const t1 = now(io);
         step_ns += @intCast(t1 - t0);
         try w.liftLinks(params, 1.0 / 60.0);
         samples[i] = ms(elapsed(io, t0));
+        const after = world_mod.prof;
+        detail[i] = .{
+            .step = ms(@intCast(t1 - t0)),
+            .topo = ms(@intCast(tb - ta)),
+            .pres = ms(@intCast(t1 - tb)),
+            .scan = ms(after.scan_ns - before.scan_ns),
+            .build = ms(after.build_ns - before.build_ns),
+            .sort = ms(after.sort_ns - before.sort_ns),
+            .fade = ms(after.fade_ns - before.fade_ns),
+            .churn = 0,
+            .lifted = w.lifted.items.len,
+            .cut = w.cut.items.len,
+            .marks = w.marks.items.len,
+        };
 
         if (prev_cut.count() > 0) {
             var entered: usize = 0;
@@ -591,8 +636,10 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
                 if (!prev_cut.contains(c)) entered += 1;
             }
             const left = prev_cut.count() - (w.cut.items.len - entered);
-            churn_sum += @as(f64, @floatFromInt(entered + left)) /
+            const frac = @as(f64, @floatFromInt(entered + left)) /
                 @as(f64, @floatFromInt(@max(1, w.cut.items.len)));
+            detail[i].churn = frac;
+            churn_sum += frac;
             churn_n += 1;
         }
         prev_cut.clearRetainingCapacity();
@@ -626,6 +673,30 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
             w.links.items.len,
         },
     );
+
+    // The three worst frames, by name. A p95 four times the median is a hitch, and a hitch has a
+    // cause that a distribution cannot show.
+    var order: [frames]usize = undefined;
+    for (&order, 0..) |*o, i| o.* = i;
+    const By = struct {
+        s: []const f64,
+        fn worse(c: @This(), a: usize, b: usize) bool {
+            return c.s[a] > c.s[b];
+        }
+    };
+    std.mem.sort(usize, &order, By{ .s = &samples }, By.worse);
+    for (order[0..3]) |i| {
+        std.debug.print(
+            "         worst f{d:<3} {d:.2} ms = topo {d:.2} pres {d:.2} scan {d:.2} build {d:.2} sort {d:.2} fade {d:.2}" ++
+                "   churn {d:.0}%  cut {d}  marks {d}  lifted {d}\n",
+            .{
+                i,                 samples[i],       detail[i].topo,  detail[i].pres,
+                detail[i].scan,    detail[i].build,  detail[i].sort,  detail[i].fade,
+                detail[i].churn * 100,
+                detail[i].cut,     detail[i].marks,  detail[i].lifted,
+            },
+        );
+    }
 }
 
 fn worldSynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void {

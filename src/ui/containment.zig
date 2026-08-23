@@ -239,11 +239,94 @@ pub const Field = struct {
             nr += 1;
         }
 
+        // -- the search, reduced to the terms that actually vary --------------------------------
+        //
+        // `arrangementCost` recomputed the whole cost for each of the up to 720 permutations, and
+        // most of what it computed was the same number every time. Every ring slot is the same
+        // distance `ring` from the centre, so the `mass_k` pull is constant, and so is any sibling
+        // pair with the centre child at one end. What is left — ring-to-ring pair distance and the
+        // outward-facing `ext_k` term — is precomputed per (child, slot) here and then summed
+        // incrementally, which is also what lets the search prune: both terms are non-negative, so
+        // a partial arrangement already at or above the best complete one cannot beat it.
+        //
+        // This matters because placement is lazy and a fast pan reveals thousands of cells in one
+        // frame: at the coalesce boundary that was a ~5 ms hitch inside `World.present`.
+        var sd: [8][8]f32 = undefined;
+        for (0..ring_slots) |a| {
+            for (0..ring_slots) |b| sd[a][b] = Vec2.dist(slot[a], slot[b]);
+        }
+
+        // child index -> ring position, or `centre_child` for the one in the middle.
+        const centre_child: u8 = 255;
+        var ring_of: [8]u8 = .{centre_child} ** 8;
+        for (ring_idx[0..nr], 0..) |ci, i| ring_of[ci] = @intCast(i);
+
+        // Ring-to-ring sibling weight, summed into a dense matrix so a duplicated pair and a long
+        // pair list both collapse to at most 21 entries.
+        var pw: [8][8]f32 = .{.{0} ** 8} ** 8;
+        for (lad.pairsOf(cell)) |sp| {
+            if (sp.i >= ring_of.len or sp.j >= ring_of.len) continue;
+            const a = ring_of[sp.i];
+            const b = ring_of[sp.j];
+            if (a == centre_child or b == centre_child) continue; // constant, hoisted out
+            pw[@min(a, b)][@max(a, b)] += sp.w;
+        }
+
+        var ext_cost: [8][8]f32 = .{.{0} ** 8} ** 8;
+        if (self.opts.ext_k != 0) {
+            for (lad.extOf(cell)) |e| {
+                if (e.child >= ring_of.len) continue;
+                const rp = ring_of[e.child];
+                if (rp == centre_child) continue; // centre has no direction
+                if (e.toward >= self.pos.len) continue;
+                const tx = self.pos[e.toward].x - centre.x;
+                const ty = self.pos[e.toward].y - centre.y;
+                const t_len = @sqrt(tx * tx + ty * ty);
+                if (t_len < 1e-6) continue;
+                for (0..ring_slots) |sl| {
+                    const sv = slot[sl];
+                    const s_len = @sqrt(sv.x * sv.x + sv.y * sv.y);
+                    if (s_len < 1e-6) continue;
+                    const cos = (sv.x * tx + sv.y * ty) / (s_len * t_len);
+                    ext_cost[rp][sl] += self.opts.ext_k * e.w * (1.0 - cos);
+                }
+            }
+        }
+
+        // Everything `arrangementCost` computes that the arrangement cannot change. Every ring slot
+        // is the same distance `ring` from the centre, so the `mass_k` pull is the same for every
+        // permutation, and so is a sibling pair with the centre child at one end. Part of the bound
+        // rather than dropped, because the bound is compared against a cost that still includes it.
+        var fixed: f32 = 0;
+        for (lad.pairsOf(cell)) |sp| {
+            if (sp.i >= ring_of.len or sp.j >= ring_of.len) continue;
+            if (ring_of[sp.i] == centre_child or ring_of[sp.j] == centre_child) fixed += sp.w * ring;
+        }
+        if (self.opts.mass_k != 0) {
+            for (ring_kids[0..nr]) |k| {
+                const cnt: f32 = @floatFromInt(lad.cells[k].count);
+                fixed += self.opts.mass_k * @sqrt(cnt) * ring;
+            }
+        }
+
         var best: [8]u8 = undefined;
         for (0..nr) |i| best[i] = @intCast(i);
         var perm: [8]u8 = best;
         var best_cost = self.arrangementCost(lad, cell, ring_idx[0..nr], perm[0..nr], slot[0..ring_slots], ring_kids[0..nr], @intCast(big));
-        permute(self, lad, cell, ring_idx[0..nr], &perm, 0, nr, slot[0..ring_slots], ring_kids[0..nr], @intCast(big), &best, &best_cost);
+        var ctx: SearchCtx = .{
+            .f = self,
+            .lad = lad,
+            .cell = cell,
+            .ring_idx = ring_idx[0..nr],
+            .slot = slot[0..ring_slots],
+            .ring_kids = ring_kids[0..nr],
+            .big = @intCast(big),
+            .pw = &pw,
+            .sd = &sd,
+            .ext_cost = &ext_cost,
+            .fixed = fixed,
+        };
+        searchRing(&ctx, &perm, 0, nr, 0, &best, &best_cost);
 
         self.pos[kids[big]] = centre;
         for (0..nr) |i| {
@@ -313,26 +396,59 @@ pub const Field = struct {
     }
 };
 
-/// Exhaustive over ring arrangements. At most `(arity-1)! = 720` for arity 7 — evaluated only
-/// when a cell is opened, so a frame at the usual budget searches a few hundred of these.
-fn permute(
+/// Test hook: with this off, `searchRing` walks every arrangement, which is what it did before the
+/// bound existed. "Pruning changes no layout" is then a property a test can assert directly, over
+/// real ladders, rather than something argued from the shape of the bound.
+pub var ring_pruning: bool = true;
+
+/// Everything `searchRing` needs to bound a partial arrangement and to score a complete one.
+const SearchCtx = struct {
     f: *Field,
     lad: *const fold.Ladder,
     cell: u32,
     ring_idx: []const u8,
-    perm: *[8]u8,
-    k: usize,
-    n: usize,
     slot: []const Vec2,
     ring_kids: []const u32,
     big: u8,
+    /// Ring-position pair weights, `[min][max]`.
+    pw: *const [8][8]f32,
+    /// Slot-to-slot distances.
+    sd: *const [8][8]f32,
+    /// `[ring position][slot]` cost of the outward-facing `ext_k` term.
+    ext_cost: *const [8][8]f32,
+    /// The part of the cost no arrangement can change.
+    fixed: f32,
+};
+
+/// Best ring arrangement — the same exhaustive walk as before, with branches that cannot win cut.
+///
+/// The arrangement this returns is **identical** to the unpruned walk's, and that is the whole
+/// design constraint: it scores every surviving complete arrangement with `arrangementCost` itself,
+/// in the same enumeration order, replacing the incumbent on the same strict `<`. The pruning only
+/// decides which branches are *reached*, never how one is scored.
+///
+/// The bound is the part of the cost already determined by the assignments made so far — the fixed
+/// terms plus the pair and `ext_k` contributions of the children already placed. Every remaining
+/// term is non-negative, so a branch whose bound already exceeds the incumbent cannot contain a
+/// strictly cheaper arrangement. `tol` keeps that sound in the face of the two costs being summed
+/// in different orders: near-ties are never pruned, they are simply evaluated the old way, which is
+/// what stops a tie from resolving differently than it used to.
+///
+/// This matters because placement is lazy: a fast pan at the coalesce boundary opens thousands of
+/// cells in one frame, and at arity 7 the unpruned walk is 720 full cost evaluations each.
+fn searchRing(
+    c: *const SearchCtx,
+    perm: *[8]u8,
+    k: usize,
+    n: usize,
+    partial: f32,
     best: *[8]u8,
     best_cost: *f32,
 ) void {
     if (k == n) {
-        const c = f.arrangementCost(lad, cell, ring_idx, perm[0..n], slot, ring_kids, big);
-        if (c < best_cost.*) {
-            best_cost.* = c;
+        const cost = c.f.arrangementCost(c.lad, c.cell, c.ring_idx, perm[0..n], c.slot, c.ring_kids, c.big);
+        if (cost < best_cost.*) {
+            best_cost.* = cost;
             best.* = perm.*;
         }
         return;
@@ -340,7 +456,14 @@ fn permute(
     var i = k;
     while (i < n) : (i += 1) {
         std.mem.swap(u8, &perm[k], &perm[i]);
-        permute(f, lad, cell, ring_idx, perm, k + 1, n, slot, ring_kids, big, best, best_cost);
+        const s = perm[k];
+        var add = c.ext_cost[k][s];
+        for (perm[0..k], 0..) |sj, j| add += c.pw[j][k] * c.sd[s][sj];
+        const next = partial + add;
+        const tol = @max(@abs(best_cost.*), 1.0) * 1e-4;
+        if (!ring_pruning or c.fixed + next <= best_cost.* + tol) {
+            searchRing(c, perm, k + 1, n, next, best, best_cost);
+        }
         std.mem.swap(u8, &perm[k], &perm[i]);
     }
 }
@@ -436,6 +559,38 @@ fn buildStar(gpa: std.mem.Allocator, leaves: u32) ![]fold.Edge {
     const e = try gpa.alloc(fold.Edge, leaves);
     for (0..leaves) |i| e[i] = .{ .a = 0, .b = @intCast(i + 1) };
     return e;
+}
+
+test "pruning the ring search changes no placement" {
+    // The bound is only sound because every remaining term is non-negative, and it is only
+    // *harmless* because near-ties are left for the unpruned comparison to resolve. Asserted the
+    // direct way: place a real ladder with the bound on and off, and require every position to be
+    // bit-identical. A tie resolved differently would move a child to another slot and show up here
+    // immediately.
+    const gpa = testing.allocator;
+
+    for ([_]u32{ 60, 300, 1200 }) |n| {
+        const edges = try buildStar(gpa, n);
+        defer gpa.free(edges);
+        var lad = try fold.build(gpa, n + 1, edges, &.{}, .{ .arity = .seven });
+        defer lad.deinit(gpa);
+
+        var pruned = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .ext_k = 1 });
+        defer pruned.deinit(gpa);
+        placeAll(&pruned, &lad);
+
+        ring_pruning = false;
+        defer ring_pruning = true;
+        var full = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .ext_k = 1 });
+        defer full.deinit(gpa);
+        placeAll(&full, &lad);
+        ring_pruning = true;
+
+        for (pruned.pos, full.pos) |a, b| {
+            try testing.expectEqual(b.x, a.x);
+            try testing.expectEqual(b.y, a.y);
+        }
+    }
 }
 
 test "every child is contained inside its parent's disc" {
