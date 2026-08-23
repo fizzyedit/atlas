@@ -4568,6 +4568,11 @@ fn updateLabels(
     }
     placer.segs = seg_buf[0..seg_n];
     placer.seg_pad = @max(2.0, @min(3.5, p.camera.zoom)) * scale;
+    // Index them once rather than have every candidate slot walk the whole web. At the coalesce
+    // boundary this is twenty thousand segments against a couple of hundred candidates and their
+    // slots — the placer's own collision test was the largest single cost of a panning frame.
+    // Below a few hundred segments the linear walk is the cheaper answer and the index is skipped.
+    if (seg_n > 256) placer.seg_grid = labels.SegGrid.build(arena, vp, placer.segs);
 
     // Diagnostic for "notes resolve but carry no names". Throttled to once a second: the three
     // things that can each independently produce no label are an empty candidate list, titles that

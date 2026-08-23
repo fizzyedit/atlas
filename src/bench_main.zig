@@ -594,6 +594,7 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
         sort: f64,
         fade: f64,
         churn: f64,
+        scanned: u64,
         lifted: usize,
         cut: usize,
         marks: usize,
@@ -625,6 +626,7 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
             .sort = ms(after.sort_ns - before.sort_ns),
             .fade = ms(after.fade_ns - before.fade_ns),
             .churn = 0,
+            .scanned = after.scanned - before.scanned,
             .lifted = w.lifted.items.len,
             .cut = w.cut.items.len,
             .marks = w.marks.items.len,
@@ -688,12 +690,13 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     for (order[0..3]) |i| {
         std.debug.print(
             "         worst f{d:<3} {d:.2} ms = topo {d:.2} pres {d:.2} scan {d:.2} build {d:.2} sort {d:.2} fade {d:.2}" ++
-                "   churn {d:.0}%  cut {d}  marks {d}  lifted {d}\n",
+                "   churn {d:.0}%  cut {d}  marks {d}  lifted {d}  scanned {d}\n",
             .{
                 i,                 samples[i],       detail[i].topo,  detail[i].pres,
                 detail[i].scan,    detail[i].build,  detail[i].sort,  detail[i].fade,
                 detail[i].churn * 100,
                 detail[i].cut,     detail[i].marks,  detail[i].lifted,
+                detail[i].scanned,
             },
         );
     }

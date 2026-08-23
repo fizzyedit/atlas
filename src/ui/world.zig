@@ -176,6 +176,9 @@ pub const Prof = struct {
     focus_ns: u64 = 0,
     /// The per-cut-cell neighbour scan that produces `lifted`.
     scan_ns: u64 = 0,
+    /// Neighbour entries read by that scan, and `cutOf` calls that missed the memo.
+    scanned: u64 = 0,
+    cut_walks: u64 = 0,
     /// Materialising `lifted` out of `acc`.
     build_ns: u64 = 0,
     /// The budget sort, when `lifted` is over `keep`.
@@ -310,6 +313,14 @@ pub const Params = struct {
     }
 };
 
+/// An epoch-stamped answer for one cell. Kept as one struct rather than two parallel arrays so a
+/// lookup touches one cache line: these are indexed by cell id, which at Wikipedia scale means a
+/// random probe into megabytes, and the lift does one per neighbour.
+const Memo = struct { stamp: u32 = 0, of: u32 = fold.invalid };
+
+/// The same, for one cut cell's running per-partner weight total.
+const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
+
 /// One link's crossfade plus the frame that last saw it in the lifted set. See `World.link_fade`.
 const Fade = struct { v: f32, stamp: u32 };
 
@@ -413,10 +424,13 @@ pub const World = struct {
     /// they were culled. This *is* the drawn set's topology, and `liftLinks` reads nothing else.
     /// It replaces a per-note `owner` array whose every frame cost an `O(notes)` fill.
     cut: std.ArrayListUnmanaged(u32) = .empty,
-    /// Per-cell memo for `cutOf`, valid only while `cut_stamp[i] == cut_epoch`. The stamp exists
+    /// Per-cell memo for `cutOf`, valid only while `cut[i].stamp == cut_epoch`. The stamp exists
     /// so a new frame costs nothing to invalidate — no 341k-entry memset.
-    cut_of: []u32,
-    cut_stamp: []u32,
+    ///
+    /// Stamp and answer share one struct because they are never read apart: as two arrays, every
+    /// memo hit was two cache misses into two megabyte-sized arrays instead of one, and the lift
+    /// does this once per neighbour — 52,000 times on a hard pan frame at the coalesce boundary.
+    cut_of: []Memo,
     cut_epoch: u32 = 0,
     /// Scratch for the lift and the crossfades, kept across frames rather than rebuilt inside it.
     ///
@@ -438,8 +452,7 @@ pub const World = struct {
     /// endpoint — 40,000 lookups a frame between them at the top of the quality slider — and each
     /// built its own `AutoHashMapUnmanaged(u32, Point)` from the mark list to answer it. The answer
     /// is a property of the frame's marks, so the `World` publishes it once and both read it.
-    mark_of: []u32,
-    mark_stamp: []u32,
+    mark_of: []Memo,
     mark_epoch: u32 = 0,
 
     /// One cut cell's per-neighbour-cell weight totals, dense and epoch-stamped instead of hashed.
@@ -449,8 +462,7 @@ pub const World = struct {
     /// indexed by cell id does without hashing anything. The stamp is the same trick `cut_of` uses:
     /// a new accumulation costs an epoch bump, not a memset of one entry per cell in the vault.
     /// `side_hit` records which entries were touched so reading the totals back is O(touched).
-    side_w: []f32,
-    side_stamp: []u32,
+    side: []SideAcc,
     side_epoch: u32 = 0,
     side_hit: std.ArrayListUnmanaged(u32) = .empty,
 
@@ -530,12 +542,9 @@ pub const World = struct {
             .py = try gpa.alloc(f32, n_cells),
             .mul = try gpa.alloc(f32, n_cells),
             .open = try gpa.alloc(bool, n_cells),
-            .cut_of = try gpa.alloc(u32, n_cells),
-            .cut_stamp = try gpa.alloc(u32, n_cells),
-            .side_w = try gpa.alloc(f32, n_cells),
-            .side_stamp = try gpa.alloc(u32, n_cells),
-            .mark_of = try gpa.alloc(u32, n_cells),
-            .mark_stamp = try gpa.alloc(u32, n_cells),
+            .cut_of = try gpa.alloc(Memo, n_cells),
+            .side = try gpa.alloc(SideAcc, n_cells),
+            .mark_of = try gpa.alloc(Memo, n_cells),
         };
         @memset(w.anim, 0);
         @memset(w.px, 0);
@@ -544,11 +553,11 @@ pub const World = struct {
         @memset(w.open, false);
         // Zeroed once here so the first frame's `cut_epoch` of 1 cannot collide with uninitialised
         // memory and read a stale memo as valid.
-        @memset(w.cut_stamp, 0);
-        // Same contract as `cut_stamp`: `side_epoch` is bumped *before* each use, so a stamp of 0
-        // can never match the epoch of the first accumulation.
-        @memset(w.side_stamp, 0);
-        @memset(w.mark_stamp, 0);
+        @memset(w.cut_of, .{});
+        // Same contract: `side_epoch` and `mark_epoch` are bumped *before* each use, so a stamp of
+        // 0 can never match the epoch of the first accumulation.
+        @memset(w.side, .{});
+        @memset(w.mark_of, .{});
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
@@ -575,11 +584,8 @@ pub const World = struct {
         self.gpa.free(self.mul);
         self.gpa.free(self.open);
         self.gpa.free(self.cut_of);
-        self.gpa.free(self.cut_stamp);
-        self.gpa.free(self.side_w);
-        self.gpa.free(self.side_stamp);
+        self.gpa.free(self.side);
         self.gpa.free(self.mark_of);
-        self.gpa.free(self.mark_stamp);
         self.side_hit.deinit(self.gpa);
         self.sc_acc.deinit(self.gpa);
         self.sc_focus_pairs.deinit(self.gpa);
@@ -827,20 +833,20 @@ pub const World = struct {
         // their tens of thousands of endpoint lookups become array indexing.
         self.mark_epoch +%= 1;
         if (self.mark_epoch == 0) {
-            @memset(self.mark_stamp, 0);
+            @memset(self.mark_of, .{});
             self.mark_epoch = 1;
         }
         for (self.marks.items, 0..) |m, i| {
-            self.mark_of[m.cell] = @intCast(i);
-            self.mark_stamp[m.cell] = self.mark_epoch;
+            self.mark_of[m.cell] = .{ .stamp = self.mark_epoch, .of = @intCast(i) };
         }
     }
 
     /// Index into `marks` of the mark drawn for `cell` this frame, or null when it has none.
     pub fn markIndex(self: *const World, cell: u32) ?u32 {
-        if (cell >= self.mark_stamp.len) return null;
-        if (self.mark_stamp[cell] != self.mark_epoch) return null;
-        return self.mark_of[cell];
+        if (cell >= self.mark_of.len) return null;
+        const m = self.mark_of[cell];
+        if (m.stamp != self.mark_epoch) return null;
+        return m.of;
     }
 
 
@@ -912,9 +918,10 @@ pub const World = struct {
     /// Stamping against `cut_epoch` means no per-frame clear of a 341k array: a stale stamp is
     /// simply a miss.
     fn cutOf(self: *World, cell: u32) ?u32 {
-        if (self.cut_stamp[cell] == self.cut_epoch) {
-            const memo = self.cut_of[cell];
-            return if (memo == fold.invalid) null else memo;
+        prof.cut_walks += 1;
+        const memo = self.cut_of[cell];
+        if (memo.stamp == self.cut_epoch) {
+            return if (memo.of == fold.invalid) null else memo.of;
         }
 
         // Climb to the root, then read back down. The ladder is at most `max_levels` deep, and a
@@ -937,8 +944,7 @@ pub const World = struct {
         while (i > 0) {
             i -= 1;
             if (answer == fold.invalid and !self.open[chain[i]]) answer = chain[i];
-            self.cut_of[chain[i]] = answer;
-            self.cut_stamp[chain[i]] = self.cut_epoch;
+            self.cut_of[chain[i]] = .{ .stamp = self.cut_epoch, .of = answer };
         }
         return if (answer == fold.invalid) null else answer;
     }
@@ -1281,25 +1287,25 @@ pub const World = struct {
             // left over from the previous lap would read as current and silently drop a cell's
             // whole neighbour weight, so clear on the way past rather than leave it to chance.
             if (self.side_epoch == 0) {
-                @memset(self.side_stamp, 0);
+                @memset(self.side, .{});
                 self.side_epoch = 1;
             }
             self.side_hit.clearRetainingCapacity();
+            prof.scanned += end - lo;
             for (self.web.nbr[lo..end], self.web.w[lo..end]) |v, w| {
                 const cv = self.cutOf(v) orelse continue; // cut is deeper there; found from it
                 if (cv == u) continue; // both ends inside the same cut cell — nothing to draw
-                if (self.side_stamp[cv] != self.side_epoch) {
-                    self.side_stamp[cv] = self.side_epoch;
-                    self.side_w[cv] = 0;
+                if (self.side[cv].stamp != self.side_epoch) {
+                    self.side[cv] = .{ .stamp = self.side_epoch, .w = 0 };
                     try self.side_hit.append(self.gpa, cv);
                 }
-                self.side_w[cv] += w;
+                self.side[cv].w += w;
             }
             for (self.side_hit.items) |cv| {
                 const key = (@as(u64, @min(u, cv)) << 32) | @as(u64, @max(u, cv));
                 const gop = try acc.getOrPut(self.gpa, key);
                 const prev = if (gop.found_existing) gop.value_ptr.* else 0;
-                gop.value_ptr.* = @max(prev, self.side_w[cv]);
+                gop.value_ptr.* = @max(prev, self.side[cv].w);
             }
         }
         prof.scan_ns += plap(&pt);
