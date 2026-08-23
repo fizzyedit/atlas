@@ -154,12 +154,13 @@ pub fn draw(
     if (w.links.items.len > 0) {
         // One pass over the marks instead of a scan per endpoint: the web is budgeted at 900 and
         // the marks at a few hundred, so the naive version was ~250k comparisons a frame.
-        var pos = std.AutoHashMapUnmanaged(u32, dvui.Point.Physical){};
-        defer pos.deinit(arena);
-        pos.ensureTotalCapacity(arena, @intCast(w.marks.items.len)) catch {};
-        for (w.marks.items) |m| {
-            pos.put(arena, m.cell, toScreen(cam, dctx, m)) catch {};
-        }
+        //
+        // A plain array parallel to `marks`, not a map: `World.markIndex` already answers
+        // "which mark is this cell's" from a dense stamped array, so the two lookups every link
+        // endpoint needs — 40,000 a frame at the top of the quality slider — are index reads.
+        const scr = arena.alloc(dvui.Point.Physical, w.marks.items.len) catch return stats;
+        defer arena.free(scr);
+        for (w.marks.items, scr) |m, *q| q.* = toScreen(cam, dctx, m);
 
         var batch = galaxy.LineBatch.init(arena);
         // Ambient segments are collected before any are emitted, because their opacity depends on
@@ -197,13 +198,13 @@ pub fn draw(
         const standIn = struct {
             fn f(
                 world: *const world_mod.World,
-                live: std.AutoHashMapUnmanaged(u32, dvui.Point.Physical),
+                live: []const dvui.Point.Physical,
                 cell: u32,
             ) ?dvui.Point.Physical {
                 var c = cell;
                 var guard: u8 = 0;
                 while (c != world_mod.fold.invalid and guard < 64) : (guard += 1) {
-                    if (live.get(c)) |pt| return pt;
+                    if (world.markIndex(c)) |i| return live[i];
                     if (c >= world.lad.cells.len) return null;
                     c = world.lad.cells[c].parent;
                 }
@@ -216,10 +217,10 @@ pub fn draw(
                 world: *const world_mod.World,
                 c: *const Camera,
                 d: DrawCtx,
-                live: std.AutoHashMapUnmanaged(u32, dvui.Point.Physical),
+                live: []const dvui.Point.Physical,
                 cell: u32,
             ) ?dvui.Point.Physical {
-                if (live.get(cell)) |p| return p;
+                if (world.markIndex(cell)) |i| return live[i];
                 if (cell >= world.field.pos.len) return null;
                 const fp = world.field.pos[cell];
                 return c.worldToScreen(d.toWorld(d.ctx, .{ .x = fp.x, .y = fp.y }));
@@ -258,8 +259,8 @@ pub fn draw(
             // strictly more correct: a link between two off-screen cells whose segment crosses the
             // viewport used to be discarded by the guard and is now drawn, which is the whole point
             // of clipping rather than culling by endpoint.
-            const a = endpoint(w, cam, dctx, pos, l.a) orelse continue;
-            const b = endpoint(w, cam, dctx, pos, l.b) orelse continue;
+            const a = endpoint(w, cam, dctx, scr, l.a) orelse continue;
+            const b = endpoint(w, cam, dctx, scr, l.b) orelse continue;
             const seg = clipToRect(a, b, clip_rect) orelse continue;
             segs.append(arena, .{ .a = seg.a, .b = seg.b, .alpha = l.alpha }) catch {};
         }
@@ -282,10 +283,10 @@ pub fn draw(
         for (w.focus_links.items) |fl| {
             const a_snap = focus_endpoints != .true_position;
             const b_snap = focus_endpoints == .stand_in;
-            const a = (if (a_snap) standIn(w, pos, fl.a) else null) orelse
-                endpoint(w, cam, dctx, pos, fl.a) orelse continue;
-            const b = (if (b_snap) standIn(w, pos, fl.b) else null) orelse
-                endpoint(w, cam, dctx, pos, fl.b) orelse continue;
+            const a = (if (a_snap) standIn(w, scr, fl.a) else null) orelse
+                endpoint(w, cam, dctx, scr, fl.a) orelse continue;
+            const b = (if (b_snap) standIn(w, scr, fl.b) else null) orelse
+                endpoint(w, cam, dctx, scr, fl.b) orelse continue;
             // This link's own reach, not the frame's: `World.stepFocusGrow` advances one value per
             // link, so clicking a new node leaves an already-extended connection where it is and
             // only the newly focused ones travel.

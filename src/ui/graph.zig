@@ -838,6 +838,9 @@ pub const Panel = struct {
     /// 160 bytes, so that is the same whole-vault stride `syncNodesFromWorld` already refuses to
     /// pay. Only a placed name is ever non-zero, so tracking the handful is exact, and `drawLabels`
     /// walks the same list instead of the vault.
+    /// Cells covering at least one open document this frame — the ancestor chains of the open
+    /// notes' leaves, and nothing else. See `updateHoldsOpen`.
+    holds_open: std.AutoHashMapUnmanaged(u32, void) = .empty,
     label_live: std.ArrayListUnmanaged(u32) = .empty,
     interior_label_live: std.ArrayListUnmanaged(u32) = .empty,
     at_level0: []bool = &.{},
@@ -1012,6 +1015,7 @@ pub fn shutdownPanel(p: *Panel) void {
         p.job = null;
     }
     p.path_index.deinit(sdk.allocator());
+    p.holds_open.deinit(sdk.allocator());
     p.label_live.deinit(sdk.allocator());
     p.interior_label_live.deinit(sdk.allocator());
     if (p.world_state) |*w| {
@@ -4101,6 +4105,7 @@ fn stepWorld(p: *Panel, prof: *i96) void {
     const params = worldParams(p);
     w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
     applyMorph(p, w, view);
+    updateHoldsOpen(p, w);
     frame_profile.world_step_ns = profLap(prof);
     syncNodesFromWorld(p, w);
 
@@ -4301,21 +4306,42 @@ fn syncNodesFromWorld(p: *Panel, w: *const world_mod.World) void {
 
 /// World position of a living cell, or null when it is not drawn this frame.
 fn markWorldPos(w: *const world_mod.World, cell: u32) ?dvui.Point {
-    for (w.marks.items) |m| {
-        if (m.cell == cell) return .{ .x = m.wx, .y = m.wy };
+    const i = w.markIndex(cell) orelse return null;
+    const m = w.marks.items[i];
+    return .{ .x = m.wx, .y = m.wy };
+}
+
+/// Collect the cells covering an open document, once per frame.
+///
+/// The question the draw asks is "does this mark cover an open note", and it asks it of every mark.
+/// Answering it per mark meant walking that cell's whole note range — and the marks partition what
+/// is on screen, so at overview the sum of those ranges *is* the vault: 300,000 reads at a 160-byte
+/// stride, every frame, to find the two or three notes that are actually open.
+///
+/// Asked from the other end it is trivial. A cell covers an open note exactly when it is an
+/// ancestor of that note's leaf, so the answer set is the union of the open notes' ancestor chains
+/// — a handful of tabs times the ladder's seven levels. Identical answers, and the cost is now a
+/// property of how many documents are open rather than of how large the vault is.
+fn updateHoldsOpen(p: *Panel, w: *const world_mod.World) void {
+    p.holds_open.clearRetainingCapacity();
+    for (p.open_notes.items) |gi| {
+        if (gi >= w.lad.leaf_cell.len) continue;
+        var c = w.lad.leaf_cell[gi];
+        var guard: u8 = 0;
+        while (c != fold.invalid and c < w.lad.cells.len and guard < 64) : (guard += 1) {
+            const gop = p.holds_open.getOrPut(sdk.allocator(), c) catch break;
+            // Another open note already claimed this cell, so it claimed everything above it too.
+            if (gop.found_existing) break;
+            c = w.lad.cells[c].parent;
+        }
     }
-    return null;
 }
 
 /// True when this mark covers at least one open document, at any level — so a coalesced mass
 /// holding an open note reads as highlight before it has split out as a leaf.
 fn worldMarkHoldsOpen(p: *const Panel, w: *const world_mod.World, m: world_mod.Mark) bool {
-    const c = w.lad.cells[m.cell];
-    for (c.ls..c.le) |slot| {
-        const note = w.lad.note_at[slot];
-        if (note < p.nodes.len and p.nodes[note].open) return true;
-    }
-    return false;
+    _ = w;
+    return p.holds_open.contains(m.cell);
 }
 
 fn frameCluster(p: *Panel, target: Visible) void {
@@ -4510,26 +4536,23 @@ fn updateLabels(
     const seg_cap = if (containment_links) |cl| cl.len else edges.len;
     const seg_buf = arena.alloc(labels.Segment, seg_cap) catch return;
     // Cell -> world position for this frame's marks, so resolving a link's two endpoints is two
-    // hash lookups rather than two scans of the mark list. `markWorldPos` is linear, and at the
+    // lookups rather than two scans of the mark list. `markWorldPos` is linear, and at the
     // 4000-mark budget the slider allows that came to ~80 million comparisons a frame — a cost
     // that grows with the *budget*, so raising it to see more punished you quadratically.
-    // `world_draw.zig` already fixed exactly this with exactly this map; this was its twin.
-    var mark_pos: std.AutoHashMapUnmanaged(u32, dvui.Point) = .empty;
-    defer mark_pos.deinit(arena);
-    if (containment_links != null) {
-        const w = &p.world_state.?;
-        mark_pos.ensureTotalCapacity(arena, @intCast(w.marks.items.len)) catch {};
-        for (w.marks.items) |m| mark_pos.put(arena, m.cell, .{ .x = m.wx, .y = m.wy }) catch {};
-    }
+    // The lookup is `World.markIndex`, the same dense stamped array `world_draw.zig` reads; this
+    // used to be a second `AutoHashMapUnmanaged` built from the same mark list every frame.
     var seg_n: usize = 0;
     for (0..seg_cap) |i| {
         var wa: dvui.Point = undefined;
         var wb: dvui.Point = undefined;
         if (containment_links) |cl| {
-            const ca = mark_pos.get(cl[i].a) orelse continue;
-            const cb = mark_pos.get(cl[i].b) orelse continue;
-            wa = ca;
-            wb = cb;
+            const w = &p.world_state.?;
+            const ia = w.markIndex(cl[i].a) orelse continue;
+            const ib = w.markIndex(cl[i].b) orelse continue;
+            const ma = w.marks.items[ia];
+            const mb = w.marks.items[ib];
+            wa = .{ .x = ma.wx, .y = ma.wy };
+            wb = .{ .x = mb.wx, .y = mb.wy };
         } else {
             const e = edges[i];
             if (e.a >= nodes.len or e.b >= nodes.len) continue;

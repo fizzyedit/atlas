@@ -378,6 +378,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     // Timed, because this is what every republish costs: the layout job rebuilds the whole World
     // — `fold.build` over every note, `cellweb` over every link — each time the index bumps the
     // generation, including for a one-note edit.
+    gpa_for_probe = gpa;
     const build_t0 = std.Io.Clock.boot.now(io).nanoseconds;
     var w = try world_mod.World.init(gpa, n, edges, paths, .{}, .{});
     defer w.deinit();
@@ -551,6 +552,8 @@ fn interiorSweep(gpa: std.mem.Allocator) !void {
 /// bookkeeping. A pan changes the cut nearly every frame, so the whole lift is recomputed at frame
 /// rate, and none of that shows up in a sweep that only measures settled frames. Two separate
 /// performance investigations have measured the parked case and concluded the panel was fine.
+var gpa_for_probe: std.mem.Allocator = undefined;
+
 fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world_mod.Params, px_per_frame: f32) !void {
     const frames = 120;
     // A hand pan runs about 800 screen px/s, so ~13 px a frame at 60. Converting through the zoom
@@ -561,6 +564,14 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     world_mod.prof = .{};
     world_mod.prof_io = io;
     defer world_mod.prof_io = null;
+
+    // How much of the cut actually turns over between consecutive frames. This is the number that
+    // decides whether an *incremental* lift is worth building: if a pan replaces most of the cut
+    // every frame there is nothing to reuse, and if it replaces a handful there is everything to.
+    var churn_sum: f64 = 0;
+    var churn_n: usize = 0;
+    var prev_cut: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer prev_cut.deinit(gpa_for_probe);
 
     var samples: [frames]f64 = undefined;
     var step_ns: u64 = 0;
@@ -573,7 +584,21 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
         step_ns += @intCast(t1 - t0);
         try w.liftLinks(params, 1.0 / 60.0);
         samples[i] = ms(elapsed(io, t0));
+
+        if (prev_cut.count() > 0) {
+            var entered: usize = 0;
+            for (w.cut.items) |c| {
+                if (!prev_cut.contains(c)) entered += 1;
+            }
+            const left = prev_cut.count() - (w.cut.items.len - entered);
+            churn_sum += @as(f64, @floatFromInt(entered + left)) /
+                @as(f64, @floatFromInt(@max(1, w.cut.items.len)));
+            churn_n += 1;
+        }
+        prev_cut.clearRetainingCapacity();
+        for (w.cut.items) |c| try prev_cut.put(gpa_for_probe, c, {});
     }
+    const churn = if (churn_n > 0) churn_sum / @as(f64, @floatFromInt(churn_n)) else 0;
 
     var sorted = samples;
     std.mem.sort(f64, &sorted, {}, std.sort.asc(f64));
@@ -587,12 +612,13 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
         }
     }.f;
     std.debug.print(
-        "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}\n" ++
+        "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}  cut churn {d:.1}%\n" ++
             "         ms/frame: step {d:.2} | lift focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n",
         .{
             if (px_per_frame == 0) "park" else "pan ",
             sum / @as(f64, frames), sorted[frames / 2], sorted[frames * 95 / 100], sorted[frames - 1],
             pr.recomputes,          pr.calls,
+            churn * 100,
             per(step_ns),           per(pr.focus_ns),
             per(pr.scan_ns),
             per(pr.build_ns),       per(pr.sort_ns),

@@ -432,6 +432,16 @@ pub const World = struct {
     sc_grow_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_grow_dead: std.ArrayListUnmanaged(u64) = .empty,
 
+    /// Cell -> index into `marks` for this frame, dense and epoch-stamped.
+    ///
+    /// Both the draw and the label placer need "where is the mark for this cell", once per link
+    /// endpoint — 40,000 lookups a frame between them at the top of the quality slider — and each
+    /// built its own `AutoHashMapUnmanaged(u32, Point)` from the mark list to answer it. The answer
+    /// is a property of the frame's marks, so the `World` publishes it once and both read it.
+    mark_of: []u32,
+    mark_stamp: []u32,
+    mark_epoch: u32 = 0,
+
     /// One cut cell's per-neighbour-cell weight totals, dense and epoch-stamped instead of hashed.
     ///
     /// The inner loop of the lift is "for each of this cell's neighbours, add its weight to
@@ -524,6 +534,8 @@ pub const World = struct {
             .cut_stamp = try gpa.alloc(u32, n_cells),
             .side_w = try gpa.alloc(f32, n_cells),
             .side_stamp = try gpa.alloc(u32, n_cells),
+            .mark_of = try gpa.alloc(u32, n_cells),
+            .mark_stamp = try gpa.alloc(u32, n_cells),
         };
         @memset(w.anim, 0);
         @memset(w.px, 0);
@@ -536,6 +548,7 @@ pub const World = struct {
         // Same contract as `cut_stamp`: `side_epoch` is bumped *before* each use, so a stamp of 0
         // can never match the epoch of the first accumulation.
         @memset(w.side_stamp, 0);
+        @memset(w.mark_stamp, 0);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
@@ -565,6 +578,8 @@ pub const World = struct {
         self.gpa.free(self.cut_stamp);
         self.gpa.free(self.side_w);
         self.gpa.free(self.side_stamp);
+        self.gpa.free(self.mark_of);
+        self.gpa.free(self.mark_stamp);
         self.side_hit.deinit(self.gpa);
         self.sc_acc.deinit(self.gpa);
         self.sc_focus_pairs.deinit(self.gpa);
@@ -806,6 +821,26 @@ pub const World = struct {
                 }
             }
         }
+
+        // Publish cell -> mark index for the frame. One pass over the marks (a few thousand at the
+        // top of the slider) so the draw and the label placer stop building a hash map each, and
+        // their tens of thousands of endpoint lookups become array indexing.
+        self.mark_epoch +%= 1;
+        if (self.mark_epoch == 0) {
+            @memset(self.mark_stamp, 0);
+            self.mark_epoch = 1;
+        }
+        for (self.marks.items, 0..) |m, i| {
+            self.mark_of[m.cell] = @intCast(i);
+            self.mark_stamp[m.cell] = self.mark_epoch;
+        }
+    }
+
+    /// Index into `marks` of the mark drawn for `cell` this frame, or null when it has none.
+    pub fn markIndex(self: *const World, cell: u32) ?u32 {
+        if (cell >= self.mark_stamp.len) return null;
+        if (self.mark_stamp[cell] != self.mark_epoch) return null;
+        return self.mark_of[cell];
     }
 
 
