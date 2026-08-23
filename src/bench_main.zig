@@ -563,11 +563,14 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     defer world_mod.prof_io = null;
 
     var samples: [frames]f64 = undefined;
+    var step_ns: u64 = 0;
     var v = view;
     for (0..frames) |i| {
         v.cx = view.cx + dx * @as(f32, @floatFromInt(i));
         const t0 = now(io);
         try w.step(v, params, 1.0 / 60.0);
+        const t1 = now(io);
+        step_ns += @intCast(t1 - t0);
         try w.liftLinks(params, 1.0 / 60.0);
         samples[i] = ms(elapsed(io, t0));
     }
@@ -585,12 +588,13 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     }.f;
     std.debug.print(
         "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}\n" ++
-            "         lift ms/frame: focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n",
+            "         ms/frame: step {d:.2} | lift focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n",
         .{
             if (px_per_frame == 0) "park" else "pan ",
             sum / @as(f64, frames), sorted[frames / 2], sorted[frames * 95 / 100], sorted[frames - 1],
             pr.recomputes,          pr.calls,
-            per(pr.focus_ns),       per(pr.scan_ns),
+            per(step_ns),           per(pr.focus_ns),
+            per(pr.scan_ns),
             per(pr.build_ns),       per(pr.sort_ns),
             per(pr.fade_ns),
             w.links.items.len,

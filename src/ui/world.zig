@@ -310,6 +310,9 @@ pub const Params = struct {
     }
 };
 
+/// One link's crossfade plus the frame that last saw it in the lifted set. See `World.link_fade`.
+const Fade = struct { v: f32, stamp: u32 };
+
 /// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
 ///
 /// A strict total order — the `(a, b)` tie-break is the pair identity, so no two distinct links
@@ -425,7 +428,6 @@ pub const World = struct {
     sc_acc: std.AutoHashMapUnmanaged(u64, f32) = .empty,
     sc_focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    sc_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_dead: std.ArrayListUnmanaged(u64) = .empty,
     sc_grow_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_grow_dead: std.ArrayListUnmanaged(u64) = .empty,
@@ -457,7 +459,13 @@ pub const World = struct {
     /// Pair key -> crossfade, surviving across frames so a link that leaves the lifted set fades
     /// out instead of blinking. Bounded: live links are capped by `link_budget`, and a dying entry
     /// is dropped as soon as it is invisible.
-    link_fade: std.AutoHashMapUnmanaged(u64, f32) = .empty,
+    ///
+    /// The stamp is how "is this pair still in the lifted set" is answered. It used to be a second
+    /// hash map built from scratch each frame — one insert per link, so ~22,000 of them at the top
+    /// of the quality slider, to answer a question this table can answer itself by recording which
+    /// frame last touched each entry.
+    link_fade: std.AutoHashMapUnmanaged(u64, Fade) = .empty,
+    fade_epoch: u32 = 0,
     /// Per-link reach-out progress for the focused note's own links.
     ///
     /// Keyed by the **unordered** leaf pair, which is what lets the reader ride an edge. Following
@@ -561,7 +569,6 @@ pub const World = struct {
         self.sc_acc.deinit(self.gpa);
         self.sc_focus_pairs.deinit(self.gpa);
         self.sc_edge_seen.deinit(self.gpa);
-        self.sc_live.deinit(self.gpa);
         self.sc_dead.deinit(self.gpa);
         self.sc_grow_live.deinit(self.gpa);
         self.sc_grow_dead.deinit(self.gpa);
@@ -1010,24 +1017,32 @@ pub const World = struct {
 
         // Rise the ones that are present, and remember them so the sweep below can tell which
         // stored entries no longer are.
-        const live = &self.sc_live;
-        live.clearRetainingCapacity();
-        try live.ensureTotalCapacity(self.gpa, @intCast(self.lifted.items.len));
+        self.fade_epoch +%= 1;
+        // A stamp left over from the previous lap would read as current and keep a dead link
+        // drawn forever, so clear on the way past rather than leave it to chance. Once every
+        // 4 billion frames.
+        if (self.fade_epoch == 0) {
+            var reset = self.link_fade.valueIterator();
+            while (reset.next()) |v| v.stamp = 0;
+            self.fade_epoch = 1;
+        }
+        const epoch = self.fade_epoch;
+
+        try self.links.ensureUnusedCapacity(self.gpa, self.lifted.items.len);
         for (self.lifted.items) |l| {
             const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
-            live.putAssumeCapacity(key, {});
             const gop = try self.link_fade.getOrPut(self.gpa, key);
-            const prev: f32 = if (gop.found_existing) gop.value_ptr.* else 0;
+            const prev: f32 = if (gop.found_existing) gop.value_ptr.v else 0;
             // The focused note's own links do not fade in. Everything else is ambient web whose
             // arrival can be gentle, but these are the answer to a question the reader just asked
             // — a link that eases in over half a second reads as one that was not there.
             const next = if (l.focus) 1 else prev + (1 - prev) * rate;
-            gop.value_ptr.* = if (next > 0.996) 1 else next;
+            gop.value_ptr.* = .{ .v = if (next > 0.996) 1 else next, .stamp = epoch };
 
             var out = l;
-            out.alpha = gop.value_ptr.*;
+            out.alpha = gop.value_ptr.v;
             if (out.alpha < 1) self.settled = false;
-            try self.links.append(self.gpa, out);
+            self.links.appendAssumeCapacity(out);
         }
 
         // Fall the ones that are not, and re-emit them until they are gone.
@@ -1035,13 +1050,13 @@ pub const World = struct {
         dead.clearRetainingCapacity();
         var it = self.link_fade.iterator();
         while (it.next()) |kv| {
-            if (live.contains(kv.key_ptr.*)) continue;
-            const next = kv.value_ptr.* * (1 - rate);
+            if (kv.value_ptr.stamp == epoch) continue; // still in the lifted set, risen above
+            const next = kv.value_ptr.v * (1 - rate);
             if (next < 0.02) {
                 try dead.append(self.gpa, kv.key_ptr.*);
                 continue;
             }
-            kv.value_ptr.* = next;
+            kv.value_ptr.v = next;
             self.settled = false;
             try self.links.append(self.gpa, .{
                 .a = @intCast(kv.key_ptr.* >> 32),
