@@ -55,6 +55,13 @@ var world_budget: usize = 280;
 /// frame costs then. The settled numbers below it are the parked-camera steady state; a pan is the
 /// case the reader actually complains about, because it invalidates the lift cache every frame.
 var world_pan: bool = false;
+/// `--zoom-mul=F`: zoom ratio between sweep steps. The default doubling can step clean over a
+/// narrow band, which is exactly how a band-shaped bug hides from this sweep.
+var world_zoom_mul: f32 = 2.0;
+/// `--focus=N`: sweep with note `N` focused and open, so the focused note's own leaf-precision
+/// links are exercised. Without it `focus_leaf` is invalid at every zoom and the whole highlight
+/// path — the thing a reader looks at after clicking a node — is never entered by the bench.
+var world_focus: i64 = -1;
 /// `--pan-px=N`: screen pixels the `--pan` probe moves the camera per frame. 13 is a normal hand
 /// pan at 60 fps (~800 px/s); a flick is several times that, and the interesting failures are all
 /// at the fast end.
@@ -123,6 +130,12 @@ pub fn main(init: std.process.Init) !void {
             world_pan = true;
             world_mode = true;
         }
+        if (std.mem.startsWith(u8, a, "--zoom-mul=")) {
+            world_zoom_mul = try std.fmt.parseFloat(f32, a["--zoom-mul=".len..]);
+        }
+        if (std.mem.startsWith(u8, a, "--focus=")) {
+            world_focus = try std.fmt.parseInt(i64, a["--focus=".len..], 10);
+        }
         if (std.mem.startsWith(u8, a, "--pan-px=")) {
             world_pan_px = try std.fmt.parseFloat(f32, a["--pan-px=".len..]);
             world_pan = true;
@@ -176,6 +189,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--world")) continue;
         if (std.mem.eql(u8, a, "--pan")) continue;
         if (std.mem.startsWith(u8, a, "--pan-px=")) continue;
+        if (std.mem.startsWith(u8, a, "--focus=")) continue;
+        if (std.mem.startsWith(u8, a, "--zoom-mul=")) continue;
         if (std.mem.eql(u8, a, "--index")) continue;
         if (std.mem.eql(u8, a, "--index-warm")) continue;
         if (std.mem.eql(u8, a, "--index-edit")) continue;
@@ -399,8 +414,16 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     // `Params.ambientLinkBudget`. Hardcoding a number here is how this sweep once came to report
     // 10,000 links at every coarse zoom while the app drew 900. A bench that quietly measures
     // different parameters than the thing it stands in for is worse than no bench.
+    var focus_leaf: u32 = world_mod.fold.invalid;
+    var open_leaves: [1]u32 = .{world_mod.fold.invalid};
+    if (world_focus >= 0 and @as(usize, @intCast(world_focus)) < w.lad.leaf_cell.len) {
+        focus_leaf = w.lad.leaf_cell[@intCast(world_focus)];
+        open_leaves[0] = focus_leaf;
+    }
     const params: world_mod.Params = .{
         .budget = budget,
+        .focus_leaf = focus_leaf,
+        .open_leaves = if (focus_leaf == world_mod.fold.invalid) &.{} else open_leaves[0..1],
         .link_budget = if (world_link_budget > 0)
             world_link_budget
         else
@@ -447,9 +470,20 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
 
     var zoom = z_fit;
     var stepn: usize = 0;
-    while (stepn < 14) : (stepn += 1) {
+    const steps: usize = if (world_zoom_mul < 1.5) 40 else 14;
+    while (stepn < steps) : (stepn += 1) {
         // settle, so what is printed is the resting set rather than a mid-crossfade frame
-        const view: world_mod.View = .{ .w = vw, .h = vh, .zoom = zoom, .cx = 0, .cy = 0 };
+        // Centre on the focused note, which is what clicking one does — the whole report is about
+        // what the reader sees after that.
+        var cx: f32 = 0;
+        var cy: f32 = 0;
+        if (world_focus >= 0) {
+            if (w.noteWorldPos(@intCast(world_focus))) |fp| {
+                cx = fp.x;
+                cy = fp.y;
+            }
+        }
+        const view: world_mod.View = .{ .w = vw, .h = vh, .zoom = zoom, .cx = cx, .cy = cy };
         for (0..120) |_| try w.step(view, params, 1.0 / 60.0);
 
         // One more frame, phase by phase. Timings are of the *settled* frame — the steady state a
@@ -480,6 +514,17 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             if (l.focus) continue;
             if (have.contains(l.a) or have.contains(l.b)) drawn += 1;
         }
+        if (world_focus >= 0) {
+            std.debug.print("    focus: leaf links {d}  ambient draw list {d}{s}\n", .{
+                w.focus_links.items.len,
+                w.links.items.len,
+                // `world_draw` nests the focused note's own pass inside the ambient one.
+                if (w.focus_links.items.len > 0 and w.links.items.len == 0)
+                    "   <-- HIGHLIGHT NOT DRAWN"
+                else
+                    "",
+            });
+        }
         std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6}   {d:>7.2} {d:>7.2} {d:>7.2} {d:>7.2} {d:>8.2}\n", .{
             zoom,
             w.marks.items.len,
@@ -499,7 +544,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             try panProbe(io, &w, view, params, 0);
             try panProbe(io, &w, view, params, world_pan_px);
         }
-        zoom *= 2.0;
+        zoom *= world_zoom_mul;
     }
 }
 

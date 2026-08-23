@@ -469,6 +469,9 @@ pub const World = struct {
     /// Fingerprint of the cut the cached `lifted` set was built from, plus the inputs that change
     /// what the lift produces. See `liftLinks`.
     lift_key: u64 = 0,
+    /// The focus/open/budget half of that fingerprint, kept apart because `Params.lift_hold` may
+    /// only excuse a stale *cut* — never a stale answer to what the reader just clicked.
+    lift_focus_key: u64 = 0,
     lift_valid: bool = false,
     /// The lifted set itself, cached across frames. `links` is the per-frame *draw* list built
     /// from this plus whatever is still fading out.
@@ -642,6 +645,11 @@ pub const World = struct {
         self.cut.clearRetainingCapacity();
         @memset(self.open, false);
         self.bound = false;
+        // `marks` is gone, so the cell -> mark index that points into it is too. `present` stamps a
+        // fresh one; until it does, `markIndex` must answer "no mark" rather than hand out an index
+        // into an array that no longer has it — which on a frame `step` returns early from (a world
+        // with no roots) would be a read past the end.
+        self.mark_epoch +%= 1;
         // Invalidate the `cutOf` memo by moving the epoch, not by clearing 341k entries.
         self.cut_epoch +%= 1;
     }
@@ -1130,24 +1138,38 @@ pub const World = struct {
             fp ^= c;
             fp *%= 0x100000001b3;
         }
-        fp ^= @as(u64, p.focus_leaf);
-        fp *%= 0x100000001b3;
+
+        // Two keys, because only one of them may be held.
+        //
+        // `lift_hold` exists to stop the *ambient* web being rebuilt on every frame of a camera
+        // flight, and a web that lags the marks by a few frames while the view is moving is
+        // invisible. The focused note's own links are not that: they are the answer to the click
+        // that started the flight, and holding them answers with the *previous* note's links —
+        // or, on the frame the focus first arrives, with nothing at all. So the connections of the
+        // note you just clicked go missing for as long as the camera is moving fast enough to hold,
+        // and reappear when it slows. One key covers what may lag; the other never may.
+        var focus_fp: u64 = 0xcbf29ce484222325;
+        focus_fp ^= @as(u64, p.focus_leaf);
+        focus_fp *%= 0x100000001b3;
         // The open set is part of the lift now that every open note's links are built here, so a
         // tab opening or closing has to invalidate the cache the same way a cut change does.
         for (p.open_leaves) |leaf| {
-            fp ^= @as(u64, leaf) +% 1;
-            fp *%= 0x100000001b3;
+            focus_fp ^= @as(u64, leaf) +% 1;
+            focus_fp *%= 0x100000001b3;
         }
-        fp ^= @as(u64, p.link_budget);
-        fp *%= 0x100000001b3;
+        focus_fp ^= @as(u64, p.link_budget);
+        focus_fp *%= 0x100000001b3;
 
-        if (self.lift_valid and (fp == self.lift_key or p.lift_hold)) {
+        if (self.lift_valid and focus_fp == self.lift_focus_key and
+            (fp == self.lift_key or p.lift_hold))
+        {
             pt = pnow();
             try self.fadeLinks(p, dt);
             prof.fade_ns += plap(&pt);
             return;
         }
         self.lift_key = fp;
+        self.lift_focus_key = focus_fp;
         self.lift_valid = true;
         prof.recomputes += 1;
 
@@ -1567,6 +1589,43 @@ test "the focused note keeps every link however far the camera travels" {
             try testing.expect(fl.b != p.focus_leaf);
         }
     }
+}
+
+test "a held lift still answers a new focus" {
+    // `lift_hold` lets the ambient web lag while the camera flies, which is invisible and saves the
+    // whole lift on the frames that can least afford it. It must not hold the focused note's own
+    // links: clicking a node *starts* the flight, so the frames where the hold is engaged are
+    // exactly the frames where the reader is waiting to see what they just clicked connect to.
+    // Held, they answer with the previous note's links — and on the first click of a session, with
+    // nothing — until the camera slows enough to release.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 4, .cx = 0, .cy = 0 };
+
+    var p: Params = .{ .focus_leaf = w.lad.leaf_cell[2000] };
+    try settle(&w, view, p, 8);
+    try w.liftLinks(p, 1.0 / 60.0);
+    for (w.focus_links.items) |fl| try testing.expectEqual(p.focus_leaf, fl.a);
+
+    // The click: a new focus arriving on a frame the camera is moving fast enough to hold.
+    p.focus_leaf = w.lad.leaf_cell[2400];
+    p.lift_hold = true;
+    try w.step(view, p, 1.0 / 60.0);
+    try w.liftLinks(p, 1.0 / 60.0);
+
+    try testing.expectEqual(@as(usize, 2), w.focus_links.items.len);
+    for (w.focus_links.items) |fl| try testing.expectEqual(p.focus_leaf, fl.a);
+
+    // And the hold still does its job for the ambient web: with the focus unchanged, a moved
+    // camera reuses the lifted set rather than rebuilding it.
+    const before = prof.recomputes;
+    try w.step(.{ .w = 900, .h = 600, .zoom = 4, .cx = 400, .cy = 0 }, p, 1.0 / 60.0);
+    try w.liftLinks(p, 1.0 / 60.0);
+    try testing.expectEqual(before, prof.recomputes);
 }
 
 test "a splitting mass shrinks toward a note's size as it fades" {

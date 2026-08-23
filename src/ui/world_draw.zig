@@ -151,7 +151,13 @@ pub fn draw(
     var stats: DrawStats = .{};
 
     // Links first so the web passes under the marks rather than over them.
-    if (w.links.items.len > 0) {
+    //
+    // The focused note's own links are drawn by this block too, and they are a *separate* set with
+    // a separate reason to exist — so the gate has to admit either one. Keyed on the ambient list
+    // alone, a frame whose lift produced no cell-to-cell web took the reader's highlighted
+    // connections down with it: the note stays drawn as itself, its neighbours stay drawn as
+    // themselves, and the lines between them simply are not there.
+    if (w.links.items.len > 0 or w.focus_links.items.len > 0) {
         // One pass over the marks instead of a scan per endpoint: the web is budgeted at 900 and
         // the marks at a few hundred, so the naive version was ~250k comparisons a frame.
         //
