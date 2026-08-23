@@ -287,7 +287,14 @@ const GraphNode = struct {
     /// rather than a slice, so this never points at the frame arena.
     label_len: usize = 0,
     label_ellipsis: bool = false,
+    /// `label_epoch` of the `updateLabels` run that last gave this node a placement. Lets the
+    /// fade pass tell "placed this frame" from "was showing a moment ago" without a per-node
+    /// array — see `updateLabels`.
+    label_epoch: u32 = 0,
 };
+
+/// Bumped once per `updateLabels` call, so a node's `label_epoch` names one specific run.
+var label_epoch: u32 = 0;
 
 /// `a` is the link *source* — edges grow outward from it, so direction is not incidental.
 const GraphEdge = struct { a: usize, b: usize };
@@ -824,6 +831,15 @@ pub const Panel = struct {
     /// Per node, whether it is being drawn as itself this frame. Read by the edge pass, which
     /// has no business drawing a link to a note that has been merged into a marker. Lives in the
     /// panel arena, so it is sized with the arrangement.
+    /// Nodes whose `label_vis` is not yet zero, per cloud.
+    ///
+    /// The label fade used to be a pass over every node in the vault, every frame the placer ran —
+    /// which is every frame of a pan — to move at most `max_labels` non-zero values. `GraphNode` is
+    /// 160 bytes, so that is the same whole-vault stride `syncNodesFromWorld` already refuses to
+    /// pay. Only a placed name is ever non-zero, so tracking the handful is exact, and `drawLabels`
+    /// walks the same list instead of the vault.
+    label_live: std.ArrayListUnmanaged(u32) = .empty,
+    interior_label_live: std.ArrayListUnmanaged(u32) = .empty,
     at_level0: []bool = &.{},
     /// `layout_epoch` the `at_level0` array was last cleared wholesale for. `syncNodesFromWorld`
     /// otherwise only clears the entries it set, so a freshly (re)allocated array needs exactly one
@@ -996,6 +1012,8 @@ pub fn shutdownPanel(p: *Panel) void {
         p.job = null;
     }
     p.path_index.deinit(sdk.allocator());
+    p.label_live.deinit(sdk.allocator());
+    p.interior_label_live.deinit(sdk.allocator());
     if (p.world_state) |*w| {
         w.deinit();
         p.world_state = null;
@@ -1184,10 +1202,10 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
         // that does draw names has to redo them.
         p.labels_stale = true;
     } else if (p.interior.t < 0.5) {
-        if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items, 1);
+        if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items, &p.label_live, 1);
         for (p.interior.nodes) |*n| n.label_vis = 0;
     } else {
-        if (labels_dirty) updateLabels(p, p.interior.nodes, p.interior.edges, p.interior.slot, p.interior_visible.items, 0);
+        if (labels_dirty) updateLabels(p, p.interior.nodes, p.interior.edges, p.interior.slot, p.interior_visible.items, &p.interior_label_live, 0);
         // Only the overview notes that *have* a name placed, which is the set `visible` names — the
         // whole-vault version of this line is the same 160-byte-stride sweep that cost 3.7 ms a
         // frame at a million notes, and `at_cluster_zoom` above already refuses to pay it.
@@ -1696,6 +1714,18 @@ fn rewarmPointer(p: *Panel) void {
     p.pointer_warm.clearRetainingCapacity();
     for (p.nodes, 0..) |n, i| {
         if (@abs(n.pointer_t) > 0.004) p.pointer_warm.append(sdk.allocator(), @intCast(i)) catch {};
+    }
+}
+
+/// Re-seed a cloud's label live set after its node array is rebuilt.
+///
+/// The counterpart to `rewarmPointer`, and for the same reason: a rebuild reallocates and renumbers
+/// the nodes, and `finishRebuild` carries `label_vis` across by note id, so the old indices name the
+/// wrong nodes. One pass over the new array here, rather than one per frame.
+fn rewarmLabels(nodes: []const GraphNode, live: *std.ArrayListUnmanaged(u32)) void {
+    live.clearRetainingCapacity();
+    for (nodes, 0..) |n, i| {
+        if (n.label_vis > 0.004) live.append(sdk.allocator(), @intCast(i)) catch {};
     }
 }
 
@@ -2307,6 +2337,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     p.live_pos = try arena.alloc(dvui.Point, n);
     for (nodes, p.live_pos) |node, *q| q.* = node.pos;
     rewarmPointer(p);
+    rewarmLabels(nodes, &p.label_live);
     p.layout_settled = !any_layout_move;
     // The names have to be re-placed even if nothing moved — see `Panel.labels_stale`.
     p.labels_stale = true;
@@ -2882,6 +2913,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     for (edges, 0..) |e, i| graph_edges[i] = .{ .a = e.a, .b = e.b };
 
     p.interior.nodes = nodes;
+    rewarmLabels(nodes, &p.interior_label_live);
     p.interior.edges = graph_edges;
     p.interior.built_id = id;
     p.interior.built_gen = gen;
@@ -4427,6 +4459,9 @@ fn updateLabels(
     edges: []const GraphEdge,
     slot: f32,
     selection: ?[]const Visible,
+    /// This cloud's set of nodes with a non-zero `label_vis` — read and rewritten here. See
+    /// `Panel.label_live`.
+    live: *std.ArrayListUnmanaged(u32),
     /// Minimum reveal for every candidate, regardless of zoom.
     ///
     /// The classic path fades names in as `slot * zoom` crosses a pixel gap, because it draws
@@ -4453,10 +4488,12 @@ fn updateLabels(
     const font = dvui.Font.theme(.body).larger(label_font_delta);
     const vp = p.camera.viewport;
 
-    // One slot per node saying "the placer found room for me". Out of memory here means we
-    // keep last frame's placement rather than dropping every label at once.
-    const want = arena.alloc(bool, nodes.len) catch return;
-    @memset(want, false);
+    // Which nodes the placer found room for, as a list rather than one bool per note in the vault.
+    // The allocation and its memset were themselves whole-vault work on every frame of a pan.
+    label_epoch +%= 1;
+    const epoch = label_epoch;
+    var placed_now: std.ArrayList(u32) = .empty;
+    placed_now.ensureTotalCapacity(arena, max_labels) catch {};
     const rect_buf = arena.alloc(dvui.Rect.Physical, max_reserved_bubbles + max_labels) catch return;
     var placer = labels.Placer.init(rect_buf, vp, label_slack * scale);
     // A name sitting on a link is almost as unreadable as one sitting on a bubble. Feed the
@@ -4635,16 +4672,39 @@ fn updateLabels(
         n.label_rect = placement.rect;
         n.label_len = draw_len;
         n.label_ellipsis = cut;
-        want[i] = true;
+        n.label_epoch = epoch;
+        placed_now.append(arena, @intCast(i)) catch {};
         placed += 1;
     }
 
+    // Fade in what was just placed, fade out only what was showing a moment ago, and leave the
+    // rest of the vault alone — nothing else can hold a non-zero `label_vis`, because this is the
+    // only code that ever raises one.
     var unsettled = false;
-    for (nodes, 0..) |*n, i| {
-        const target: f32 = if (want[i]) 1 else 0;
-        n.label_vis += (target - n.label_vis) * t_chase;
-        if (@abs(n.label_vis - target) > 0.004) unsettled = true;
+    var next: std.ArrayList(u32) = .empty;
+    next.ensureTotalCapacity(arena, placed_now.items.len + live.items.len) catch {};
+    for (placed_now.items) |i| {
+        const n = &nodes[i];
+        n.label_vis += (1 - n.label_vis) * t_chase;
+        if (@abs(n.label_vis - 1) > 0.004) unsettled = true;
+        next.append(arena, i) catch {};
     }
+    for (live.items) |i| {
+        if (i >= nodes.len) continue;
+        const n = &nodes[i];
+        if (n.label_epoch == epoch) continue; // placed above, already stepped
+        n.label_vis += (0 - n.label_vis) * t_chase;
+        if (@abs(n.label_vis) > 0.004) {
+            unsettled = true;
+            next.append(arena, i) catch {};
+        } else {
+            // Snap the last sliver so the node leaves the tracked set instead of decaying
+            // forever below the threshold anything draws at.
+            n.label_vis = 0;
+        }
+    }
+    live.clearRetainingCapacity();
+    live.appendSlice(sdk.allocator(), next.items) catch {};
     p.labels_settled = !unsettled;
     if (unsettled) dvui.refresh(null, @src(), dvui.parentGet().data().id);
 }
@@ -4699,9 +4759,12 @@ fn drawLabels(p: *Panel) void {
         return;
     }
 
-    for (p.nodes, 0..) |n, i| {
+    // The tracked set, not the vault: only a node `updateLabels` placed can have a name to draw.
+    for (p.label_live.items) |li| {
+        const i: usize = li;
+        if (i >= p.nodes.len) continue;
         if (p.hover_node == i) continue;
-        drawLabel(n, zoom_t, fade);
+        drawLabel(p.nodes[i], zoom_t, fade);
     }
     // The one you pointed at goes on top — it is the only label allowed to sit over another,
     // and only while a displaced neighbour is still crossfading out.
