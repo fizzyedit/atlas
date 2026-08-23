@@ -310,6 +310,80 @@ pub const Params = struct {
     }
 };
 
+/// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
+///
+/// A strict total order — the `(a, b)` tie-break is the pair identity, so no two distinct links
+/// ever compare equal. `selectTopK` depends on that: with ties possible, which of several equal
+/// links survived truncation would depend on partition order, and a parked camera would not keep
+/// the same web.
+fn heavier(x: LiftedLink, y: LiftedLink) bool {
+    if (x.focus != y.focus) return x.focus;
+    if (x.essential != y.essential) return x.essential;
+    if (x.w != y.w) return x.w > y.w;
+    // deterministic tie-break, so a parked camera keeps the same web
+    if (x.a != y.a) return x.a < y.a;
+    return x.b < y.b;
+}
+
+/// Partition `items` so that `items[0..k]` holds the `k` that `heavier` ranks first.
+///
+/// Introselect: quickselect with a median-of-three pivot, falling back to a full sort of the
+/// remaining range if the pivots keep going badly, so the worst case is `n log n` rather than
+/// `n²`. Order *within* the kept prefix is unspecified — the caller wants a set, and the drawn
+/// ambient web is one colour whose per-line alpha is 1 at rest, so compositing it is
+/// order-invariant there. (The branch that keeps everything never sorted at all, so the draw has
+/// always taken this list in hash order at most zooms.)
+fn selectTopK(items: []LiftedLink, k: usize) void {
+    if (k == 0 or k >= items.len) return;
+    var lo: usize = 0;
+    var hi: usize = items.len; // exclusive
+    var budget: usize = 2 * std.math.log2_int_ceil(usize, items.len + 1) + 4;
+    while (hi - lo > 16) {
+        if (budget == 0) {
+            std.mem.sort(LiftedLink, items[lo..hi], {}, struct {
+                fn less(_: void, x: LiftedLink, y: LiftedLink) bool {
+                    return heavier(x, y);
+                }
+            }.less);
+            return;
+        }
+        budget -= 1;
+        const pivot_at = partitionLinks(items, lo, hi);
+        // Everything before `pivot_at` outranks everything after it, so exactly one side can still
+        // contain the k'th element; the other is already on its correct side of the cut.
+        if (k <= pivot_at) hi = pivot_at else lo = pivot_at + 1;
+    }
+    std.sort.insertion(LiftedLink, items[lo..hi], {}, struct {
+        fn less(_: void, x: LiftedLink, y: LiftedLink) bool {
+            return heavier(x, y);
+        }
+    }.less);
+}
+
+/// Lomuto partition of `items[lo..hi]` around a median-of-three pivot. Returns the pivot's final
+/// index; everything before it is heavier, everything after it lighter.
+fn partitionLinks(items: []LiftedLink, lo: usize, hi: usize) usize {
+    const last = hi - 1;
+    const mid = lo + (hi - lo) / 2;
+    if (heavier(items[mid], items[lo])) std.mem.swap(LiftedLink, &items[mid], &items[lo]);
+    if (heavier(items[last], items[lo])) std.mem.swap(LiftedLink, &items[last], &items[lo]);
+    if (heavier(items[last], items[mid])) std.mem.swap(LiftedLink, &items[last], &items[mid]);
+    // `items[mid]` is now the median of the three; park it at the end as the pivot.
+    std.mem.swap(LiftedLink, &items[mid], &items[last]);
+    const pivot = items[last];
+
+    var i = lo;
+    var j = lo;
+    while (j < last) : (j += 1) {
+        if (heavier(items[j], pivot)) {
+            std.mem.swap(LiftedLink, &items[i], &items[j]);
+            i += 1;
+        }
+    }
+    std.mem.swap(LiftedLink, &items[i], &items[last]);
+    return i;
+}
+
 pub const World = struct {
     gpa: std.mem.Allocator,
     lad: fold.Ladder,
@@ -341,6 +415,33 @@ pub const World = struct {
     cut_of: []u32,
     cut_stamp: []u32,
     cut_epoch: u32 = 0,
+    /// Scratch for the lift and the crossfades, kept across frames rather than rebuilt inside it.
+    ///
+    /// Every one of these used to be `.empty` on entry and freed on exit, so a pan frame — which
+    /// misses the lift cache 119 times out of 120 — grew a 17k–29k-entry table up from nothing and
+    /// rehashed the whole way, then threw it away, sixty times a second. `clearRetainingCapacity`
+    /// pays that growth once for the life of the `World`. Nothing here is state: every field is
+    /// cleared before use, and the only thing that survives a frame is the allocation.
+    sc_acc: std.AutoHashMapUnmanaged(u64, f32) = .empty,
+    sc_focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_dead: std.ArrayListUnmanaged(u64) = .empty,
+    sc_grow_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_grow_dead: std.ArrayListUnmanaged(u64) = .empty,
+
+    /// One cut cell's per-neighbour-cell weight totals, dense and epoch-stamped instead of hashed.
+    ///
+    /// The inner loop of the lift is "for each of this cell's neighbours, add its weight to
+    /// whichever cut cell owns it", which is a scatter-add over cell ids — exactly what an array
+    /// indexed by cell id does without hashing anything. The stamp is the same trick `cut_of` uses:
+    /// a new accumulation costs an epoch bump, not a memset of one entry per cell in the vault.
+    /// `side_hit` records which entries were touched so reading the totals back is O(touched).
+    side_w: []f32,
+    side_stamp: []u32,
+    side_epoch: u32 = 0,
+    side_hit: std.ArrayListUnmanaged(u32) = .empty,
+
     /// Fingerprint of the cut the cached `lifted` set was built from, plus the inputs that change
     /// what the lift produces. See `liftLinks`.
     lift_key: u64 = 0,
@@ -413,6 +514,8 @@ pub const World = struct {
             .open = try gpa.alloc(bool, n_cells),
             .cut_of = try gpa.alloc(u32, n_cells),
             .cut_stamp = try gpa.alloc(u32, n_cells),
+            .side_w = try gpa.alloc(f32, n_cells),
+            .side_stamp = try gpa.alloc(u32, n_cells),
         };
         @memset(w.anim, 0);
         @memset(w.px, 0);
@@ -422,6 +525,9 @@ pub const World = struct {
         // Zeroed once here so the first frame's `cut_epoch` of 1 cannot collide with uninitialised
         // memory and read a stale memo as valid.
         @memset(w.cut_stamp, 0);
+        // Same contract as `cut_stamp`: `side_epoch` is bumped *before* each use, so a stamp of 0
+        // can never match the epoch of the first accumulation.
+        @memset(w.side_stamp, 0);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
@@ -449,6 +555,16 @@ pub const World = struct {
         self.gpa.free(self.open);
         self.gpa.free(self.cut_of);
         self.gpa.free(self.cut_stamp);
+        self.gpa.free(self.side_w);
+        self.gpa.free(self.side_stamp);
+        self.side_hit.deinit(self.gpa);
+        self.sc_acc.deinit(self.gpa);
+        self.sc_focus_pairs.deinit(self.gpa);
+        self.sc_edge_seen.deinit(self.gpa);
+        self.sc_live.deinit(self.gpa);
+        self.sc_dead.deinit(self.gpa);
+        self.sc_grow_live.deinit(self.gpa);
+        self.sc_grow_dead.deinit(self.gpa);
         self.lifted.deinit(self.gpa);
         self.focus_links.deinit(self.gpa);
         self.field.deinit(self.gpa);
@@ -840,8 +956,8 @@ pub const World = struct {
         // animation was added to fix. Capping the step stretches a hitch instead of skipping it.
         const step_dt = @min(dt, 1.0 / 20.0);
         const base = step_dt / @max(0.01, p.focus_reach_secs);
-        var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer live.deinit(self.gpa);
+        const live = &self.sc_grow_live;
+        live.clearRetainingCapacity();
         try live.ensureTotalCapacity(self.gpa, @intCast(self.focus_links.items.len));
         for (self.focus_links.items) |*fl| {
             const key = (@as(u64, @min(fl.a, fl.b)) << 32) | @as(u64, @max(fl.a, fl.b));
@@ -876,8 +992,8 @@ pub const World = struct {
         // focus note's own link set too, under the same unordered key, so it stays live and keeps
         // the extension it already had.
         var it = self.focus_grow.iterator();
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.gpa);
+        const dead = &self.sc_grow_dead;
+        dead.clearRetainingCapacity();
         while (it.next()) |kv| {
             if (!live.contains(kv.key_ptr.*)) try dead.append(self.gpa, kv.key_ptr.*);
         }
@@ -894,8 +1010,8 @@ pub const World = struct {
 
         // Rise the ones that are present, and remember them so the sweep below can tell which
         // stored entries no longer are.
-        var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer live.deinit(self.gpa);
+        const live = &self.sc_live;
+        live.clearRetainingCapacity();
         try live.ensureTotalCapacity(self.gpa, @intCast(self.lifted.items.len));
         for (self.lifted.items) |l| {
             const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
@@ -915,8 +1031,8 @@ pub const World = struct {
         }
 
         // Fall the ones that are not, and re-emit them until they are gone.
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.gpa);
+        const dead = &self.sc_dead;
+        dead.clearRetainingCapacity();
         var it = self.link_fade.iterator();
         while (it.next()) |kv| {
             if (live.contains(kv.key_ptr.*)) continue;
@@ -995,10 +1111,8 @@ pub const World = struct {
         // class of bug the sweep exists to catch. Taking the max needs no level reasoning at all:
         // whichever side sees the whole aggregate wins, a side that sees nothing contributes
         // nothing, and a side that sees part of it is dominated.
-        var acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
-        defer acc.deinit(self.gpa);
-        var side: std.AutoHashMapUnmanaged(u32, f32) = .empty;
-        defer side.deinit(self.gpa);
+        const acc = &self.sc_acc;
+        acc.clearRetainingCapacity();
         // How deep into one cell's neighbour list it is worth reading.
         //
         // `link_scan_cap` alone is a fixed ceiling, and a fixed ceiling is the wrong shape: on a
@@ -1030,8 +1144,8 @@ pub const World = struct {
         // lifted the same way everything else is: each neighbour leaf mapped to whatever cell
         // currently stands in for it. So when the note is coalesced its links still point at the
         // right places, instead of the mass's entire incident set being painted as the document's.
-        var focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer focus_pairs.deinit(self.gpa);
+        const focus_pairs = &self.sc_focus_pairs;
+        focus_pairs.clearRetainingCapacity();
         // One entry per *edge*, not per (note, neighbour).
         //
         // The highlighted web is a set of edges: `A—B` and `B—A` are the same line. With both notes
@@ -1039,8 +1153,8 @@ pub const World = struct {
         // different reveal state, so the edge the reader had just travelled along could sweep again
         // from its far end. Claimed first-come, and the focused note is processed first, so an edge
         // belongs to the note being looked at and is drawn outward from it.
-        var edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer edge_seen.deinit(self.gpa);
+        const edge_seen = &self.sc_edge_seen;
+        edge_seen.clearRetainingCapacity();
         self.focus_links.clearRetainingCapacity();
         // The focused leaf first and always, then every other open note. `focus_leaf` is not
         // required to appear in `open_leaves` — a caller may set only the focus, and the pinned
@@ -1112,20 +1226,30 @@ pub const World = struct {
                 @min(hi, lo +| p.link_scan_cap)
             else
                 @min(hi, lo +| cap);
-            side.clearRetainingCapacity();
+            self.side_epoch +%= 1;
+            // Wrap is once every 4 billion cut cells — hours of continuous panning — but a stamp
+            // left over from the previous lap would read as current and silently drop a cell's
+            // whole neighbour weight, so clear on the way past rather than leave it to chance.
+            if (self.side_epoch == 0) {
+                @memset(self.side_stamp, 0);
+                self.side_epoch = 1;
+            }
+            self.side_hit.clearRetainingCapacity();
             for (self.web.nbr[lo..end], self.web.w[lo..end]) |v, w| {
                 const cv = self.cutOf(v) orelse continue; // cut is deeper there; found from it
                 if (cv == u) continue; // both ends inside the same cut cell — nothing to draw
-                const gop = try side.getOrPut(self.gpa, cv);
-                gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + w;
+                if (self.side_stamp[cv] != self.side_epoch) {
+                    self.side_stamp[cv] = self.side_epoch;
+                    self.side_w[cv] = 0;
+                    try self.side_hit.append(self.gpa, cv);
+                }
+                self.side_w[cv] += w;
             }
-            var sit = side.iterator();
-            while (sit.next()) |kv| {
-                const cv = kv.key_ptr.*;
+            for (self.side_hit.items) |cv| {
                 const key = (@as(u64, @min(u, cv)) << 32) | @as(u64, @max(u, cv));
                 const gop = try acc.getOrPut(self.gpa, key);
                 const prev = if (gop.found_existing) gop.value_ptr.* else 0;
-                gop.value_ptr.* = @max(prev, kv.value_ptr.*);
+                gop.value_ptr.* = @max(prev, self.side_w[cv]);
             }
         }
         prof.scan_ns += plap(&pt);
@@ -1164,17 +1288,13 @@ pub const World = struct {
             // one relationship set that was asked for, while everything below it still competes on
             // weight exactly as before. No second list and no second code path: the same sort,
             // with one more key in front, so determinism is unchanged.
-            const S = struct {
-                pub fn heavier(_: void, x: LiftedLink, y: LiftedLink) bool {
-                    if (x.focus != y.focus) return x.focus;
-                    if (x.essential != y.essential) return x.essential;
-                    if (x.w != y.w) return x.w > y.w;
-                    // deterministic tie-break, so a parked camera keeps the same web
-                    if (x.a != y.a) return x.a < y.a;
-                    return x.b < y.b;
-                }
-            };
-            std.mem.sort(LiftedLink, self.lifted.items, {}, S.heavier);
+            // Select, don't sort. What this needs is the *set* of the `keep` heaviest, and a full
+            // sort also puts the ~20,000 links it is about to discard in order — 2.0 ms a frame at
+            // 300k notes, the single largest item in a moving frame. `selectTopK` partitions to the
+            // same set for a fraction of that. The set is uniquely determined either way, because
+            // `heavier` is a strict total order: the `(a, b)` tie-break is the pair itself, so no
+            // two links can compare equal and there is no boundary ambiguity to resolve by luck.
+            selectTopK(self.lifted.items, keep);
             self.lifted.shrinkRetainingCapacity(keep);
         }
         prof.sort_ns += plap(&pt);
@@ -1195,6 +1315,55 @@ pub const World = struct {
 // ---- tests ----------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "selectTopK keeps exactly the set a full sort would keep" {
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    const r = rng.random();
+    const gpa = testing.allocator;
+
+    for ([_]usize{ 1, 2, 17, 64, 1000, 9999 }) |n| {
+        const items = try gpa.alloc(LiftedLink, n);
+        defer gpa.free(items);
+        for (items, 0..) |*l, i| {
+            l.* = .{
+                .a = @intCast(i),
+                .b = r.int(u16),
+                // Heavy duplication on purpose: weight ties are the case where a selection can
+                // disagree with a sort, and the `(a, b)` tie-break is what stops it.
+                .w = @floatFromInt(r.intRangeAtMost(u8, 0, 8)),
+                .focus = r.boolean(),
+                .essential = r.boolean(),
+            };
+        }
+
+        const reference = try gpa.dupe(LiftedLink, items);
+        defer gpa.free(reference);
+        std.mem.sort(LiftedLink, reference, {}, struct {
+            fn less(_: void, x: LiftedLink, y: LiftedLink) bool {
+                return heavier(x, y);
+            }
+        }.less);
+
+        for ([_]usize{ 0, 1, n / 3, n / 2, n - 1, n }) |k| {
+            const scratch = try gpa.dupe(LiftedLink, items);
+            defer gpa.free(scratch);
+            selectTopK(scratch, k);
+            if (k == 0 or k >= n) continue;
+
+            // Sets, not orders: `selectTopK` promises the prefix holds the same links, not that it
+            // holds them in the same sequence.
+            var want: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer want.deinit(gpa);
+            for (reference[0..k]) |l| {
+                try want.put(gpa, (@as(u64, l.a) << 32) | @as(u64, l.b), {});
+            }
+            for (scratch[0..k]) |l| {
+                try testing.expect(want.remove((@as(u64, l.a) << 32) | @as(u64, l.b)));
+            }
+            try testing.expectEqual(@as(usize, 0), want.count());
+        }
+    }
+}
 
 fn chainLinks(gpa: std.mem.Allocator, n: u32) ![]fold.Edge {
     const e = try gpa.alloc(fold.Edge, n - 1);
