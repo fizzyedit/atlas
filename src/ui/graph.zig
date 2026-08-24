@@ -114,45 +114,7 @@ const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
 const hover_fill_mix: f32 = 0.45;
-/// The hover ring's size, as a multiple of the largest a normal note is drawn at. See
-/// `ringMultiplier`.
-/// The floor: a note with nothing in it gets no extra size at all, only the ordinary proximity
-/// swell every note near the cursor already has. Growth here is *information* — it says how much is
-/// waiting inside — so a note with nothing to say should not claim any of it.
-const hover_ring_min_mult: f32 = 1.0;
-/// The ceiling, for a document long enough that its size is the point.
-const hover_ring_max_mult: f32 = 3.0;
-/// Added multiple per √item, above the floor.
-///
-/// Deliberately shallow. The dashed rim already announces which note the cursor is on, so size does
-/// not have to carry that too and is free to mean only one thing: how much is inside. A ramp steep
-/// enough to make an ordinary note double is a ramp on which almost every note looks large, and a
-/// difference every note shares is not a difference. At this value ten items comes to 1.16, fifty
-/// to 1.35, two hundred to 1.7, and the ceiling belongs to documents of genuinely unusual length.
-///
-/// Square root rather than logarithm: a log law compresses the top of the range so hard that a
-/// ten-item note and a two-hundred-item one open by nearly the same amount, which is the one
-/// distinction this exists to draw.
-const pointer_grow_k: f32 = 0.05;
 
-/// How far the node under the cursor opens, by how much is inside it, as a multiple of the largest
-/// a normal note is drawn at.
-///
-/// The point is to answer "what am I about to open" before the reader commits. A two-line stub
-/// barely moves; a note with forty paragraphs opens a visible clearing. It is an honest indicator
-/// of size rather than a literal preview: `buildInteriorWorld` normalises every cloud to the same
-/// berth on purpose — `scale = berth / extent` — so the interior's own footprint carries no size
-/// information to match against, and changing that is what would make a two-item note and a
-/// two-hundred-item note settle at different zooms.
-fn ringMultiplier(n: GraphNode) f32 {
-    if (n.is_sun) return 1 + sun_grow_factor;
-    const items: f32 = @floatFromInt(n.interior_items);
-    return std.math.clamp(
-        hover_ring_min_mult + pointer_grow_k * @sqrt(items),
-        hover_ring_min_mult,
-        hover_ring_max_mult,
-    );
-}
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
 /// The same for a merged region, which is drawn at the size of the area it covers rather than at
@@ -334,13 +296,6 @@ const GraphNode = struct {
     /// fade pass tell "placed this frame" from "was showing a moment ago" without a per-node
     /// array — see `updateLabels`.
     label_epoch: u32 = 0,
-    /// Headings + body blocks in this note — how much is waiting inside it.
-    ///
-    /// Presentation only. It sizes the hover expansion so the ring says something about the
-    /// document before you commit to opening it, and it is read nowhere else: the layout, the
-    /// ladder and the LOD thresholds must not move with content, or every edit to a note reshapes
-    /// the vault around it.
-    interior_items: u32 = 0,
 };
 
 /// Bumped once per `updateLabels` call, so a node's `label_epoch` names one specific run.
@@ -2365,7 +2320,6 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
             .title = title,
             .phantom = info.phantom,
             .degree = job.degrees[gi],
-            .interior_items = info.interior,
             .link_sig = sigs[gi],
             .target = start,
             .home = start,
@@ -4279,16 +4233,14 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         border_rest;
 
     // The dashed clearing, and the request to be painted last.
-    // Dashed is a *state*, not a size: the note under the cursor and the notes the reader has
-    // open, and nothing else.
+    // Dashed means *open*, and nothing else.
     //
-    // This replaces a separate expanding ring drawn around the node, which never worked. Keyed on
-    // the discrete hover it had a hard edge the hit test did not share, so parts of the ring did
-    // not respond; keyed on the proximity field it had no edge but every neighbour drew a faint
-    // ring of its own, and mid-zoom the reader got a nest of concentric circles with the real node
-    // showing through the middle of them. There is no ring now. The mark itself is the ring.
-    const is_dashed = m.is_note and m.note < p.nodes.len and
-        (p.nodes[m.note].open or pointed > 0.02);
+    // It is the one shape the reader carries across a zoom: an open note is a dashed rim out here,
+    // and the sun at the centre of its interior is a dashed rim too, so diving in continues
+    // something rather than cutting to something new. Spending it on hover as well spent the
+    // meaning — every note the cursor passed became dashed, so dashed stopped saying "this is the
+    // one you are in".
+    const is_dashed = m.is_note and m.note < p.nodes.len and p.nodes[m.note].open;
 
     return .{
         .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
@@ -5064,20 +5016,7 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
-    const capped = @max(@min(want, gap_px * gap_radius_frac), floor);
-
-    // On top of the proximity swell, the note under the cursor opens by how much is inside it.
-    //
-    // *After* the caps, so it is a clean multiple of the drawn size — folded in before them, the
-    // lattice-gap cap is what binds at overview density and every note flattened to the same
-    // fraction of the spacing whatever it contained. And inside this function rather than beside
-    // it, which is the point: `hitTestNodes` and `updateLabels` both call this, so the thing you
-    // can see, the thing you can click and the space the name is placed around are the same circle
-    // again. Kept outside it, the drawn mark ran several times past its own hit target and the
-    // parts of it that did nothing were exactly the parts the reader aimed at.
-    const pointed = std.math.clamp(n.pointer_t, 0, 1);
-    if (pointed <= 0.002) return capped;
-    return capped * std.math.lerp(1.0, ringMultiplier(n), dvui.easing.outCubic(pointed));
+    return @max(@min(want, gap_px * gap_radius_frac), floor);
 }
 
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the

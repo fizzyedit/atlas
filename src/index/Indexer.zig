@@ -46,10 +46,6 @@ const log = std.log.scoped(.atlas);
     degree: u32,
     /// File size in bytes. 0 for phantoms / synth notes that did not set one.
     size: u32 = 0,
-    /// Headings plus body blocks — the interior items a reader meets after diving into this note.
-    /// Read only by the overview's hover expansion, so a note that is about to open into forty
-    /// paragraphs opens a larger ring than a two-line stub. 0 for phantoms and for synth vaults.
-    interior: u32 = 0,
 };
 
 pub const SnapEdge = struct {
@@ -1720,37 +1716,7 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
             .size = @intCast(@max(row.size, 0)),
         });
     }
-    const nodes = try list.toOwnedSlice(arena);
-    try fillInteriorCounts(db, arena, nodes);
-    return nodes;
-}
-
-/// Headings + body blocks per note, as two grouped passes.
-///
-/// Deliberately *not* a correlated subquery per row — that shape is what made degree the largest
-/// single cost of publishing a snapshot on a 283,878-note vault, and the lesson was expensive
-/// enough not to repeat. `headings_note` and `blocks_note` already exist, so each pass is a walk of
-/// one index and the join back onto the node list is `O(notes)`.
-fn fillInteriorCounts(db: *Db, arena: std.mem.Allocator, nodes: []SnapNode) !void {
-    var by_note = std.AutoHashMap(i64, u32).init(arena);
-    try by_note.ensureTotalCapacity(@intCast(@max(nodes.len, 1)));
-
-    inline for (.{
-        "SELECT note_id, count(*) FROM headings GROUP BY note_id",
-        "SELECT note_id, count(*) FROM blocks GROUP BY note_id",
-    }) |sql| {
-        var stmt = try db.conn.prepare(sql);
-        defer stmt.deinit();
-        var iter = try stmt.iterator(struct { note_id: i64, n: i64 }, .{});
-        while (true) {
-            const row = (try iter.next(.{})) orelse break;
-            if (row.n <= 0) continue;
-            const add: u32 = @intCast(row.n);
-            const gop = try by_note.getOrPut(row.note_id);
-            if (gop.found_existing) gop.value_ptr.* +|= add else gop.value_ptr.* = add;
-        }
-    }
-    for (nodes) |*n| n.interior = by_note.get(n.id) orelse 0;
+    return list.toOwnedSlice(arena);
 }
 
 fn loadSnapEdges(db: *Db, arena: std.mem.Allocator) ![]const SnapEdge {
