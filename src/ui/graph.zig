@@ -189,7 +189,6 @@ const max_shove_slots: f32 = 2.0;
 const hover_chase_k: f32 = 14;
 /// Dwell before the mass-influence ring appears. A glance should not paint a second disc
 /// around every note the cursor skims; 400 ms is long enough to mean "I am looking at this."
-const mass_ring_dwell_s: f32 = 0.40;
 /// Chase rate for the button-style pointer highlight (1/s). Snappier than the proximity
 /// swell — this one is a direct answer to "the cursor is on me", so it should feel instant.
 const pointer_chase_k: f32 = 22;
@@ -855,18 +854,15 @@ pub const Panel = struct {
     /// individual note. Mutually exclusive with `hover_node` — only one of the two is drawn at
     /// any given place on screen.
     hover_cluster: ?Visible = null,
-    /// Seconds the current hover target has been held. The mass ring waits for
-    /// `mass_ring_dwell_s` so a skim does not flash influence discs across the field.
-    hover_dwell_s: f32 = 0,
-    /// Packed hover identity: `note_index` or `1<<32 | cell`. Null when nothing is hovered.
-    hover_dwell_key: ?u64 = null,
-    /// 0..1 ease of the mass-influence ring. Chases 1 after the dwell, 0 when the cursor leaves.
-    hover_mass_t: f32 = 0,
-    /// Last cell the ring was aimed at, so it can fade out in place after the cursor leaves.
-    hover_mass_cell: u32 = fold.invalid,
-    hover_mass_wx: f32 = 0,
-    hover_mass_wy: f32 = 0,
-    hover_mass_visual: f32 = 0,
+    /// Which note owns the hover ring right now.
+    ///
+    /// Not the same question as `hover_node`. `pointer_t` decays over several frames after the
+    /// cursor moves off, so for a moment *two* notes have a non-zero value — the one arriving and
+    /// the one leaving — and `world_draw` keeps a single slot for the ring, which the later mark in
+    /// the list wins. That is how a ring ended up drawn around a note the cursor was nowhere near.
+    /// The arriving note takes ownership immediately; the leaving one keeps its ease only until
+    /// something else claims it.
+    halo_node: ?usize = null,
     /// Soft-sprite atlas + same-language density mips (Galaxy LOD).
     density: ?galaxy.Density = null,
 
@@ -1320,7 +1316,6 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
         _ = profLap(&prof);
         // One hierarchy, positions derived from it. Owns the whole overview.
         drawWorldMarks(p, 1 - t);
-        drawMassInfluenceRing(p, 1 - t);
         frame_profile.draw_edges_ns = profLap(&prof);
         frame_profile.draw_nodes_ns = 0;
         frame_profile.draw_clusters_ns = 0;
@@ -1724,9 +1719,9 @@ fn updateHover(p: *Panel) void {
         // a note could not open its document.
         p.hover_node = hitTestNodes(p, p.nodes, p.layout_slot, mouse);
         p.hover_cluster = if (p.hover_node != null) null else hitTestClusters(p, mouse);
+        if (p.hover_node) |i| p.halo_node = i;
     }
 
-    stepMassRing(p, inside_interior);
 
     const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
     const t_chase = 1.0 - @exp(-pointer_chase_k * dt);
@@ -4303,9 +4298,10 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         border_rest;
 
     // The dashed clearing, and the request to be painted last.
+    const owns_halo = if (p.halo_node) |h| h == m.note else false;
     var halo_r: f32 = 0;
     var halo_fill = border_rest;
-    if (m.is_note and m.note < p.nodes.len and pointed > 0.002) {
+    if (owns_halo and m.is_note and m.note < p.nodes.len and pointed > 0.002) {
         halo_r = hoverHaloRadius(p.nodes[m.note], zoom_t, gap_px);
         // The lit fill, because the clearing *is* the node now — it covers it completely, so
         // taking the resting colour would mean hovering changed nothing the reader can see.
@@ -4317,7 +4313,7 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         .border = border,
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
-        .on_top = pointed > 0.002,
+        .on_top = owns_halo and pointed > 0.002,
         .halo_r_px = halo_r,
         .halo_fill = halo_fill,
     };
@@ -4367,96 +4363,6 @@ fn drawWorldMarks(p: *Panel, fade: f32) void {
 }
 
 /// Packed identity for the mass-ring dwell: a note index, or a coalesced cell with the high bit.
-fn hoverDwellKey(p: *const Panel) ?u64 {
-    if (p.hover_node) |i| return i;
-    if (p.hover_cluster) |c| return (@as(u64, 1) << 32) | c.index;
-    return null;
-}
-
-/// After 400 ms on the same mark, ease in a dashed ring at that body's push radius — the
-/// room it already claimed for its interior, which is why a large file sits in a clearing.
-fn stepMassRing(p: *Panel, inside_interior: bool) void {
-    const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
-    const key: ?u64 = if (inside_interior) null else hoverDwellKey(p);
-    if (key != p.hover_dwell_key) {
-        p.hover_dwell_key = key;
-        p.hover_dwell_s = 0;
-    }
-    if (key != null) p.hover_dwell_s += dt else p.hover_dwell_s = 0;
-
-    var showing = false;
-    if (!inside_interior and p.hover_dwell_s >= mass_ring_dwell_s) {
-        if (resolveMassRingTarget(p)) |t| {
-            p.hover_mass_cell = t.cell;
-            p.hover_mass_wx = t.wx;
-            p.hover_mass_wy = t.wy;
-            p.hover_mass_visual = t.visual;
-            showing = true;
-        }
-    }
-
-    const t_chase = 1.0 - @exp(-hover_chase_k * dt);
-    const want: f32 = if (showing) 1 else 0;
-    p.hover_mass_t += (want - p.hover_mass_t) * t_chase;
-    if (@abs(p.hover_mass_t - want) <= 0.004) p.hover_mass_t = want;
-
-    const dwelling = key != null and p.hover_dwell_s < mass_ring_dwell_s;
-    const chasing = p.hover_mass_t != want;
-    if (dwelling or chasing) {
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-    }
-}
-
-const MassRingTarget = struct { cell: u32, wx: f32, wy: f32, visual: f32 };
-
-fn resolveMassRingTarget(p: *Panel) ?MassRingTarget {
-    const w = if (p.world_state) |*ws| ws else return null;
-    if (p.hover_node) |ni| {
-        for (w.marks.items) |m| {
-            if (!m.is_note or m.note != ni) continue;
-            const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
-            const gap_px = p.layout_slot * p.camera.zoom;
-            const visual = if (ni < p.nodes.len)
-                bubbleScreenRadius(p.nodes[ni], zoom_t, gap_px)
-            else
-                m.r;
-            return .{ .cell = m.cell, .wx = m.wx, .wy = m.wy, .visual = visual };
-        }
-        return null;
-    }
-    if (p.hover_cluster) |c| {
-        for (w.marks.items) |m| {
-            if (m.is_note or m.cell != c.index) continue;
-            return .{ .cell = m.cell, .wx = m.wx, .wy = m.wy, .visual = m.r };
-        }
-    }
-    return null;
-}
-
-fn drawMassInfluenceRing(p: *Panel, fade: f32) void {
-    if (p.hover_mass_t < 0.01 or fade < 0.05) return;
-    if (p.hover_mass_cell == fold.invalid) return;
-    const w = if (p.world_state) |*ws| ws else return;
-    const dens = p.ensureDensity() orelse return;
-    const sr = w.field.separationRadius(&w.lad, p.hover_mass_cell);
-    const target_px = sr * p.camera.zoom;
-    const visual = p.hover_mass_visual;
-    const t = p.hover_mass_t;
-    const r_px = visual + (@max(target_px, visual) - visual) * t;
-    if (r_px < 4) return;
-
-    const theme = dvui.themeGet();
-    const screen = p.camera.worldToScreen(.{ .x = p.hover_mass_wx, .y = p.hover_mass_wy });
-    var buf: [1]galaxy.StyledMark = .{.{
-        .screen = screen,
-        .r_px = r_px,
-        .fill = theme.color(.highlight, .fill).opacity(0.15),
-        .border = theme.color(.highlight, .fill),
-        .is_note = false,
-    }};
-    _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade * t, &buf);
-}
-
 /// Publish the world's leaf poses back onto `p.nodes`, and mark which notes are drawn as
 /// themselves this frame.
 ///
