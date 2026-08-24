@@ -112,9 +112,29 @@ const max_node_screen_r: f32 = 48;
 /// large the instant the descent begins, not snap down to some other resting size and grow back.
 const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
-/// Extra grow for the one node under the cursor, on top of the proximity field. See
-/// `bubbleScreenRadius`.
-const pointer_grow_factor: f32 = 0.9;
+/// Extra grow for the one node under the cursor, on top of the proximity field — the range it
+/// spans between an empty note and a large one. See `pointerGrow`.
+const pointer_grow_min: f32 = 0.25;
+const pointer_grow_max: f32 = 2.0;
+/// Interior item count at which the expansion reaches `pointer_grow_max`. Logarithmic below it,
+/// because the spread on a real vault runs from 0 to several hundred and a linear law would leave
+/// every ordinary note indistinguishable at the bottom of the range.
+const pointer_grow_ref: f32 = 64;
+
+/// How far the node under the cursor opens, by how much is inside it.
+///
+/// The point is to answer "what am I about to open" before the reader commits. A two-line stub
+/// barely moves; a note with forty paragraphs opens a visible clearing. It is an honest indicator
+/// of size rather than a literal preview: `buildInteriorWorld` normalises every cloud to the same
+/// berth on purpose — `scale = berth / extent` — so the interior's own footprint carries no size
+/// information to match against, and changing that is what would make a two-item note and a
+/// two-hundred-item note settle at different zooms.
+fn pointerGrow(n: GraphNode) f32 {
+    if (n.is_sun) return sun_grow_factor;
+    const items: f32 = @floatFromInt(n.interior_items);
+    const t = std.math.clamp(@log2(1 + items) / @log2(1 + pointer_grow_ref), 0, 1);
+    return std.math.lerp(pointer_grow_min, pointer_grow_max, t);
+}
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
 /// The same for a merged region, which is drawn at the size of the area it covers rather than at
@@ -297,6 +317,13 @@ const GraphNode = struct {
     /// fade pass tell "placed this frame" from "was showing a moment ago" without a per-node
     /// array — see `updateLabels`.
     label_epoch: u32 = 0,
+    /// Headings + body blocks in this note — how much is waiting inside it.
+    ///
+    /// Presentation only. It sizes the hover expansion so the ring says something about the
+    /// document before you commit to opening it, and it is read nowhere else: the layout, the
+    /// ladder and the LOD thresholds must not move with content, or every edit to a note reshapes
+    /// the vault around it.
+    interior_items: u32 = 0,
 };
 
 /// Bumped once per `updateLabels` call, so a node's `label_epoch` names one specific run.
@@ -2335,6 +2362,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
             .title = title,
             .phantom = info.phantom,
             .degree = job.degrees[gi],
+            .interior_items = info.interior,
             .link_sig = sigs[gi],
             .target = start,
             .home = start,
@@ -5064,15 +5092,24 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     // grows the click target with the ring, and `updateLabels` re-places the name against the
     // expanded disc — which is why a hovered node's label steps clear rather than sitting on it.
     const pointed = std.math.clamp(n.pointer_t, 0, 1);
-    const pointer_boost = pointer_grow_factor * dvui.easing.outBack(pointed);
+    const pointer_boost = pointerGrow(n) * dvui.easing.outBack(pointed);
     // `gap_px` comes from the camera and is already physical, so the tuned sizes join it there.
     const s = dpiScale();
-    const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s;
+    // Both ceilings relax by exactly what the pointer opened.
+    //
+    // `max_node_screen_r` and the lattice-gap cap below both exist to stop a node swallowing its
+    // neighbours at coarse zoom, and at overview density the gap cap is what binds — it is a
+    // fraction of the spacing between notes. Applied unchanged to the hovered node they would
+    // clip the expansion away entirely at exactly the zooms where standing out of the crowd is the
+    // whole point, and every note would open by the same clipped amount regardless of what is in
+    // it. Lifting the crowd is the intent, so the caps yield to it and to nothing else.
+    const relax = 1.0 + pointer_boost;
+    const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s * relax;
     const want = @min(base * s * (1.0 + zoom_boost + hover_boost + pointer_boost), cap);
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
-    return @max(@min(want, gap_px * gap_radius_frac), floor);
+    return @max(@min(want, gap_px * gap_radius_frac * relax), floor);
 }
 
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the
