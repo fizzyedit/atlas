@@ -335,11 +335,22 @@ pub fn draw(
     for (w.marks.items) |m| {
         const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
         const style = dctx.style(dctx.ctx, w, m, holds_open);
+        // `Mark.alpha`, finally applied.
+        //
+        // This is the entire mechanism by which a split or a merge is continuous. `present` chases
+        // `anim` toward the topology decision, slides a closing cell's children in toward their
+        // parent's centre, and hands each one an alpha that falls to zero as it arrives — and none
+        // of it reached the screen, because `MarkStyle` carries colours and `StyledMark` had
+        // nowhere to put a per-mark opacity. Marks were painted at full strength until `present`
+        // stopped emitting them below 0.02, so a merge read as the children sliding to the middle
+        // and then vanishing on one frame. The parent mass fading *in* underneath was lost the same
+        // way, which is the other half of the crossfade.
+        const a = std.math.clamp(m.alpha, 0, 1);
         buf[n] = .{
             .screen = toScreen(cam, dctx, m),
             .r_px = style.r_px,
-            .fill = style.fill,
-            .border = style.border,
+            .fill = withAlpha(style.fill, a),
+            .border = withAlpha(style.border, a),
             .is_note = style.is_note,
             .dying = false,
         };
