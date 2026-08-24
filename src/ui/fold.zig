@@ -87,7 +87,7 @@ pub const Cell = struct {
     /// counterpart to `level`, and the one anything reasoning about how much room a subtree needs
     /// wants.
     height: u16 = 0,
-    /// Total incident link weight of the notes beneath this cell.
+    /// Total incident link *count* of the notes beneath this cell — raw degree, summed.
     ///
     /// `count` is how many notes a cell holds, which is the right measure of the *area* it needs
     /// and the wrong one for how much it matters. Every leaf has a count of exactly one, so at the
@@ -158,8 +158,12 @@ pub const Ladder = struct {
 
 pub const Options = struct {
     arity: Arity = .seven,
-    /// Weight of note↔folder and folder↔parent-folder edges, against 1.0 for a real link.
+    /// Weight of note↔folder and folder↔parent-folder edges, against 1.0 for a *typical* real
+    /// link — see `degree_norm`, which is what keeps "typical" meaning 1.0.
     folder_w: f32 = 0.25,
+    /// How hard to discount a link for the popularity of its endpoints. 0 is off; 1 is the full
+    /// `1/√(deg_a · deg_b)` normalisation. See `degreeNormalised`.
+    degree_norm: f32 = 1.0,
     /// Safety stop. A correct run terminates in ~log_arity(n) levels.
     max_levels: u16 = 40,
     /// Checked between coarsening levels so a caller running this on a worker can abandon it.
@@ -170,6 +174,73 @@ pub const Options = struct {
     /// join is the whole build, and closing the editor mid-build looks like a hang.
     cancel: ?*std.atomic.Value(bool) = null,
 };
+
+/// Discount every link by how popular its endpoints are: `w · K^p / (deg_a · deg_b)^(p/2)`.
+///
+/// On a wiki most links are stopwords. Two thirds of Simple English Wikipedia's edges have an
+/// endpoint above degree 128 — links to *France*, *country*, *year* — and they say almost nothing
+/// about the note that carries them, because nearly every note carries them. Weighted equally with
+/// everything else they dominate three separate decisions at once: which notes coarsen together,
+/// which lines the ambient web spends its budget on, and which neighbours a focused note shows.
+///
+/// This is Salton's cosine normalisation, and the intuition is the same one that makes it work for
+/// text: a term that appears everywhere carries no information about the document it appears in. A
+/// link between two obscure notes is evidence that they are related; a link to *France* is evidence
+/// of nothing.
+///
+/// `K` is the mean degree, so a link between two typical notes comes out at 1.0 and every constant
+/// calibrated against "a real link" — `folder_w` above, the link budgets downstream — keeps its
+/// meaning. At `p = 1` on the reference corpus this runs from about 0.06 for a link to the largest
+/// hub up to about 4 for a link between two rarely-cited notes.
+pub fn degreeNormalised(
+    gpa: std.mem.Allocator,
+    n_notes: usize,
+    links: []const Edge,
+    p: f32,
+) ![]Edge {
+    const out = try gpa.alloc(Edge, links.len);
+    errdefer gpa.free(out);
+    if (p == 0 or links.len == 0) {
+        @memcpy(out, links);
+        return out;
+    }
+
+    const deg = try gpa.alloc(f32, n_notes);
+    defer gpa.free(deg);
+    @memset(deg, 0);
+    var counted: usize = 0;
+    for (links) |e| {
+        if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+        deg[e.a] += 1;
+        deg[e.b] += 1;
+        counted += 1;
+    }
+    if (counted == 0) {
+        @memcpy(out, links);
+        return out;
+    }
+    const mean_deg: f32 = 2.0 * @as(f32, @floatFromInt(counted)) / @as(f32, @floatFromInt(n_notes));
+
+    const k2 = mean_deg * mean_deg;
+    if (p == 1) {
+        // The overwhelmingly common case, and `pow(x, 0.5)` is a library call where `@sqrt` is one
+        // instruction. Over 3.3M edges that is most of the cost of this function.
+        for (links, out) |e, *o| {
+            o.* = e;
+            if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+            o.w = e.w * @sqrt(k2 / (@max(deg[e.a], 1) * @max(deg[e.b], 1)));
+        }
+        return out;
+    }
+    for (links, out) |e, *o| {
+        o.* = e;
+        if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+        const da = @max(deg[e.a], 1);
+        const db = @max(deg[e.b], 1);
+        o.w = e.w * std.math.pow(f32, k2 / (da * db), p * 0.5);
+    }
+    return out;
+}
 
 /// Build the ladder. `paths` may be empty (no folder nodes); otherwise `paths[i]` is note `i`'s
 /// vault-relative path and only its directory part is used.
@@ -187,9 +258,11 @@ pub fn build(
     const arena = arena_state.allocator();
 
     // ---- augment: folder nodes -------------------------------------------------------------
+    const scored = try degreeNormalised(arena, n_notes, links, opts.degree_norm);
+
     var edges: std.ArrayListUnmanaged(Edge) = .empty;
     try edges.ensureTotalCapacity(arena, links.len + n_notes * 2);
-    for (links) |e| {
+    for (scored) |e| {
         if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
         edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = e.w });
     }
@@ -211,13 +284,16 @@ pub fn build(
         }
     }
 
-    // Link mass per note, from the real links only — see `Cell.weight`.
+    // Link mass per note — see `Cell.weight`. Raw degree, deliberately *not* the normalised
+    // weight: normalisation exists to stop a hub dominating the *grouping*, while mass exists to
+    // make a hub look like the star it is. Counting edges rather than summing weights keeps the two
+    // independent, so tuning `degree_norm` never quietly resizes anything.
     const wnote = try arena.alloc(f32, n_notes);
     @memset(wnote, 0);
     for (links) |e| {
         if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
-        wnote[e.a] += e.w;
-        wnote[e.b] += e.w;
+        wnote[e.a] += 1;
+        wnote[e.b] += 1;
     }
 
     // ---- coarsen ---------------------------------------------------------------------------
@@ -276,7 +352,7 @@ pub fn build(
     }
     lad.depth = deepest;
 
-    try buildPairs(gpa, &lad, links, n_notes);
+    try buildPairs(gpa, &lad, scored, n_notes);
     return lad;
 }
 

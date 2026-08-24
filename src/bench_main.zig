@@ -59,6 +59,9 @@ var world_pan: bool = false;
 /// `--zoom-mul=F`: zoom ratio between sweep steps. The default doubling can step clean over a
 /// narrow band, which is exactly how a band-shaped bug hides from this sweep.
 var world_zoom_mul: f32 = 2.0;
+/// `--degree-norm=F`: `fold.Options.degree_norm`, how hard a link is discounted for the popularity
+/// of its endpoints.
+var fold_degree_norm: ?f32 = null;
 /// `--fill=F`, `--radius-exp=F`, `--pack-gap=F`: `containment.Options`, so the layout's tuning can
 /// be swept against the layout report instead of guessed at and rebuilt.
 var place_fill: ?f32 = null;
@@ -139,6 +142,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) {
             world_zoom_mul = try std.fmt.parseFloat(f32, a["--zoom-mul=".len..]);
         }
+        if (std.mem.startsWith(u8, a, "--degree-norm=")) {
+            fold_degree_norm = try std.fmt.parseFloat(f32, a["--degree-norm=".len..]);
+        }
         if (std.mem.startsWith(u8, a, "--fill=")) {
             place_fill = try std.fmt.parseFloat(f32, a["--fill=".len..]);
         }
@@ -206,6 +212,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--pan-px=")) continue;
         if (std.mem.startsWith(u8, a, "--focus=")) continue;
         if (std.mem.startsWith(u8, a, "--fill=")) continue;
+        if (std.mem.startsWith(u8, a, "--degree-norm=")) continue;
         if (std.mem.startsWith(u8, a, "--radius-exp=")) continue;
         if (std.mem.startsWith(u8, a, "--pack-gap=")) continue;
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) continue;
@@ -427,7 +434,9 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     if (place_fill) |v| place_opts.fill = v;
     if (place_radius_exp) |v| place_opts.radius_exp = v;
     if (place_pack_gap) |v| place_opts.pack_gap = v;
-    var w = try world_mod.World.init(gpa, n, edges, paths, .{}, place_opts);
+    var fold_opts: fold.Options = .{};
+    if (fold_degree_norm) |v| fold_opts.degree_norm = v;
+    var w = try world_mod.World.init(gpa, n, edges, paths, fold_opts, place_opts);
     defer w.deinit();
     const build_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
 
@@ -468,7 +477,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     var web_ns: u64 = 0;
     {
         const f0 = std.Io.Clock.boot.now(io).nanoseconds;
-        var lad2 = try fold.build(gpa, n, edges, paths, .{});
+        var lad2 = try fold.build(gpa, n, edges, paths, fold_opts);
         defer lad2.deinit(gpa);
         const f1 = std.Io.Clock.boot.now(io).nanoseconds;
         var web2 = try cellweb.build(gpa, &lad2, edges);

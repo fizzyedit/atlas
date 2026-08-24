@@ -537,7 +537,17 @@ pub const World = struct {
         fold_opts: fold.Options,
         place_opts: containment.Options,
     ) !World {
-        var lad = try fold.build(gpa, n_notes, links, paths, fold_opts);
+        // Discount the stopword links once, here, and hand the same array to both consumers.
+        //
+        // `fold.build` would do it itself, and `cellweb` needs it too — but doing it in both places
+        // means two passes over 3.3M edges and two 40 MB allocations on every republish, for one
+        // answer. Computed once and passed down with the option zeroed so `fold` does not redo it.
+        const scored = try fold.degreeNormalised(gpa, n_notes, links, fold_opts.degree_norm);
+        defer gpa.free(scored);
+        var scored_opts = fold_opts;
+        scored_opts.degree_norm = 0;
+
+        var lad = try fold.build(gpa, n_notes, scored, paths, scored_opts);
         errdefer lad.deinit(gpa);
         const n_cells = lad.cells.len;
 
@@ -570,7 +580,9 @@ pub const World = struct {
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
-        w.web = try cellweb.build(gpa, &w.lad, links);
+        // The same array the coarsening used, so the drawn web cannot disagree with the hierarchy
+        // about which links matter.
+        w.web = try cellweb.build(gpa, &w.lad, scored);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
@@ -1765,9 +1777,17 @@ test "the cell-web lift matches a brute-force note-level lift" {
         try w.liftLinks(p, 1.0);
 
         // Brute force, over the same cut: every edge onto the cut cell owning each endpoint.
+        //
+        // Over the *same weights*, too. `World.init` discounts a link by the popularity of its
+        // endpoints before handing it to `cellweb` (see `fold.degreeNormalised`), so a brute force
+        // fed raw weights would be comparing the lift against a different graph and failing for a
+        // reason that has nothing to do with the lift.
+        const scored = try fold.degreeNormalised(gpa, n, edges.items, (fold.Options{}).degree_norm);
+        defer gpa.free(scored);
+
         var want: std.AutoHashMapUnmanaged(u64, f32) = .empty;
         defer want.deinit(gpa);
-        for (edges.items) |e| {
+        for (scored) |e| {
             const la = w.lad.leaf_cell[e.a];
             const lb = w.lad.leaf_cell[e.b];
             if (la == fold.invalid or lb == fold.invalid) continue;

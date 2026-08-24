@@ -110,8 +110,9 @@ const separation_k: f32 = 0.72;
 /// rules; separation is what decides the spacing.
 const cohesion_k: f32 = 0.05;
 const link_k: f32 = 0.10;
-/// How far the `ext` aim nudges per step, as a fraction of the parent radius.
-const ext_k_step: f32 = 0.01;
+/// Where the `ext` aim pulls a child toward, as a fraction of the parent radius. Out near the rim,
+/// because a child pointing at something outside the cell belongs on that side of it.
+const ext_rim: f32 = 0.8;
 
 /// Wrap an angle into `[0, τ)`.
 fn wrapTau(a: f32) f32 {
@@ -292,9 +293,19 @@ pub const Field = struct {
 
         // Where each child's out-of-cell neighbours lie, as one unit direction per child.
         var ext_dir: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
+        var ext_mag: [8]f32 = .{0} ** 8;
         if (self.opts.ext_k != 0) {
             for (lad.extOf(cell)) |e| {
                 if (e.child >= n or e.toward >= self.pos.len) continue;
+                // A target that has not been placed yet still has `pos` of `{0, 0}`, which is a
+                // perfectly valid coordinate — it is the root's centre — so aiming at it is not
+                // detectably wrong, it is just wrong. Placement is lazy and depth-first, so roughly
+                // half of a cell's out-of-cell neighbours are unplaced when it expands, and every
+                // one of them was dragging a child toward the middle of the vault under the name of
+                // pointing at a neighbour. The old slot search survived this because `ext` only
+                // broke ties there; here it chooses the seed outright, and a wrong direction is the
+                // whole answer.
+                if (!self.isPlaced(lad, e.toward)) continue;
                 const tx = self.pos[e.toward].x - centre.x;
                 const ty = self.pos[e.toward].y - centre.y;
                 const tl = @sqrt(tx * tx + ty * ty);
@@ -304,6 +315,11 @@ pub const Field = struct {
             }
             for (0..n) |i| {
                 const l = @sqrt(ext_dir[i].x * ext_dir[i].x + ext_dir[i].y * ext_dir[i].y);
+                // How much this child wants a direction at all, kept before the vector is
+                // normalised away. A child pulled hard in one direction and a child pulled feebly
+                // in two opposing ones both end up with a unit vector, and they should not get an
+                // equal say in the assignment below.
+                ext_mag[i] = l;
                 if (l > 1e-6) {
                     ext_dir[i].x /= l;
                     ext_dir[i].y /= l;
@@ -385,9 +401,12 @@ pub const Field = struct {
             for (0..m) |off| {
                 var cost: f32 = 0;
                 for (0..m) |k| {
-                    const wa = want[order[k]];
+                    const child = order[k];
+                    const wa = want[child];
                     if (std.math.isNan(wa)) continue;
-                    cost += angleGap(wa, slot_a[slot_order[(k + off) % m]]);
+                    // Weighted by how much the child wants it, so the strongest pull gets the
+                    // closest slot when they cannot all be satisfied.
+                    cost += ext_mag[idx[child]] * angleGap(wa, slot_a[slot_order[(k + off) % m]]);
                 }
                 if (cost < best_cost) {
                     best_cost = cost;
@@ -437,15 +456,6 @@ pub const Field = struct {
                 p[a].y += dy * f * share;
                 p[b].x -= dx * f * (1 - share);
                 p[b].y -= dy * f * (1 - share);
-            }
-
-            // aim outward at what we link to
-            if (self.opts.ext_k != 0) {
-                const reach = self.opts.ext_k * ext_k_step * r_parent;
-                for (0..n) |i| {
-                    p[i].x += ext_dir[i].x * reach;
-                    p[i].y += ext_dir[i].y * reach;
-                }
             }
 
             // separation — last, and it wins
@@ -505,9 +515,63 @@ pub const Field = struct {
             p[big] = .{ .x = 0, .y = 0 };
         }
 
+        // Finally, turn the whole cell to face its neighbours.
+        //
+        // A rigid rotation about the centre changes no distance between any two bodies, so it
+        // cannot undo the packing the relaxation just found — separation, containment and the
+        // sibling links are all invariant under it. What it *can* fix is the one thing they leave
+        // undetermined: which way the arrangement points.
+        //
+        // Trying to steer for this during the relaxation does not work. `ext` is one force among
+        // several there, and on a cell whose children are chained to each other the chain wins —
+        // aim came out worse than seeding at random, because the pull dragged one child off its
+        // spiral slot and the sibling attraction then dragged it somewhere else entirely. Rotation
+        // sidesteps the competition: settle the shape first, then point it.
+        //
+        // Closed form. Maximising `Σ wᵢ·cos(aᵢ + θ − tᵢ)` over θ is maximising
+        // `Re[e^{iθ} · Σ wᵢ·e^{i(aᵢ − tᵢ)}]`, so the best θ is minus the argument of that sum. It
+        // also replaces the per-cell hash rotation as the thing that decides orientation, which is
+        // strictly better: the cell now faces something real instead of facing nowhere in
+        // particular.
+        if (self.opts.ext_k != 0) {
+            var sx: f64 = 0;
+            var sy: f64 = 0;
+            for (0..n) |i| {
+                if (i == big or ext_mag[i] <= 1e-6) continue;
+                const d = @sqrt(p[i].x * p[i].x + p[i].y * p[i].y);
+                if (d < 1e-6) continue;
+                const ai = std.math.atan2(p[i].y, p[i].x);
+                const ti = std.math.atan2(ext_dir[i].y, ext_dir[i].x);
+                sx += @as(f64, ext_mag[i]) * @cos(@as(f64, ai - ti));
+                sy += @as(f64, ext_mag[i]) * @sin(@as(f64, ai - ti));
+            }
+            if (@abs(sx) > 1e-9 or @abs(sy) > 1e-9) {
+                const theta: f32 = @floatCast(-std.math.atan2(sy, sx));
+                const cs = @cos(theta);
+                const sn = @sin(theta);
+                for (0..n) |i| {
+                    const x = p[i].x;
+                    const y = p[i].y;
+                    p[i].x = x * cs - y * sn;
+                    p[i].y = x * sn + y * cs;
+                }
+            }
+        }
+
         for (kids, 0..) |k, i| {
             self.pos[k] = .{ .x = centre.x + p[i].x, .y = centre.y + p[i].y };
         }
+    }
+
+    /// Has this cell been given a position yet?
+    ///
+    /// Placement is lazy: a cell is positioned by its parent's `ensureChildren`, so it is placed
+    /// exactly when its parent has been expanded. Roots are placed up front by `placeRoots`.
+    pub fn isPlaced(self: Field, lad: *const fold.Ladder, cell: u32) bool {
+        if (cell >= lad.cells.len) return false;
+        const parent = lad.cells[cell].parent;
+        if (parent == fold.invalid) return true; // a root
+        return parent < self.expanded.len and self.expanded[parent];
     }
 
     /// How much room a body asks its neighbours for, which is not the same as the disc it occupies.
