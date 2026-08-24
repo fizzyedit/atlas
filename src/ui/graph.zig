@@ -116,16 +116,24 @@ const max_sun_screen_r: f32 = 58;
 const hover_fill_mix: f32 = 0.45;
 /// The hover ring's size, as a multiple of the largest a normal note is drawn at. See
 /// `ringMultiplier`.
-/// The floor: an empty note still opens to twice the biggest dot on screen, which is what makes
-/// the ring unmistakably a ring rather than a slightly larger disc.
-const hover_ring_min_mult: f32 = 2.0;
-/// The ceiling, for a long document.
-const hover_ring_max_mult: f32 = 7.0;
-/// Added multiple per √item, above the floor. Square root rather than logarithm: a log law
-/// compresses the top of the range so hard that a ten-item note and a two-hundred-item one open by
-/// nearly the same amount, which is the distinction this exists to draw. At this value an ordinary
-/// note of around ten items sits at 3x, forty items at 4x, and the ceiling arrives near 250.
-const pointer_grow_k: f32 = 0.32;
+/// The floor: a note with nothing in it gets no extra size at all, only the ordinary proximity
+/// swell every note near the cursor already has. Growth here is *information* — it says how much is
+/// waiting inside — so a note with nothing to say should not claim any of it.
+const hover_ring_min_mult: f32 = 1.0;
+/// The ceiling, for a document long enough that its size is the point.
+const hover_ring_max_mult: f32 = 3.0;
+/// Added multiple per √item, above the floor.
+///
+/// Deliberately shallow. The dashed rim already announces which note the cursor is on, so size does
+/// not have to carry that too and is free to mean only one thing: how much is inside. A ramp steep
+/// enough to make an ordinary note double is a ramp on which almost every note looks large, and a
+/// difference every note shares is not a difference. At this value ten items comes to 1.16, fifty
+/// to 1.35, two hundred to 1.7, and the ceiling belongs to documents of genuinely unusual length.
+///
+/// Square root rather than logarithm: a log law compresses the top of the range so hard that a
+/// ten-item note and a two-hundred-item one open by nearly the same amount, which is the one
+/// distinction this exists to draw.
+const pointer_grow_k: f32 = 0.05;
 
 /// How far the node under the cursor opens, by how much is inside it, as a multiple of the largest
 /// a normal note is drawn at.
