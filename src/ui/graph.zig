@@ -112,14 +112,34 @@ const max_node_screen_r: f32 = 48;
 /// large the instant the descent begins, not snap down to some other resting size and grow back.
 const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
+/// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
+const hover_fill_mix: f32 = 0.45;
 /// Extra grow for the one node under the cursor, on top of the proximity field — the range it
 /// spans between an empty note and a large one. See `pointerGrow`.
 const pointer_grow_min: f32 = 0.25;
-const pointer_grow_max: f32 = 2.0;
-/// Interior item count at which the expansion reaches `pointer_grow_max`. Logarithmic below it,
-/// because the spread on a real vault runs from 0 to several hundred and a linear law would leave
-/// every ordinary note indistinguishable at the bottom of the range.
-const pointer_grow_ref: f32 = 64;
+const pointer_grow_max: f32 = 5.0;
+/// Growth per √item. Square root rather than logarithm: a log law compresses the top of the range
+/// so hard that a ten-item note and a two-hundred-item one open by nearly the same amount, which is
+/// the distinction this exists to draw. Tuned so an ordinary note — around ten headings and blocks
+/// — lands at 1.0, meaning twice its drawn size.
+const pointer_grow_k: f32 = 0.32;
+
+/// The dashed clearing around the node under the cursor: its drawn radius, times what is inside.
+///
+/// A plain multiple of the *finished* radius, deliberately. The first attempt folded the pointer
+/// growth into `bubbleScreenRadius` ahead of its two ceilings — `max_node_screen_r` and the
+/// lattice-gap cap — and relaxed both by the same factor to stop them clipping it. At overview
+/// density the gap cap is what binds, so every note inflated to about the same fraction of the
+/// lattice spacing whatever was in it: uniformly enormous, and carrying no information at all.
+/// Multiplying the radius you can actually see keeps the promise legible — 2x means twice the disc.
+///
+/// Returns 0 when nothing is hovered, which is the caller's signal that there is no halo to draw.
+fn hoverHaloRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
+    const pointed = std.math.clamp(n.pointer_t, 0, 1);
+    if (pointed <= 0.002) return 0;
+    const grow = pointerGrow(n) * dvui.easing.outBack(pointed);
+    return bubbleScreenRadius(n, zoom_t, gap_px) * (1.0 + grow);
+}
 
 /// How far the node under the cursor opens, by how much is inside it.
 ///
@@ -132,8 +152,7 @@ const pointer_grow_ref: f32 = 64;
 fn pointerGrow(n: GraphNode) f32 {
     if (n.is_sun) return sun_grow_factor;
     const items: f32 = @floatFromInt(n.interior_items);
-    const t = std.math.clamp(@log2(1 + items) / @log2(1 + pointer_grow_ref), 0, 1);
-    return std.math.lerp(pointer_grow_min, pointer_grow_max, t);
+    return std.math.clamp(pointer_grow_k * @sqrt(items), pointer_grow_min, pointer_grow_max);
 }
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
@@ -4273,11 +4292,28 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     else
         border_rest;
 
+    // The dashed clearing, and the request to be painted last.
+    //
+    // The halo's face is the node's *resting* fill, not its hovered one: the effect being drawn is
+    // one node expanding into a dashed container, so the container has to be the same material as
+    // the thing inside it. Taking the lit fill instead would read as a second, brighter object.
+    var halo_r: f32 = 0;
+    var halo_fill = border_rest;
+    if (m.is_note and m.note < p.nodes.len and pointed > 0.002) {
+        halo_r = hoverHaloRadius(p.nodes[m.note], zoom_t, gap_px);
+        var resting = p.nodes[m.note];
+        resting.pointer_t = 0;
+        halo_fill = nodeFill(theme, resting);
+    }
+
     return .{
         .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
         .border = border,
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
+        .on_top = pointed > 0.002,
+        .halo_r_px = halo_r,
+        .halo_fill = halo_fill,
     };
 }
 
@@ -4916,10 +4952,10 @@ fn drawLabels(p: *Panel) void {
         const fade = p.interior.t;
         for (p.interior.nodes, 0..) |n, i| {
             if (p.hover_node == i) continue;
-            drawLabel(n, zoom_t, fade, false);
+            drawLabel(n, zoom_t, fade);
         }
         if (p.hover_node) |i| {
-            if (i < p.interior.nodes.len) drawLabel(p.interior.nodes[i], zoom_t, fade, true);
+            if (i < p.interior.nodes.len) drawLabel(p.interior.nodes[i], zoom_t, fade);
         }
         return;
     }
@@ -4945,20 +4981,59 @@ fn drawLabels(p: *Panel) void {
             if (v.index >= p.nodes.len) continue;
             if (p.hover_node == v.index) continue;
             if (open_idx) |oi| if (oi == v.index) continue;
-            drawLabel(p.nodes[v.index], zoom_t, fade, false);
-        }
-        // The one you pointed at goes on top — it is the only label allowed to sit over another,
-        // and only while a displaced neighbour is still crossfading out — and it takes the
-        // highlight colour, so "which of these am I on" is answered by the name and not only by a
-        // swell that is easy to lose at overview density.
-        if (p.hover_node) |i| {
-            const is_open = if (open_idx) |oi| oi == i else false;
-            if (!is_open and i < p.nodes.len and p.at_level0.len == p.nodes.len and p.at_level0[i]) {
-                drawLabel(p.nodes[i], zoom_t, fade, true);
-            }
+            if (p.hover_node == v.index) continue; // `drawHoverLabel` owns this one
+            drawLabel(p.nodes[v.index], zoom_t, fade);
         }
         drawFocusNoteLabel(p, fade);
+        drawHoverLabel(p, fade);
     }
+}
+
+/// The hovered note's name, drawn last and unconditionally, just outside its halo.
+///
+/// Not routed through the placer like every other label. The placer decides which names fit, which
+/// is right for the ambient field and wrong for this one: whether the reader can read the name of
+/// the thing under their cursor must not depend on how crowded that part of the vault is, and at
+/// any zoom where names are being suppressed it is the only way to tell what a click would open.
+///
+/// In the ordinary text colour, not the highlight. The disc under the cursor is already mixed
+/// toward the highlight, and a highlight-coloured name sitting on a highlight-tinted disc is the
+/// one combination that cannot be read.
+fn drawHoverLabel(p: *Panel, fade: f32) void {
+    if (fade <= 0.02) return;
+    const i = p.hover_node orelse return;
+    if (i >= p.nodes.len) return;
+    if (p.at_level0.len != p.nodes.len or !p.at_level0[i]) return;
+    // The focused note already has its own unconditional name; two would sit on each other.
+    if (focusNodeIndex(p)) |oi| {
+        if (oi == i) return;
+    }
+    const n = p.nodes[i];
+    if (n.title.len == 0) return;
+
+    const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), @as(f32, 1));
+    const gap_px = p.layout_slot * p.camera.zoom;
+    const r = @max(hoverHaloRadius(n, zoom_t, gap_px), bubbleScreenRadius(n, zoom_t, gap_px));
+
+    const cw = dvui.currentWindow();
+    const font = dvui.Font.theme(.body).larger(label_font_delta).withWeight(.bold);
+    const size = font.textSize(n.title);
+    const centre = p.camera.worldToScreen(n.pos);
+    const col = dvui.themeGet().color(.content, .text).opacity(fade);
+    dvui.renderText(.{
+        .font = font,
+        .text = n.title,
+        .rs = .{
+            .r = .{
+                .x = centre.x - size.w * 0.5,
+                .y = centre.y + r + label_gap_px * dpiScale(),
+                .w = size.w,
+                .h = size.h,
+            },
+            .s = cw.natural_scale,
+        },
+        .color = col,
+    }) catch {};
 }
 
 /// The focused document's name, drawn last and unconditionally.
@@ -5019,7 +5094,7 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
     }) catch {};
 }
 
-fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32, hot: bool) void {
+fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32) void {
     if (n.label_vis <= 0.02 or n.label_len == 0 or n.label_len > n.title.len) return;
     const alpha = labelReveal(n, zoom_t) * n.label_vis * n.alpha * fade;
     if (alpha <= 0.02) return;
@@ -5036,10 +5111,9 @@ fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32, hot: bool) void {
     else
         body;
 
-    // The name under the cursor answers "which one am I pointing at" — the bubble swells, but at
-    // overview density a swell is easy to lose among its neighbours and the name is the part that
-    // actually identifies it.
-    const base = if (hot) theme.color(.highlight, .fill) else theme.color(.content, .text);
+    // Always the ordinary text colour. The name of the node under the cursor is drawn by
+    // `drawHoverLabel` instead, which does not go through the placer at all.
+    const base = theme.color(.content, .text);
     dvui.renderText(.{
         .font = dvui.Font.theme(.body).larger(label_font_delta),
         .text = text,
@@ -5080,36 +5154,14 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const hover = std.math.clamp(n.hover_t, 0, 1);
     const grow = if (n.is_sun) sun_grow_factor else grow_factor;
     const hover_boost = grow * dvui.easing.outBack(hover);
-    // The node actually under the cursor opens further than the proximity field around it.
-    //
-    // Two channels, deliberately. `hover_t` is a *field* — it falls off with distance and lifts
-    // everything near the pointer, which is what makes a dense region feel responsive. `pointer_t`
-    // is exactly one node. Folding the second into the first would mean either the whole
-    // neighbourhood opening up (unreadable) or the one you are pointing at not standing out at
-    // all, and the reader needs to know which node a click will take.
-    //
-    // Everything downstream reads this radius, so the effects follow for free: `hitTestNodes`
-    // grows the click target with the ring, and `updateLabels` re-places the name against the
-    // expanded disc — which is why a hovered node's label steps clear rather than sitting on it.
-    const pointed = std.math.clamp(n.pointer_t, 0, 1);
-    const pointer_boost = pointerGrow(n) * dvui.easing.outBack(pointed);
     // `gap_px` comes from the camera and is already physical, so the tuned sizes join it there.
     const s = dpiScale();
-    // Both ceilings relax by exactly what the pointer opened.
-    //
-    // `max_node_screen_r` and the lattice-gap cap below both exist to stop a node swallowing its
-    // neighbours at coarse zoom, and at overview density the gap cap is what binds — it is a
-    // fraction of the spacing between notes. Applied unchanged to the hovered node they would
-    // clip the expansion away entirely at exactly the zooms where standing out of the crowd is the
-    // whole point, and every note would open by the same clipped amount regardless of what is in
-    // it. Lifting the crowd is the intent, so the caps yield to it and to nothing else.
-    const relax = 1.0 + pointer_boost;
-    const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s * relax;
-    const want = @min(base * s * (1.0 + zoom_boost + hover_boost + pointer_boost), cap);
+    const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s;
+    const want = @min(base * s * (1.0 + zoom_boost + hover_boost), cap);
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
-    return @max(@min(want, gap_px * gap_radius_frac * relax), floor);
+    return @max(@min(want, gap_px * gap_radius_frac), floor);
 }
 
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the
@@ -5151,7 +5203,13 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
     const target = theme.color(.highlight, .fill);
     // Phantoms are deliberately translucent; keep that while still letting them light up.
     const to = if (n.phantom) target.opacity(0.55) else target;
-    return rest.lerp(to, dvui.easing.outQuad(std.math.clamp(lit, 0, 1)));
+    // Part way, not all the way.
+    //
+    // Going fully to the highlight makes the disc the same colour as the things that mean
+    // "selected" — including its own label, which then becomes unreadable sitting on top of it.
+    // Mixed, the node still clearly lifts out of the field while staying a node rather than
+    // turning into a solid chip of accent.
+    return rest.lerp(to, hover_fill_mix * dvui.easing.outQuad(std.math.clamp(lit, 0, 1)));
 }
 
 /// Floating round "zoom to fit" button in the bottom-right of the graph viewport.

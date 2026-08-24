@@ -30,6 +30,15 @@ pub const MarkStyle = struct {
     border: dvui.Color,
     r_px: f32,
     is_note: bool,
+    /// Draw this mark after every other one, so it is not buried by whatever the mark list happens
+    /// to emit later. Exactly one mark should ask for it — the one under the cursor.
+    on_top: bool = false,
+    /// Radius of a dashed halo to draw around this mark, or 0 for none. Drawn *under* the mark's
+    /// own disc, so the node stays visible at the centre of its clearing.
+    halo_r_px: f32 = 0,
+    /// Face colour of that halo. Opaque, and normally the mark's own resting fill, so the effect
+    /// reads as the node expanding into a dashed container rather than as a second object.
+    halo_fill: dvui.Color = .{},
 };
 
 pub const DrawCtx = struct {
@@ -330,8 +339,12 @@ pub fn draw(
         batch.flush();
     }
 
-    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return stats;
+    // Two extra slots: a mark that asks to go on top is deferred to the end, and it may bring a
+    // halo with it.
+    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len + 2) catch return stats;
     var n: usize = 0;
+    var top: ?galaxy.StyledMark = null;
+    var top_halo: ?galaxy.StyledMark = null;
     for (w.marks.items) |m| {
         const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
         const style = dctx.style(dctx.ctx, w, m, holds_open);
@@ -354,8 +367,41 @@ pub fn draw(
             .is_note = style.is_note,
             .dying = false,
         };
+        if (style.on_top) {
+            // Held back rather than emitted here.
+            //
+            // Marks are drawn in whatever order `present` walked the tree, so the node under the
+            // cursor is routinely painted over by neighbours that happen to come after it — which
+            // is worst exactly where it matters, in the dense regions where the reader most needs
+            // to know what they are pointing at. One mark deferred to the end costs nothing and
+            // makes the answer unambiguous.
+            top = buf[n];
+            if (style.halo_r_px > style.r_px) {
+                top_halo = .{
+                    .screen = buf[n].screen,
+                    .r_px = style.halo_r_px,
+                    .fill = style.halo_fill,
+                    .border = buf[n].border,
+                    .is_note = false,
+                    .halo = true,
+                };
+            }
+            continue;
+        }
         n += 1;
         if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
+    }
+    // The halo first, then the node inside it: the clearing is a container the node sits in, not a
+    // lid over it.
+    if (top_halo) |h| {
+        buf[n] = h;
+        n += 1;
+        stats.clusters_drawn += 1;
+    }
+    if (top) |t| {
+        buf[n] = t;
+        n += 1;
+        if (t.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
     }
     _ = galaxy.drawStyledMarks(&dens.soft, cam, fade, buf[0..n]);
     return stats;

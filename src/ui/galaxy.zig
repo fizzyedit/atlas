@@ -52,6 +52,13 @@ pub const StyledMark = struct {
     border: dvui.Color,
     is_note: bool,
     dying: bool = false,
+    /// Draw as a dashed rim around a *fully opaque* disc.
+    ///
+    /// A coalesced mass uses the same dashed rim but keeps its face at 0.28 so the web reads
+    /// through it — the rim carries the shape and the mass is understood as a container. This is
+    /// the opposite intent: the halo around a hovered note is a clearing, and it has to occlude
+    /// the hairball behind it or the thing it is announcing stays unreadable.
+    halo: bool = false,
 };
 
 /// Shared soft-sprite stack (frustum cull + cheap dense path). Used by harness and plugin.
@@ -125,7 +132,9 @@ pub fn drawStyledMarks(
             }
         } else {
             // Mass: soft disc at low opacity so the dashed rim carries the shape (sun idiom).
-            const face = m.fill.opacity(alpha * 0.28 * dying_a);
+            // A halo is the same rim over a solid face — see `StyledMark.halo`.
+            const face_k: f32 = if (m.halo) 1.0 else 0.28;
+            const face = m.fill.opacity(alpha * face_k * dying_a);
             if (!cheap and r > 4) {
                 sprites.add(.{
                     .center = screen,
