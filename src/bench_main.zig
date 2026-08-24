@@ -653,6 +653,22 @@ fn layoutReport(
     const ext = @max(w.extent(), 1e-3);
     const sample_cap: usize = 60_000;
 
+    // -- 0. degree, so link spread can be read by what kind of link it is -----------------------
+    //
+    // A hub link cannot be short, and no layout can make it short. One note holds one position, so
+    // at arity 7 at most six of a hub's neighbours can be its siblings — the other 29,442 are
+    // somewhere else by arithmetic, not by any failure of placement. Reporting one number over all
+    // links therefore buries the only part that is actually decidable: whether the *local* web,
+    // between ordinary notes, is short. Bucketing by the busier endpoint separates the two.
+    const deg = try gpa.alloc(u32, w.lad.leaf_cell.len);
+    defer gpa.free(deg);
+    @memset(deg, 0);
+    for (edges) |e| {
+        if (e.a >= deg.len or e.b >= deg.len or e.a == e.b) continue;
+        deg[e.a] += 1;
+        deg[e.b] += 1;
+    }
+
     // -- 1. link spread: how far a link has to travel ------------------------------------------
     //
     // The objective for "things that are linked should end up near each other". Note that this is
@@ -690,6 +706,54 @@ fn layoutReport(
                     @as(f64, @floatFromInt(far)) * 100.0 / n,
                 },
             );
+        }
+
+        // The same sample, split by the busier endpoint's degree.
+        const cuts = [_]u32{ 8, 32, 128, 512, std.math.maxInt(u32) };
+        var b_sum: [cuts.len]f64 = .{0} ** cuts.len;
+        var b_far: [cuts.len]usize = .{0} ** cuts.len;
+        var b_n: [cuts.len]usize = .{0} ** cuts.len;
+        var ei: usize = 0;
+        while (ei < edges.len) : (ei += stride) {
+            const e = edges[ei];
+            if (e.a >= deg.len or e.b >= deg.len) continue;
+            const a = w.noteWorldPos(e.a) orelse continue;
+            const b = w.noteWorldPos(e.b) orelse continue;
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            const l = @sqrt(dx * dx + dy * dy);
+            const d = @max(deg[e.a], deg[e.b]);
+            for (cuts, 0..) |c, bi| {
+                if (d <= c) {
+                    b_sum[bi] += l;
+                    b_n[bi] += 1;
+                    if (l > ext * 0.25) b_far[bi] += 1;
+                    break;
+                }
+            }
+        }
+        std.debug.print("     by busier endpoint's degree:\n", .{});
+        var lo: u32 = 0;
+        for (cuts, 0..) |c, bi| {
+            if (b_n[bi] == 0) {
+                lo = c + 1;
+                continue;
+            }
+            const bn: f64 = @floatFromInt(b_n[bi]);
+            var lbuf: [24]u8 = undefined;
+            const name = if (c == std.math.maxInt(u32))
+                try std.fmt.bufPrint(&lbuf, "{d}+", .{lo})
+            else
+                try std.fmt.bufPrint(&lbuf, "{d}-{d}", .{ lo, c });
+            std.debug.print(
+                "       deg {s:>9}   n {d:>6}  ({d:>4.1}% of links)   mean {d:.3}r   crossing {d:.1}%\n",
+                .{
+                    name,                    b_n[bi],
+                    bn * 100.0 / @as(f64, @floatFromInt(lens.items.len)),
+                    b_sum[bi] / bn / ext,    @as(f64, @floatFromInt(b_far[bi])) * 100.0 / bn,
+                },
+            );
+            lo = c + 1;
         }
     }
 
