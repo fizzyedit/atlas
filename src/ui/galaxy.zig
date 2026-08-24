@@ -52,13 +52,15 @@ pub const StyledMark = struct {
     border: dvui.Color,
     is_note: bool,
     dying: bool = false,
-    /// Draw as a dashed rim around a *fully opaque* disc.
+    /// Draw this mark as a dashed rim over a *fully opaque* face, in vector rather than sprites,
+    /// after every other mark.
     ///
-    /// A coalesced mass uses the same dashed rim but keeps its face at 0.28 so the web reads
-    /// through it — the rim carries the shape and the mass is understood as a container. This is
-    /// the opposite intent: the halo around a hovered note is a clearing, and it has to occlude
-    /// the hairball behind it or the thing it is announcing stays unreadable.
-    halo: bool = false,
+    /// For the handful of marks the reader is actually dealing with — the note under the cursor,
+    /// the notes they have open. A coalesced mass uses a dashed rim too but keeps its face at 0.28
+    /// so the web reads through it: a mass is a container you are looking *into*. These are the
+    /// opposite, and have to occlude the hairball behind them or the thing being announced stays
+    /// unreadable.
+    dashed: bool = false,
 };
 
 /// Shared soft-sprite stack (frustum cull + cheap dense path). Used by harness and plugin.
@@ -98,8 +100,8 @@ pub fn drawStyledMarks(
     // for small marks; path strokes stay round when the mark is big on screen.
     const Dash = struct { c: dvui.Point.Physical, r: f32, col: dvui.Color };
     var vector_dashes: std.ArrayListUnmanaged(Dash) = .empty;
-    const Halo = struct { c: dvui.Point.Physical, r: f32, face: dvui.Color, rim: dvui.Color };
-    var halos: std.ArrayListUnmanaged(Halo) = .empty;
+    const Dashed = struct { c: dvui.Point.Physical, r: f32, face: dvui.Color, rim: dvui.Color };
+    var dashed_marks: std.ArrayListUnmanaged(Dashed) = .empty;
 
     for (marks) |m| {
         if (m.dying and m.r_px < 0.8) continue;
@@ -108,6 +110,22 @@ pub fn drawStyledMarks(
         if (screen.x + r < x0 or screen.x - r > x1 or screen.y + r < y0 or screen.y - r > y1) continue;
 
         const dying_a: f32 = if (m.dying) 0.35 else 1;
+        if (m.dashed) {
+            // Drawn the expensive way, and it looks it: a crisp filled circle and a vector dashed
+            // rim, no atlas sprite. The standing rejection of path-stroked dashed rings is about
+            // *thousands* of masses — 4,000 measured at ~8 fps — and says nothing about the two or
+            // three marks the reader is actually dealing with. The sprite's feathered edge is
+            // obvious on a mark you are looking straight at, and its glow pass reads as a second
+            // ring around the first.
+            dashed_marks.append(arena, .{
+                .c = screen,
+                .r = r,
+                .face = m.fill.opacity(alpha * dying_a),
+                .rim = m.border.opacity(0.95 * alpha * dying_a),
+            }) catch {};
+            stats.marks += 1;
+            continue;
+        }
         if (m.is_note) {
             const face = m.fill.opacity(alpha * dying_a);
             if (!cheap and r > 3) {
@@ -132,23 +150,6 @@ pub fn drawStyledMarks(
                     .uv = ring_uv,
                 });
             }
-        } else if (m.halo) {
-            // The hover clearing. Exactly one of these exists per frame, so it is drawn the
-            // expensive way and looks it: a crisp filled circle and a vector dashed rim, no atlas
-            // sprite anywhere. The rejection of path-stroked dashed rings is about *thousands* of
-            // masses; one ring costs nothing and the softness of the sprite path is obvious when
-            // there is a single ring on screen to look at.
-            //
-            // No glow, either. The soft outer falloff a mass gets reads as a second, larger band
-            // around the ring, and the whole point here is that the reader sees one ring.
-            halos.append(arena, .{
-                .c = screen,
-                .r = r,
-                .face = m.fill.opacity(alpha * dying_a),
-                .rim = m.border.opacity(0.95 * alpha * dying_a),
-            }) catch {};
-            stats.marks += 1;
-            continue;
         } else {
             // Mass: soft disc at low opacity so the dashed rim carries the shape (sun idiom).
             const face = m.fill.opacity(alpha * 0.28 * dying_a);
@@ -201,23 +202,20 @@ pub fn drawStyledMarks(
             .color = d.col,
         });
     }
-    // Last of all, over every sprite: a clearing has to occlude the node it grew out of, or the
-    // reader sees a ring with the old dot still sitting inside it instead of one thing expanding.
-    //
-    // Smallest first, so the one nearest the cursor — which the proximity field guarantees is the
-    // largest — ends up on top of its neighbours rather than under whichever of them the mark list
-    // happened to emit later.
+    // Last of all, over every sprite. Smallest first, so the largest — the one under the cursor —
+    // ends up on top rather than under whichever of the others the mark list happened to emit
+    // later.
     const BySize = struct {
-        fn less(_: void, x: Halo, y: Halo) bool {
+        fn less(_: void, x: Dashed, y: Dashed) bool {
             return x.r < y.r;
         }
     };
-    std.mem.sort(Halo, halos.items, {}, BySize.less);
-    for (halos.items) |h| {
-        fillCircle(h.c, h.r, h.face);
-        strokeCircleDashed(h.c, h.r, .{
-            .thickness = std.math.clamp(h.r * 0.07, 1.5, 2.5),
-            .color = h.rim,
+    std.mem.sort(Dashed, dashed_marks.items, {}, BySize.less);
+    for (dashed_marks.items) |d| {
+        fillCircle(d.c, d.r, d.face);
+        strokeCircleDashed(d.c, d.r, .{
+            .thickness = std.math.clamp(d.r * 0.07, 1.5, 2.5),
+            .color = d.rim,
         });
     }
     return stats;

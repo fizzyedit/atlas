@@ -30,15 +30,9 @@ pub const MarkStyle = struct {
     border: dvui.Color,
     r_px: f32,
     is_note: bool,
-    /// Draw this mark after every other one, so it is not buried by whatever the mark list happens
-    /// to emit later. Exactly one mark should ask for it — the one under the cursor.
-    on_top: bool = false,
-    /// Radius of a dashed halo to draw around this mark, or 0 for none. Drawn *under* the mark's
-    /// own disc, so the node stays visible at the centre of its clearing.
-    halo_r_px: f32 = 0,
-    /// Face colour of that halo. Opaque, and normally the mark's own resting fill, so the effect
-    /// reads as the node expanding into a dashed container rather than as a second object.
-    halo_fill: dvui.Color = .{},
+    /// Draw this mark as a dashed rim over an opaque face, in vector, above everything else.
+    /// For the note under the cursor and the notes the reader has open — see `galaxy.StyledMark`.
+    dashed: bool = false,
 };
 
 pub const DrawCtx = struct {
@@ -339,14 +333,8 @@ pub fn draw(
         batch.flush();
     }
 
-    // Room for the rings as well as the marks. Only notes inside the proximity falloff carry one,
-    // which is a handful around the cursor, so the cap is generous and never reached in practice —
-    // it exists so a pathological frame cannot allocate its way out of the arena.
-    const max_rings: usize = 24;
-    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len + max_rings + 1) catch return stats;
+    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return stats;
     var n: usize = 0;
-    var rings: usize = 0;
-    var top: ?galaxy.StyledMark = null;
     for (w.marks.items) |m| {
         const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
         const style = dctx.style(dctx.ctx, w, m, holds_open);
@@ -368,51 +356,13 @@ pub fn draw(
             .border = withAlpha(style.border, a),
             .is_note = style.is_note,
             .dying = false,
+            // Ordering is `galaxy`'s problem now: it holds every dashed mark back past the sprite
+            // pass and sorts them by size, so the largest — the one under the cursor — lands on
+            // top. Nothing here has to be deferred or held in a slot.
+            .dashed = style.dashed,
         };
-        // The proximity ring, if this note is close enough to the cursor to have one. `galaxy`
-        // defers every ring past the sprite pass and orders them by size, so position in this list
-        // does not matter — only that they are here.
-        if (style.halo_r_px > style.r_px and rings < max_rings) {
-            // Parked at a fixed offset past every possible mark, not at `n + …` — `n` is still
-            // moving, so a ring parked early would be overwritten by a mark emitted later.
-            buf[w.marks.items.len + 1 + rings] = .{
-                .screen = buf[n].screen,
-                .r_px = style.halo_r_px,
-                .fill = style.halo_fill,
-                .border = buf[n].border,
-                .is_note = false,
-                .halo = true,
-            };
-            rings += 1;
-        }
-        if (style.on_top) {
-            // Held back rather than emitted here.
-            //
-            // Marks are drawn in whatever order `present` walked the tree, so the node under the
-            // cursor is routinely painted over by neighbours that happen to come after it — which
-            // is worst exactly where it matters, in the dense regions where the reader most needs
-            // to know what they are pointing at. One mark deferred to the end costs nothing and
-            // makes the answer unambiguous.
-            top = buf[n];
-            continue;
-        }
         n += 1;
         if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
-    }
-    if (top) |t| {
-        buf[n] = t;
-        n += 1;
-        if (t.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
-    }
-    // Slide the rings down against the marks — they were parked past `n` while it was still moving.
-    if (rings > 0) {
-        std.mem.copyForwards(
-            galaxy.StyledMark,
-            buf[n .. n + rings],
-            buf[w.marks.items.len + 1 ..][0..rings],
-        );
-        n += rings;
-        stats.clusters_drawn += @intCast(rings);
     }
     _ = galaxy.drawStyledMarks(&dens.soft, cam, fade, buf[0..n]);
     return stats;

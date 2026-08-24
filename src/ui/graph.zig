@@ -127,39 +127,6 @@ const hover_ring_max_mult: f32 = 7.0;
 /// note of around ten items sits at 3x, forty items at 4x, and the ceiling arrives near 250.
 const pointer_grow_k: f32 = 0.32;
 
-/// The dashed clearing, grown out of the proximity field rather than out of a discrete hover.
-///
-/// This is the third attempt and the first that does not fight the panel it lives in. The other two
-/// keyed the ring on *which node is hovered* — first on `pointer_t`, then on a dwell timer — and
-/// both inherited the same flaw from that choice: a binary state drawn at a size the hit test does
-/// not share. The ring is several times the disc, the click target is the disc, so moving the
-/// cursor inside the ring but off the disc dropped the hover and collapsed it. Parts of the thing
-/// you can see simply do not respond, which is exactly as bad as it sounds. Adding a dwell made a
-/// skim quieter and made that worse, because now the ring took time to come back.
-///
-/// `hover_t` has no edge to fall off. It is a *field* — `applyProximity` computes it from screen
-/// distance to the cursor with a smooth falloff — so as the cursor travels between two overlapping
-/// notes one ring grows while the other shrinks, continuously, with no moment of handover to get
-/// wrong and nothing to wait for. Every node can draw one; the nearest is simply the largest,
-/// because the field peaks under the cursor. That is the single-largest guarantee, by construction
-/// rather than by bookkeeping.
-///
-/// Cubed so the peak is unambiguous. Raw `hover_t` falls off gently enough that a whole
-/// neighbourhood would open to a similar size and the reader could not tell which one they were on.
-fn hoverRingRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
-    const t = std.math.clamp(n.hover_t, 0, 1);
-    const sharp = t * t * t;
-    if (sharp <= 0.004) return 0;
-
-    // From the disc as it is actually drawn right now — which already carries the swell — so the
-    // ring covers it at every value of `t` and the two never separate.
-    const here = bubbleScreenRadius(n, zoom_t, gap_px);
-    var swollen = n;
-    swollen.hover_t = 1;
-    const full = bubbleScreenRadius(swollen, zoom_t, gap_px) * ringMultiplier(n);
-    return std.math.lerp(here, @max(full, here), sharp);
-}
-
 /// How far the node under the cursor opens, by how much is inside it, as a multiple of the largest
 /// a normal note is drawn at.
 ///
@@ -4294,7 +4261,9 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         std.math.clamp(p.nodes[m.note].pointer_t, 0, 1)
     else
         0;
-    const border = if (holds_open)
+    // A dashed mark is always highlight-rimmed — that is what makes dashed mean "this one" rather
+    // than just "this one is drawn differently".
+    const border = if (holds_open or (m.is_note and m.note < p.nodes.len and p.nodes[m.note].open))
         hot
     else if (pointed > 0.002)
         border_rest.lerp(hot, dvui.easing.outQuad(pointed))
@@ -4302,23 +4271,24 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         border_rest;
 
     // The dashed clearing, and the request to be painted last.
-    var halo_r: f32 = 0;
-    var halo_fill = border_rest;
-    if (m.is_note and m.note < p.nodes.len) {
-        halo_r = hoverRingRadius(p.nodes[m.note], zoom_t, gap_px);
-        // The lit fill, because the clearing *is* the node — it covers it completely, so taking the
-        // resting colour would mean approaching a note changed nothing the reader can see.
-        if (halo_r > 0) halo_fill = nodeFill(theme, p.nodes[m.note]);
-    }
+    // Dashed is a *state*, not a size: the note under the cursor and the notes the reader has
+    // open, and nothing else.
+    //
+    // This replaces a separate expanding ring drawn around the node, which never worked. Keyed on
+    // the discrete hover it had a hard edge the hit test did not share, so parts of the ring did
+    // not respond; keyed on the proximity field it had no edge but every neighbour drew a faint
+    // ring of its own, and mid-zoom the reader got a nest of concentric circles with the real node
+    // showing through the middle of them. There is no ring now. The mark itself is the ring.
+    const is_dashed = m.is_note and m.note < p.nodes.len and
+        (p.nodes[m.note].open or pointed > 0.02);
 
     return .{
         .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
+
         .border = border,
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
-        .on_top = pointed > 0.002,
-        .halo_r_px = halo_r,
-        .halo_fill = halo_fill,
+        .dashed = is_dashed,
     };
 }
 
@@ -4930,7 +4900,7 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
 
     const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), @as(f32, 1));
     const gap_px = p.layout_slot * p.camera.zoom;
-    const r = @max(hoverRingRadius(n, zoom_t, gap_px), bubbleScreenRadius(n, zoom_t, gap_px));
+    const r = bubbleScreenRadius(n, zoom_t, gap_px);
 
     const cw = dvui.currentWindow();
     const font = dvui.Font.theme(.body).larger(label_font_delta).withWeight(.bold);
@@ -5086,7 +5056,20 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
-    return @max(@min(want, gap_px * gap_radius_frac), floor);
+    const capped = @max(@min(want, gap_px * gap_radius_frac), floor);
+
+    // On top of the proximity swell, the note under the cursor opens by how much is inside it.
+    //
+    // *After* the caps, so it is a clean multiple of the drawn size — folded in before them, the
+    // lattice-gap cap is what binds at overview density and every note flattened to the same
+    // fraction of the spacing whatever it contained. And inside this function rather than beside
+    // it, which is the point: `hitTestNodes` and `updateLabels` both call this, so the thing you
+    // can see, the thing you can click and the space the name is placed around are the same circle
+    // again. Kept outside it, the drawn mark ran several times past its own hit target and the
+    // parts of it that did nothing were exactly the parts the reader aimed at.
+    const pointed = std.math.clamp(n.pointer_t, 0, 1);
+    if (pointed <= 0.002) return capped;
+    return capped * std.math.lerp(1.0, ringMultiplier(n), dvui.easing.outCubic(pointed));
 }
 
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the
