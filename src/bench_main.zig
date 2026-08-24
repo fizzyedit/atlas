@@ -463,6 +463,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             @as(f64, @floatFromInt(web_ns)) / 1e6,
         },
     );
+    try layoutReport(gpa, io, &w, edges, label);
     std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6}   {s:>7} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{
         "zoom",  "marks",  "notes",   "masses",  "links",   "drawn",
         "bound", "clr ms", "topo ms", "pres ms", "lift ms", "frame ms",
@@ -608,6 +609,247 @@ fn interiorSweep(gpa: std.mem.Allocator) !void {
 /// rate, and none of that shows up in a sweep that only measures settled frames. Two separate
 /// performance investigations have measured the parked case and concluded the panel was fine.
 var gpa_for_probe: std.mem.Allocator = undefined;
+
+/// What the finished layout is actually like, in numbers.
+///
+/// Four measurements, because "the graph looks like a lattice glob" is not something the existing
+/// sweep can see. It reports marks and links and frame times, all of which can be perfect while the
+/// picture is wrong — and they were. A layout change with no grade attached is how two attempts
+/// came to be believed and one came to be disbelieved on the wrong evidence.
+///
+/// Everything is sampled. Placing 284k leaves and every cell exhaustively is minutes of work and
+/// the distributions settle in the first few thousand; `ensurePlaced` is memoised, so a strided
+/// sample warms the ancestors it shares and later draws are nearly free.
+fn layoutReport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *world_mod.World,
+    edges: []const fold.Edge,
+    label: []const u8,
+) !void {
+    const t0 = now(io);
+    const ext = @max(w.extent(), 1e-3);
+    const sample_cap: usize = 60_000;
+
+    // -- 1. link spread: how far a link has to travel ------------------------------------------
+    //
+    // The objective for "things that are linked should end up near each other". Note that this is
+    // *not* the one that tracks how the map looks — a curve-order coarsening made this worse while
+    // changing the picture not at all, and the picture was the complaint. Kept because it is still
+    // the honest grade for grouping, and because a layout change that wrecks it is worth knowing
+    // about even if it looks nicer.
+    if (edges.len > 0) {
+        var lens: std.ArrayListUnmanaged(f32) = .empty;
+        defer lens.deinit(gpa);
+        const stride = @max(1, edges.len / sample_cap);
+        var i: usize = 0;
+        while (i < edges.len) : (i += stride) {
+            const a = w.noteWorldPos(edges[i].a) orelse continue;
+            const b = w.noteWorldPos(edges[i].b) orelse continue;
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            try lens.append(gpa, @sqrt(dx * dx + dy * dy));
+        }
+        if (lens.items.len > 0) {
+            std.mem.sort(f32, lens.items, {}, std.sort.asc(f32));
+            var sum: f64 = 0;
+            var far: usize = 0;
+            for (lens.items) |l| {
+                sum += l;
+                if (l > ext * 0.25) far += 1;
+            }
+            const n: f64 = @floatFromInt(lens.items.len);
+            std.debug.print(
+                "  link spread   mean {d:.3}r  p50 {d:.3}r  p90 {d:.3}r   crossing {d:.1}%\n",
+                .{
+                    sum / n / ext,
+                    @as(f64, lens.items[lens.items.len / 2]) / ext,
+                    @as(f64, lens.items[lens.items.len * 9 / 10]) / ext,
+                    @as(f64, @floatFromInt(far)) * 100.0 / n,
+                },
+            );
+        }
+    }
+
+    // -- 2 & 4. sibling overlap and hexagonal order --------------------------------------------
+    //
+    // Overlap is the "glob": `containment` computes its own separation threshold
+    // (`minRadiusExp(fill)` ≈ 0.619 at the shipped fill) and ships `radius_exp = 0.5`, so siblings
+    // are expected to intersect at every level. This says by how much.
+    //
+    // Order is the "+ sign and horizontal rows". Every cell places six ring children on a uniform
+    // 60° step, so each cell on its own is perfectly hexagonal — but the rotation is a function of
+    // *level*, so every cell at a given level shares one orientation and the hexagons line up
+    // across the whole vault. `local` is the first effect, `global` the second, and it is the
+    // second that reads as a lattice.
+    {
+        var pairs: usize = 0;
+        var overlapping: usize = 0;
+        var penetration: f64 = 0;
+        var local_sum: f64 = 0;
+        var local_n: usize = 0;
+        var gx: f64 = 0;
+        var gy: f64 = 0;
+        var gn: usize = 0;
+
+        const stride = @max(1, w.lad.cells.len / 20_000);
+        var ci: usize = 0;
+        while (ci < w.lad.cells.len) : (ci += stride) {
+            const cell: u32 = @intCast(ci);
+            if (w.lad.cells[cell].child_count < 2) continue;
+            w.field.ensurePlaced(&w.lad, cell);
+            const centre = w.field.pos[cell];
+            const kids = w.lad.childrenOf(cell);
+
+            for (kids, 0..) |ka, ai| {
+                for (kids[ai + 1 ..]) |kb| {
+                    const pa = w.field.pos[ka];
+                    const pb = w.field.pos[kb];
+                    const ra = w.field.radius(&w.lad, ka);
+                    const rb = w.field.radius(&w.lad, kb);
+                    const dx = pa.x - pb.x;
+                    const dy = pa.y - pb.y;
+                    const d = @sqrt(dx * dx + dy * dy);
+                    pairs += 1;
+                    if (d < ra + rb) {
+                        overlapping += 1;
+                        penetration += @as(f64, (ra + rb - d)) / @max(1e-6, @min(ra, rb));
+                    }
+                }
+            }
+
+            // Six-fold order parameter of this cell's children about its centre.
+            var sx: f64 = 0;
+            var sy: f64 = 0;
+            var kn: usize = 0;
+            for (kids) |k| {
+                const p = w.field.pos[k];
+                const dx = p.x - centre.x;
+                const dy = p.y - centre.y;
+                if (@abs(dx) < 1e-6 and @abs(dy) < 1e-6) continue; // the centre child has no angle
+                const th = std.math.atan2(dy, dx);
+                sx += @cos(6 * th);
+                sy += @sin(6 * th);
+                gx += @cos(6 * th);
+                gy += @sin(6 * th);
+                kn += 1;
+                gn += 1;
+            }
+            if (kn > 0) {
+                const kf: f64 = @floatFromInt(kn);
+                local_sum += @sqrt(sx * sx + sy * sy) / kf;
+                local_n += 1;
+            }
+        }
+
+        if (pairs > 0) {
+            std.debug.print(
+                "  sibling discs overlapping {d:.1}%   mean penetration {d:.2}x smaller radius\n",
+                .{
+                    @as(f64, @floatFromInt(overlapping)) * 100.0 / @as(f64, @floatFromInt(pairs)),
+                    if (overlapping > 0) penetration / @as(f64, @floatFromInt(overlapping)) else 0,
+                },
+            );
+        }
+        if (local_n > 0 and gn > 0) {
+            const gf: f64 = @floatFromInt(gn);
+            std.debug.print(
+                "  hex order     local {d:.3}  global {d:.3}   (1 = perfect lattice, 0 = isotropic)\n",
+                .{
+                    local_sum / @as(f64, @floatFromInt(local_n)),
+                    @sqrt(gx * gx + gy * gy) / gf,
+                },
+            );
+        }
+    }
+
+    // -- 3. radial density profile -------------------------------------------------------------
+    //
+    // Equal-area rings, so a uniform layout reports eight equal numbers and the shape of the list
+    // *is* the density gradient. "Dense in the middle, fading out" is a front-loaded list; the
+    // blank annulus the reader sees around the giant component is a trailing zero.
+    {
+        const rings = 8;
+        var hist: [rings]usize = .{0} ** rings;
+        var total: usize = 0;
+        const n_notes = w.lad.leaf_cell.len;
+        const stride = @max(1, n_notes / sample_cap);
+        var i: usize = 0;
+        while (i < n_notes) : (i += stride) {
+            const p = w.noteWorldPos(@intCast(i)) orelse continue;
+            const r = @sqrt(p.x * p.x + p.y * p.y) / ext;
+            // Equal-area rings: ring `b` spans radii √(b/rings) .. √((b+1)/rings).
+            const b: usize = @intFromFloat(@min(@as(f32, rings - 1), r * r * rings));
+            hist[b] += 1;
+            total += 1;
+        }
+        if (total > 0) {
+            std.debug.print("  radial density (equal-area rings, centre first):  ", .{});
+            for (hist) |h| {
+                std.debug.print("{d:>5.1}", .{@as(f64, @floatFromInt(h)) * 100.0 / @as(f64, @floatFromInt(total))});
+            }
+            std.debug.print("  %\n", .{});
+        }
+    }
+
+    std.debug.print("  [layout report {d:.0} ms]\n", .{ms(elapsed(io, t0))});
+    if (svg_dir) |d| try writeWorldSvg(gpa, io, w, edges, d, label);
+}
+
+/// A picture of the placed vault, so a layout idea can be looked at without launching the editor.
+///
+/// The reason the earlier attempts were judged badly is that the only way to see a layout was to
+/// run the app and squint at a hairball. An SVG can be opened, zoomed and diffed against the last
+/// one.
+fn writeWorldSvg(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *world_mod.World,
+    edges: []const fold.Edge,
+    dir: []const u8,
+    label: []const u8,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Cap the drawing, not the vault: an SVG with 284k circles and 3.3M lines is a file no viewer
+    // will open. A strided sample keeps the shape and loses only the ink.
+    const draw_cap: usize = 12_000;
+    const n_notes = w.lad.leaf_cell.len;
+    const stride = @max(1, n_notes / draw_cap);
+
+    var pts: std.ArrayListUnmanaged(dvui.Point) = .empty;
+    const slot = try arena.alloc(u32, n_notes);
+    @memset(slot, std.math.maxInt(u32));
+    var i: usize = 0;
+    while (i < n_notes) : (i += stride) {
+        const p = w.noteWorldPos(@intCast(i)) orelse continue;
+        slot[i] = @intCast(pts.items.len);
+        try pts.append(arena, .{ .x = p.x, .y = p.y });
+    }
+    if (pts.items.len == 0) return;
+
+    var kept: std.ArrayListUnmanaged(layout_full.Edge) = .empty;
+    for (edges) |e| {
+        if (e.a >= n_notes or e.b >= n_notes) continue;
+        const sa = slot[e.a];
+        const sb = slot[e.b];
+        if (sa == std.math.maxInt(u32) or sb == std.math.maxInt(u32)) continue;
+        try kept.append(arena, .{ .a = sa, .b = sb });
+    }
+
+    const degrees = try arena.alloc(u32, pts.items.len);
+    @memset(degrees, 0);
+    for (kept.items) |e| {
+        degrees[e.a] += 1;
+        degrees[e.b] += 1;
+    }
+
+    const name = try std.fmt.allocPrint(arena, "world-{s}", .{std.fs.path.basename(label)});
+    try writeSvg(io, dir, name, pts.items, kept.items, degrees, arena);
+    std.debug.print("  svg -> {s}/{s}.svg  ({d} notes, {d} links)\n", .{ dir, name, pts.items.len, kept.items.len });
+}
 
 fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world_mod.Params, px_per_frame: f32) !void {
     const frames = 120;
