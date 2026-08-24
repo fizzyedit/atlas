@@ -114,44 +114,53 @@ const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
 const hover_fill_mix: f32 = 0.45;
-/// Extra grow for the one node under the cursor, on top of the proximity field — the range it
-/// spans between an empty note and a large one. See `pointerGrow`.
-const pointer_grow_min: f32 = 0.25;
-const pointer_grow_max: f32 = 5.0;
-/// Growth per √item. Square root rather than logarithm: a log law compresses the top of the range
-/// so hard that a ten-item note and a two-hundred-item one open by nearly the same amount, which is
-/// the distinction this exists to draw. Tuned so an ordinary note — around ten headings and blocks
-/// — lands at 1.0, meaning twice its drawn size.
+/// The hover ring's size, as a multiple of the largest a normal note is drawn at. See
+/// `ringMultiplier`.
+/// The floor: an empty note still opens to twice the biggest dot on screen, which is what makes
+/// the ring unmistakably a ring rather than a slightly larger disc.
+const hover_ring_min_mult: f32 = 2.0;
+/// The ceiling, for a long document.
+const hover_ring_max_mult: f32 = 7.0;
+/// Added multiple per √item, above the floor. Square root rather than logarithm: a log law
+/// compresses the top of the range so hard that a ten-item note and a two-hundred-item one open by
+/// nearly the same amount, which is the distinction this exists to draw. At this value an ordinary
+/// note of around ten items sits at 3x, forty items at 4x, and the ceiling arrives near 250.
 const pointer_grow_k: f32 = 0.32;
 
-/// The dashed clearing around the node under the cursor: its drawn radius, times what is inside.
+/// The dashed clearing around the node under the cursor.
 ///
-/// A plain multiple of the *finished* radius, deliberately. The first attempt folded the pointer
+/// A multiple of a radius the reader can actually see, deliberately. The first attempt folded the
 /// growth into `bubbleScreenRadius` ahead of its two ceilings — `max_node_screen_r` and the
 /// lattice-gap cap — and relaxed both by the same factor to stop them clipping it. At overview
 /// density the gap cap is what binds, so every note inflated to about the same fraction of the
 /// lattice spacing whatever was in it: uniformly enormous, and carrying no information at all.
-/// Multiplying the radius you can actually see keeps the promise legible — 2x means twice the disc.
 ///
-/// Returns 0 when nothing is hovered, which is the caller's signal that there is no halo to draw.
+/// Returns 0 when nothing is hovered, which is the caller's signal that there is no ring to draw.
 fn hoverHaloRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const pointed = std.math.clamp(n.pointer_t, 0, 1);
     if (pointed <= 0.002) return 0;
-    // From the note's *resting* size, with both hover channels cleared.
+
+    // Anchored on the largest a *normal* note is ever drawn at this zoom, not on this note's
+    // resting size.
     //
-    // Multiplying the live radius compounds two growths that are already happening: the proximity
-    // swell lifts the disc by up to `grow_factor` and `zoom_rest_swell` adds more, so a 6x clearing
-    // came out at fourteen times the neighbouring dots — an enormous band with the real ring
-    // stranded somewhere inside it. Anchoring on the resting radius makes the multiple mean what it
-    // says: 6x is six times the dot every other note is drawn at.
-    var at_rest = n;
-    at_rest.hover_t = 0;
-    at_rest.pointer_t = 0;
-    const grow = pointerGrow(n) * dvui.easing.outBack(pointed);
-    return bubbleScreenRadius(at_rest, zoom_t, gap_px) * (1.0 + grow);
+    // The ring has one job the multiple has to guarantee: cover the disc underneath it. Anchoring
+    // on the resting radius does not, because the node being hovered is also carrying the proximity
+    // swell — up to `grow_factor` on top of `zoom_rest_swell` — so a small note's ring came out
+    // *inside* its own swollen disc and the effect read as an ordinary node with a faint outline
+    // rather than as anything dashed. Measuring against the swollen maximum makes the floor
+    // meaningful: twice the biggest dot on screen is always bigger than this dot.
+    var swollen = n;
+    swollen.hover_t = 1;
+    swollen.pointer_t = 0;
+    const r_max = bubbleScreenRadius(swollen, zoom_t, gap_px);
+
+    // Grown *from* that maximum rather than from nothing, so the ring already covers the node on
+    // the first frame of the hover and the expansion is the only thing the reader sees.
+    return std.math.lerp(r_max, r_max * ringMultiplier(n), dvui.easing.outBack(pointed));
 }
 
-/// How far the node under the cursor opens, by how much is inside it.
+/// How far the node under the cursor opens, by how much is inside it, as a multiple of the largest
+/// a normal note is drawn at.
 ///
 /// The point is to answer "what am I about to open" before the reader commits. A two-line stub
 /// barely moves; a note with forty paragraphs opens a visible clearing. It is an honest indicator
@@ -159,10 +168,14 @@ fn hoverHaloRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
 /// berth on purpose — `scale = berth / extent` — so the interior's own footprint carries no size
 /// information to match against, and changing that is what would make a two-item note and a
 /// two-hundred-item note settle at different zooms.
-fn pointerGrow(n: GraphNode) f32 {
-    if (n.is_sun) return sun_grow_factor;
+fn ringMultiplier(n: GraphNode) f32 {
+    if (n.is_sun) return 1 + sun_grow_factor;
     const items: f32 = @floatFromInt(n.interior_items);
-    return std.math.clamp(pointer_grow_k * @sqrt(items), pointer_grow_min, pointer_grow_max);
+    return std.math.clamp(
+        hover_ring_min_mult + pointer_grow_k * @sqrt(items),
+        hover_ring_min_mult,
+        hover_ring_max_mult,
+    );
 }
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
