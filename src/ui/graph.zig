@@ -112,6 +112,9 @@ const max_node_screen_r: f32 = 48;
 /// large the instant the descent begins, not snap down to some other resting size and grow back.
 const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
+/// Extra grow for the one node under the cursor, on top of the proximity field. See
+/// `bubbleScreenRadius`.
+const pointer_grow_factor: f32 = 0.9;
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
 /// The same for a merged region, which is drawn at the size of the area it covers rather than at
@@ -4228,9 +4231,23 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px)
     else
         m.r;
+    // The ring lights with the fill, eased on the same channel, so the whole disc reads as one
+    // thing rather than a highlighted centre inside a resting outline. `holds_open` still wins
+    // outright: an open document is lit whether or not the cursor is anywhere near it.
+    const pointed: f32 = if (m.is_note and m.note < p.nodes.len)
+        std.math.clamp(p.nodes[m.note].pointer_t, 0, 1)
+    else
+        0;
+    const border = if (holds_open)
+        hot
+    else if (pointed > 0.002)
+        border_rest.lerp(hot, dvui.easing.outQuad(pointed))
+    else
+        border_rest;
+
     return .{
         .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
-        .border = if (holds_open) hot else border_rest,
+        .border = border,
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
     };
@@ -5035,10 +5052,23 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const hover = std.math.clamp(n.hover_t, 0, 1);
     const grow = if (n.is_sun) sun_grow_factor else grow_factor;
     const hover_boost = grow * dvui.easing.outBack(hover);
+    // The node actually under the cursor opens further than the proximity field around it.
+    //
+    // Two channels, deliberately. `hover_t` is a *field* — it falls off with distance and lifts
+    // everything near the pointer, which is what makes a dense region feel responsive. `pointer_t`
+    // is exactly one node. Folding the second into the first would mean either the whole
+    // neighbourhood opening up (unreadable) or the one you are pointing at not standing out at
+    // all, and the reader needs to know which node a click will take.
+    //
+    // Everything downstream reads this radius, so the effects follow for free: `hitTestNodes`
+    // grows the click target with the ring, and `updateLabels` re-places the name against the
+    // expanded disc — which is why a hovered node's label steps clear rather than sitting on it.
+    const pointed = std.math.clamp(n.pointer_t, 0, 1);
+    const pointer_boost = pointer_grow_factor * dvui.easing.outBack(pointed);
     // `gap_px` comes from the camera and is already physical, so the tuned sizes join it there.
     const s = dpiScale();
     const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s;
-    const want = @min(base * s * (1.0 + zoom_boost + hover_boost), cap);
+    const want = @min(base * s * (1.0 + zoom_boost + hover_boost + pointer_boost), cap);
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
@@ -5073,7 +5103,15 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
 
     const lit = n.pointer_t;
     if (lit <= 0.002) return rest;
-    const target = if (n.open) theme.color(.control, .fill_press) else accent;
+    // The highlight colour, not a lifted control fill.
+    //
+    // A `fill` → `fill_hover` step is the right feedback for a button in a row of buttons, where
+    // position already says which one you are on. In a field of thousands of near-identical discs
+    // it says almost nothing: the lift is a few percent of luminance against neighbours that are
+    // already every shade the proximity swell makes them. The highlight is the colour this panel
+    // already uses to mean "this is the one" — the focused note's links, the focused note's name —
+    // so hover joins that vocabulary instead of inventing a quieter one.
+    const target = theme.color(.highlight, .fill);
     // Phantoms are deliberately translucent; keep that while still letting them light up.
     const to = if (n.phantom) target.opacity(0.55) else target;
     return rest.lerp(to, dvui.easing.outQuad(std.math.clamp(lit, 0, 1)));
