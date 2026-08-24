@@ -65,8 +65,33 @@ pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, li
 ///
 /// The bounds are chosen so the shipped default lands where it already was: at `graph_detail`'s
 /// 360 the web is 900 lines, which comes out at ~0.26 against the 0.22 this replaced.
-/// Opacity of the focused note's own links. See the `lit` colour in `draw`.
-const focus_link_alpha: f32 = 0.5;
+/// The focused note's own links thin as they thicken, on the same argument as `ambientAlpha` and
+/// for a sharper reason.
+///
+/// A note with six links wants all six unmistakable. A hub with two thousand, drawn at the same
+/// opacity, is a solid disc of highlight centred on the note — every line individually correct and
+/// the picture saying nothing at all, since a starburst that saturates cannot show which direction
+/// carries the most or where the structure is. Thinning restores that: the same two thousand lines
+/// at low ink read as a *density*, and the directions that carry many of them stand out from the
+/// ones that carry a few.
+///
+/// Kept well above the ambient curve at every count. These are the answer to a question the reader
+/// asked by clicking, and they have to stay the brightest thing on screen even when there are a lot
+/// of them.
+const focus_alpha_lit: f32 = 0.55;
+const focus_alpha_wash: f32 = 0.22;
+const focus_lines_lit: f32 = 40;
+const focus_lines_wash: f32 = 3000;
+
+fn focusAlpha(drawn: usize) f32 {
+    const n: f32 = @floatFromInt(@max(1, drawn));
+    const t = std.math.clamp(
+        @log2(n / focus_lines_lit) / @log2(focus_lines_wash / focus_lines_lit),
+        0,
+        1,
+    );
+    return std.math.lerp(focus_alpha_lit, focus_alpha_wash, t);
+}
 const ambient_alpha_lit: f32 = 0.40;
 const ambient_alpha_wash: f32 = 0.08;
 /// At or below this many drawn lines the web is at full strength; at or above the second, at its
@@ -184,14 +209,15 @@ pub fn draw(
             alpha: f32,
         }) = .empty;
         defer segs.deinit(arena);
-        // Half strength, not full.
-        //
-        // A note with many links drew each of them at near-opaque highlight, and the starburst then
-        // buried the very thing it was pointing at — the neighbours' names. The ambient web already
-        // thins its ink as it thickens (`ambientAlpha`); the highlight needs the same courtesy for
-        // the same reason. Half is still unmistakably brighter than ambient at its lit end.
-        var lit = theme.color(.highlight, .fill);
-        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * focus_link_alpha * fade);
+        var lit_segs: std.ArrayListUnmanaged(struct {
+            a: dvui.Point.Physical,
+            b: dvui.Point.Physical,
+        }) = .empty;
+        defer lit_segs.deinit(arena);
+        // The highlight's own opacity is decided below, once the surviving count is known — the
+        // same two-pass shape the ambient web uses, and for the same reason: how thick the web
+        // turns out to be is only knowable *after* culling.
+        const lit_base = theme.color(.highlight, .fill);
 
         // Where a link's endpoint is, even when that endpoint has no mark this frame.
         //
@@ -327,6 +353,13 @@ pub fn draw(
                 stats.links_drawn += 1;
             }
             const seg = clipToRect(a, tip, clip_rect) orelse continue;
+            lit_segs.append(arena, .{ .a = seg.a, .b = seg.b }) catch {};
+        }
+
+        // Now the count is known, so the ink can be mixed and the highlight emitted.
+        var lit = lit_base;
+        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * focusAlpha(lit_segs.items.len) * fade);
+        for (lit_segs.items) |seg| {
             batch.add(seg.a, seg.b, 1.8, lit);
             stats.links_drawn += 1;
         }
