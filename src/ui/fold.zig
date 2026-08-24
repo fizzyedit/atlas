@@ -79,7 +79,14 @@ pub const Cell = struct {
     ext_count: u16 = 0,
     /// Real notes beneath this cell. Folder nodes never count.
     count: u32 = 0,
+    /// Depth *below the root*, assigned by `assignRanges` — which overwrites whatever the
+    /// coarsening put here, so during a build it counts up from the leaves and after one it counts
+    /// down from the root. Read it only after `build` returns.
     level: u16 = 0,
+    /// Levels of ladder *beneath* this cell: 0 for a leaf, the subtree's depth for a root. The
+    /// counterpart to `level`, and the one anything reasoning about how much room a subtree needs
+    /// wants — see `containment.contentRadius`.
+    height: u16 = 0,
     /// Set iff this cell is a single real note.
     note: u32 = invalid,
     /// Connected component of the *link* graph this cell belongs to. Coarsening never merges
@@ -246,8 +253,7 @@ pub fn build(
     var cursor: u32 = 0;
     var deepest: u16 = 0;
     for (lad.roots) |r| {
-        assignRanges(&lad, r, 0, &cursor);
-        deepest = @max(deepest, maxDepth(lad, r));
+        deepest = @max(deepest, assignRanges(&lad, r, 0, &cursor));
     }
     lad.depth = deepest;
 
@@ -687,11 +693,18 @@ fn prune(lad: *Ladder, id: u32) ?u32 {
     return id;
 }
 
-fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) void {
-    const c = &lad.cells[id];
-    c.level = level;
-    c.ls = cursor.*;
-    if (c.child_count == 0) {
+/// One walk that assigns depth, note ranges and height. Returns the height so the parent can take
+/// the max of its children without a second traversal.
+fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) u16 {
+    var h: u16 = 0;
+    {
+        const c = &lad.cells[id];
+        c.level = level;
+        c.ls = cursor.*;
+    }
+    const child_count = lad.cells[id].child_count;
+    if (child_count == 0) {
+        const c = &lad.cells[id];
         if (c.note != invalid) {
             lad.note_at[cursor.*] = c.note;
             lad.slot_of[c.note] = cursor.*;
@@ -699,11 +712,15 @@ fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) void {
             cursor.* += 1;
         }
     } else {
-        for (0..c.child_count) |i| {
-            assignRanges(lad, lad.children[c.child_start + i], level + 1, cursor);
+        const start = lad.cells[id].child_start;
+        for (0..child_count) |i| {
+            h = @max(h, 1 + assignRanges(lad, lad.children[start + i], level + 1, cursor));
         }
     }
+    const c = &lad.cells[id];
     c.le = cursor.*;
+    c.height = h;
+    return h;
 }
 
 fn maxDepth(lad: Ladder, id: u32) u16 {

@@ -34,6 +34,7 @@ const multilevel = @import("ui/multilevel.zig");
 const vault_synth = @import("ui/vault_synth.zig");
 const bench_stats = @import("bench_stats.zig");
 const world_mod = @import("ui/world.zig");
+const containment = @import("ui/containment.zig");
 const fold = @import("ui/fold.zig");
 const cellweb = @import("ui/cellweb.zig");
 
@@ -58,6 +59,11 @@ var world_pan: bool = false;
 /// `--zoom-mul=F`: zoom ratio between sweep steps. The default doubling can step clean over a
 /// narrow band, which is exactly how a band-shaped bug hides from this sweep.
 var world_zoom_mul: f32 = 2.0;
+/// `--fill=F`, `--radius-exp=F`, `--pack-gap=F`: `containment.Options`, so the layout's tuning can
+/// be swept against the layout report instead of guessed at and rebuilt.
+var place_fill: ?f32 = null;
+var place_radius_exp: ?f32 = null;
+var place_pack_gap: ?f32 = null;
 /// `--focus=N`: sweep with note `N` focused and open, so the focused note's own leaf-precision
 /// links are exercised. Without it `focus_leaf` is invalid at every zoom and the whole highlight
 /// path — the thing a reader looks at after clicking a node — is never entered by the bench.
@@ -133,6 +139,15 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) {
             world_zoom_mul = try std.fmt.parseFloat(f32, a["--zoom-mul=".len..]);
         }
+        if (std.mem.startsWith(u8, a, "--fill=")) {
+            place_fill = try std.fmt.parseFloat(f32, a["--fill=".len..]);
+        }
+        if (std.mem.startsWith(u8, a, "--radius-exp=")) {
+            place_radius_exp = try std.fmt.parseFloat(f32, a["--radius-exp=".len..]);
+        }
+        if (std.mem.startsWith(u8, a, "--pack-gap=")) {
+            place_pack_gap = try std.fmt.parseFloat(f32, a["--pack-gap=".len..]);
+        }
         if (std.mem.startsWith(u8, a, "--focus=")) {
             world_focus = try std.fmt.parseInt(i64, a["--focus=".len..], 10);
         }
@@ -190,6 +205,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--pan")) continue;
         if (std.mem.startsWith(u8, a, "--pan-px=")) continue;
         if (std.mem.startsWith(u8, a, "--focus=")) continue;
+        if (std.mem.startsWith(u8, a, "--fill=")) continue;
+        if (std.mem.startsWith(u8, a, "--radius-exp=")) continue;
+        if (std.mem.startsWith(u8, a, "--pack-gap=")) continue;
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) continue;
         if (std.mem.eql(u8, a, "--index")) continue;
         if (std.mem.eql(u8, a, "--index-warm")) continue;
@@ -405,7 +423,11 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     // generation, including for a one-note edit.
     gpa_for_probe = gpa;
     const build_t0 = std.Io.Clock.boot.now(io).nanoseconds;
-    var w = try world_mod.World.init(gpa, n, edges, paths, .{}, .{});
+    var place_opts: containment.Options = .{};
+    if (place_fill) |v| place_opts.fill = v;
+    if (place_radius_exp) |v| place_opts.radius_exp = v;
+    if (place_pack_gap) |v| place_opts.pack_gap = v;
+    var w = try world_mod.World.init(gpa, n, edges, paths, .{}, place_opts);
     defer w.deinit();
     const build_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
 
