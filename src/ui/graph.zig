@@ -114,6 +114,9 @@ const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
 const hover_fill_mix: f32 = 0.45;
+/// Radius of the contrast outline behind the two unconditional labels, in logical pixels. See
+/// `renderTextOutlined`.
+const label_outline_px: f32 = 1.25;
 
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
@@ -4834,6 +4837,42 @@ fn drawLabels(p: *Panel) void {
     }
 }
 
+/// Draw a name with a ring of background-coloured copies behind it.
+///
+/// The two unconditional labels — the focused note's and the hovered one's — have to be readable
+/// wherever they land, and where they land is often on top of that note's own links. A hub's
+/// starburst is not a translucency problem that can be tuned away: dozens of lines overlap near the
+/// note, and `1 - (1 - a)^n` reaches 1.000 by about twenty-five of them whatever `a` is. Halving
+/// per-line alpha takes the composite from 1.000 to 0.999. The ink underneath is opaque and no
+/// amount of thinning changes that.
+///
+/// So the text carries its own contrast. Eight offset copies in the panel's background colour,
+/// then the glyphs on top — an outline rather than a plate. A plate reads as a chip and blots out
+/// the links and dots it sits on, which is why ambient labels do not get one; an outline occludes
+/// only the pixels immediately around each stroke, so the web still reads through the gaps in the
+/// letterforms. Nine `renderText` calls, for at most two labels a frame.
+fn renderTextOutlined(
+    font: dvui.Font,
+    text: []const u8,
+    r: dvui.Rect.Physical,
+    scale: f32,
+    col: dvui.Color,
+    halo: dvui.Color,
+) void {
+    const o = label_outline_px * dpiScale();
+    const offsets = [_][2]f32{
+        .{ -o, 0 }, .{ o, 0 },  .{ 0, -o },  .{ 0, o },
+        .{ -o, -o }, .{ o, -o }, .{ -o, o }, .{ o, o },
+    };
+    for (offsets) |d| {
+        var rr = r;
+        rr.x += d[0];
+        rr.y += d[1];
+        dvui.renderText(.{ .font = font, .text = text, .rs = .{ .r = rr, .s = scale }, .color = halo }) catch {};
+    }
+    dvui.renderText(.{ .font = font, .text = text, .rs = .{ .r = r, .s = scale }, .color = col }) catch {};
+}
+
 /// The hovered note's name, drawn last and unconditionally, just outside its halo.
 ///
 /// Not routed through the placer like every other label. The placer decides which names fit, which
@@ -4866,21 +4905,20 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
     const font = dvui.Font.theme(.body).larger(label_font_delta).withWeight(.bold);
     const size = font.textSize(n.title);
     const centre = p.camera.worldToScreen(n.pos);
-    const col = dvui.themeGet().color(.highlight, .fill).opacity(fade);
-    dvui.renderText(.{
-        .font = font,
-        .text = n.title,
-        .rs = .{
-            .r = .{
-                .x = centre.x - size.w * 0.5,
-                .y = centre.y + r + label_gap_px * dpiScale(),
-                .w = size.w,
-                .h = size.h,
-            },
-            .s = cw.natural_scale,
+    const theme = dvui.themeGet();
+    renderTextOutlined(
+        font,
+        n.title,
+        .{
+            .x = centre.x - size.w * 0.5,
+            .y = centre.y + r + label_gap_px * dpiScale(),
+            .w = size.w,
+            .h = size.h,
         },
-        .color = col,
-    }) catch {};
+        cw.natural_scale,
+        theme.color(.highlight, .fill).opacity(fade),
+        theme.color(.window, .fill).opacity(0.92 * fade),
+    );
 }
 
 /// The focused document's name, drawn last and unconditionally.
@@ -4924,21 +4962,20 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
     // it — the hue reads as emphasis only once the glyphs are heavy enough to hold it.
     const font = dvui.Font.theme(.body).larger(label_font_delta + 1).withWeight(.bold);
     const size = font.textSize(n.title);
-    const col = dvui.themeGet().color(.highlight, .fill).opacity(fade);
-    dvui.renderText(.{
-        .font = font,
-        .text = n.title,
-        .rs = .{
-            .r = .{
-                .x = centre.x - size.w * 0.5,
-                .y = centre.y + below + label_gap_px * dpiScale(),
-                .w = size.w,
-                .h = size.h,
-            },
-            .s = cw.natural_scale,
+    const theme = dvui.themeGet();
+    renderTextOutlined(
+        font,
+        n.title,
+        .{
+            .x = centre.x - size.w * 0.5,
+            .y = centre.y + below + label_gap_px * dpiScale(),
+            .w = size.w,
+            .h = size.h,
         },
-        .color = col,
-    }) catch {};
+        cw.natural_scale,
+        theme.color(.highlight, .fill).opacity(fade),
+        theme.color(.window, .fill).opacity(0.92 * fade),
+    );
 }
 
 fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32) void {
