@@ -37,13 +37,15 @@ const log = std.log.scoped(.atlas);
 /// but a rebuild frame on a large vault outlives *many* commits (a full scan publishes every
 /// 200 files), so the ring wrapped and the arena backing the strings the layout was walking got
 /// freed underneath it. Counts alone are pointer-free; see `counts`.
-pub const SnapNode = struct {
+    pub const SnapNode = struct {
     id: i64,
     path: []const u8,
     title: []const u8,
     phantom: bool,
     /// Distinct neighbour count (in ∪ out). Drives node radius.
     degree: u32,
+    /// File size in bytes. 0 for phantoms / synth notes that did not set one.
+    size: u32 = 0,
 };
 
 pub const SnapEdge = struct {
@@ -1681,7 +1683,7 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
     // "distinct neighbours (in ∪ out)", so it counts degree there in one pass over an array it has
     // in hand. `SnapNode.degree` survives for `publishSynthetic`, which is handed real degrees.
     var stmt = try db.conn.prepare(
-        \\SELECT n.id, n.path, n.title, n.stem, n.phantom, 0 AS degree
+        \\SELECT n.id, n.path, n.title, n.stem, n.phantom, 0 AS degree, n.size
         \\FROM notes n
     );
     defer stmt.deinit();
@@ -1700,6 +1702,7 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
         stem: []const u8,
         phantom: i64,
         degree: i64,
+        size: i64,
     }, .{});
     while (true) {
         const row = (try iter.nextAlloc(arena, .{})) orelse break;
@@ -1710,6 +1713,7 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
             .title = title,
             .phantom = row.phantom != 0,
             .degree = @intCast(@max(row.degree, 0)),
+            .size = @intCast(@max(row.size, 0)),
         });
     }
     return list.toOwnedSlice(arena);

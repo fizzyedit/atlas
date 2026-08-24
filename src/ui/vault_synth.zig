@@ -11,7 +11,7 @@
 //! communities (`Graph.communities`) so the coarsening ladder can later be scored against them.
 //!
 //! Spec string: `synth:N`, `synth:N:shape`, or `synth:N:shape:avg_deg`
-//!   shapes: scale-free | islands | hub | bipartite | chain | orphans | lfr
+//!   shapes: scale-free | islands | hub | bipartite | chain | orphans | lfr | motifs
 
 const std = @import("std");
 const dvui = @import("dvui");
@@ -32,6 +32,10 @@ pub const Shape = enum {
     chain,
     orphans,
     lfr,
+    /// Tiny disconnected geometric components: pairs, triangles, hexes, Ys, small stars.
+    /// Built so gravity placement can be judged by eye — each island is small enough to
+    /// land in one fold cell.
+    motifs,
 
     pub fn parse(s: []const u8) !Shape {
         if (std.mem.eql(u8, s, "scale-free") or std.mem.eql(u8, s, "scalefree")) return .scale_free;
@@ -41,6 +45,7 @@ pub const Shape = enum {
         if (std.mem.eql(u8, s, "chain") or std.mem.eql(u8, s, "path")) return .chain;
         if (std.mem.eql(u8, s, "orphans") or std.mem.eql(u8, s, "loners")) return .orphans;
         if (std.mem.eql(u8, s, "lfr") or std.mem.eql(u8, s, "realistic")) return .lfr;
+        if (std.mem.eql(u8, s, "motifs") or std.mem.eql(u8, s, "motif")) return .motifs;
         return error.UnknownSynthShape;
     }
 
@@ -53,6 +58,7 @@ pub const Shape = enum {
             .chain => "chain",
             .orphans => "orphans",
             .lfr => "lfr",
+            .motifs => "motifs",
         };
     }
 };
@@ -405,6 +411,7 @@ pub fn generate(gpa: std.mem.Allocator, arena: std.mem.Allocator, spec: Spec) !G
         .chain => try genChain(gpa, spec, &edges),
         .orphans => {},
         .lfr => try genLfr(gpa, arena, rand, spec, &edges, communities),
+        .motifs => try genMotifs(gpa, spec, &edges),
     }
 
     // Cross-island bridges, before anything downstream counts components or derives folders
@@ -827,6 +834,48 @@ fn genChain(gpa: std.mem.Allocator, spec: Spec, edges: *std.ArrayListUnmanaged(l
     while (i + 2 < n and added < skip) : (i += 2) {
         try edges.append(gpa, .{ .a = @intCast(i), .b = @intCast(i + 2) });
         added += 1;
+    }
+}
+
+/// Cycle through tiny geometric islands that each fit in one arity-7 fold cell.
+fn genMotifs(gpa: std.mem.Allocator, spec: Spec, edges: *std.ArrayListUnmanaged(layout_full.Edge)) !void {
+    const kinds = [_]u32{ 2, 3, 6, 4, 7 };
+    var cursor: u32 = 0;
+    var kind_i: usize = 0;
+    while (cursor < spec.n) {
+        const kind = kinds[kind_i % kinds.len];
+        kind_i += 1;
+        const remaining: u32 = @intCast(spec.n - cursor);
+        const sz = @min(kind, remaining);
+        if (sz < 2) break;
+        switch (sz) {
+            2 => try edges.append(gpa, .{ .a = cursor, .b = cursor + 1 }),
+            3 => {
+                try edges.append(gpa, .{ .a = cursor, .b = cursor + 1 });
+                try edges.append(gpa, .{ .a = cursor + 1, .b = cursor + 2 });
+                try edges.append(gpa, .{ .a = cursor + 2, .b = cursor });
+            },
+            4 => {
+                // Y: centre plus three exclusive leaves.
+                try edges.append(gpa, .{ .a = cursor, .b = cursor + 1 });
+                try edges.append(gpa, .{ .a = cursor, .b = cursor + 2 });
+                try edges.append(gpa, .{ .a = cursor, .b = cursor + 3 });
+            },
+            6 => {
+                var k: u32 = 0;
+                while (k < 6) : (k += 1) {
+                    try edges.append(gpa, .{ .a = cursor + k, .b = cursor + (k + 1) % 6 });
+                }
+            },
+            else => {
+                // Small star: note 0 is the hub.
+                var k: u32 = 1;
+                while (k < sz) : (k += 1) {
+                    try edges.append(gpa, .{ .a = cursor, .b = cursor + k });
+                }
+            },
+        }
+        cursor += sz;
     }
 }
 
@@ -1568,6 +1617,17 @@ test "lfr shape is parsed from both spellings" {
     try testing.expect(a == .lfr);
     const b = try Shape.parse("realistic");
     try testing.expect(b == .lfr);
+}
+
+test "motifs: tiny geometric islands, no leftover notes" {
+    const spec = Spec{ .n = 110, .shape = .motifs };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var g = try generate(testing.allocator, arena_state.allocator(), spec);
+    defer g.deinit(testing.allocator);
+    try testing.expect(g.edges.len > 0);
+    try testing.expect(g.components > 10);
+    try testing.expectEqual(@as(usize, 110), g.positions.len);
 }
 
 test "non-lfr shapes fill communities with the orphan sentinel" {

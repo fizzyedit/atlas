@@ -20,16 +20,18 @@
 //!    off-screen cell's whole subtree is off-screen and the test is exact. Without this the
 //!    candidate list fills with the entire vault, the budget check never passes, and the dive
 //!    stalls partway showing nothing but coalesced rings.
-//! 2. **Decide a level by a count threshold, never by visit order.** Opening biggest-first until
+//! 2. **Decide a level by a radius-class threshold, never by visit order.** Opening biggest-first until
 //!    the budget runs out leaves identical neighbours resolved differently depending on the walk —
 //!    a visible seam. But opening a whole level or none of it wastes most of the budget, since
 //!    level sizes go 1, arity, arity²…: the gauntlet drew 57 marks against a budget of 280.
-//!    Thresholding on *count* gets both — equal-count cells always agree, and the budget fills.
+//!    Thresholding on *span* gets both — equal-radius cells always agree, and the budget fills.
+//!    Gravity placement makes nearby groups of equal count differ in size; that is a feature.
 //! 3. **Never force an open cell closed at the budget wall.** Closing frees budget, which allows
 //!    reopening, which exceeds it again. The wall refuses only *new* opens.
 //! 4. **A note is a fixed screen size.** Only masses are count-and-zoom scaled, and soft-capped so
 //!    a cell the budget refused cannot inflate to fill the screen.
-//! 5. Radius is the area-conserving law `√count`, anchored on the note size.
+//! 5. Radius is the area-conserving law `√count` as a floor, grown for exclusive groups under
+//!    gravity, then replaced by the settled bound once a cell opens.
 //! 6. Split and merge crossfade through `anim`; topology itself stays discrete.
 //!
 //! Screen-space out, no dvui in: marks are plain numbers so this stays headless-testable.
@@ -118,7 +120,7 @@ pub const FocusLink = struct {
 /// space a leaf asks for, and it is deliberately *not* uniform from cell to cell. This is the
 /// pitch of the canonical full cell, which is what the scale calibration needs; the test below is
 /// the definition, so if the relaxation is retuned, run it and paste the number back here.
-pub const leaf_pitch: f32 = 0.71;
+pub const leaf_pitch: f32 = 1.48;
 
 /// Liang–Barsky clip of the segment `(ax,ay)-(bx,by)` against the rect `(rx,ry,rw,rh)`.
 /// Null when the segment misses the rect entirely.
@@ -692,7 +694,7 @@ pub const World = struct {
             // cell's whole subtree is off-screen and this test is exact.
             vis.clearRetainingCapacity();
             for (frontier.items) |id| {
-                if (self.onScreen(id, view, p)) {
+                if (self.restOnScreen(id, view, p)) {
                     try vis.append(self.gpa, id);
                 } else {
                     // Still part of the cut, so a link leaving the viewport keeps a target. This
@@ -702,7 +704,7 @@ pub const World = struct {
             }
             if (vis.items.len == 0) break;
 
-            // -- rule 2: a count threshold, never visit order (see the module header) --
+            // -- rule 2: a radius-class threshold, never visit order (see the module header) --
             var extra: usize = 0;
             var want_open: usize = 0;
             for (vis.items) |id| {
@@ -712,22 +714,26 @@ pub const World = struct {
                 }
             }
 
-            var cutoff: u32 = 0;
+            var cutoff: ?u32 = null;
             if (closed + vis.items.len + extra > p.budget and want_open > 0) {
                 self.bound = true;
-                cutoff = try self.countCutoff(vis.items, view, p, closed, want_open);
+                cutoff = try self.radiusCutoff(vis.items, view, p, closed, want_open);
             }
 
             next.clearRetainingCapacity();
             for (vis.items) |id| {
-                const c = self.lad.cells[id];
-                const will_open = self.wantsSplit(id, view, p) and c.count > cutoff;
+                const will_open = self.wantsSplit(id, view, p) and
+                    (cutoff == null or self.radiusClass(id) > cutoff.?);
                 self.open[id] = will_open;
                 if (!will_open) {
                     closed += 1;
                     try self.cut.append(self.gpa, id);
                     continue;
                 }
+                // Place children now, not in `present`, so the next frontier's rest cull sees
+                // real positions rather than the origin, and `bound_r` is set before the next
+                // frame's radius-class cutoff would otherwise shift.
+                self.field.ensureChildren(&self.lad, id);
                 for (self.lad.childrenOf(id)) |k| try next.append(self.gpa, k);
             }
             std.mem.swap(std.ArrayListUnmanaged(u32), &frontier, &next);
@@ -735,9 +741,21 @@ pub const World = struct {
     }
 
     fn onScreen(self: *const World, id: u32, view: View, p: Params) bool {
-        const sr = self.field.radius(&self.lad, id) * view.zoom;
-        const sx = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom;
-        const sy = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom;
+        return discOnScreen(self.px[id], self.py[id], self.field.radius(&self.lad, id), view, p);
+    }
+
+    /// Topology cull: resting placement, not the crossfade pose. `px`/`py` are presentation
+    /// state, and using them here is exactly "the budget reads animation" that this module
+    /// exists to forbid.
+    fn restOnScreen(self: *const World, id: u32, view: View, p: Params) bool {
+        const pos = self.field.pos[id];
+        return discOnScreen(pos.x, pos.y, self.field.radius(&self.lad, id), view, p);
+    }
+
+    fn discOnScreen(x: f32, y: f32, radius: f32, view: View, p: Params) bool {
+        const sr = radius * view.zoom;
+        const sx = view.w * 0.5 + (x - view.cx) * view.zoom;
+        const sy = view.h * 0.5 + (y - view.cy) * view.zoom;
         const m = sr + p.cull_pad_px;
         return sx >= -m and sx <= view.w + m and sy >= -m and sy <= view.h + m;
     }
@@ -747,41 +765,51 @@ pub const World = struct {
         return c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px;
     }
 
-    /// Largest count class that does not fit. That class and every smaller one stay closed, so
-    /// cells of equal count never disagree and no order-dependent seam can appear.
-    fn countCutoff(
+    /// Bucket so equal-span cells always agree. ~3.5% steps in radius; visit order cannot
+    /// open one neighbour and refuse its twin.
+    fn radiusClass(self: *const World, id: u32) u32 {
+        const r = self.field.radius(&self.lad, id);
+        if (r <= 0) return 0;
+        return @intFromFloat(@max(0, @round(@log2(r) * 20)));
+    }
+
+    /// Largest radius class that does not fit. That class and every smaller one stay closed, so
+    /// cells of equal span never disagree and no order-dependent seam can appear. Unequal spans
+    /// at the same zoom — a large exclusive pair next to a still-coalesced dense mass — is the
+    /// point of gravity radii. Null when every class fits.
+    fn radiusCutoff(
         self: *World,
         vis: []const u32,
         view: View,
         p: Params,
         closed: usize,
         want_open: usize,
-    ) !u32 {
-        const counts = try self.gpa.alloc(u32, want_open);
-        defer self.gpa.free(counts);
+    ) !?u32 {
+        const classes = try self.gpa.alloc(u32, want_open);
+        defer self.gpa.free(classes);
         var ci: usize = 0;
         for (vis) |id| {
             if (self.wantsSplit(id, view, p)) {
-                counts[ci] = self.lad.cells[id].count;
+                classes[ci] = self.radiusClass(id);
                 ci += 1;
             }
         }
-        std.mem.sort(u32, counts, {}, comptime std.sort.desc(u32));
+        std.mem.sort(u32, classes, {}, comptime std.sort.desc(u32));
 
         var spent = closed + vis.len;
         var prev: u32 = std.math.maxInt(u32);
-        for (counts) |cnt| {
-            if (cnt == prev) continue; // same class, already paid for
-            prev = cnt;
+        for (classes) |cls| {
+            if (cls == prev) continue; // same class, already paid for
+            prev = cls;
             var class_cost: usize = 0;
             for (vis) |id| {
                 const c = self.lad.cells[id];
-                if (c.count == cnt and self.wantsSplit(id, view, p)) class_cost += c.child_count - 1;
+                if (self.radiusClass(id) == cls and self.wantsSplit(id, view, p)) class_cost += c.child_count - 1;
             }
-            if (spent + class_cost > p.budget) return cnt;
+            if (spent + class_cost > p.budget) return cls;
             spent += class_cost;
         }
-        return 0;
+        return null;
     }
 
     /// Pass 2 — how the decided set looks right now. Chases `anim` toward `open`, lerps poses, and

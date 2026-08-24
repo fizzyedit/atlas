@@ -96,6 +96,10 @@ pub const Cell = struct {
     /// is the measure that separates a hub from a stub, and it is free: the edge list is already
     /// here. Real links only; the folder chain is a placement prior, not evidence of importance.
     weight: f32 = 0,
+    /// Sum of file sizes (bytes) of notes beneath this cell. Gravity uses a log of this as
+    /// extra inertial mass and push — a long note claims more interior-entry room than a stub
+    /// with the same degree. 0 when the caller did not pass `Options.bodies`.
+    body: f32 = 0,
     /// Set iff this cell is a single real note.
     note: u32 = invalid,
     /// Connected component of the *link* graph this cell belongs to. Coarsening never merges
@@ -173,6 +177,10 @@ pub const Options = struct {
     /// it is running lives in a dylib that is about to be unloaded. Without a check in here that
     /// join is the whole build, and closing the editor mid-build looks like a hang.
     cancel: ?*std.atomic.Value(bool) = null,
+    /// Parallel to notes `0..n_notes`: file size in bytes. Empty means every body is 0.
+    /// Gravity placement uses `log(1+body)` as extra mass and personal space, so a save that
+    /// grows a document without adding links still opens more room for its interior.
+    bodies: []const f32 = &.{},
 };
 
 /// Discount every link by how popular its endpoints are: `w · K^p / (deg_a · deg_b)^(p/2)`.
@@ -306,6 +314,7 @@ pub fn build(
             .note = @intCast(i),
             .comp = comp[i],
             .weight = wnote[i],
+            .body = if (opts.bodies.len == n_notes) opts.bodies[i] else 0,
         });
     }
 
@@ -799,6 +808,7 @@ fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) u16 {
     }
     const child_count = lad.cells[id].child_count;
     var w: f32 = 0;
+    var body: f32 = 0;
     if (child_count == 0) {
         const c = &lad.cells[id];
         if (c.note != invalid) {
@@ -813,13 +823,17 @@ fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) u16 {
             const kid = lad.children[start + i];
             h = @max(h, 1 + assignRanges(lad, kid, level + 1, cursor));
             w += lad.cells[kid].weight;
+            body += lad.cells[kid].body;
         }
     }
     const c = &lad.cells[id];
     c.le = cursor.*;
     c.height = h;
-    // Leaves carry the weight they were created with; everything above is the sum beneath it.
-    if (child_count > 0) c.weight = w;
+    // Leaves carry the weight/body they were created with; everything above is the sum beneath.
+    if (child_count > 0) {
+        c.weight = w;
+        c.body = body;
+    }
     return h;
 }
 

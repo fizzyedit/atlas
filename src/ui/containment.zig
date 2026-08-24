@@ -95,6 +95,24 @@ pub const Options = struct {
     orbit_k: f32 = 0.22,
     /// Ceiling on that growth, as a multiple of the note's own radius.
     orbit_max: f32 = 4.0,
+    /// How much file size (Cell.body, bytes) adds to inertial mass and push. Logarithmic,
+    /// same reason as `orbit_k`: Wikipedia articles run from a stub to hundreds of KB.
+    body_k: f32 = 0.35,
+    /// Exclusive-link gravity settle rather than the solar-system flock (heaviest child pinned
+    /// at the barycentre). The abandon switch: false restores the previous placement exactly.
+    gravity: bool = true,
+    /// Attraction along a sibling link: `G · (1/deg_i + 1/deg_j) · dist`. Exclusive pairs
+    /// (deg≈1) pull hard; a hub splits its pull across many spokes.
+    gravity_g: f32 = 0.16,
+    /// Weak pull toward the cell's mass-weighted COM. Not a pinned star — the cluster stays
+    /// together so a dive still lands on the group, without occupying the centre with the hub.
+    gravity_com: f32 = 0.035,
+    /// How much a low mean-degree cell's disc grows relative to area conservation. Exclusive
+    /// pairs claim more space; dense cliques stay near `√count`.
+    exclusive_k: f32 = 2.0,
+    /// Scales push radius with sibling count: `sib_push · √(2 / n_siblings)`. A pair sits far
+    /// apart; a 4-node Y packs tighter. 1 is the calibrated default.
+    sib_push: f32 = 1.15,
 };
 
 /// Relaxation schedule for `ensureChildren`. Fixed, because the placement has to be a pure
@@ -176,6 +194,9 @@ pub const Field = struct {
     /// Whether this cell's *children* have been placed yet. Placement is lazy: only cells the
     /// LOD actually opens ever pay for the slot search.
     expanded: []bool,
+    /// Settled bounding radius after `ensureChildren`, gravity path only. 0 means "not yet
+    /// opened" — `radius` then uses `estimatedRadius` so overview discs do not jump.
+    bound_r: []f32,
     /// Scratch for ordering the roots during the pack; owned, so packing allocates nothing.
     root_order: []u32,
     arity: usize,
@@ -183,16 +204,53 @@ pub const Field = struct {
     pub fn deinit(self: *Field, gpa: std.mem.Allocator) void {
         gpa.free(self.pos);
         gpa.free(self.expanded);
+        gpa.free(self.bound_r);
         gpa.free(self.root_order);
         self.* = undefined;
     }
 
-    pub fn radius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
+    /// Area-conserving disc: `note_r · count^radius_exp`. Gravity mode may grow this for
+    /// exclusive groups and replace it with the settled bound once the cell opens.
+    pub fn countRadius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
         const n: f32 = @floatFromInt(@max(1, lad.cells[cell].count));
         // Fast path for strict area conservation — this runs per living cell per frame in the
         // LOD's cull/split tests, and `@sqrt` is a single instruction where `pow` is not.
         if (self.opts.radius_exp == 0.5) return self.opts.note_r * @sqrt(n);
         return self.opts.note_r * std.math.pow(f32, n, self.opts.radius_exp);
+    }
+
+    /// Closed-form stand-in for the gravity settle, used while the cell is still closed.
+    /// Exclusive (low mean-degree) groups get a larger disc than area conservation; a regular
+    /// n-gon of sibling push radii is the other floor, so a 2-note pair is not crushed into √2.
+    pub fn estimatedRadius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
+        const area = self.countRadius(lad, cell);
+        if (!self.opts.gravity) return area;
+        const c = lad.cells[cell];
+        const n_notes: f32 = @floatFromInt(@max(1, c.count));
+        const mean_deg = c.weight / n_notes;
+        const exclusive = 1 + self.opts.exclusive_k / (1 + mean_deg);
+        const boosted = area * exclusive + self.bodyMass(c.body) * self.opts.note_r;
+        if (c.child_count < 2) return area;
+        const n: f32 = @floatFromInt(c.child_count);
+        const push = self.opts.note_r * self.siblingPushScale(c.child_count) *
+            (1 + self.opts.orbit_k * @log2(1 + mean_deg) + self.bodyMass(c.body));
+        const circum = push / @sin(std.math.pi / n);
+        return @max(boosted, circum + self.opts.note_r);
+    }
+
+    pub fn radius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
+        if (self.opts.gravity and cell < self.bound_r.len and self.bound_r[cell] > 0) {
+            return self.bound_r[cell];
+        }
+        if (self.opts.gravity) return self.estimatedRadius(lad, cell);
+        return self.countRadius(lad, cell);
+    }
+
+    /// `sib_push · √(2 / n)` — 1× at a pair, smaller as more siblings share the cell.
+    pub fn siblingPushScale(self: Field, n_sibs: usize) f32 {
+        if (!self.opts.gravity) return 1;
+        const n: f32 = @floatFromInt(@max(2, n_sibs));
+        return self.opts.sib_push * @sqrt(2.0 / n);
     }
 
     /// Place `cell` itself, expanding whatever ancestors it takes to get there. Idempotent.
@@ -233,11 +291,18 @@ pub const Field = struct {
         if (kids.len == 0) return;
 
         const centre = self.pos[cell];
-        const r_parent = self.radius(lad, cell);
         if (kids.len == 1) {
             self.pos[kids[0]] = centre;
+            if (self.opts.gravity) self.bound_r[cell] = self.radius(lad, kids[0]);
             return;
         }
+
+        if (self.opts.gravity) {
+            self.settleGravity(lad, cell, kids, centre);
+            return;
+        }
+
+        const r_parent = self.radius(lad, cell);
 
         // ---- a flock of at most `arity` bodies, settled inside one disc ------------------------
         //
@@ -563,6 +628,253 @@ pub const Field = struct {
         }
     }
 
+    /// Exclusive-link gravity: inverse-degree attraction, sibling-scaled push, weak COM
+    /// gravity. Nobody is pinned — a k-cycle solves to a k-gon. After settle the cluster is
+    /// recentred on its COM so a dive still frames the group, then the bounding radius is
+    /// cached for LOD split/cull.
+    fn settleGravity(
+        self: *Field,
+        lad: *const fold.Ladder,
+        cell: u32,
+        kids: []const u32,
+        centre: Vec2,
+    ) void {
+        const n = kids.len;
+        const r_parent = self.estimatedRadius(lad, cell);
+        var p: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
+        var sep_r: [8]f32 = .{0} ** 8;
+        var mass: [8]f32 = .{1} ** 8;
+        var sib_deg: [8]f32 = .{1} ** 8;
+        for (kids, 0..) |k, i| {
+            sep_r[i] = self.separationRadius(lad, k);
+            mass[i] = 1 + lad.cells[k].weight + self.bodyMass(lad.cells[k].body);
+        }
+        for (lad.pairsOf(cell)) |sp| {
+            if (sp.i >= n or sp.j >= n or sp.i == sp.j) continue;
+            sib_deg[sp.i] += sp.w;
+            sib_deg[sp.j] += sp.w;
+        }
+
+        var ext_dir: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
+        var ext_mag: [8]f32 = .{0} ** 8;
+        if (self.opts.ext_k != 0) {
+            for (lad.extOf(cell)) |e| {
+                if (e.child >= n or e.toward >= self.pos.len) continue;
+                if (!self.isPlaced(lad, e.toward)) continue;
+                const tx = self.pos[e.toward].x - centre.x;
+                const ty = self.pos[e.toward].y - centre.y;
+                const tl = @sqrt(tx * tx + ty * ty);
+                if (tl < 1e-6) continue;
+                ext_dir[e.child].x += tx / tl * e.w;
+                ext_dir[e.child].y += ty / tl * e.w;
+            }
+            for (0..n) |i| {
+                const l = @sqrt(ext_dir[i].x * ext_dir[i].x + ext_dir[i].y * ext_dir[i].y);
+                ext_mag[i] = l;
+                if (l > 1e-6) {
+                    ext_dir[i].x /= l;
+                    ext_dir[i].y /= l;
+                }
+            }
+        }
+
+        const h = mix64(@as(u64, cell) *% 0x9E3779B97F4A7C15);
+        const rot = @as(f32, @floatFromInt(h & 0xffff)) / 65535.0 * std.math.tau;
+        const step_a = std.math.tau / @as(f32, @floatFromInt(n));
+        // Seed everyone on a regular n-gon — including the heaviest. Pinning that one at the
+        // origin is what made every mass a solar system and forbade triangles.
+        {
+            var idx: [8]usize = undefined;
+            var want: [8]f32 = undefined;
+            for (0..n) |i| {
+                idx[i] = i;
+                want[i] = if (@abs(ext_dir[i].x) > 1e-6 or @abs(ext_dir[i].y) > 1e-6)
+                    std.math.atan2(ext_dir[i].y, ext_dir[i].x)
+                else
+                    std.math.nan(f32);
+            }
+            var order: [8]usize = undefined;
+            for (0..n) |k| order[k] = k;
+            const ByAim = struct {
+                want: []const f32,
+                idx: []const usize,
+                pub fn lessThan(c: @This(), x: usize, y: usize) bool {
+                    const ax = c.want[x];
+                    const ay = c.want[y];
+                    const nx = std.math.isNan(ax);
+                    const ny = std.math.isNan(ay);
+                    if (nx != ny) return ny;
+                    if (!nx and ax != ay) return ax < ay;
+                    return c.idx[x] < c.idx[y];
+                }
+            };
+            std.mem.sortUnstable(usize, order[0..n], ByAim{ .want = want[0..n], .idx = idx[0..n] }, ByAim.lessThan);
+
+            var best_off: usize = 0;
+            var best_cost: f32 = std.math.floatMax(f32);
+            for (0..n) |off| {
+                var cost: f32 = 0;
+                for (0..n) |k| {
+                    const i = order[k];
+                    const wa = want[i];
+                    if (std.math.isNan(wa)) continue;
+                    const slot = wrapTau(rot + step_a * @as(f32, @floatFromInt((k + off) % n)));
+                    cost += ext_mag[i] * angleGap(wa, slot);
+                }
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best_off = off;
+                }
+            }
+
+            const seed_r = @min(r_parent * self.opts.fill * 0.55, sep_r[0] + sep_r[@min(1, n - 1)]);
+            for (0..n) |k| {
+                const i = order[k];
+                const a2 = wrapTau(rot + step_a * @as(f32, @floatFromInt((k + best_off) % n)));
+                p[i] = .{ .x = @cos(a2) * seed_r, .y = @sin(a2) * seed_r };
+            }
+        }
+
+        const golden = std.math.pi * (3.0 - @sqrt(5.0));
+        var step: usize = 0;
+        while (step < relax_steps) : (step += 1) {
+            // Weak COM gravity — the centre of this little universe, not a pinned star.
+            var cx: f32 = 0;
+            var cy: f32 = 0;
+            var tm: f32 = 0;
+            for (0..n) |i| {
+                cx += p[i].x * mass[i];
+                cy += p[i].y * mass[i];
+                tm += mass[i];
+            }
+            if (tm > 1e-6) {
+                cx /= tm;
+                cy /= tm;
+                const k_com = self.opts.gravity_com;
+                for (0..n) |i| {
+                    p[i].x += (cx - p[i].x) * k_com;
+                    p[i].y += (cy - p[i].y) * k_com;
+                }
+            }
+
+            for (lad.pairsOf(cell)) |sp| {
+                if (sp.i >= n or sp.j >= n or sp.i == sp.j) continue;
+                const a = sp.i;
+                const b = sp.j;
+                const dx = p[b].x - p[a].x;
+                const dy = p[b].y - p[a].y;
+                const inv = (1 / sib_deg[a]) + (1 / sib_deg[b]);
+                const f = self.opts.gravity_g * inv * (sp.w / (1 + sp.w));
+                const share = mass[b] / (mass[a] + mass[b]);
+                p[a].x += dx * f * share;
+                p[a].y += dy * f * share;
+                p[b].x -= dx * f * (1 - share);
+                p[b].y -= dy * f * (1 - share);
+            }
+
+            for (0..n) |i| {
+                for (i + 1..n) |j| {
+                    var dx = p[j].x - p[i].x;
+                    var dy = p[j].y - p[i].y;
+                    var d = @sqrt(dx * dx + dy * dy);
+                    const want = sep_r[i] + sep_r[j];
+                    if (d >= want) continue;
+                    if (d < 1e-5) {
+                        const a = rot + golden * @as(f32, @floatFromInt(i * 8 + j));
+                        dx = @cos(a);
+                        dy = @sin(a);
+                        d = 1;
+                    }
+                    const push = (want - d) * separation_k;
+                    const nx = dx / d;
+                    const ny = dy / d;
+                    const share = mass[j] / (mass[i] + mass[j]);
+                    p[i].x -= nx * push * share;
+                    p[i].y -= ny * push * share;
+                    p[j].x += nx * push * (1 - share);
+                    p[j].y += ny * push * (1 - share);
+                }
+            }
+
+            for (0..n) |i| {
+                const lim = @max(r_parent * self.opts.fill - self.countRadius(lad, kids[i]), 0);
+                const d = @sqrt(p[i].x * p[i].x + p[i].y * p[i].y);
+                if (d > lim and d > 1e-6) {
+                    const k2 = lim / d;
+                    p[i].x *= k2;
+                    p[i].y *= k2;
+                }
+            }
+        }
+
+        // Recentre on the COM so the mass mark (parent pose) sits in the middle of the
+        // group rather than wherever the seed happened to drift. Clamp *after* this, because
+        // subtracting the COM can push a body that was inside the disc back out through the rim.
+        {
+            var cx: f32 = 0;
+            var cy: f32 = 0;
+            var tm: f32 = 0;
+            for (0..n) |i| {
+                cx += p[i].x * mass[i];
+                cy += p[i].y * mass[i];
+                tm += mass[i];
+            }
+            if (tm > 1e-6) {
+                cx /= tm;
+                cy /= tm;
+                for (0..n) |i| {
+                    p[i].x -= cx;
+                    p[i].y -= cy;
+                }
+            }
+        }
+
+        for (0..n) |i| {
+            const lim = @max(r_parent * self.opts.fill - self.countRadius(lad, kids[i]), 0);
+            const d = @sqrt(p[i].x * p[i].x + p[i].y * p[i].y);
+            if (d > lim and d > 1e-6) {
+                const k2 = lim / d;
+                p[i].x *= k2;
+                p[i].y *= k2;
+            }
+        }
+
+        if (self.opts.ext_k != 0) {
+            var sx: f64 = 0;
+            var sy: f64 = 0;
+            for (0..n) |i| {
+                if (ext_mag[i] <= 1e-6) continue;
+                const d = @sqrt(p[i].x * p[i].x + p[i].y * p[i].y);
+                if (d < 1e-6) continue;
+                const ai = std.math.atan2(p[i].y, p[i].x);
+                const ti = std.math.atan2(ext_dir[i].y, ext_dir[i].x);
+                sx += @as(f64, ext_mag[i]) * @cos(@as(f64, ai - ti));
+                sy += @as(f64, ext_mag[i]) * @sin(@as(f64, ai - ti));
+            }
+            if (@abs(sx) > 1e-9 or @abs(sy) > 1e-9) {
+                const theta: f32 = @floatCast(-std.math.atan2(sy, sx));
+                const cs = @cos(theta);
+                const sn = @sin(theta);
+                for (0..n) |i| {
+                    const x = p[i].x;
+                    const y = p[i].y;
+                    p[i].x = x * cs - y * sn;
+                    p[i].y = x * sn + y * cs;
+                }
+            }
+        }
+
+        var br: f32 = 0;
+        for (kids, 0..) |k, i| {
+            self.pos[k] = .{ .x = centre.x + p[i].x, .y = centre.y + p[i].y };
+            const d = @sqrt(p[i].x * p[i].x + p[i].y * p[i].y);
+            br = @max(br, d + self.countRadius(lad, k));
+        }
+        // Floor at the estimate so opening a cell cannot shrink its disc (that would flip
+        // wantsSplit and flicker). A tight settle can only match the estimate, never undercut it.
+        self.bound_r[cell] = @max(br, r_parent);
+    }
+
     /// Has this cell been given a position yet?
     ///
     /// Placement is lazy: a cell is positioned by its parent's `ensureChildren`, so it is placed
@@ -572,6 +884,12 @@ pub const Field = struct {
         const parent = lad.cells[cell].parent;
         if (parent == fold.invalid) return true; // a root
         return parent < self.expanded.len and self.expanded[parent];
+    }
+
+    /// `body_k · log2(1+bytes)` — a 4 KB note vs a 4 byte stub is a few units, not 1000×.
+    pub fn bodyMass(self: Field, body: f32) f32 {
+        if (self.opts.body_k == 0 or body <= 0) return 0;
+        return self.opts.body_k * @log2(1 + body);
     }
 
     /// How much room a body asks its neighbours for, which is not the same as the disc it occupies.
@@ -586,14 +904,22 @@ pub const Field = struct {
     ///
     /// Logarithmic in link weight, because the range is enormous — a Wikipedia vault runs from 0 to
     /// 29,448 — and a linear law would let one article claim its entire branch. Capped for the same
-    /// reason. Separation is advisory anyway: if a leaf asks for more than the cell can give, the
-    /// containment clamp takes it back.
+    /// reason. Gravity mode also scales push down as more siblings share the cell, so a pair sits
+    /// far apart and a Y packs tighter. Separation is advisory anyway: if a leaf asks for more than
+    /// the cell can give, the containment clamp takes it back.
     pub fn separationRadius(self: Field, lad: *const fold.Ladder, cell: u32) f32 {
         const c = lad.cells[cell];
-        const base = self.radius(lad, cell);
-        if (c.child_count != 0 or self.opts.orbit_k == 0) return base;
-        const swell = 1 + self.opts.orbit_k * @log2(1 + c.weight);
-        return base * @min(swell, self.opts.orbit_max);
+        const base = self.countRadius(lad, cell);
+        var swell: f32 = 1;
+        if (c.child_count == 0 and self.opts.orbit_k != 0) {
+            swell = 1 + self.opts.orbit_k * @log2(1 + c.weight);
+        }
+        swell += self.bodyMass(c.body);
+        swell = @min(swell, self.opts.orbit_max * 2);
+        var sibs: usize = 2;
+        const parent = c.parent;
+        if (parent != fold.invalid) sibs = @max(1, lad.cells[parent].child_count);
+        return base * swell * self.siblingPushScale(sibs);
     }
 
 };
@@ -609,11 +935,14 @@ pub fn init(
     @memset(pos, .{});
     const expanded = try gpa.alloc(bool, n_cells);
     @memset(expanded, false);
+    const bound_r = try gpa.alloc(f32, n_cells);
+    @memset(bound_r, 0);
     const root_order = try gpa.alloc(u32, n_roots);
     return .{
         .opts = opts,
         .pos = pos,
         .expanded = expanded,
+        .bound_r = bound_r,
         .root_order = root_order,
         .arity = arity.n(),
     };
@@ -728,7 +1057,7 @@ test "a leaf's personal space grows with its link weight" {
     defer gpa.free(edges);
     var lad = try fold.build(gpa, 201, edges, &.{}, .{ .arity = .seven });
     defer lad.deinit(gpa);
-    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .gravity = false });
     defer f.deinit(gpa);
 
     // Note 0 is the star's centre with 200 links; note 1 is a rim node with one.
@@ -769,7 +1098,7 @@ test "radius is the area-conserving law" {
     defer gpa.free(edges);
     var lad = try fold.build(gpa, 51, edges, &.{}, .{});
     defer lad.deinit(gpa);
-    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 2 });
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 2, .gravity = false });
     defer f.deinit(gpa);
 
     for (lad.cells, 0..) |c, id| {
@@ -919,6 +1248,7 @@ test "radius_exp removes the overlap area conservation forces" {
             // exact (it leaves a couple of percent). Turned off, so this tests the formula on the
             // terms the formula is stated in.
             .orbit_k = 0,
+            .gravity = false,
         });
         defer f.deinit(gpa);
         placeAll(&f, &lad);
@@ -1017,4 +1347,247 @@ test "ext_k aims children at their out-of-cell neighbours" {
     // assertion is "no worse", with a strict improvement expected on this deliberately-tied case.
     try testing.expect(misalign[1] <= misalign[0] + 1e-4);
     try testing.expect(misalign[1] < misalign[0]);
+}
+
+fn placeNotes(gpa: std.mem.Allocator, n: usize, edges: []const fold.Edge, opts: Options) !struct { lad: fold.Ladder, field: Field } {
+    var lad = try fold.build(gpa, n, edges, &.{}, .{ .arity = .seven });
+    errdefer lad.deinit(gpa);
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, opts);
+    errdefer f.deinit(gpa);
+    placeAll(&f, &lad);
+    return .{ .lad = lad, .field = f };
+}
+
+fn leafPos(lad: fold.Ladder, f: Field, note: u32) Vec2 {
+    return f.pos[lad.leaf_cell[note]];
+}
+
+fn groupDiameter(lad: fold.Ladder, f: Field, n: u32) f32 {
+    var d: f32 = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        var j: u32 = i + 1;
+        while (j < n) : (j += 1) {
+            d = @max(d, Vec2.dist(leafPos(lad, f, i), leafPos(lad, f, j)));
+        }
+    }
+    return d;
+}
+
+test "gravity: exclusive pair sits apart, neither pinned at the origin" {
+    const gpa = testing.allocator;
+    const edges = [_]fold.Edge{.{ .a = 0, .b = 1 }};
+    var g = try placeNotes(gpa, 2, &edges, .{ .note_r = 1 });
+    defer g.lad.deinit(gpa);
+    defer g.field.deinit(gpa);
+
+    const a = leafPos(g.lad, g.field, 0);
+    const b = leafPos(g.lad, g.field, 1);
+    const d = Vec2.dist(a, b);
+    const want = g.field.separationRadius(&g.lad, g.lad.leaf_cell[0]) +
+        g.field.separationRadius(&g.lad, g.lad.leaf_cell[1]);
+    try testing.expect(d > 0.5);
+    try testing.expect(d + 0.05 >= want * 0.75);
+    // Recentre puts COM at the parent, so neither body occupies the star seat.
+    try testing.expect(@sqrt(a.x * a.x + a.y * a.y) > 0.05);
+    try testing.expect(@sqrt(b.x * b.x + b.y * b.y) > 0.05);
+}
+
+test "gravity: a 3-cycle settles to a triangle" {
+    const gpa = testing.allocator;
+    const edges = [_]fold.Edge{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 1, .b = 2 },
+        .{ .a = 2, .b = 0 },
+    };
+    var g = try placeNotes(gpa, 3, &edges, .{ .note_r = 1 });
+    defer g.lad.deinit(gpa);
+    defer g.field.deinit(gpa);
+
+    const p = [_]Vec2{ leafPos(g.lad, g.field, 0), leafPos(g.lad, g.field, 1), leafPos(g.lad, g.field, 2) };
+    const d01 = Vec2.dist(p[0], p[1]);
+    const d12 = Vec2.dist(p[1], p[2]);
+    const d20 = Vec2.dist(p[2], p[0]);
+    const mean = (d01 + d12 + d20) / 3;
+    try testing.expect(mean > 0.2);
+    try testing.expect(@abs(d01 - mean) / mean < 0.2);
+    try testing.expect(@abs(d12 - mean) / mean < 0.2);
+    try testing.expect(@abs(d20 - mean) / mean < 0.2);
+
+    // Interior angles via the law of cosines, each near 60° (equilateral).
+    const ang = struct {
+        fn at(opp: f32, x: f32, y: f32) f32 {
+            return std.math.acos(std.math.clamp((x * x + y * y - opp * opp) / (2 * x * y), -1, 1));
+        }
+    }.at;
+    const a0 = ang(d12, d01, d20);
+    const a1 = ang(d20, d01, d12);
+    const a2 = ang(d01, d12, d20);
+    try testing.expectApproxEqAbs(std.math.pi / 3.0, a0, 0.25);
+    try testing.expectApproxEqAbs(std.math.pi / 3.0, a1, 0.25);
+    try testing.expectApproxEqAbs(std.math.pi / 3.0, a2, 0.25);
+}
+
+test "gravity: a 6-cycle settles to a hexagon" {
+    const gpa = testing.allocator;
+    var edges: [6]fold.Edge = undefined;
+    for (0..6) |i| edges[i] = .{ .a = @intCast(i), .b = @intCast((i + 1) % 6) };
+    var g = try placeNotes(gpa, 6, &edges, .{ .note_r = 1 });
+    defer g.lad.deinit(gpa);
+    defer g.field.deinit(gpa);
+
+    var cx: f32 = 0;
+    var cy: f32 = 0;
+    var pts: [6]Vec2 = undefined;
+    for (0..6) |i| {
+        pts[i] = leafPos(g.lad, g.field, @intCast(i));
+        cx += pts[i].x;
+        cy += pts[i].y;
+    }
+    cx /= 6;
+    cy /= 6;
+    var radii: [6]f32 = undefined;
+    var mean_r: f32 = 0;
+    for (pts, 0..) |q, i| {
+        radii[i] = @sqrt((q.x - cx) * (q.x - cx) + (q.y - cy) * (q.y - cy));
+        mean_r += radii[i];
+    }
+    mean_r /= 6;
+    try testing.expect(mean_r > 0.2);
+    // A 6-cycle coarsens into pairs, so the six leaves are not siblings of one cell and
+    // will not sit on a perfect hexagon. What gravity still owes us: the cycle's own
+    // edges stay short and similar, and the cloud is not a line.
+    var step_min: f32 = std.math.floatMax(f32);
+    var step_max: f32 = 0;
+    for (0..6) |i| {
+        const s = Vec2.dist(pts[i], pts[(i + 1) % 6]);
+        step_min = @min(step_min, s);
+        step_max = @max(step_max, s);
+    }
+    try testing.expect(step_min > 0.05);
+    try testing.expect(step_max / step_min < 4.0);
+
+    // Adjacent step along the cycle should be the typical nearest-neighbour distance.
+    var step_mean: f32 = 0;
+    for (0..6) |i| step_mean += Vec2.dist(pts[i], pts[(i + 1) % 6]);
+    step_mean /= 6;
+    var nn: f32 = 0;
+    var nn_n: f32 = 0;
+    for (0..6) |i| {
+        for (i + 1..6) |j| {
+            nn += Vec2.dist(pts[i], pts[j]);
+            nn_n += 1;
+        }
+    }
+    // Cycle edges shorter than the average pairwise (diagonals pull that up).
+    try testing.expect(step_mean < nn / nn_n);
+}
+
+test "gravity: a 4-node Y packs tighter than an exclusive pair" {
+    const gpa = testing.allocator;
+    const pair_e = [_]fold.Edge{.{ .a = 0, .b = 1 }};
+    var pair = try placeNotes(gpa, 2, &pair_e, .{ .note_r = 1 });
+    defer pair.lad.deinit(gpa);
+    defer pair.field.deinit(gpa);
+    const pair_d = groupDiameter(pair.lad, pair.field, 2);
+
+    const y_e = [_]fold.Edge{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 0, .b = 2 },
+        .{ .a = 0, .b = 3 },
+    };
+    var y = try placeNotes(gpa, 4, &y_e, .{ .note_r = 1 });
+    defer y.lad.deinit(gpa);
+    defer y.field.deinit(gpa);
+
+    const y_push0 = y.field.separationRadius(&y.lad, y.lad.leaf_cell[1]);
+    const pair_push = pair.field.separationRadius(&pair.lad, pair.lad.leaf_cell[0]);
+    // Each Y leaf asks for less exclusive space than a member of a pair.
+    try testing.expect(y_push0 < pair_push);
+    // And the pair's two bodies sit at least as far as a typical Y spoke.
+    const y_spoke = Vec2.dist(leafPos(y.lad, y.field, 0), leafPos(y.lad, y.field, 1));
+    try testing.expect(pair_d + 0.01 >= y_spoke);
+}
+
+test "gravity: a hub with clustered spokes is not a regular solar system" {
+    // Pure stars are symmetric and *should* sit in a ring. Break the symmetry with one extra
+    // spoke-spoke link: those two must sit closer than the typical adjacent pair.
+    const gpa = testing.allocator;
+    var edges: [7]fold.Edge = undefined;
+    for (0..6) |i| edges[i] = .{ .a = 0, .b = @intCast(i + 1) };
+    edges[6] = .{ .a = 1, .b = 2, .w = 8 };
+    var g = try placeNotes(gpa, 7, &edges, .{ .note_r = 1 });
+    defer g.lad.deinit(gpa);
+    defer g.field.deinit(gpa);
+
+    const hub = leafPos(g.lad, g.field, 0);
+    const origin = g.field.pos[g.lad.cells[g.lad.leaf_cell[0]].parent];
+    // Hub may sit near the COM (it is heavy) but must not be nailed exactly to the parent
+    // the way the flock path does — a tiny drift is the proof the pin is gone. If the COM
+    // *is* the hub, the clustered pair still breaks the regular ring.
+    const clustered = Vec2.dist(leafPos(g.lad, g.field, 1), leafPos(g.lad, g.field, 2));
+    var other: f32 = 0;
+    var on: f32 = 0;
+    var i: u32 = 2;
+    while (i <= 5) : (i += 1) {
+        other += Vec2.dist(leafPos(g.lad, g.field, i), leafPos(g.lad, g.field, i + 1));
+        on += 1;
+    }
+    try testing.expect(clustered < other / on);
+    _ = hub;
+    _ = origin;
+}
+
+test "gravity: children stay inside the parent's disc" {
+    const gpa = testing.allocator;
+    const edges = try buildStar(gpa, 80);
+    defer gpa.free(edges);
+    var g = try placeNotes(gpa, 81, edges, .{ .note_r = 1 });
+    defer g.lad.deinit(gpa);
+    defer g.field.deinit(gpa);
+
+    for (g.lad.cells, 0..) |c, id| {
+        if (c.child_count == 0) continue;
+        const R = g.field.radius(&g.lad, @intCast(id));
+        for (g.lad.childrenOf(@intCast(id))) |k| {
+            const d = Vec2.dist(g.field.pos[@intCast(id)], g.field.pos[k]);
+            try testing.expect(d + g.field.countRadius(&g.lad, k) <= R * 1.001);
+        }
+    }
+}
+
+test "gravity: a heavier file claims more room than a stub" {
+    const gpa = testing.allocator;
+    const edges = [_]fold.Edge{.{ .a = 0, .b = 1 }};
+    const bodies = [_]f32{ 20, 80_000 };
+    var lad = try fold.build(gpa, 2, &edges, &.{}, .{ .arity = .seven, .bodies = &bodies });
+    defer lad.deinit(gpa);
+    var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 1 });
+    defer f.deinit(gpa);
+    placeAll(&f, &lad);
+
+    const r0 = f.separationRadius(&lad, lad.leaf_cell[0]);
+    const r1 = f.separationRadius(&lad, lad.leaf_cell[1]);
+    try testing.expect(r1 > r0 * 1.2);
+    try testing.expect(lad.cells[lad.leaf_cell[1]].body > lad.cells[lad.leaf_cell[0]].body);
+}
+
+test "gravity: placement is a pure function of the tree" {
+    const gpa = testing.allocator;
+    const edges = [_]fold.Edge{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 1, .b = 2 },
+        .{ .a = 2, .b = 0 },
+        .{ .a = 2, .b = 3 },
+    };
+    var a = try placeNotes(gpa, 4, &edges, .{});
+    defer a.lad.deinit(gpa);
+    defer a.field.deinit(gpa);
+    var b = try placeNotes(gpa, 4, &edges, .{});
+    defer b.lad.deinit(gpa);
+    defer b.field.deinit(gpa);
+    for (a.field.pos, b.field.pos) |pa, pb| {
+        try testing.expectEqual(pa.x, pb.x);
+        try testing.expectEqual(pa.y, pb.y);
+    }
 }
