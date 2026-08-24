@@ -85,8 +85,17 @@ pub const Cell = struct {
     level: u16 = 0,
     /// Levels of ladder *beneath* this cell: 0 for a leaf, the subtree's depth for a root. The
     /// counterpart to `level`, and the one anything reasoning about how much room a subtree needs
-    /// wants — see `containment.contentRadius`.
+    /// wants.
     height: u16 = 0,
+    /// Total incident link weight of the notes beneath this cell.
+    ///
+    /// `count` is how many notes a cell holds, which is the right measure of the *area* it needs
+    /// and the wrong one for how much it matters. Every leaf has a count of exactly one, so at the
+    /// zoom where notes are drawn individually — the one a reader spends most of their time at —
+    /// every body in the field has identical mass and nothing can behave like a star. Link weight
+    /// is the measure that separates a hub from a stub, and it is free: the edge list is already
+    /// here. Real links only; the folder chain is a placement prior, not evidence of importance.
+    weight: f32 = 0,
     /// Set iff this cell is a single real note.
     note: u32 = invalid,
     /// Connected component of the *link* graph this cell belongs to. Coarsening never merges
@@ -202,6 +211,15 @@ pub fn build(
         }
     }
 
+    // Link mass per note, from the real links only — see `Cell.weight`.
+    const wnote = try arena.alloc(f32, n_notes);
+    @memset(wnote, 0);
+    for (links) |e| {
+        if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+        wnote[e.a] += e.w;
+        wnote[e.b] += e.w;
+    }
+
     // ---- coarsen ---------------------------------------------------------------------------
     var cells: std.ArrayListUnmanaged(Cell) = .empty;
     try cells.ensureTotalCapacity(gpa, total * 2);
@@ -211,6 +229,7 @@ pub fn build(
             .count = 1,
             .note = @intCast(i),
             .comp = comp[i],
+            .weight = wnote[i],
         });
     }
 
@@ -703,6 +722,7 @@ fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) u16 {
         c.ls = cursor.*;
     }
     const child_count = lad.cells[id].child_count;
+    var w: f32 = 0;
     if (child_count == 0) {
         const c = &lad.cells[id];
         if (c.note != invalid) {
@@ -714,12 +734,16 @@ fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) u16 {
     } else {
         const start = lad.cells[id].child_start;
         for (0..child_count) |i| {
-            h = @max(h, 1 + assignRanges(lad, lad.children[start + i], level + 1, cursor));
+            const kid = lad.children[start + i];
+            h = @max(h, 1 + assignRanges(lad, kid, level + 1, cursor));
+            w += lad.cells[kid].weight;
         }
     }
     const c = &lad.cells[id];
     c.le = cursor.*;
     c.height = h;
+    // Leaves carry the weight they were created with; everything above is the sum beneath it.
+    if (child_count > 0) c.weight = w;
     return h;
 }
 

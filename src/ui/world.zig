@@ -108,11 +108,17 @@ pub const FocusLink = struct {
 
 /// Centre-to-centre distance between two ring-adjacent leaves, in units of `note_r`.
 ///
-/// A cell of `arity` leaves has radius `√arity · note_r`; its ring sits at
-/// `√arity · fill − note_r` and adjacent ring slots are one step apart, whose chord at arity 7 is
-/// the ring radius itself. A caller that needs notes a specific world distance apart — to match
-/// an existing lattice, say — divides that pitch by this.
-pub const leaf_pitch: f32 = 1.381;
+/// A caller that needs notes a specific world distance apart — to match an existing lattice, say —
+/// divides that pitch by this to get `note_r`.
+///
+/// Measured, not derived. It used to be read off the ring construction: a cell of `arity` leaves
+/// has radius `√arity · note_r`, its ring sat at `√arity · fill − note_r`, and adjacent slots were
+/// one uniform step apart. There is no ring any more — `containment.ensureChildren` settles its
+/// children by relaxation, so the spacing is a property of that settle and of how much personal
+/// space a leaf asks for, and it is deliberately *not* uniform from cell to cell. This is the
+/// pitch of the canonical full cell, which is what the scale calibration needs; the test below is
+/// the definition, so if the relaxation is retuned, run it and paste the number back here.
+pub const leaf_pitch: f32 = 0.71;
 
 /// Liang–Barsky clip of the segment `(ax,ay)-(bx,by)` against the rect `(rx,ry,rw,rh)`.
 /// Null when the segment misses the rect entirely.
@@ -1808,7 +1814,8 @@ test "leaf_pitch matches the geometry it claims to describe" {
             if (d > 1e-4) best = @min(best, d);
         }
     }
-    try testing.expectApproxEqAbs(leaf_pitch, best, 0.05);
+    // Loose, because the relaxation makes this an empirical constant rather than an identity.
+    try testing.expectApproxEqAbs(leaf_pitch, best, 0.08);
 }
 
 test "an empty vault does not crash" {
