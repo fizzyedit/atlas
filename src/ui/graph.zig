@@ -1442,7 +1442,18 @@ fn applyProximity(
     //     `strength` is 0; far in, the world-space falloff is tiny so almost nothing swells;
     //     in between, a large share of the cloud is swollen and the whole thing is quadratic.
     //     That band is exactly where the frame rate fell off a cliff.
-    if (any_shove and strength > 0.001) {
+    // The overview draws its marks from the world's own positions (`Mark.wx/wy`), not from
+    // `n.pos` — so a shove applied here is never drawn there. It still moved `n.pos`, which is what
+    // hit-testing and the label placer read, so near the cursor the ring you can see and the target
+    // you can click drifted apart: the node lights up, the cursor does not become a hand, and the
+    // click lands on nothing. Worse at some zooms than others, because the reach is a world-space
+    // distance derived from a screen-space radius.
+    //
+    // Drawing the shove instead would be the other repair, and it is the wrong one: link endpoints
+    // come from the same world positions the marks do, so shoved nodes would pull away from their
+    // own lines.
+    const drawn_from_world = nodes.ptr == p.nodes.ptr;
+    if (any_shove and strength > 0.001 and !drawn_from_world) {
         const gap_w = neighbor_gap_px * dpiScale() / zoom;
         const reach_cap = slot * max_shove_slots;
 
@@ -4746,10 +4757,10 @@ fn drawLabels(p: *Panel) void {
         const fade = p.interior.t;
         for (p.interior.nodes, 0..) |n, i| {
             if (p.hover_node == i) continue;
-            drawLabel(n, zoom_t, fade);
+            drawLabel(n, zoom_t, fade, false);
         }
         if (p.hover_node) |i| {
-            if (i < p.interior.nodes.len) drawLabel(p.interior.nodes[i], zoom_t, fade);
+            if (i < p.interior.nodes.len) drawLabel(p.interior.nodes[i], zoom_t, fade, true);
         }
         return;
     }
@@ -4775,28 +4786,20 @@ fn drawLabels(p: *Panel) void {
             if (v.index >= p.nodes.len) continue;
             if (p.hover_node == v.index) continue;
             if (open_idx) |oi| if (oi == v.index) continue;
-            drawLabel(p.nodes[v.index], zoom_t, fade);
+            drawLabel(p.nodes[v.index], zoom_t, fade, false);
         }
+        // The one you pointed at goes on top — it is the only label allowed to sit over another,
+        // and only while a displaced neighbour is still crossfading out — and it takes the
+        // highlight colour, so "which of these am I on" is answered by the name and not only by a
+        // swell that is easy to lose at overview density.
         if (p.hover_node) |i| {
             const is_open = if (open_idx) |oi| oi == i else false;
             if (!is_open and i < p.nodes.len and p.at_level0.len == p.nodes.len and p.at_level0[i]) {
-                drawLabel(p.nodes[i], zoom_t, fade);
+                drawLabel(p.nodes[i], zoom_t, fade, true);
             }
         }
         drawFocusNoteLabel(p, fade);
-        return;
     }
-
-    // The tracked set, not the vault: only a node `updateLabels` placed can have a name to draw.
-    for (p.label_live.items) |li| {
-        const i: usize = li;
-        if (i >= p.nodes.len) continue;
-        if (p.hover_node == i) continue;
-        drawLabel(p.nodes[i], zoom_t, fade);
-    }
-    // The one you pointed at goes on top — it is the only label allowed to sit over another,
-    // and only while a displaced neighbour is still crossfading out.
-    if (p.hover_node) |i| drawLabel(p.nodes[i], zoom_t, fade);
 }
 
 /// The focused document's name, drawn last and unconditionally.
@@ -4857,7 +4860,7 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
     }) catch {};
 }
 
-fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32) void {
+fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32, hot: bool) void {
     if (n.label_vis <= 0.02 or n.label_len == 0 or n.label_len > n.title.len) return;
     const alpha = labelReveal(n, zoom_t) * n.label_vis * n.alpha * fade;
     if (alpha <= 0.02) return;
@@ -4874,10 +4877,14 @@ fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32) void {
     else
         body;
 
+    // The name under the cursor answers "which one am I pointing at" — the bubble swells, but at
+    // overview density a swell is easy to lose among its neighbours and the name is the part that
+    // actually identifies it.
+    const base = if (hot) theme.color(.highlight, .fill) else theme.color(.content, .text);
     dvui.renderText(.{
         .font = dvui.Font.theme(.body).larger(label_font_delta),
         .text = text,
-        .color = theme.color(.content, .text).opacity(0.95 * alpha),
+        .color = base.opacity(0.95 * alpha),
         .rs = .{ .r = n.label_rect, .s = scale },
     }) catch {};
 }

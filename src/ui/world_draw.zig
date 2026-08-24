@@ -62,6 +62,8 @@ pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, li
 ///
 /// The bounds are chosen so the shipped default lands where it already was: at `graph_detail`'s
 /// 360 the web is 900 lines, which comes out at ~0.26 against the 0.22 this replaced.
+/// Opacity of the focused note's own links. See the `lit` colour in `draw`.
+const focus_link_alpha: f32 = 0.5;
 const ambient_alpha_lit: f32 = 0.40;
 const ambient_alpha_wash: f32 = 0.08;
 /// At or below this many drawn lines the web is at full strength; at or above the second, at its
@@ -179,8 +181,14 @@ pub fn draw(
             alpha: f32,
         }) = .empty;
         defer segs.deinit(arena);
+        // Half strength, not full.
+        //
+        // A note with many links drew each of them at near-opaque highlight, and the starburst then
+        // buried the very thing it was pointing at — the neighbours' names. The ambient web already
+        // thins its ink as it thickens (`ambientAlpha`); the highlight needs the same courtesy for
+        // the same reason. Half is still unmistakably brighter than ambient at its lit end.
         var lit = theme.color(.highlight, .fill);
-        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * 0.95 * fade);
+        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * focus_link_alpha * fade);
 
         // Where a link's endpoint is, even when that endpoint has no mark this frame.
         //
