@@ -121,51 +121,43 @@ const hover_fill_mix: f32 = 0.45;
 const hover_ring_min_mult: f32 = 2.0;
 /// The ceiling, for a long document.
 const hover_ring_max_mult: f32 = 7.0;
-/// How long the cursor must rest on a note before its ring begins to open. Short enough not to feel
-/// like a wait, long enough that crossing a field of notes opens none of them.
-const hover_ring_dwell_s: f32 = 0.16;
-/// Exponential rate of the ring's expansion. Well below `pointer_chase_k`: the colour change is a
-/// few pixels of fill and can be instant, while the ring sweeps across a large piece of the screen
-/// and reads as violent at the same speed.
-const hover_ring_chase_k: f32 = 7;
 /// Added multiple per √item, above the floor. Square root rather than logarithm: a log law
 /// compresses the top of the range so hard that a ten-item note and a two-hundred-item one open by
 /// nearly the same amount, which is the distinction this exists to draw. At this value an ordinary
 /// note of around ten items sits at 3x, forty items at 4x, and the ceiling arrives near 250.
 const pointer_grow_k: f32 = 0.32;
 
-/// The dashed clearing around the node under the cursor.
+/// The dashed clearing, grown out of the proximity field rather than out of a discrete hover.
 ///
-/// A multiple of a radius the reader can actually see, deliberately. The first attempt folded the
-/// growth into `bubbleScreenRadius` ahead of its two ceilings — `max_node_screen_r` and the
-/// lattice-gap cap — and relaxed both by the same factor to stop them clipping it. At overview
-/// density the gap cap is what binds, so every note inflated to about the same fraction of the
-/// lattice spacing whatever was in it: uniformly enormous, and carrying no information at all.
+/// This is the third attempt and the first that does not fight the panel it lives in. The other two
+/// keyed the ring on *which node is hovered* — first on `pointer_t`, then on a dwell timer — and
+/// both inherited the same flaw from that choice: a binary state drawn at a size the hit test does
+/// not share. The ring is several times the disc, the click target is the disc, so moving the
+/// cursor inside the ring but off the disc dropped the hover and collapsed it. Parts of the thing
+/// you can see simply do not respond, which is exactly as bad as it sounds. Adding a dwell made a
+/// skim quieter and made that worse, because now the ring took time to come back.
 ///
-/// Returns 0 when nothing is hovered, which is the caller's signal that there is no ring to draw.
-fn hoverHaloRadius(p: *const Panel, n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
-    const pointed = std.math.clamp(p.halo_t, 0, 1);
-    if (pointed <= 0.002) return 0;
+/// `hover_t` has no edge to fall off. It is a *field* — `applyProximity` computes it from screen
+/// distance to the cursor with a smooth falloff — so as the cursor travels between two overlapping
+/// notes one ring grows while the other shrinks, continuously, with no moment of handover to get
+/// wrong and nothing to wait for. Every node can draw one; the nearest is simply the largest,
+/// because the field peaks under the cursor. That is the single-largest guarantee, by construction
+/// rather than by bookkeeping.
+///
+/// Cubed so the peak is unambiguous. Raw `hover_t` falls off gently enough that a whole
+/// neighbourhood would open to a similar size and the reader could not tell which one they were on.
+fn hoverRingRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
+    const t = std.math.clamp(n.hover_t, 0, 1);
+    const sharp = t * t * t;
+    if (sharp <= 0.004) return 0;
 
-    // Anchored on the largest a *normal* note is ever drawn at this zoom, not on this note's
-    // resting size.
-    //
-    // The ring has one job the multiple has to guarantee: cover the disc underneath it. Anchoring
-    // on the resting radius does not, because the node being hovered is also carrying the proximity
-    // swell — up to `grow_factor` on top of `zoom_rest_swell` — so a small note's ring came out
-    // *inside* its own swollen disc and the effect read as an ordinary node with a faint outline
-    // rather than as anything dashed. Measuring against the swollen maximum makes the floor
-    // meaningful: twice the biggest dot on screen is always bigger than this dot.
+    // From the disc as it is actually drawn right now — which already carries the swell — so the
+    // ring covers it at every value of `t` and the two never separate.
+    const here = bubbleScreenRadius(n, zoom_t, gap_px);
     var swollen = n;
     swollen.hover_t = 1;
-    swollen.pointer_t = 0;
-    const r_max = bubbleScreenRadius(swollen, zoom_t, gap_px);
-
-    // Grown *from* that maximum rather than from nothing, so the ring already covers the node on
-    // the first frame of the hover and the expansion is the only thing the reader sees.
-    // `outCubic`, not `outBack`. The overshoot that gives a small button a pleasing pop is, on a
-    // ring several times the size of everything around it, a lurch past the target and back.
-    return std.math.lerp(r_max, r_max * ringMultiplier(n), dvui.easing.outCubic(pointed));
+    const full = bubbleScreenRadius(swollen, zoom_t, gap_px) * ringMultiplier(n);
+    return std.math.lerp(here, @max(full, here), sharp);
 }
 
 /// How far the node under the cursor opens, by how much is inside it, as a multiple of the largest
@@ -876,30 +868,6 @@ pub const Panel = struct {
     /// individual note. Mutually exclusive with `hover_node` — only one of the two is drawn at
     /// any given place on screen.
     hover_cluster: ?Visible = null,
-    /// Which note owns the hover ring right now.
-    ///
-    /// Not the same question as `hover_node`. `pointer_t` decays over several frames after the
-    /// cursor moves off, so for a moment *two* notes have a non-zero value — the one arriving and
-    /// the one leaving — and `world_draw` keeps a single slot for the ring, which the later mark in
-    /// the list wins. That is how a ring ended up drawn around a note the cursor was nowhere near.
-    /// The arriving note takes ownership immediately; the leaving one keeps its ease only until
-    /// something else claims it.
-    halo_node: ?usize = null,
-    /// The target `halo_dwell_s` is counting for. Null when nothing is hovered.
-    halo_dwell_key: ?usize = null,
-    /// Seconds the cursor has been continuously on `halo_node`.
-    ///
-    /// The ring waits this out before it starts opening. Skimming across a field of notes changes
-    /// the hovered node every few frames, and without a dwell every one of them starts an
-    /// expansion — a stutter of half-drawn rings following the cursor. Resetting the timer on every
-    /// change means a skim produces nothing at all and only a deliberate pause opens anything.
-    halo_dwell_s: f32 = 0,
-    /// 0..1 expansion of the hover ring, on its own slow chase rather than on `pointer_t`.
-    ///
-    /// Separate channels on purpose. Colour should answer instantly — the reader needs to know
-    /// what a click would take before they finish moving — while the ring is a much larger piece of
-    /// motion and reads as violent at the same speed.
-    halo_t: f32 = 0,
     /// Soft-sprite atlas + same-language density mips (Galaxy LOD).
     density: ?galaxy.Density = null,
 
@@ -1756,9 +1724,7 @@ fn updateHover(p: *Panel) void {
         // a note could not open its document.
         p.hover_node = hitTestNodes(p, p.nodes, p.layout_slot, mouse);
         p.hover_cluster = if (p.hover_node != null) null else hitTestClusters(p, mouse);
-        if (p.hover_node) |i| p.halo_node = i;
     }
-    stepHoverRing(p, inside_interior);
 
 
     const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
@@ -1798,34 +1764,6 @@ fn updateHover(p: *Panel) void {
     }
     p.pointer_settled = !unsettled;
     if (unsettled) dvui.refresh(null, @src(), dvui.parentGet().data().id);
-}
-
-/// Advance the hover ring's dwell and expansion.
-///
-/// Panel-level rather than per-node because exactly one ring exists at a time, and because the
-/// thing being animated is the ring itself rather than any particular note's state — a cursor
-/// crossing from one note to the next should not restart an expansion, it should abandon it.
-fn stepHoverRing(p: *Panel, inside_interior: bool) void {
-    const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
-
-    // Any change of target restarts the wait, including losing the target entirely.
-    const key: ?usize = if (inside_interior) null else p.hover_node;
-    if (key != p.halo_dwell_key) {
-        p.halo_dwell_key = key;
-        p.halo_dwell_s = 0;
-    }
-    if (key != null) p.halo_dwell_s += dt else p.halo_dwell_s = 0;
-
-    const want: f32 = if (key != null and p.halo_dwell_s >= hover_ring_dwell_s) 1 else 0;
-    const t_chase = 1.0 - @exp(-hover_ring_chase_k * dt);
-    p.halo_t += (want - p.halo_t) * t_chase;
-    if (@abs(p.halo_t - want) <= 0.002) p.halo_t = want;
-
-    // Neither the dwell nor the chase is driven by input, so nothing else will ask for these
-    // frames.
-    if (p.halo_t != want or (key != null and p.halo_dwell_s < hover_ring_dwell_s)) {
-        dvui.refresh(null, @src(), dvui.parentGet().data().id);
-    }
 }
 
 /// Chase the overview's `pointer_t` toward `target` without touching the vault.
@@ -4364,14 +4302,13 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         border_rest;
 
     // The dashed clearing, and the request to be painted last.
-    const owns_halo = if (p.halo_node) |h| h == m.note else false;
     var halo_r: f32 = 0;
     var halo_fill = border_rest;
-    if (owns_halo and m.is_note and m.note < p.nodes.len and p.halo_t > 0.002) {
-        halo_r = hoverHaloRadius(p, p.nodes[m.note], zoom_t, gap_px);
-        // The lit fill, because the clearing *is* the node now — it covers it completely, so
-        // taking the resting colour would mean hovering changed nothing the reader can see.
-        halo_fill = nodeFill(theme, p.nodes[m.note]);
+    if (m.is_note and m.note < p.nodes.len) {
+        halo_r = hoverRingRadius(p.nodes[m.note], zoom_t, gap_px);
+        // The lit fill, because the clearing *is* the node — it covers it completely, so taking the
+        // resting colour would mean approaching a note changed nothing the reader can see.
+        if (halo_r > 0) halo_fill = nodeFill(theme, p.nodes[m.note]);
     }
 
     return .{
@@ -4379,7 +4316,7 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         .border = border,
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
-        .on_top = owns_halo and (pointed > 0.002 or p.halo_t > 0.002),
+        .on_top = pointed > 0.002,
         .halo_r_px = halo_r,
         .halo_fill = halo_fill,
     };
@@ -4993,7 +4930,7 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
 
     const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), @as(f32, 1));
     const gap_px = p.layout_slot * p.camera.zoom;
-    const r = @max(hoverHaloRadius(p, n, zoom_t, gap_px), bubbleScreenRadius(n, zoom_t, gap_px));
+    const r = @max(hoverRingRadius(n, zoom_t, gap_px), bubbleScreenRadius(n, zoom_t, gap_px));
 
     const cw = dvui.currentWindow();
     const font = dvui.Font.theme(.body).larger(label_font_delta).withWeight(.bold);

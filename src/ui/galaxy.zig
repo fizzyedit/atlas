@@ -99,7 +99,7 @@ pub fn drawStyledMarks(
     const Dash = struct { c: dvui.Point.Physical, r: f32, col: dvui.Color };
     var vector_dashes: std.ArrayListUnmanaged(Dash) = .empty;
     const Halo = struct { c: dvui.Point.Physical, r: f32, face: dvui.Color, rim: dvui.Color };
-    var halo: ?Halo = null;
+    var halos: std.ArrayListUnmanaged(Halo) = .empty;
 
     for (marks) |m| {
         if (m.dying and m.r_px < 0.8) continue;
@@ -141,12 +141,12 @@ pub fn drawStyledMarks(
             //
             // No glow, either. The soft outer falloff a mass gets reads as a second, larger band
             // around the ring, and the whole point here is that the reader sees one ring.
-            halo = .{
+            halos.append(arena, .{
                 .c = screen,
                 .r = r,
                 .face = m.fill.opacity(alpha * dying_a),
                 .rim = m.border.opacity(0.95 * alpha * dying_a),
-            };
+            }) catch {};
             stats.marks += 1;
             continue;
         } else {
@@ -201,9 +201,19 @@ pub fn drawStyledMarks(
             .color = d.col,
         });
     }
-    // Last of all, over every sprite: the clearing has to occlude the node it grew out of, or the
+    // Last of all, over every sprite: a clearing has to occlude the node it grew out of, or the
     // reader sees a ring with the old dot still sitting inside it instead of one thing expanding.
-    if (halo) |h| {
+    //
+    // Smallest first, so the one nearest the cursor — which the proximity field guarantees is the
+    // largest — ends up on top of its neighbours rather than under whichever of them the mark list
+    // happened to emit later.
+    const BySize = struct {
+        fn less(_: void, x: Halo, y: Halo) bool {
+            return x.r < y.r;
+        }
+    };
+    std.mem.sort(Halo, halos.items, {}, BySize.less);
+    for (halos.items) |h| {
         fillCircle(h.c, h.r, h.face);
         strokeCircleDashed(h.c, h.r, .{
             .thickness = std.math.clamp(h.r * 0.07, 1.5, 2.5),

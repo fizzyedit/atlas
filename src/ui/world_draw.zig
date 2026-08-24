@@ -339,12 +339,14 @@ pub fn draw(
         batch.flush();
     }
 
-    // Two extra slots: a mark that asks to go on top is deferred to the end, and it may bring a
-    // halo with it.
-    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len + 2) catch return stats;
+    // Room for the rings as well as the marks. Only notes inside the proximity falloff carry one,
+    // which is a handful around the cursor, so the cap is generous and never reached in practice —
+    // it exists so a pathological frame cannot allocate its way out of the arena.
+    const max_rings: usize = 24;
+    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len + max_rings + 1) catch return stats;
     var n: usize = 0;
+    var rings: usize = 0;
     var top: ?galaxy.StyledMark = null;
-    var top_halo: ?galaxy.StyledMark = null;
     for (w.marks.items) |m| {
         const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
         const style = dctx.style(dctx.ctx, w, m, holds_open);
@@ -367,6 +369,22 @@ pub fn draw(
             .is_note = style.is_note,
             .dying = false,
         };
+        // The proximity ring, if this note is close enough to the cursor to have one. `galaxy`
+        // defers every ring past the sprite pass and orders them by size, so position in this list
+        // does not matter — only that they are here.
+        if (style.halo_r_px > style.r_px and rings < max_rings) {
+            // Parked at a fixed offset past every possible mark, not at `n + …` — `n` is still
+            // moving, so a ring parked early would be overwritten by a mark emitted later.
+            buf[w.marks.items.len + 1 + rings] = .{
+                .screen = buf[n].screen,
+                .r_px = style.halo_r_px,
+                .fill = style.halo_fill,
+                .border = buf[n].border,
+                .is_note = false,
+                .halo = true,
+            };
+            rings += 1;
+        }
         if (style.on_top) {
             // Held back rather than emitted here.
             //
@@ -376,33 +394,25 @@ pub fn draw(
             // to know what they are pointing at. One mark deferred to the end costs nothing and
             // makes the answer unambiguous.
             top = buf[n];
-            if (style.halo_r_px > style.r_px) {
-                top_halo = .{
-                    .screen = buf[n].screen,
-                    .r_px = style.halo_r_px,
-                    .fill = style.halo_fill,
-                    .border = buf[n].border,
-                    .is_note = false,
-                    .halo = true,
-                };
-            }
             continue;
         }
         n += 1;
         if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
     }
-    // Order between these two no longer matters — `galaxy` defers the halo past every sprite so it
-    // occludes the node it grew out of — but the node still goes last among the sprites, which is
-    // what keeps it visible while the clearing is still smaller than it.
-    if (top_halo) |h| {
-        buf[n] = h;
-        n += 1;
-        stats.clusters_drawn += 1;
-    }
     if (top) |t| {
         buf[n] = t;
         n += 1;
         if (t.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
+    }
+    // Slide the rings down against the marks — they were parked past `n` while it was still moving.
+    if (rings > 0) {
+        std.mem.copyForwards(
+            galaxy.StyledMark,
+            buf[n .. n + rings],
+            buf[w.marks.items.len + 1 ..][0..rings],
+        );
+        n += rings;
+        stats.clusters_drawn += @intCast(rings);
     }
     _ = galaxy.drawStyledMarks(&dens.soft, cam, fade, buf[0..n]);
     return stats;
