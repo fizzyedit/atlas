@@ -98,6 +98,8 @@ pub fn drawStyledMarks(
     // for small marks; path strokes stay round when the mark is big on screen.
     const Dash = struct { c: dvui.Point.Physical, r: f32, col: dvui.Color };
     var vector_dashes: std.ArrayListUnmanaged(Dash) = .empty;
+    const Halo = struct { c: dvui.Point.Physical, r: f32, face: dvui.Color, rim: dvui.Color };
+    var halo: ?Halo = null;
 
     for (marks) |m| {
         if (m.dying and m.r_px < 0.8) continue;
@@ -130,11 +132,26 @@ pub fn drawStyledMarks(
                     .uv = ring_uv,
                 });
             }
+        } else if (m.halo) {
+            // The hover clearing. Exactly one of these exists per frame, so it is drawn the
+            // expensive way and looks it: a crisp filled circle and a vector dashed rim, no atlas
+            // sprite anywhere. The rejection of path-stroked dashed rings is about *thousands* of
+            // masses; one ring costs nothing and the softness of the sprite path is obvious when
+            // there is a single ring on screen to look at.
+            //
+            // No glow, either. The soft outer falloff a mass gets reads as a second, larger band
+            // around the ring, and the whole point here is that the reader sees one ring.
+            halo = .{
+                .c = screen,
+                .r = r,
+                .face = m.fill.opacity(alpha * dying_a),
+                .rim = m.border.opacity(0.95 * alpha * dying_a),
+            };
+            stats.marks += 1;
+            continue;
         } else {
             // Mass: soft disc at low opacity so the dashed rim carries the shape (sun idiom).
-            // A halo is the same rim over a solid face — see `StyledMark.halo`.
-            const face_k: f32 = if (m.halo) 1.0 else 0.28;
-            const face = m.fill.opacity(alpha * face_k * dying_a);
+            const face = m.fill.opacity(alpha * 0.28 * dying_a);
             if (!cheap and r > 4) {
                 sprites.add(.{
                     .center = screen,
@@ -184,7 +201,31 @@ pub fn drawStyledMarks(
             .color = d.col,
         });
     }
+    // Last of all, over every sprite: the clearing has to occlude the node it grew out of, or the
+    // reader sees a ring with the old dot still sitting inside it instead of one thing expanding.
+    if (halo) |h| {
+        fillCircle(h.c, h.r, h.face);
+        strokeCircleDashed(h.c, h.r, .{
+            .thickness = std.math.clamp(h.r * 0.07, 1.5, 2.5),
+            .color = h.rim,
+        });
+    }
     return stats;
+}
+
+/// A crisp filled disc. The soft-atlas sprite has a feathered edge, which is right for a field of
+/// thousands and wrong for the one mark the reader is looking straight at.
+fn fillCircle(center: dvui.Point.Physical, radius: f32, col: dvui.Color) void {
+    if (radius < 1) return;
+    const arena = dvui.currentWindow().arena();
+    const samples: usize = @max(@as(usize, 32), @as(usize, @intFromFloat(radius * 1.5)));
+    const pts = arena.alloc(dvui.Point.Physical, samples) catch return;
+    for (pts, 0..) |*pt, i| {
+        const a = std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(samples));
+        pt.* = .{ .x = center.x + @cos(a) * radius, .y = center.y + @sin(a) * radius };
+    }
+    const path: dvui.Path = .{ .points = pts };
+    path.fillConvex(.{ .color = col });
 }
 
 /// Same dash recipe as the interior document sun — vector path so large masses stay round.

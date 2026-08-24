@@ -391,8 +391,9 @@ pub fn draw(
         n += 1;
         if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
     }
-    // The halo first, then the node inside it: the clearing is a container the node sits in, not a
-    // lid over it.
+    // Order between these two no longer matters — `galaxy` defers the halo past every sprite so it
+    // occludes the node it grew out of — but the node still goes last among the sprites, which is
+    // what keeps it visible while the clearing is still smaller than it.
     if (top_halo) |h| {
         buf[n] = h;
         n += 1;

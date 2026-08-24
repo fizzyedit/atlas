@@ -137,8 +137,18 @@ const pointer_grow_k: f32 = 0.32;
 fn hoverHaloRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const pointed = std.math.clamp(n.pointer_t, 0, 1);
     if (pointed <= 0.002) return 0;
+    // From the note's *resting* size, with both hover channels cleared.
+    //
+    // Multiplying the live radius compounds two growths that are already happening: the proximity
+    // swell lifts the disc by up to `grow_factor` and `zoom_rest_swell` adds more, so a 6x clearing
+    // came out at fourteen times the neighbouring dots — an enormous band with the real ring
+    // stranded somewhere inside it. Anchoring on the resting radius makes the multiple mean what it
+    // says: 6x is six times the dot every other note is drawn at.
+    var at_rest = n;
+    at_rest.hover_t = 0;
+    at_rest.pointer_t = 0;
     const grow = pointerGrow(n) * dvui.easing.outBack(pointed);
-    return bubbleScreenRadius(n, zoom_t, gap_px) * (1.0 + grow);
+    return bubbleScreenRadius(at_rest, zoom_t, gap_px) * (1.0 + grow);
 }
 
 /// How far the node under the cursor opens, by how much is inside it.
@@ -4293,17 +4303,13 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         border_rest;
 
     // The dashed clearing, and the request to be painted last.
-    //
-    // The halo's face is the node's *resting* fill, not its hovered one: the effect being drawn is
-    // one node expanding into a dashed container, so the container has to be the same material as
-    // the thing inside it. Taking the lit fill instead would read as a second, brighter object.
     var halo_r: f32 = 0;
     var halo_fill = border_rest;
     if (m.is_note and m.note < p.nodes.len and pointed > 0.002) {
         halo_r = hoverHaloRadius(p.nodes[m.note], zoom_t, gap_px);
-        var resting = p.nodes[m.note];
-        resting.pointer_t = 0;
-        halo_fill = nodeFill(theme, resting);
+        // The lit fill, because the clearing *is* the node now — it covers it completely, so
+        // taking the resting colour would mean hovering changed nothing the reader can see.
+        halo_fill = nodeFill(theme, p.nodes[m.note]);
     }
 
     return .{
