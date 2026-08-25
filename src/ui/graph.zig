@@ -1218,13 +1218,12 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // label before the interior branch below could place any, so names vanished inside a note
     // whenever the vault behind it happened to be fully coalesced.
     const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0 and p.interior.t < 0.5;
-    // A flick-zoom cannot be read at label resolution, and the placer is one of the heaviest
-    // per-frame costs there is. Skip it; open/hover names still draw from the notes themselves.
-    // A click-to-focus chase is not a flick: skip only while the camera is still flying, then
-    // place immediately rather than waiting for `zoom_speed` to decay.
-    const motion_busy = p.camera.chasing() or
-        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps * 0.45) or
-        p.motion_bias > 1.08;
+    // A zoom *flick* cannot be read at label resolution, and the LOD is exploding under it.
+    // A pan cannot: searching around a close-in neighbourhood is exactly what the names are
+    // for, and the placer already runs over `visible` (this frame's resolved notes), so a
+    // viewport of a few dozen is cheap. Gating on pan speed / chase used to blank every name
+    // the moment the camera moved, including at leaf zoom.
+    const motion_busy = p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps * 0.45;
     const labels_dirty = !at_cluster_zoom and !motion_busy and
         (p.labels_stale or !p.labels_settled or !p.proximity_settled or
             !p.pointer_settled or !p.layout_settled or p.camera.chasing() or labelViewMoved(p));
