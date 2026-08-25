@@ -123,8 +123,13 @@ const label_plate_pad_x: f32 = 6;
 const label_plate_pad_y: f32 = 2;
 const label_plate_opacity: f32 = 0.6;
 
-/// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
+/// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size). Extra is added
+/// at coalesced zoom — see `coalesce_grow`.
 const grow_factor: f32 = 1.0;
+/// Extra grow once the lattice gap is smaller than a resting disc. That is the zoom where notes
+/// sit next to coalesced masses, and where `gap_radius_frac` used to pin every note to the same
+/// ceiling so hover could not swell them into the ring they are being absorbed by.
+const coalesce_grow: f32 = 1.6;
 /// The same for a merged region, which is drawn at the size of the area it covers rather than at
 /// a fixed target size — so it needs far less growth to read as picked out, and much more would
 /// bury the regions around it.
@@ -240,8 +245,9 @@ const fit_label_px: f32 = open_screen_r + label_gap + 15;
 const fit_pad_frac: f32 = 0.16;
 /// Resting size boost from zoom alone (additive scale), before proximity stacks on top.
 const zoom_rest_swell: f32 = 0.35;
-/// Largest a node may be relative to the on-screen gap between lattice cells. Under a half, so
-/// two neighbours always have air between them — see `bubbleScreenRadius`.
+/// Largest a *resting* node may be relative to the on-screen gap between lattice cells. Under a
+/// half, so two neighbours always have air between them. Hover is allowed to fill past this —
+/// see `hoverSizeCap`.
 const gap_radius_frac: f32 = 0.42;
 const pan_fling_tuning: Fling.Tuning = .{
     .decay = 4.0,
@@ -5320,10 +5326,26 @@ fn drawLabel(n: GraphNode, zoom_t: f32, fade: f32) void {
 /// shadow, an outline, and a full tessellated disc. Zoomed out on a large vault that was the
 /// entire frame budget, spent drawing a solid blob.
 ///
-/// So the radius is additionally capped at a fraction of the on-screen gap between lattice
-/// cells. Zoomed in, `gap_px` is large and this never binds. Zoomed out it shrinks the node
-/// smoothly, which lets the cheap-dot path, the shadow cut-off and the outline cut-off all
-/// engage on their own.
+/// So a *resting* radius is capped at a fraction of the on-screen gap between lattice cells.
+/// Zoomed in, `gap_px` is large and this never binds. Zoomed out it shrinks the node smoothly,
+/// which lets the cheap-dot path, the shadow cut-off and the outline cut-off all engage on
+/// their own. Hover is allowed to fill past that ceiling — see `hoverSizeCap` — so a note next
+/// to a coalesced mass can swell into it rather than sitting at the same size as every neighbour.
+/// How much extra `grow_factor` to add when the lattice is crushing discs smaller than they
+/// want to rest. 0 when the gap already fits a resting note; 1 when the gap has flattened
+/// every disc to the same ceiling.
+fn coalesceCrush(gap_cap: f32, rest_px: f32) f32 {
+    return std.math.clamp(1.0 - gap_cap / @max(rest_px, 1e-3), 0, 1);
+}
+
+/// Screen-px cap at this hover. Resting notes stay inside their lattice cell (`gap_cap`);
+/// hover fills toward `screen_cap` so a note can grow into the mass it is merging with
+/// instead of sitting at the same ceiling as every neighbour.
+fn hoverSizeCap(gap_cap: f32, screen_cap: f32, hover: f32) f32 {
+    const t = std.math.clamp(hover, 0, 1);
+    return std.math.lerp(gap_cap, @max(gap_cap, screen_cap), t);
+}
+
 fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const base: f32 = if (n.is_sun)
         sun_screen_r
@@ -5334,16 +5356,18 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     const zoom_boost = zoom_rest_swell * std.math.clamp(zoom_t, 0, 1);
     // outBack only on the hover channel — pop on the way in, ends at grow when t=1.
     const hover = std.math.clamp(n.hover_t, 0, 1);
-    const grow = if (n.is_sun) sun_grow_factor else grow_factor;
-    const hover_boost = grow * dvui.easing.outBack(hover);
     // `gap_px` comes from the camera and is already physical, so the tuned sizes join it there.
     const s = dpiScale();
     const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s;
+    const gap_cap = gap_px * gap_radius_frac;
+    const rest_px = base * s * (1.0 + zoom_boost);
+    const grow = if (n.is_sun) sun_grow_factor else grow_factor + coalesce_grow * coalesceCrush(gap_cap, rest_px);
+    const hover_boost = grow * dvui.easing.outBack(hover);
     const want = @min(base * s * (1.0 + zoom_boost + hover_boost), cap);
     // Hovered and open notes keep a floor: they are the ones the reader is deliberately tracking,
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
-    return @max(@min(want, gap_px * gap_radius_frac), floor);
+    return @max(@min(want, hoverSizeCap(gap_cap, cap, hover)), floor);
 }
 
 /// The disc colour notes and coalesced masses share at rest.
@@ -6261,4 +6285,24 @@ test "dropping a vault forgets hover, interior, camera, and the previous generat
     try std.testing.expectEqual(@as(f32, 0), p.world_radius);
     try std.testing.expectEqual(@as(u32, 0), p.notes_at_level0);
     try std.testing.expectEqual(@as(usize, 0), p.nodes.len);
+}
+
+test "a crushed lattice is the zoom where every note hits the same ceiling" {
+    // Resting disc 12px, gap cap 4px: crush is 1 - 4/12 = 2/3. An open lattice (cap 20 > 12)
+    // is not crushing anything.
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), coalesceCrush(4, 12), 1e-5);
+    try std.testing.expectEqual(@as(f32, 0), coalesceCrush(20, 12));
+    try std.testing.expectEqual(@as(f32, 1), coalesceCrush(0, 12));
+}
+
+test "hover is allowed to fill past the lattice gap toward the screen cap" {
+    // The regression: every note sat at gap_cap, so approaching a coalesced mass did nothing
+    // — the field was already at the ceiling. Resting still keeps air between neighbours.
+    const gap_cap: f32 = 4;
+    const screen_cap: f32 = 48;
+    try std.testing.expectEqual(gap_cap, hoverSizeCap(gap_cap, screen_cap, 0));
+    try std.testing.expectEqual(screen_cap, hoverSizeCap(gap_cap, screen_cap, 1));
+    try std.testing.expectApproxEqAbs(@as(f32, 26), hoverSizeCap(gap_cap, screen_cap, 0.5), 1e-5);
+    // An already-open lattice must not shrink on hover.
+    try std.testing.expectEqual(@as(f32, 60), hoverSizeCap(60, 48, 1));
 }
