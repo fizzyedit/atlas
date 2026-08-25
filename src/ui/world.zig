@@ -760,10 +760,24 @@ pub const World = struct {
 
         while (frontier.items.len > 0 and guard < 64) : (guard += 1) {
             // -- rule 1: cull first. Children live inside their parent's disc, so an off-screen
-            // cell's whole subtree is off-screen and this test is exact.
+            // cell's whole subtree is off-screen and this test is *nearly* exact.
+            //
+            // Nearly, because containment only guarantees it once a cell has been expanded and
+            // carries its settled bound. An unexpanded cell's radius is an estimate, and the
+            // packing is tighter than the drawing, so a parent's estimated disc can fail to
+            // contain a child that is genuinely on screen.
+            //
+            // For the field at large that is a rare, invisible miss — one mass drawn a level
+            // coarser than it might have been. For a note the reader has open it is the whole
+            // bug: the chain is severed *here*, before the never-coalesce rule below is ever
+            // consulted, so the note is never visited, never opened, and `present` never descends
+            // to it. Its pose then keeps whatever the walk last wrote, measured in the app at 18
+            // slots from where the note actually is, and since neither it nor any ancestor emits
+            // a mark, the note vanishes entirely while its links -- which fall back to the resting
+            // position -- carry on converging on empty space.
             vis.clearRetainingCapacity();
             for (frontier.items) |id| {
-                if (self.restOnScreen(id, view, p)) {
+                if (self.restOnScreen(id, view, p) or self.containsOpenSlot(id, open_slots.items)) {
                     try vis.append(self.gpa, id);
                 } else {
                     // Still part of the cut, so a link leaving the viewport keeps a target. This
@@ -1881,6 +1895,46 @@ test "the note you have open never coalesces, and never moves" {
         try testing.expect(m.is_note);
         try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
         try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+    }
+}
+
+test "an open note is never lost to the cull" {
+    // The invariant, stated where it can be checked: whenever the note the reader has open is
+    // within the view, it is drawn as itself, at its resting position.
+    //
+    // Rule 1 culls a branch whose parent disc is off screen, on the grounds that children live
+    // inside that disc. That holds only for expanded cells with a settled bound; an estimated
+    // radius can be tighter than the subtree it stands for. When the miss lands on an ancestor of
+    // an open note, the chain is cut before the never-coalesce rule is reached, `present` stops
+    // descending, and the note keeps a stale pose with no mark anywhere above it to stand in.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const leaf = w.lad.leaf_cell[2000];
+    w.field.ensurePlaced(&w.lad, leaf);
+    const own = w.field.pos[leaf];
+    const p: Params = .{ .budget = 300, .focus_leaf = leaf };
+
+    // Walk the camera across the note from several directions and distances, so a branch that
+    // leaves the view and comes back is exercised rather than only the settled case.
+    const offs = [_]f32{ -600, -220, -80, -12, 0, 12, 80, 220, 600 };
+    for (offs) |ox| {
+        for (offs) |oy| {
+            const view: View = .{ .w = 900, .h = 600, .zoom = 30, .cx = own.x + ox, .cy = own.y + oy };
+            try settle(&w, view, p, 200);
+            if (!w.restOnScreen(leaf, view, p)) continue;
+            const mi = w.markIndex(leaf) orelse {
+                std.debug.print("no mark at cx {d:.0} cy {d:.0}\n", .{ ox, oy });
+                return error.TestUnexpectedResult;
+            };
+            const m = w.marks.items[mi];
+            try testing.expect(m.is_note);
+            try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
+            try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+        }
     }
 }
 

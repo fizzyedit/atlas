@@ -1197,7 +1197,7 @@ pub fn shutdown() void {
 /// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
 /// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
 /// text HUD and scanning every node for span every frame is pure overhead on the hot path.
-const debug_hud = false;
+const debug_hud = true; // TEMPORARY: diagnosing the flying-note report. Revert to false.
 /// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
 ///
 /// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
@@ -5747,11 +5747,98 @@ fn drawDebugHud(p: *Panel) void {
         }
     }.f;
 
+    // What the note you are looking at is actually doing.
+    //
+    // "It flies away as I zoom toward it" has had several different causes, and they are
+    // indistinguishable from the outside: the leaf stops being its own mark and its pose slides
+    // to an ancestor's centre; or the pose is mid-crossfade and lags its resting position; or
+    // the LOD coarsened because `split_px` was inflated by the motion bias. Each leaves a
+    // different signature here, so the next report can name one instead of describing motion.
+    //
+    //   at    where the note resolves — `leaf` is itself, `^N` is N levels up (coalesced)
+    //   off   distance from its mark's pose to its resting position, in slots; 0 when settled
+    //   bias  `motion_bias`, which multiplies `split_px`; > 1 means the LOD is coarsening
+    //   zoom  direction and speed of the zoom, and whether topology is being held
+    const focus = blk: {
+        const w = if (p.world_state) |*ws| ws else break :blk "focus: (no world)";
+        const gi = focusNodeIndex(p) orelse break :blk "focus: (none)";
+        if (gi >= w.lad.leaf_cell.len) break :blk "focus: (out of range)";
+        const leaf = w.lad.leaf_cell[gi];
+        if (leaf == fold.invalid or leaf >= w.lad.cells.len) break :blk "focus: (no leaf)";
+        w.field.ensurePlaced(&w.lad, leaf);
+        const own = w.field.pos[leaf];
+
+        var cell = leaf;
+        var up: u8 = 0;
+        const found: ?u32 = while (cell != fold.invalid and up < 64) {
+            if (w.markIndex(cell)) |mi| break mi;
+            if (cell >= w.lad.cells.len) break null;
+            cell = w.lad.cells[cell].parent;
+            up += 1;
+        } else null;
+
+        var at_buf: [16]u8 = undefined;
+        const at = if (found == null)
+            "none"
+        else if (up == 0)
+            "leaf"
+        else
+            std.fmt.bufPrint(&at_buf, "^{d}", .{up}) catch "^?";
+        const off: f32 = if (found) |mi| dist: {
+            const m = w.marks.items[mi];
+            const dx = m.wx - own.x;
+            const dy = m.wy - own.y;
+            break :dist @sqrt(dx * dx + dy * dy) / @max(p.layout_slot, 1e-6);
+        } else 0;
+
+        // With no mark there is nothing to measure `off` against, and "at none" on its own does
+        // not say *why*. These three do:
+        //
+        //   pose  the presented position `present` last wrote for the leaf, against its resting
+        //         position. `present` only descends into a cell while `anim > 0`, so a leaf under
+        //         a closed ancestor keeps whatever pose it had when the walk last reached it —
+        //         a stale value, from a different camera, which is a second position for the same
+        //         note.
+        //   scr   whether the resting position is inside the viewport at all. If it is not, the
+        //         note really is elsewhere and the question is why the camera went there.
+        //   par   the parent cell's open flag and crossfade, which is what decides both whether
+        //         the leaf is emitted and whether its pose is being updated.
+        const par = w.lad.cells[leaf].parent;
+        const has_par = par != fold.invalid and par < w.lad.cells.len;
+        const pose_dx = w.px[leaf] - own.x;
+        const pose_dy = w.py[leaf] - own.y;
+        const pose_off = @sqrt(pose_dx * pose_dx + pose_dy * pose_dy) / @max(p.layout_slot, 1e-6);
+        const scr = p.camera.worldToScreen(.{ .x = own.x, .y = own.y });
+        const on_screen = p.camera.viewport.contains(scr);
+
+        break :blk std.fmt.allocPrint(
+            cw.arena(),
+            "focus: at {s}  off {d:.2}  pose {d:.2}  rest {s}  par {s}/{d:.2} mul {d:.2}  bias {d:.2}  zdir {d} spd {d:.2}{s}",
+            .{
+                at,
+                off,
+                pose_off,
+                if (on_screen) "on" else "OFF",
+                if (!has_par) "-" else if (w.open[par]) "open" else "shut",
+                if (has_par) w.anim[par] else 0,
+                w.mul[leaf],
+                p.motion_bias,
+                p.zoom_dir,
+                p.zoom_speed,
+                if (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps and p.zoom_dir >= 0)
+                    "  HELD"
+                else
+                    "",
+            },
+        ) catch "focus: ?";
+    };
+
     const shape = std.fmt.allocPrint(
         cw.arena(),
         "pane {d:.0}x{d:.0}  raw {d:.2}  smooth {d:.2}  aspect {d:.2}\n" ++
             "nodes {d}  edges {d}  slot {d:.0}  zoom {d:.3}  span {d:.2}  islands {d}\n" ++
             "framing {s}  interior t {d:.2}\n" ++
+            "{s}\n" ++
             "awake: {s}",
         .{
             vp.w,                             vp.h,
@@ -5760,7 +5847,8 @@ fn drawDebugHud(p: *Panel) void {
             p.edges.len,                      p.layout_slot,
             p.camera.zoom,                    span,
             p.island_count,                   @tagName(p.framing),
-            p.interior.t,                     if (awake.len == 0) "(asleep)" else awake,
+            p.interior.t,                     focus,
+            if (awake.len == 0) "(asleep)" else awake,
         },
     ) catch return;
 
