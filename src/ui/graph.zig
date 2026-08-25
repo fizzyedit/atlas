@@ -142,7 +142,7 @@ const coalesce_grow: f32 = 1.6;
 /// The same for a merged region, which is drawn at the size of the area it covers rather than at
 /// a fixed target size — so it needs far less growth to read as picked out, and much more would
 /// bury the regions around it.
-const cluster_grow_factor: f32 = 0.18;
+
 /// Sun grows more than a section bubble — approaching the exit should feel generous.
 const sun_grow_factor: f32 = 1.45;
 /// Screen-space falloff for mouse influence at overview zoom.
@@ -1214,7 +1214,7 @@ pub fn shutdown() void {
 /// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
 /// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
 /// text HUD and scanning every node for span every frame is pure overhead on the hot path.
-const debug_hud = true; // TEMPORARY: diagnosing the slowdown-over-time report.
+const debug_hud = false;
 /// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
 ///
 /// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
@@ -4671,9 +4671,24 @@ fn massProximitySwell(p: *const Panel, m: world_mod.Mark) f32 {
     const d = @sqrt(dx * dx + dy * dy);
     // Reach from the mass's own rim, not its centre: a big mass should respond when the cursor
     // approaches the shape you can see, not only when it nears a point buried inside it.
-    const t = std.math.clamp(1.0 - @max(d - m.r, 0) / (proximity_falloff_px * dpiScale()), 0, 1);
+    // The same reach and the same growth a note gets, on the mass's own larger base.
+    //
+    // These were two unrelated curves: a note swelled by `grow_factor` (1.0, and up to 1.6 more
+    // when the lattice was crushing it) across a reach that widens by `proximity_falloff_zoom_boost`
+    // as you zoom in, while a mass swelled by a separate constant of 0.18 across a flat 100 px.
+    // So at any zoom showing both, notes leapt under the cursor and masses barely moved, and the
+    // field stopped reading as one kind of thing responding to one gesture.
+    //
+    // `coalesce_grow` stays out of it: that exists because a note gets squeezed below its natural
+    // size when the layout gap closes (`coalesceCrush`), and a mass is not squeezed that way — it
+    // is soft-capped by `mass_cap_px` instead. Growing by the same *fraction* from a bigger base
+    // is what keeps a mass proportionally larger, which is the point.
+    const zoom_t = detailRevealT(p.layout_slot, p.camera.zoom);
+    const falloff = proximity_falloff_px * dpiScale() *
+        std.math.lerp(1.0, proximity_falloff_zoom_boost, zoom_t);
+    const t = std.math.clamp(1.0 - @max(d - m.r, 0) / falloff, 0, 1);
     if (t <= 0.001) return 1;
-    return 1 + cluster_grow_factor * dvui.easing.outBack(t);
+    return 1 + grow_factor * dvui.easing.outBack(t);
 }
 
 fn overviewHoldsOpen(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark) bool {
