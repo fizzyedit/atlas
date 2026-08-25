@@ -105,6 +105,9 @@ pub const StyledMark = struct {
     /// dashes is the 8 fps cliff. This flag is for the handful of marks the reader is dealing
     /// with, drawn last.
     dashed: bool = false,
+    /// Ignore the pass mix and stay at full strength. The interior sun uses this so the dashed
+    /// ring that was the overview node does not fade out and fade back in during the descent.
+    hold: bool = false,
     /// Redraw after the field (and after the web) so a piled-in fill stays visible.
     on_top: bool = false,
     /// Among overlay marks, this one is under the cursor and paints last of all.
@@ -114,11 +117,11 @@ pub const StyledMark = struct {
 /// Fill quad as a fraction of the ring quad. Notes and masses share this, which is what lets
 /// overlapping discs merge into one blob whose outline is still a rim.
 ///
-/// Atlas geometry: disc core is 0.90 of half-size, dash inner is 0.72 of the ring's half-size.
-/// 0.80 puts the fill against the inside of the dashes so the ring stays a visible rim.
+/// Atlas geometry: disc core is 0.90 of half-size. Solid ring inner is 0.72; dash inner is
+/// 0.82 − 0.055 = 0.765. 0.80 still sits inside both, so the rim stays a visible stroke.
 const fill_of_ring: f32 = 0.80;
-/// Radius past which the narrow dash cell keeps the stroke near two screen pixels.
-const dash_thin_from: f32 = 24;
+/// Radius past which the narrow dash cell keeps the stroke near a screen pixel and a half.
+const dash_thin_from: f32 = 20;
 
 /// Atlas rim is dashed for masses and for any mark that overlays dashed (open / hovered mass).
 pub fn rimIsDashed(m: StyledMark) bool {
@@ -200,7 +203,7 @@ pub const PreparedMarks = struct {
         for (self.overlay) |d| {
             fillCircle(d.c, d.r, d.face);
             const stroke: dvui.Path.StrokeOptions = .{
-                .thickness = std.math.clamp(d.r * 0.07, 1.5, 2.5),
+                .thickness = std.math.clamp(d.r * 0.05, 1.1, 1.8),
                 .color = d.rim,
             };
             if (d.overlay_dashed) {
@@ -218,7 +221,17 @@ pub fn prepareStyledMarks(
     mix: f32,
     marks: []const StyledMark,
 ) ?PreparedMarks {
-    if (mix <= 0.01 or marks.len == 0) return null;
+    if (marks.len == 0) return null;
+    if (mix <= 0.01) {
+        var held = false;
+        for (marks) |m| {
+            if (m.hold) {
+                held = true;
+                break;
+            }
+        }
+        if (!held) return null;
+    }
     if (!soft.ensureTexture()) return null;
     const tex = soft.texture() orelse return null;
     const arena = dvui.currentWindow().arena();
@@ -243,7 +256,8 @@ pub fn prepareStyledMarks(
         if (screen.x + r < x0 or screen.x - r > x1 or screen.y + r < y0 or screen.y - r > y1) continue;
 
         const dying_t: f32 = if (m.dying) 0.35 else 1;
-        const t = mix * dying_t;
+        const t = (if (m.hold) 1 else mix) * dying_t;
+        if (t <= 0.01) continue;
         const item: MarkItem = .{
             .c = screen,
             .r = r,
@@ -340,8 +354,8 @@ fn strokeCircleDashed(center: dvui.Point.Physical, radius: f32, stroke: dvui.Pat
     }
     pts[samples] = pts[0];
 
-    const dash = std.math.clamp(radius * 0.42, 4, 11);
-    const gap = std.math.clamp(radius * 0.26, 3, 7);
+    const dash = std.math.clamp(radius * 0.52, 5, 14);
+    const gap = std.math.clamp(radius * 0.22, 2.5, 6);
     strokePolylineDashed(pts, dash, gap, stroke);
 }
 
@@ -429,9 +443,9 @@ test "lighter picks the brighter fill" {
 }
 
 test "fill sits inside the rim for notes and masses" {
-    // Atlas: disc core is 0.90 of half-size; dash inner is 0.82 − 0.10 = 0.72 of the ring
-    // half-size. Raising `fill_of_ring` past this covers the dashes with the fill and the
-    // shared stack (rims, then fills) stops showing a rim.
+    // Atlas: disc core is 0.90 of half-size; solid-ring inner is 0.82 − 0.10 = 0.72.
+    // Dash inner is 0.82 − 0.055 = 0.765. Raising `fill_of_ring` past the solid inner covers
+    // the rim with the fill and the shared stack (rims, then fills) stops showing a rim.
     try std.testing.expect(fill_of_ring * 0.90 <= 0.72 + 0.001);
 }
 

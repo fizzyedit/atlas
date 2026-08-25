@@ -4470,7 +4470,7 @@ fn stepWorld(p: *Panel, prof: *i96) void {
 /// the sun-then-content split the fold/containment version needed to keep the root out of its
 /// packing.
 fn drawInteriorMarks(p: *Panel, fade: f32) void {
-    if (fade <= 0.004 or p.interior.nodes.len == 0) return;
+    if (p.interior.nodes.len == 0) return;
     const dens = p.ensureDensity() orelse return;
     const arena = dvui.currentWindow().arena();
     const theme = dvui.themeGet();
@@ -4495,6 +4495,9 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
             .is_note = !node.is_sun,
             .dying = false,
             .dashed = node.is_sun,
+            // The sun *is* the overview ring, grown. Holding it at full strength (and omitting
+            // the overview copy) is what keeps that ring from fading out and back in.
+            .hold = node.is_sun,
             .on_top = node.is_sun or p.hover_node == i,
             .hover = p.hover_node == i,
         };
@@ -4567,6 +4570,13 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         break :blk galaxy.joinFill(own, rest, m.alpha);
     } else rest;
 
+    const omit_for_sun = blk: {
+        if (p.interior.nodes.len == 0) break :blk false;
+        const id = p.interior.note_id orelse break :blk false;
+        if (!m.is_note or m.note >= p.nodes.len) break :blk false;
+        break :blk p.nodes[m.note].note_id == id;
+    };
+
     return .{
         .fill = fill,
 
@@ -4576,6 +4586,7 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         .dashed = is_dashed,
         .on_top = hovered_note or hovered_mass or is_open,
         .hover = hovered_note or hovered_mass,
+        .omit = omit_for_sun,
     };
 }
 

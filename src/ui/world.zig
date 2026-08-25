@@ -2125,6 +2125,58 @@ test "an aimed-at note stays on its stand-in instead of sliding to the leaf" {
     try testing.expect(d_c < d_t);
 }
 
+test "resolved notes keep their layout position when zoom increases" {
+    // Once a note is drawn as itself, further zoom is a camera move, not another placement.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const p: Params = .{ .budget = 2000 };
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 40, .cx = 0, .cy = 0 }, p, 200);
+
+    var best: ?Mark = null;
+    var best_d: f32 = std.math.floatMax(f32);
+    for (w.marks.items) |m| {
+        if (!m.is_note) continue;
+        const d = m.wx * m.wx + m.wy * m.wy;
+        if (d < best_d) {
+            best_d = d;
+            best = m;
+        }
+    }
+    const first = best orelse return error.TestUnexpectedResult;
+    const cell = first.cell;
+    const at = w.field.pos[cell];
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 40, .cx = at.x, .cy = at.y }, p, 80);
+    const mid_field = w.field.pos[cell];
+    const mid_mark = coveringMark(&w, cell) orelse return error.TestUnexpectedResult;
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 160, .cx = at.x, .cy = at.y }, p, 200);
+    const late_field = w.field.pos[cell];
+    const late_mark = coveringMark(&w, cell);
+
+    const df = (late_field.x - mid_field.x) * (late_field.x - mid_field.x) +
+        (late_field.y - mid_field.y) * (late_field.y - mid_field.y);
+    std.debug.print("\nnote cell={d} field delta2={d:.6} mid_mark=({d:.3},{d:.3}) late_mark={any}\n", .{
+        cell,
+        df,
+        mid_mark.wx,
+        mid_mark.wy,
+        if (late_mark) |m| m else null,
+    });
+    if (late_mark) |m| {
+        const dm = (m.wx - mid_mark.wx) * (m.wx - mid_mark.wx) + (m.wy - mid_mark.wy) * (m.wy - mid_mark.wy);
+        std.debug.print("mark delta2={d:.6} is_note={any} cell={d}->{d}\n", .{ dm, m.is_note, mid_mark.cell, m.cell });
+        try testing.expect(dm < 0.01);
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(df < 1e-8);
+}
+
 test "an empty vault does not crash" {
     const gpa = testing.allocator;
     var w = try World.init(gpa, 0, &.{}, &.{}, .{}, .{});

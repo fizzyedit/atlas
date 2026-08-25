@@ -36,6 +36,10 @@ pub const MarkStyle = struct {
     on_top: bool = false,
     /// Among overlay marks, paint this one last.
     hover: bool = false,
+    /// Skip this mark. The interior sun replaces the overview node it grew out of, so that
+    /// node is omitted rather than crossfaded — two copies of the same ring fading past each
+    /// other is the dip that read as the ring disappearing.
+    omit: bool = false,
 };
 
 pub const DrawCtx = struct {
@@ -132,6 +136,7 @@ pub fn draw(
     for (w.marks.items) |m| {
         const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
         const style = dctx.style(dctx.ctx, w, m, holds_open);
+        if (style.omit) continue;
         // Split and merge stay continuous through pose, not through colour.
         //
         // `present` chases `anim`, slides a closing cell's children in toward their parent's
