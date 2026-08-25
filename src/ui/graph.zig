@@ -2482,10 +2482,11 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
 /// whichever tab sat under the camera centre, so a click on B after a failed enter on A could
 /// still dive into A.
 ///
-/// Otherwise the camera itself names the note. Zooming is meant to be literal, so aiming at a
-/// node and pushing in is the same request as clicking it; only a click used to name one, which
-/// left a hand-driven zoom blooming an interior *only* when a cloud happened to still be alive
-/// from an earlier click — the "sometimes it works" the descent is reported to have.
+/// Otherwise the cursor names the note. Zooming is meant to be literal, so the disc under the
+/// pointer (the same one hover already lights) is the one that opens. A keep-band around the
+/// previous note's *layout home* used to outrank a closer neighbour, and a walk of every home
+/// (including notes still inside a mass) disagreed with what was on screen — aiming at one node
+/// and getting another's interior.
 fn interiorWant(p: *const Panel, t: f32) ?i64 {
     switch (p.framing) {
         .interior => |id| {
@@ -2496,77 +2497,55 @@ fn interiorWant(p: *const Panel, t: f32) ?i64 {
             // Fully at the vault: no descent to name anything for, and this is where a cloud
             // left over from a click gets dropped.
             if (t <= 0.002) return null;
-            const aim = aimPoint(p);
-            // Stay with the note being read while the aim is still on it. Without this the
-            // choice would flicker between two nodes whenever the aim sat near the boundary
-            // between them, rebuilding the cloud each time.
-            if (p.interior.nodes.len > 0) {
-                if (p.interior.note_id) |id| {
-                    if (p.id_index.get(id)) |idx| {
-                        if (withinSteps(p, p.nodes[idx].home, aim, aim_keep_steps)) return id;
-                    }
-                }
-            }
-            return nodeAtAim(p, aim) orelse p.interior.note_id;
+            return nodeAtAim(p) orelse p.interior.note_id;
         },
     }
 }
 
-/// The world point a hand-driven descent is aimed at: the cursor when it is over the panel,
+/// Screen point a hand-driven descent is aimed at: the cursor when it is over the panel,
 /// otherwise the middle of the view.
 ///
 /// The cursor, because that is what the zoom itself is anchored to — `zoomAtScreen` pushes in
 /// around the pointer, so the node the reader is pointing at is the node that stays put on
-/// screen while everything else slides outward. Choosing from the centre instead meant aiming at
-/// a note and pushing in could open the one that happened to be nearest the middle, and getting
-/// the one you wanted meant panning it to the centre first. With several notes in view at
-/// descent zoom that is most of them.
-///
-/// Falls back to the centre when the pointer is elsewhere — a trackpad pinch with the cursor off
-/// the panel, or a descent still easing after a click — where the middle of the view is the only
-/// statement of intent there is.
-fn aimPoint(p: *const Panel) dvui.Point {
+/// screen while everything else slides outward.
+fn aimScreen(p: *const Panel) dvui.Point.Physical {
     const mouse = dvui.currentWindow().mouse_pt;
-    if (p.camera.viewport.contains(mouse)) return p.camera.screenToWorld(mouse);
-    return p.camera.center;
+    if (p.camera.viewport.contains(mouse)) return mouse;
+    const vp = p.camera.viewport;
+    return .{ .x = vp.x + vp.w * 0.5, .y = vp.y + vp.h * 0.5 };
 }
 
-/// True when `world` is within `steps` lattice steps of `aim`.
-fn withinSteps(p: *const Panel, world: dvui.Point, aim: dvui.Point, steps: f32) bool {
-    const slot = aimSlot(p);
-    const dx = world.x - aim.x;
-    const dy = world.y - aim.y;
-    const r = slot * steps;
-    return dx * dx + dy * dy <= r * r;
+fn aimEligible(p: *const Panel, n: GraphNode) bool {
+    if (n.phantom) return false;
+    if (p.interior.fail_id) |f| {
+        if (f == n.note_id) return false;
+    }
+    return true;
 }
 
-fn aimSlot(p: *const Panel) f32 {
-    return if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(@max(p.nodes.len, 1));
-}
-
-/// How near the aim has to be to a node before its interior is the one that opens, and how far
-/// the aim may drift off the note already open before it gives way. The gap between them is the
-/// dead band that stops the two swapping back and forth across a boundary — and it is generous
-/// on the keep side because leaving is a decision the reader makes by moving somewhere else, not
-/// something a few pixels of drift should do for them.
-const aim_pick_steps: f32 = 1.0;
-const aim_keep_steps: f32 = 1.6;
-
-/// The overview node the reader is pointed at, if any — the note a hand-driven descent opens.
-fn nodeAtAim(p: *const Panel, aim: dvui.Point) ?i64 {
-    const slot = aimSlot(p);
-    // Beyond one step the aim is on empty grid between notes, so blooming the nearest one would
-    // open something nobody asked for.
-    var best_d2 = slot * slot * aim_pick_steps * aim_pick_steps;
+/// Closest real note under a coalesced mass, using the mass's own leaf positions.
+fn closestLeafInCell(p: *const Panel, cell: u32, screen: dvui.Point.Physical) ?i64 {
+    const w = if (p.world_state) |*ws| ws else return null;
+    if (cell >= w.lad.cells.len) return null;
+    const c = w.lad.cells[cell];
+    if (c.le <= c.ls or c.le > w.lad.note_at.len) return null;
     var best: ?i64 = null;
-    for (p.nodes) |n| {
-        // A phantom is a link with no file behind it — there are no sections to lay out.
-        if (n.phantom) continue;
-        if (p.interior.fail_id) |f| {
-            if (f == n.note_id) continue;
-        }
-        const dx = n.home.x - aim.x;
-        const dy = n.home.y - aim.y;
+    var best_d2: f32 = std.math.floatMax(f32);
+    for (w.lad.note_at[c.ls..c.le]) |gi| {
+        if (gi >= p.nodes.len) continue;
+        const n = p.nodes[gi];
+        if (!aimEligible(p, n)) continue;
+        const world = if (gi < w.lad.leaf_cell.len) blk: {
+            const leaf = w.lad.leaf_cell[gi];
+            if (leaf < w.field.pos.len) {
+                const fp = w.field.pos[leaf];
+                break :blk dvui.Point{ .x = fp.x, .y = fp.y };
+            }
+            break :blk n.pos;
+        } else n.pos;
+        const s = p.camera.worldToScreen(world);
+        const dx = s.x - screen.x;
+        const dy = s.y - screen.y;
         const d2 = dx * dx + dy * dy;
         if (d2 < best_d2) {
             best_d2 = d2;
@@ -2574,6 +2553,69 @@ fn nodeAtAim(p: *const Panel, aim: dvui.Point) ?i64 {
         }
     }
     return best;
+}
+
+/// The overview node a hand-driven descent opens: the one closest to the mouse on screen.
+///
+/// Prefers the disc hover already named, then a mass's nearest leaf, then the closest drawn
+/// note — always the nearest of what is actually visible, never a keep-band around a previous
+/// choice or a walk of every layout home.
+fn nodeAtAim(p: *const Panel) ?i64 {
+    // Hover is last frame's, which is what the reader was pointing at when this frame's zoom
+    // arrived. It indexes the overview only while descent has not taken over the pointer.
+    if (p.interior.t < 0.5) {
+        if (p.hover_node) |i| {
+            if (i < p.nodes.len and aimEligible(p, p.nodes[i])) return p.nodes[i].note_id;
+        }
+        if (p.hover_cluster) |hc| {
+            if (closestLeafInCell(p, hc.index, aimScreen(p))) |id| return id;
+        }
+    }
+
+    const screen = aimScreen(p);
+    if (p.visible.items.len > 0) {
+        // Only notes drawn as themselves this frame — a coalesced neighbour's home is not a
+        // position the reader can aim at.
+        var best: ?i64 = null;
+        var best_d2: f32 = std.math.floatMax(f32);
+        for (p.visible.items) |v| {
+            if (v.level != 0 or v.index >= p.nodes.len) continue;
+            const n = p.nodes[v.index];
+            if (!aimEligible(p, n)) continue;
+            const s = p.camera.worldToScreen(n.pos);
+            const dx = s.x - screen.x;
+            const dy = s.y - screen.y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = n.note_id;
+            }
+        }
+        if (best) |id| return id;
+    }
+
+    // Nothing resolved as a note yet — still masses. Closest leaf of the tightest mass under
+    // the cursor, else of every living mass.
+    if (p.world_state) |*w| {
+        if (hitTestClusters(p, screen)) |hit| {
+            if (closestLeafInCell(p, hit.index, screen)) |id| return id;
+        }
+        var best: ?i64 = null;
+        var best_d2: f32 = std.math.floatMax(f32);
+        for (w.marks.items) |m| {
+            if (m.is_note or m.alpha < 0.15) continue;
+            const c = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
+            const dx = screen.x - c.x;
+            const dy = screen.y - c.y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = closestLeafInCell(p, m.cell, screen);
+            }
+        }
+        if (best) |id| return id;
+    }
+    return null;
 }
 
 /// Build (or drop) the interior cloud, and recompute how far into it the camera is.
@@ -3726,7 +3768,7 @@ const cluster_frame_pad_px: f32 = 60.0;
 /// The coalesced mass under `screen_pt`, if any. Among overlapping masses prefer the **tightest**
 /// (fewest notes / highest depth) — nearest-centre picked a tiny mass sitting inside a large
 /// dashed ring and framed two nodes for a click that looked like the big cluster.
-fn hitTestClusters(p: *Panel, screen_pt: dvui.Point.Physical) ?Visible {
+fn hitTestClusters(p: *const Panel, screen_pt: dvui.Point.Physical) ?Visible {
     // Containment has no quadtree; its masses are just the non-note marks. `level` carries only
     // "this is a mass" here, and `index` is the fold cell id.
     {
@@ -4237,12 +4279,12 @@ fn markDrawnRadius(p: *Panel, m: world_mod.Mark, zoom_t: f32, gap_px: f32) f32 {
     return m.r;
 }
 
-/// A note is drawn at exactly the radius `updateLabels` reserves for it and `nodeAtAim`
-/// hit-tests against. `world` reports a flat note size because it is headless and knows nothing
-/// about hover or open tabs; the panel does, so the panel decides. Keeping the three in sync is
-/// what lets the placer find real gaps — reserving one size and drawing another had it dodging
-/// discs that were not there — and it restores the proximity swell, so a note grows under the
-/// cursor and carries that size into the interior as a dashed ring.
+/// A note is drawn at exactly the radius `updateLabels` reserves for it and hover hit-tests
+/// against. `world` reports a flat note size because it is headless and knows nothing about
+/// hover or open tabs; the panel does, so the panel decides. Keeping those in sync is what lets
+/// the placer find real gaps — reserving one size and drawing another had it dodging discs that
+/// were not there — and it restores the proximity swell, so a note grows under the cursor and
+/// carries that size into the interior as a dashed ring.
 fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Mark, holds_open: bool) world_draw.MarkStyle {
     const p: *Panel = @ptrCast(@alignCast(ctx));
     _ = w;
@@ -5190,7 +5232,7 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
     const rest = if (n.open)
         accent
     else if (n.phantom)
-        base.opacity(0.4)
+        galaxy.intoBg(base, theme.color(.window, .fill), 0.4)
     else
         base.lighten(if (theme.dark) 6 else -6);
 
@@ -5205,8 +5247,8 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
     // already uses to mean "this is the one" — the focused note's links, the focused note's name —
     // so hover joins that vocabulary instead of inventing a quieter one.
     const target = theme.color(.highlight, .fill);
-    // Phantoms are deliberately translucent; keep that while still letting them light up.
-    const to = if (n.phantom) target.opacity(0.55) else target;
+    // Phantoms stay mixed toward the background; keep that while still letting them light up.
+    const to = if (n.phantom) galaxy.intoBg(target, theme.color(.window, .fill), 0.55) else target;
     // Part way, not all the way.
     //
     // Going fully to the highlight makes the disc the same colour as the things that mean

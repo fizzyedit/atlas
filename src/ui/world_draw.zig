@@ -48,14 +48,20 @@ pub const DrawCtx = struct {
 
 pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, links_drawn: u32 = 0 };
 
-/// Ambient-web opacity, as a function of how many lines the web is drawing at once.
+/// Ambient-web mix, as a function of how many lines the web is drawing at once.
 ///
-/// A fixed opacity cannot serve both ends of the quality slider. Two hundred lines at the old flat
-/// 0.22 are a legible web; ten thousand at the same value are a grey wash that says only
+/// A fixed mix cannot serve both ends of the quality slider. Two hundred lines at full strength
+/// are a legible web; ten thousand at the same value are a solid scribble that says only
 /// "everything touches everything" — and raising the quality slider is precisely how you ask for
-/// ten thousand. So the ink thins as the web thickens: the whole vault's connections can appear at
-/// once without drowning the marks, and as you zoom in and the viewport culls most of them away,
-/// the survivors darken until an individual link reads as a line you can follow.
+/// ten thousand. So the colour walks toward the background as the web thickens: the whole vault's
+/// connections can appear at once without drowning the marks, and as you zoom in and the viewport
+/// culls most of them away, the survivors return to the text colour until an individual link
+/// reads as a line you can follow.
+///
+/// This used to be done by dropping alpha. Overlapping then composites — ten faint lines become
+/// a bright smear, and at low alpha a warm highlight goes red or yellow as 8-bit PMA rounds the
+/// weaker channels away. Mixing into the background, fully opaque, means a stack of lines is the
+/// same colour as one.
 ///
 /// Keyed on the *drawn* count — what survives the viewport — and not on the lifted count, which
 /// fills its budget at every zoom (a 300k sweep reports the full budget on every row) and so pinned
@@ -65,55 +71,48 @@ pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, li
 ///
 /// The bounds are chosen so the shipped default lands where it already was: at `graph_detail`'s
 /// 360 the web is 900 lines, which comes out at ~0.26 against the 0.22 this replaced.
-/// The focused note's own links thin as they thicken, on the same argument as `ambientAlpha` and
-/// for a sharper reason.
+/// The focused note's own links walk toward the background as they thicken, on the same argument
+/// as `ambientMix` and for a sharper reason.
 ///
 /// A note with six links wants all six unmistakable. A hub with two thousand, drawn at the same
-/// opacity, is a solid disc of highlight centred on the note — every line individually correct and
+/// mix, is a solid disc of highlight centred on the note — every line individually correct and
 /// the picture saying nothing at all, since a starburst that saturates cannot show which direction
-/// carries the most or where the structure is. Thinning restores that: the same two thousand lines
-/// at low ink read as a *density*, and the directions that carry many of them stand out from the
-/// ones that carry a few.
+/// carries the most or where the structure is. Mixing restores that: the same two thousand lines
+/// as a faint colour read as a *density*, and the directions that carry many of them stand out
+/// from the ones that carry a few.
 ///
 /// Kept well above the ambient curve at every count. These are the answer to a question the reader
 /// asked by clicking, and they have to stay the brightest thing on screen even when there are a lot
 /// of them.
-const focus_alpha_lit: f32 = 0.55;
-const focus_alpha_wash: f32 = 0.22;
+const focus_mix_lit: f32 = 0.55;
+const focus_mix_wash: f32 = 0.22;
 const focus_lines_lit: f32 = 40;
 const focus_lines_wash: f32 = 3000;
 
-fn focusAlpha(drawn: usize) f32 {
+fn focusMix(drawn: usize) f32 {
     const n: f32 = @floatFromInt(@max(1, drawn));
     const t = std.math.clamp(
         @log2(n / focus_lines_lit) / @log2(focus_lines_wash / focus_lines_lit),
         0,
         1,
     );
-    return std.math.lerp(focus_alpha_lit, focus_alpha_wash, t);
+    return std.math.lerp(focus_mix_lit, focus_mix_wash, t);
 }
-const ambient_alpha_lit: f32 = 0.40;
-const ambient_alpha_wash: f32 = 0.08;
+const ambient_mix_lit: f32 = 0.40;
+const ambient_mix_wash: f32 = 0.08;
 /// At or below this many drawn lines the web is at full strength; at or above the second, at its
 /// faintest. Interpolated in log space, since what reads as "twice as busy" is a doubling.
 const ambient_lines_lit: f32 = 200;
 const ambient_lines_wash: f32 = 6000;
 
-fn ambientAlpha(drawn: usize) f32 {
+fn ambientMix(drawn: usize) f32 {
     const n: f32 = @floatFromInt(@max(1, drawn));
     const t = std.math.clamp(
         @log2(n / ambient_lines_lit) / @log2(ambient_lines_wash / ambient_lines_lit),
         0,
         1,
     );
-    return std.math.lerp(ambient_alpha_lit, ambient_alpha_wash, t);
-}
-
-/// Scale a colour's alpha by `t`, for the per-link crossfade.
-fn withAlpha(c: dvui.Color, t: f32) dvui.Color {
-    var out = c;
-    out.a = @intFromFloat(@as(f32, @floatFromInt(c.a)) * std.math.clamp(t, 0, 1));
-    return out;
+    return std.math.lerp(ambient_mix_lit, ambient_mix_wash, t);
 }
 
 /// dvui-typed wrapper over `world_mod.clipSegment`. Null when the segment misses `r` entirely.
@@ -170,6 +169,7 @@ pub fn draw(
     if (fade <= 0.004) return .{};
     const arena = dvui.currentWindow().arena();
     const theme = dvui.themeGet();
+    const bg = theme.color(.window, .fill);
     const border_rest = theme.color(.window, .text);
 
     const toScreen = struct {
@@ -199,10 +199,10 @@ pub fn draw(
         for (w.marks.items, scr) |m, *q| q.* = toScreen(cam, dctx, m);
 
         var batch = galaxy.LineBatch.init(arena);
-        // Ambient segments are collected before any are emitted, because their opacity depends on
+        // Ambient segments are collected before any are emitted, because their mix depends on
         // how many of them there turn out to be — and that is knowable only *after* culling. What
         // falls as you zoom in is the number that survives the viewport, so that is what sets the
-        // ink.
+        // colour.
         var segs: std.ArrayListUnmanaged(struct {
             a: dvui.Point.Physical,
             b: dvui.Point.Physical,
@@ -214,7 +214,7 @@ pub fn draw(
             b: dvui.Point.Physical,
         }) = .empty;
         defer lit_segs.deinit(arena);
-        // The highlight's own opacity is decided below, once the surviving count is known — the
+        // The highlight's own mix is decided below, once the surviving count is known — the
         // same two-pass shape the ambient web uses, and for the same reason: how thick the web
         // turns out to be is only knowable *after* culling.
         const lit_base = theme.color(.highlight, .fill);
@@ -308,11 +308,19 @@ pub fn draw(
             segs.append(arena, .{ .a = seg.a, .b = seg.b, .alpha = l.alpha }) catch {};
         }
 
-        // Now the count is known, so the ink can be mixed and the ambient web emitted.
-        var ink = border_rest;
-        ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * ambientAlpha(segs.items.len) * fade);
+        // Density from the settled web, not from the fading tail. Counting dying lines too made
+        // a zoom (cut churn, twice the segments for a few frames) thin every line and then
+        // restore it — a global pulse, on top of the per-line mix, that read as the web changing
+        // colour while you moved.
+        var live_n: usize = 0;
         for (segs.items) |seg| {
-            batch.add(seg.a, seg.b, 1.0, withAlpha(ink, seg.alpha));
+            if (seg.alpha > 0.95) live_n += 1;
+        }
+        const ambient_t = ambientMix(live_n) * fade;
+        for (segs.items) |seg| {
+            const t = ambient_t * seg.alpha;
+            if (t <= 0.004) continue;
+            batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, t));
             stats.links_drawn += 1;
         }
 
@@ -338,30 +346,35 @@ pub fn draw(
                 .x = a.x + (b.x - a.x) * fgrow,
                 .y = a.y + (b.y - a.y) * fgrow,
             };
-            // The whole line first, in ambient ink, and *then* the highlight sweeping along it.
+            // The unreached remainder in ambient colour, and the grown part in highlight — not
+            // both on top of each other.
             //
             // The reach used to draw only the lit part, growing from the note. That is right for a
             // connection which was not on screen — but at any zoom where the note is drawn as
             // itself, its links are already visible as ambient web. Clicking then handed them to
             // this pass, which drew nothing at `grow = 0`: a line that was plainly there vanished
-            // and grew back, which is the "connections show, disappear, and then animate" the
-            // reader kept hitting. Keeping the full line underneath means nothing is ever removed;
-            // the reveal is the *highlight* travelling out to the far end, which is also what the
-            // animation was trying to say in the first place.
-            if (clipToRect(a, b, clip_rect)) |whole| {
-                batch.add(whole.a, whole.b, 1.0, withAlpha(ink, 1));
-                stats.links_drawn += 1;
+            // and grew back. Drawing the remainder keeps that line present. Drawing the two as
+            // *translucent* overlays used to mix orange-over-grey into yellow and red; splitting
+            // them means each pixel is one colour.
+            if (fgrow < 0.996 and ambient_t > 0.004) {
+                if (clipToRect(tip, b, clip_rect)) |rest| {
+                    batch.add(rest.a, rest.b, 1.0, galaxy.intoBg(border_rest, bg, ambient_t));
+                    stats.links_drawn += 1;
+                }
             }
+            if (fgrow <= 0.004) continue;
             const seg = clipToRect(a, tip, clip_rect) orelse continue;
             lit_segs.append(arena, .{ .a = seg.a, .b = seg.b }) catch {};
         }
 
-        // Now the count is known, so the ink can be mixed and the highlight emitted.
-        var lit = lit_base;
-        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * focusAlpha(lit_segs.items.len) * fade);
-        for (lit_segs.items) |seg| {
-            batch.add(seg.a, seg.b, 1.8, lit);
-            stats.links_drawn += 1;
+        // Now the count is known, so the highlight can be mixed and emitted.
+        const focus_t = focusMix(lit_segs.items.len) * fade;
+        if (focus_t > 0.004) {
+            const lit = galaxy.intoBg(lit_base, bg, focus_t);
+            for (lit_segs.items) |seg| {
+                batch.add(seg.a, seg.b, 1.8, lit);
+                stats.links_drawn += 1;
+            }
         }
         batch.flush();
     }
@@ -375,18 +388,16 @@ pub fn draw(
         //
         // This is the entire mechanism by which a split or a merge is continuous. `present` chases
         // `anim` toward the topology decision, slides a closing cell's children in toward their
-        // parent's centre, and hands each one an alpha that falls to zero as it arrives — and none
-        // of it reached the screen, because `MarkStyle` carries colours and `StyledMark` had
-        // nowhere to put a per-mark opacity. Marks were painted at full strength until `present`
-        // stopped emitting them below 0.02, so a merge read as the children sliding to the middle
-        // and then vanishing on one frame. The parent mass fading *in* underneath was lost the same
-        // way, which is the other half of the crossfade.
+        // parent's centre, and hands each one a mix that falls to the background as it arrives.
+        // Mixed, not translucent: overlapping children during a merge used to stack into a bright
+        // blob and then pop out. Walking the colour into the background keeps the motion and
+        // leaves the stack the same shade as one child.
         const a = std.math.clamp(m.alpha, 0, 1);
         buf[n] = .{
             .screen = toScreen(cam, dctx, m),
             .r_px = style.r_px,
-            .fill = withAlpha(style.fill, a),
-            .border = withAlpha(style.border, a),
+            .fill = galaxy.intoBg(style.fill, bg, a),
+            .border = galaxy.intoBg(style.border, bg, a),
             .is_note = style.is_note,
             .dying = false,
             // Ordering is `galaxy`'s problem now: it holds every dashed mark back past the sprite

@@ -13,6 +13,29 @@ pub const SoftAtlas = batch2d.SoftAtlas;
 pub const SpriteBatch = batch2d.SpriteBatch;
 pub const LineBatch = batch2d.LineBatch;
 
+/// Mix `c` toward `bg` by `t` (1 = `c`, 0 = `bg`) and keep the result opaque.
+///
+/// Density used to be done by dropping alpha. Overlapping then composites: ten faint orange
+/// lines become a bright yellow smear, and 8-bit PMA at low alpha rounds the weaker channels
+/// away first so a warm colour goes red. Mixing in the colour itself, fully opaque, means a
+/// stack of lines is the same colour as one — a dense web stays a texture, not a glow.
+pub fn intoBg(c: dvui.Color, bg: dvui.Color, t: f32) dvui.Color {
+    const u = std.math.clamp(t, 0, 1);
+    if (u >= 0.996) {
+        var out = c;
+        out.a = 255;
+        return out;
+    }
+    if (u <= 0.004) {
+        var out = bg;
+        out.a = 255;
+        return out;
+    }
+    var out = bg.lerp(c, u);
+    out.a = 255;
+    return out;
+}
+
 /// Marks the overview may draw in a frame. Headroom is deliberate: labels, proximity and the
 /// interior all draw on top of this.
 pub const plugin_mark_budget: usize = 360;
@@ -56,25 +79,27 @@ pub const StyledMark = struct {
     /// after every other mark.
     ///
     /// For the handful of marks the reader is actually dealing with — the note under the cursor,
-    /// the notes they have open. A coalesced mass uses a dashed rim too but keeps its face at 0.28
-    /// so the web reads through it: a mass is a container you are looking *into*. These are the
-    /// opposite, and have to occlude the hairball behind them or the thing being announced stays
-    /// unreadable.
+    /// the notes they have open. A coalesced mass uses a dashed rim too but mixes its face toward
+    /// the background so overlapping masses stay one shade rather than stacking into a glob.
     dashed: bool = false,
 };
 
 /// Shared soft-sprite stack (frustum cull + cheap dense path). Used by harness and plugin.
 /// Coalesced masses use a lighter fill + dashed ring (same language as the interior sun).
+///
+/// `mix` is how far the marks sit off the background (1 = their own colour, 0 = gone), not an
+/// alpha. See `intoBg`.
 pub fn drawStyledMarks(
     soft: *SoftAtlas,
     cam: *const Camera,
-    alpha: f32,
+    mix: f32,
     marks: []const StyledMark,
 ) DrawStats {
-    if (alpha <= 0.01 or marks.len == 0) return .{};
+    if (mix <= 0.01 or marks.len == 0) return .{};
     if (!soft.ensureTexture()) return .{};
     const tex = soft.texture() orelse return .{};
     const arena = dvui.currentWindow().arena();
+    const bg = dvui.themeGet().color(.window, .fill);
 
     var sprites = SpriteBatch.init(arena);
 
@@ -109,7 +134,8 @@ pub fn drawStyledMarks(
         const screen = m.screen;
         if (screen.x + r < x0 or screen.x - r > x1 or screen.y + r < y0 or screen.y - r > y1) continue;
 
-        const dying_a: f32 = if (m.dying) 0.35 else 1;
+        const dying_t: f32 = if (m.dying) 0.35 else 1;
+        const t = mix * dying_t;
         if (m.dashed) {
             // Drawn the expensive way, and it looks it: a crisp filled circle and a vector dashed
             // rim, no atlas sprite. The standing rejection of path-stroked dashed rings is about
@@ -120,19 +146,19 @@ pub fn drawStyledMarks(
             dashed_marks.append(arena, .{
                 .c = screen,
                 .r = r,
-                .face = m.fill.opacity(alpha * dying_a),
-                .rim = m.border.opacity(0.95 * alpha * dying_a),
+                .face = intoBg(m.fill, bg, t),
+                .rim = intoBg(m.border, bg, 0.95 * t),
             }) catch {};
             stats.marks += 1;
             continue;
         }
         if (m.is_note) {
-            const face = m.fill.opacity(alpha * dying_a);
+            const face = intoBg(m.fill, bg, t);
             if (!cheap and r > 3) {
                 sprites.add(.{
                     .center = .{ .x = screen.x + 0.8, .y = screen.y + 1.0 },
                     .half_size = r * 1.08,
-                    .color = dvui.Color.black.opacity(0.16 * alpha),
+                    .color = dvui.Color.black.opacity(0.16 * mix),
                     .uv = glow_uv,
                 });
             }
@@ -146,18 +172,20 @@ pub fn drawStyledMarks(
                 sprites.add(.{
                     .center = screen,
                     .half_size = r,
-                    .color = m.border.opacity(0.85 * alpha * dying_a),
+                    .color = intoBg(m.border, bg, 0.85 * t),
                     .uv = ring_uv,
                 });
             }
         } else {
-            // Mass: soft disc at low opacity so the dashed rim carries the shape (sun idiom).
-            const face = m.fill.opacity(alpha * 0.28 * dying_a);
+            // Mass: a faded *colour*, not a translucent disc. Overlapping masses used to stack
+            // into a bright glob; mixed into the background they stay one shade, and the dashed
+            // rim still carries the shape.
+            const face = intoBg(m.fill, bg, 0.28 * t);
             if (!cheap and r > 4) {
                 sprites.add(.{
                     .center = screen,
                     .half_size = r * 1.15,
-                    .color = m.fill.opacity(0.12 * alpha * dying_a),
+                    .color = intoBg(m.fill, bg, 0.12 * t),
                     .uv = glow_uv,
                 });
             }
@@ -167,7 +195,7 @@ pub fn drawStyledMarks(
                 .color = face,
                 .uv = disc_uv,
             });
-            const rim = m.border.opacity(0.9 * alpha * dying_a);
+            const rim = intoBg(m.border, bg, 0.9 * t);
             // `!cheap` is load-bearing, not a nicety.
             //
             // The vector path allocates a ~90-point polyline per ring and strokes each dash as its
@@ -329,4 +357,21 @@ fn appendDashedSpan(
     const dx = end_pt.x - last.x;
     const dy = end_pt.y - last.y;
     if (dx * dx + dy * dy > 1e-8) try out.append(arena, end_pt);
+}
+
+test "intoBg stays opaque and never walks through a third hue" {
+    const bg = dvui.Color{ .r = 20, .g = 20, .b = 24, .a = 255 };
+    const ink = dvui.Color{ .r = 240, .g = 160, .b = 40, .a = 200 };
+    const mid = intoBg(ink, bg, 0.5);
+    try std.testing.expectEqual(@as(u8, 255), mid.a);
+    // Halfway is between ink and bg on every channel, not a more-saturated neighbour.
+    try std.testing.expect(mid.r > bg.r and mid.r < ink.r);
+    try std.testing.expect(mid.g > bg.g and mid.g < ink.g);
+    try std.testing.expect(mid.b > bg.b and mid.b < ink.b);
+    const gone = intoBg(ink, bg, 0);
+    try std.testing.expectEqual(bg.r, gone.r);
+    try std.testing.expectEqual(@as(u8, 255), gone.a);
+    const full = intoBg(ink, bg, 1);
+    try std.testing.expectEqual(ink.r, full.r);
+    try std.testing.expectEqual(@as(u8, 255), full.a);
 }

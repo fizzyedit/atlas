@@ -564,7 +564,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
         // What the *draw* would keep, not what the lift produced. `world_draw` requires at least
         // one endpoint to have a living mark, and the two numbers diverge hard: the lift fills its
         // budget at every zoom while the drawn count collapses as the camera closes in. That gap
-        // is what `world_draw.ambientAlpha` reads, so a sweep that only reports `links` cannot
+        // is what `world_draw.ambientMix` reads, so a sweep that only reports `links` cannot
         // tell you what the web will actually look like.
         var have: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer have.deinit(gpa);
