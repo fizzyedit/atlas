@@ -5276,13 +5276,14 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
 
 /// The disc colour notes and coalesced masses share at rest.
 ///
-/// A mass used to fill with window-text mixed into the background, while a note sat on a
-/// slightly lifted control fill — close enough to the window that a merge looked like notes
-/// dissolving into nothing against a tinted blob. One colour, and the dashed ring is what
-/// says "this one is many".
+/// The lighter of content and control fill, so the disc sits off whichever surface the panel
+/// inherited. Mixing or lifting control used to land too close to the window and the merge
+/// read as notes dissolving into the pane.
 fn noteRestFill(theme: dvui.Theme) dvui.Color {
-    const base = theme.color(.control, .fill);
-    return base.lighten(if (theme.dark) 6 else -6);
+    return galaxy.lighter(
+        theme.color(.content, .fill),
+        theme.color(.control, .fill),
+    );
 }
 
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the

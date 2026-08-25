@@ -48,72 +48,16 @@ pub const DrawCtx = struct {
 
 pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, links_drawn: u32 = 0 };
 
-/// Ambient-web mix, as a function of how many lines the web is drawing at once.
+/// Ambient-web mix. Constant, not a function of how many lines are on screen.
 ///
-/// A fixed mix cannot serve both ends of the quality slider. Two hundred lines at full strength
-/// are a legible web; ten thousand at the same value are a solid scribble that says only
-/// "everything touches everything" — and raising the quality slider is precisely how you ask for
-/// ten thousand. So the colour walks toward the background as the web thickens: the whole vault's
-/// connections can appear at once without drowning the marks, and as you zoom in and the viewport
-/// culls most of them away, the survivors return to the text colour until an individual link
-/// reads as a line you can follow.
-///
-/// This used to be done by dropping alpha. Overlapping then composites — ten faint lines become
-/// a bright smear, and at low alpha a warm highlight goes red or yellow as 8-bit PMA rounds the
-/// weaker channels away. Mixing into the background, fully opaque, means a stack of lines is the
-/// same colour as one.
-///
-/// Keyed on the *drawn* count — what survives the viewport — and not on the lifted count, which
-/// fills its budget at every zoom (a 300k sweep reports the full budget on every row) and so pinned
-/// the web at its faintest no matter how far in you were. Zoom alone is the wrong variable too: the
-/// same zoom is a wash on a hub vault and nearly empty on a sparse one, and the number that
-/// actually decides legibility is lines per screen.
-///
-/// The bounds are chosen so the shipped default lands where it already was: at `graph_detail`'s
-/// 360 the web is 900 lines, which comes out at ~0.26 against the 0.22 this replaced.
-/// The focused note's own links walk toward the background as they thicken, on the same argument
-/// as `ambientMix` and for a sharper reason.
-///
-/// A note with six links wants all six unmistakable. A hub with two thousand, drawn at the same
-/// mix, is a solid disc of highlight centred on the note — every line individually correct and
-/// the picture saying nothing at all, since a starburst that saturates cannot show which direction
-/// carries the most or where the structure is. Mixing restores that: the same two thousand lines
-/// as a faint colour read as a *density*, and the directions that carry many of them stand out
-/// from the ones that carry a few.
-///
-/// Kept well above the ambient curve at every count. These are the answer to a question the reader
-/// asked by clicking, and they have to stay the brightest thing on screen even when there are a lot
-/// of them.
-const focus_mix_lit: f32 = 0.55;
-const focus_mix_wash: f32 = 0.22;
-const focus_lines_lit: f32 = 40;
-const focus_lines_wash: f32 = 3000;
-
-fn focusMix(drawn: usize) f32 {
-    const n: f32 = @floatFromInt(@max(1, drawn));
-    const t = std.math.clamp(
-        @log2(n / focus_lines_lit) / @log2(focus_lines_wash / focus_lines_lit),
-        0,
-        1,
-    );
-    return std.math.lerp(focus_mix_lit, focus_mix_wash, t);
-}
-const ambient_mix_lit: f32 = 0.40;
-const ambient_mix_wash: f32 = 0.08;
-/// At or below this many drawn lines the web is at full strength; at or above the second, at its
-/// faintest. Interpolated in log space, since what reads as "twice as busy" is a doubling.
-const ambient_lines_lit: f32 = 200;
-const ambient_lines_wash: f32 = 6000;
-
-fn ambientMix(drawn: usize) f32 {
-    const n: f32 = @floatFromInt(@max(1, drawn));
-    const t = std.math.clamp(
-        @log2(n / ambient_lines_lit) / @log2(ambient_lines_wash / ambient_lines_lit),
-        0,
-        1,
-    );
-    return std.math.lerp(ambient_mix_lit, ambient_mix_wash, t);
-}
+/// Density used to walk this toward the background as the viewport filled, so a zoom that
+/// added or culled lines recoloured *every* surviving edge. That was the flash. Overlaps
+/// already stay one shade (`intoBg` is opaque), so a dense web is a texture of this colour
+/// rather than a glow — there is nothing left for a count-based mix to do except pulse.
+const ambient_mix: f32 = 0.28;
+/// Focused-note links, also constant, and kept well above the ambient web so the answer to
+/// "what does this note connect to" stays the brightest lines on screen.
+const focus_mix: f32 = 0.55;
 
 /// dvui-typed wrapper over `world_mod.clipSegment`. Null when the segment misses `r` entirely.
 ///
@@ -199,25 +143,14 @@ pub fn draw(
         for (w.marks.items, scr) |m, *q| q.* = toScreen(cam, dctx, m);
 
         var batch = galaxy.LineBatch.init(arena);
-        // Ambient segments are collected before any are emitted, because their mix depends on
-        // how many of them there turn out to be — and that is knowable only *after* culling. What
-        // falls as you zoom in is the number that survives the viewport, so that is what sets the
-        // colour.
-        var segs: std.ArrayListUnmanaged(struct {
-            a: dvui.Point.Physical,
-            b: dvui.Point.Physical,
-            alpha: f32,
-        }) = .empty;
-        defer segs.deinit(arena);
         var lit_segs: std.ArrayListUnmanaged(struct {
             a: dvui.Point.Physical,
             b: dvui.Point.Physical,
         }) = .empty;
         defer lit_segs.deinit(arena);
-        // The highlight's own mix is decided below, once the surviving count is known — the
-        // same two-pass shape the ambient web uses, and for the same reason: how thick the web
-        // turns out to be is only knowable *after* culling.
         const lit_base = theme.color(.highlight, .fill);
+        const ambient_t = ambient_mix * fade;
+        const focus_t = focus_mix * fade;
 
         // Where a link's endpoint is, even when that endpoint has no mark this frame.
         //
@@ -305,20 +238,7 @@ pub fn draw(
             const a = endpoint(w, cam, dctx, scr, l.a) orelse continue;
             const b = endpoint(w, cam, dctx, scr, l.b) orelse continue;
             const seg = clipToRect(a, b, clip_rect) orelse continue;
-            segs.append(arena, .{ .a = seg.a, .b = seg.b, .alpha = l.alpha }) catch {};
-        }
-
-        // Density from the settled web, not from the fading tail. Counting dying lines too made
-        // a zoom (cut churn, twice the segments for a few frames) thin every line and then
-        // restore it — a global pulse, on top of the per-line mix, that read as the web changing
-        // colour while you moved.
-        var live_n: usize = 0;
-        for (segs.items) |seg| {
-            if (seg.alpha > 0.95) live_n += 1;
-        }
-        const ambient_t = ambientMix(live_n) * fade;
-        for (segs.items) |seg| {
-            const t = ambient_t * seg.alpha;
+            const t = ambient_t * l.alpha;
             if (t <= 0.004) continue;
             batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, t));
             stats.links_drawn += 1;
@@ -367,8 +287,6 @@ pub fn draw(
             lit_segs.append(arena, .{ .a = seg.a, .b = seg.b }) catch {};
         }
 
-        // Now the count is known, so the highlight can be mixed and emitted.
-        const focus_t = focusMix(lit_segs.items.len) * fade;
         if (focus_t > 0.004) {
             const lit = galaxy.intoBg(lit_base, bg, focus_t);
             for (lit_segs.items) |seg| {

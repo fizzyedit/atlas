@@ -49,6 +49,17 @@ pub fn joinFill(own: dvui.Color, rest: dvui.Color, alpha: f32) dvui.Color {
     return out;
 }
 
+/// Rec. 601 luma, integer, so two fills can be compared without a float.
+fn luma(c: dvui.Color) u32 {
+    return @as(u32, c.r) * 299 + @as(u32, c.g) * 587 + @as(u32, c.b) * 114;
+}
+
+/// The lighter of two fills. Notes rest on this so they sit off the panel background
+/// whichever of `.content` / `.control` the theme painted brighter.
+pub fn lighter(a: dvui.Color, b: dvui.Color) dvui.Color {
+    return if (luma(a) >= luma(b)) a else b;
+}
+
 /// Marks the overview may draw in a frame. Headroom is deliberate: labels, proximity and the
 /// interior all draw on top of this.
 pub const plugin_mark_budget: usize = 360;
@@ -362,6 +373,15 @@ fn appendDashedSpan(
     const dx = end_pt.x - last.x;
     const dy = end_pt.y - last.y;
     if (dx * dx + dy * dy > 1e-8) try out.append(arena, end_pt);
+}
+
+test "lighter picks the brighter fill" {
+    const dark = dvui.Color{ .r = 20, .g = 20, .b = 24, .a = 255 };
+    const pale = dvui.Color{ .r = 40, .g = 42, .b = 48, .a = 255 };
+    const got = lighter(dark, pale);
+    try std.testing.expectEqual(pale.r, got.r);
+    try std.testing.expectEqual(pale.g, got.g);
+    try std.testing.expectEqual(pale.b, got.b);
 }
 
 test "mass fill sits inside the dashed rim" {
