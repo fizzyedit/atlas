@@ -1220,7 +1220,11 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0 and p.interior.t < 0.5;
     // A flick-zoom cannot be read at label resolution, and the placer is one of the heaviest
     // per-frame costs there is. Skip it; open/hover names still draw from the notes themselves.
-    const motion_busy = p.zoom_speed > zoom_hold_oct_ps * 0.45 or p.motion_bias > 1.08;
+    // A click-to-focus chase is not a flick: skip only while the camera is still flying, then
+    // place immediately rather than waiting for `zoom_speed` to decay.
+    const motion_busy = p.camera.chasing() or
+        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps * 0.45) or
+        p.motion_bias > 1.08;
     const labels_dirty = !at_cluster_zoom and !motion_busy and
         (p.labels_stale or !p.labels_settled or !p.proximity_settled or
             !p.pointer_settled or !p.layout_settled or p.camera.chasing() or labelViewMoved(p));
@@ -1385,8 +1389,13 @@ fn updateBubbles(p: *Panel) void {
     if (inside_interior) {
         hover_unsettled = applyProximity(p, p.interior.nodes, p.interior.slot, p.interior.radius, t_hover, p.interior_visible.items) or hover_unsettled;
         // Do not decayProximity over the whole overview vault during interior — O(N).
-    } else if (coalesced_only or p.zoom_speed > zoom_hold_oct_ps) {
-        // Merged, or a flick is in progress: the shove is O(visible²) and unread at that speed.
+    } else if (coalesced_only or p.camera.chasing() or
+        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps))
+    {
+        // Merged, flying to a click, or a flick is in progress: the shove is O(visible²) and
+        // unread at that speed. After a click-flight parks, do not keep skipping just because
+        // `zoom_speed` is still decaying — that is the "camera settles, then everything jumps"
+        // hitch.
     } else {
         hover_unsettled = applyProximity(p, p.nodes, p.layout_slot, p.world_radius, t_hover, p.visible.items) or hover_unsettled;
         if (p.interior.nodes.len > 0) {
@@ -3923,7 +3932,7 @@ const zoom_fall_k: f32 = 5;
 const zoom_max_expand: usize = 24;
 
 /// Coarsen the LOD while the camera **pans** fast or **zooms out** fast, hold it still while
-/// **zooming in** fast, and let it settle back as the gesture slows.
+/// the reader **flicks zoom in**, and let it settle back as the gesture slows.
 ///
 /// Crossing the vault at close zoom drags the whole resolved middle of it through the frame: cells
 /// open and close, the cut churns, the web re-lifts, thousands of marks are placed — all to render
@@ -3933,8 +3942,11 @@ const zoom_max_expand: usize = 24;
 /// Zoom used to be excluded entirely, because feeding *every* zoom into `split_px` froze the LOD
 /// for a careful trackpad dive and then dumped every mark on release. The distinction that was
 /// missing is speed. A slow zoom *is* the dive and must split; a flick is a camera move and must
-/// not. Zoom-in holds the current open set (marks grow with the camera, nothing explodes). Zoom-out
-/// coarsens, because keeping an exploded view while pulling out is the expensive direction.
+/// not. A **user** zoom-in flick holds the current open set (marks grow with the camera). A
+/// **click-to-focus** chase is the dive: holding until the camera parked, then dumping the
+/// split, is what made the notes explode after the flight rather than with it. `max_expand`
+/// still caps the settle either way. Zoom-out coarsens, because keeping an exploded view while
+/// pulling out is the expensive direction.
 ///
 /// Raising `split_px` is the coarsening mechanism: it is already the rule that decides when a cell
 /// resolves, so scaling it makes fast motion behave exactly like being further out — the same
@@ -4162,7 +4174,10 @@ fn worldParams(p: *Panel) world_mod.Params {
         .focus_leaf = focus_leaf,
         .open_leaves = open_leaves.items,
         .lift_hold = hold,
-        .hold_topology = p.zoom_speed > zoom_hold_oct_ps and p.zoom_dir >= 0,
+        // Only a hand-driven flick holds the open set. `user_driving` is false for the whole
+        // click-to-focus chase, so the split travels with the camera instead of waiting for
+        // `zoom_speed` to decay after it parks. `max_expand` is the hitch bound either way.
+        .hold_topology = p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps and p.zoom_dir >= 0,
         .max_expand = zoom_max_expand,
         // The LOD ladder's thresholds are screen sizes too, so they get the same treatment as
         // the bubbles — otherwise cells open at twice the apparent density on a 1x monitor and

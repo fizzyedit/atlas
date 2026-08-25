@@ -274,11 +274,14 @@ pub const Params = struct {
     lift_hold: bool = false,
     /// Skip `decideTopology` and keep last frame's open set.
     ///
-    /// A fast zoom-in is asking the camera to move, not the LOD to explode. Splitting on every
-    /// tick of a flick is what hitchs the frame: each new cell pays a 128-step settle, the cut
-    /// churns, the web re-lifts. Holding the open set lets marks grow with zoom (they already
-    /// scale by `view.zoom`) and defers the split until the gesture slows — which is when the
-    /// crossfade can actually be seen.
+    /// A hand-driven zoom-in *flick* is asking the camera to move, not the LOD to explode.
+    /// Splitting on every tick is what hitchs the frame: each new cell pays a 128-step settle,
+    /// the cut churns, the web re-lifts. Holding the open set lets marks grow with zoom (they
+    /// already scale by `view.zoom`) and defers the split until the gesture slows.
+    ///
+    /// Do not set this for a click-to-focus chase. That flight *is* the dive, and holding until
+    /// it parks then dumping the split is a camera that settles and then a field that rearranges.
+    /// `max_expand` is what keeps the settle from hitching; the caller decides when to hold.
     hold_topology: bool = false,
     /// Cap on first-time `ensureChildren` calls this frame. 0 = unlimited.
     ///
@@ -2018,6 +2021,40 @@ test "holding topology keeps the open set while zoom changes" {
         if (!was and now) opened += 1;
     }
     try testing.expect(opened > 0);
+}
+
+test "an unheld zoom-in opens cells before the camera arrives" {
+    // Click-to-focus used to set `hold_topology` for the whole chase (zoom_speed stays high
+    // until the camera parks, then a while after). The open set froze, the camera settled,
+    // then everything split at once. The flight is the dive: with the hold off and
+    // `max_expand` capping the settle, cells open *during* the ease.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const far: View = .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 };
+    try settle(&w, far, .{}, 200);
+    var open_far: usize = 0;
+    for (w.open) |o| {
+        if (o) open_far += 1;
+    }
+
+    const p: Params = .{ .max_expand = 24 };
+    var z: f32 = 6;
+    const target: f32 = 80;
+    const t = 1.0 - @exp(-@as(f32, 7.0) / 60.0);
+    // Ten frames of the camera chase — well short of parked.
+    for (0..10) |_| {
+        z += (target - z) * t;
+        try w.step(.{ .w = 900, .h = 600, .zoom = z, .cx = 0, .cy = 0 }, p, 1.0 / 60.0);
+    }
+    var open_mid: usize = 0;
+    for (w.open) |o| {
+        if (o) open_mid += 1;
+    }
+    try testing.expect(open_mid > open_far);
 }
 
 test "an empty vault does not crash" {
