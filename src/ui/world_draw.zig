@@ -120,7 +120,7 @@ pub fn draw(
     if (fade <= 0.004) return .{};
     const arena = dvui.currentWindow().arena();
     const theme = dvui.themeGet();
-    const bg = theme.color(.window, .fill);
+    const bg = galaxy.panelFill(theme);
     const border_rest = theme.color(.window, .text);
 
     const toScreen = struct {

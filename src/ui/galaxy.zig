@@ -13,6 +13,18 @@ pub const SoftAtlas = batch2d.SoftAtlas;
 pub const SpriteBatch = batch2d.SpriteBatch;
 pub const LineBatch = batch2d.LineBatch;
 
+/// The surface the graph is actually drawn on.
+///
+/// `.content.fill`, because that is what Fizzy fills the window with (`Editor.zig`, `window_color`)
+/// and the graph panel paints no background of its own. Everything that mixes "toward the
+/// background" has to aim here or it never reaches it: in Fizzy Dark the panel is rgb(42, 44, 54)
+/// while `.window.fill` is rgb(28, 29, 36), so a mark faded all the way out with the wrong target
+/// lands fourteen levels *below* the surface it is sitting on and reads as a hole punched in the
+/// map rather than as absent.
+pub fn panelFill(theme: dvui.Theme) dvui.Color {
+    return theme.color(.content, .fill);
+}
+
 /// Mix `c` toward `bg` by `t` (1 = `c`, 0 = `bg`) and keep the result opaque.
 ///
 /// Density used to be done by dropping alpha. Overlapping then composites: ten faint orange
@@ -142,7 +154,6 @@ const MarkItem = struct {
     face: dvui.Color,
     rim: dvui.Color,
     dashed_rim: bool,
-    overlay_dashed: bool,
     hover: bool,
 };
 
@@ -217,7 +228,12 @@ pub const PreparedMarks = struct {
         for (self.overlay) |d| {
             const thickness = std.math.clamp(d.r * 0.05, 1.1, 1.8);
             fillCircle(d.c, d.r - thickness * 0.5, d.face);
-            if (d.overlay_dashed) {
+            // `dashed_rim`, the rim this mark actually has — not `m.dashed`, which is only the
+            // *open* flag. A coalesced mass is dashed-rimmed in the field pass whether or not it
+            // is open, so keying the overlay off the open flag repainted a solid stroke over the
+            // dashed ring of every hovered mass: pointing at one changed what kind of thing it
+            // looked like.
+            if (d.dashed_rim) {
                 strokeCircleDashed(d.c, d.r, .{ .thickness = thickness, .color = d.rim });
             } else {
                 strokeCircle(d.c, d.r, .{ .thickness = thickness, .color = d.rim });
@@ -246,7 +262,7 @@ pub fn prepareStyledMarks(
     if (!soft.ensureTexture()) return null;
     const tex = soft.texture() orelse return null;
     const arena = dvui.currentWindow().arena();
-    const bg = dvui.themeGet().color(.window, .fill);
+    const bg = panelFill(dvui.themeGet());
 
     const vp = cam.viewport;
     // Select keeps off-screen siblings alive for LOD stability — do not pay to paint them.
@@ -275,7 +291,6 @@ pub fn prepareStyledMarks(
             .face = intoBg(m.fill, bg, t),
             .rim = intoBg(m.border, bg, if (m.dashed) 0.95 * t else if (m.is_note) 0.85 * t else 0.9 * t),
             .dashed_rim = rimIsDashed(m),
-            .overlay_dashed = m.dashed,
             .hover = m.hover,
         };
         field.append(arena, item) catch {};

@@ -5550,10 +5550,18 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
 /// inherited. Mixing or lifting control used to land too close to the window and the merge
 /// read as notes dissolving into the pane.
 fn noteRestFill(theme: dvui.Theme) dvui.Color {
-    return galaxy.lighter(
-        theme.color(.content, .fill),
-        theme.color(.control, .fill),
-    );
+    // Lifted off the panel, not picked from the palette.
+    //
+    // This used to be the lighter of `.content.fill` and `.control.fill`, on the reasoning that a
+    // disc should sit off whichever surface the panel inherited. In Fizzy Dark those are
+    // rgb(42, 44, 54) and rgb(28, 29, 36), so the lighter one *is* `.content.fill` — which is
+    // exactly the surface the panel is painted with. The fill therefore matched the background
+    // precisely and every note rendered as a bare outline with nothing inside it.
+    //
+    // Deriving it from the panel colour makes the relationship hold in any theme instead of
+    // depending on which way two palette entries happen to be ordered.
+    const bg = galaxy.panelFill(theme);
+    return bg.lighten(if (theme.dark) 9 else -9);
 }
 
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the
@@ -5577,7 +5585,7 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
     const rest = if (n.open)
         accent
     else if (n.phantom)
-        galaxy.intoBg(noteRestFill(theme), theme.color(.window, .fill), phantom_fill_mix)
+        galaxy.intoBg(noteRestFill(theme), galaxy.panelFill(theme), phantom_fill_mix)
     else
         noteRestFill(theme);
 
@@ -5593,7 +5601,7 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
     // so hover joins that vocabulary instead of inventing a quieter one.
     const target = theme.color(.highlight, .fill);
     // Phantoms stay mixed toward the background; keep that while still letting them light up.
-    const to = if (n.phantom) galaxy.intoBg(target, theme.color(.window, .fill), 0.55) else target;
+    const to = if (n.phantom) galaxy.intoBg(target, galaxy.panelFill(theme), 0.55) else target;
     // Part way, not all the way.
     //
     // Going fully to the highlight makes the disc the same colour as the things that mean
