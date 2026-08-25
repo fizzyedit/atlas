@@ -188,6 +188,23 @@ const label_font_delta: f32 = -1;
 /// Gap between a mark's rim and an open document's name below it. See `drawOpenNoteLabels`.
 /// Clear space between a disc's edge and its name's plate, in logical pixels.
 const label_gap_px: f32 = 9;
+
+/// Descent at which the interior takes over the reader's *input* — hover, hit-testing, aim,
+/// clicks, and which cloud the label placer runs over.
+///
+/// Distinct from `interiorYieldT`, which is how far the overview has given way *visually* and is
+/// what any drawing decision should read. The two are not interchangeable and were being confused:
+/// this threshold sits at 0.5 while the overview is still drawn at 91% opacity, so a pass that
+/// used it to decide what to *paint* or what to swell went inert with the vault plainly on screen.
+///
+/// Written down once because it was written down nine times, inline, as a bare `0.5` — and the
+/// one place that quietly meant something else by it was a bug nobody could see from the code.
+const interior_takeover_t: f32 = 0.5;
+
+/// Has the interior taken over the pointer?
+fn interiorHasPointer(p: *const Panel) bool {
+    return p.interior.t >= interior_takeover_t;
+}
 /// Chase rate for a label winning or losing its slot (1/s). Deliberately slower than the
 /// pointer highlight — text popping in and out is far more distracting than a disc brightening.
 const label_chase_k: f32 = 9;
@@ -1345,7 +1362,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // draws every one of them. Without the `interior.t` term this gate zeroed every interior
     // label before the interior branch below could place any, so names vanished inside a note
     // whenever the vault behind it happened to be fully coalesced.
-    const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0 and p.interior.t < 0.5;
+    const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0 and !interiorHasPointer(p);
     // A zoom *flick* cannot be read at label resolution, and the LOD is exploding under it.
     // A pan cannot: searching around a close-in neighbourhood is exactly what the names are
     // for, and the placer already runs over `visible` (this frame's resolved notes), so a
@@ -1367,7 +1384,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
         // The arrangement is unchanged but no placement was computed for it, so the next frame
         // that does draw names has to redo them.
         p.labels_stale = true;
-    } else if (p.interior.t < 0.5) {
+    } else if (!interiorHasPointer(p)) {
         if (labels_dirty) updateLabels(p, p.nodes, p.edges, p.layout_slot, p.visible.items, &p.label_live, 1);
         for (p.interior.nodes) |*n| n.label_vis = 0;
     } else {
@@ -1836,7 +1853,7 @@ fn updateHover(p: *Panel) void {
     const pointer_ok = p.camera.viewport.contains(mouse) and
         !p.drag_active and !p.gesture_active and
         pointerTargetsPanel(p, mouse);
-    const inside_interior = p.interior.t >= 0.5 and p.interior.nodes.len > 0;
+    const inside_interior = interiorHasPointer(p) and p.interior.nodes.len > 0;
     if (!pointer_ok) {
         p.hover_node = null;
         p.hover_cluster = null;
@@ -2729,7 +2746,7 @@ fn closestLeafInCell(p: *const Panel, cell: u32, screen: dvui.Point.Physical) ?i
 fn nodeAtAim(p: *const Panel) ?i64 {
     // Hover is last frame's, which is what the reader was pointing at when this frame's zoom
     // arrived. It indexes the overview only while descent has not taken over the pointer.
-    if (p.interior.t < 0.5) {
+    if (!interiorHasPointer(p)) {
         if (p.hover_node) |i| {
             if (i < p.nodes.len and aimEligible(p, p.nodes[i])) return p.nodes[i].note_id;
         }
@@ -3413,7 +3430,7 @@ fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
 /// Keyed on the interior actually being on screen rather than merely built, so a cloud that is
 /// fading out cannot pin the camera inside a note the reader is leaving.
 fn insideInterior(p: *const Panel, id: i64) bool {
-    return p.interior.t >= 0.5 and (p.interior.note_id orelse 0) == id;
+    return interiorHasPointer(p) and (p.interior.note_id orelse 0) == id;
 }
 
 fn noteOpen(p: *const Panel, id: i64) bool {
@@ -3860,7 +3877,7 @@ pub fn zoomExtentsFor(p: *Panel) void {
     // Otherwise frame the vault. Closing the descended note clears `.open` first, so this
     // path becomes the eject-to-overview the open-set handler wants.
     if (p.interior.note_id) |id| {
-        if (p.interior.t >= 0.5 and p.interior.nodes.len > 0 and noteOpen(p, id)) {
+        if (interiorHasPointer(p) and p.interior.nodes.len > 0 and noteOpen(p, id)) {
             p.framing = .{ .interior = id };
             fitInteriorSun(p, .{ .animate = true });
             if (p.camera.viewport.w >= 32 and p.camera.viewport.h >= 32) {
@@ -5179,7 +5196,7 @@ fn updateLabels(
 }
 
 fn drawLabels(p: *Panel) void {
-    if (p.interior.t >= 0.5) {
+    if (interiorHasPointer(p)) {
         // Same floor the overview uses below, and for the same reason: the interior draws every
         // item it holds, so legibility is already decided — re-deriving it from a zoom heuristic
         // multiplies the placer's work by a near-zero reveal and throws the label away.
@@ -6064,7 +6081,7 @@ fn handleInput(p: *Panel, st: anytype) void {
                     if (p.moved_since_press) {
                         released_moved = true;
                     } else if (me.button.pointer() or me.button == .middle) {
-                        if (p.interior.t >= 0.5) {
+                        if (interiorHasPointer(p)) {
                             // Inside a note: sun exits to the vault view; a section scrolls the
                             // editor to that heading.
                             if (hitTestActive(p, me.p)) |ni| {
@@ -6308,7 +6325,7 @@ fn touchPinchDistance(p: *const Panel) f32 {
 }
 
 fn hitTestActive(p: *Panel, screen: dvui.Point.Physical) ?usize {
-    if (p.interior.t >= 0.5 and p.interior.nodes.len > 0) {
+    if (interiorHasPointer(p) and p.interior.nodes.len > 0) {
         return hitTestNodes(p, p.interior.nodes, p.interior.slot, screen);
     }
     return hitTestNodes(p, p.nodes, p.layout_slot, screen);
