@@ -114,6 +114,15 @@ const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
 const hover_fill_mix: f32 = 0.45;
+
+/// How far a phantom's disc sits toward the panel behind it (1 = a normal note, 0 = gone).
+///
+/// A phantom is a wikilink with no file, and reading as lighter-weight than a real note is the
+/// point. It has to be derived from `noteRestFill` rather than mixed from a colour of its own, or
+/// the two stop tracking: when the rest fill was brightened so discs would sit off the pane, the
+/// phantom fill stayed pinned near the window colour and the gap between them widened until a
+/// phantom read as a hole punched in the map rather than a fainter note.
+const phantom_fill_mix: f32 = 0.62;
 /// How far into a descent the overview keeps full strength before it begins to give way. The node
 /// being zoomed into has to stay solid while it grows. See the draw block in `drawPanel`.
 const overview_hold_t: f32 = 0.45;
@@ -4507,19 +4516,18 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
     const gap_px = p.layout_slot * p.camera.zoom;
     const radius_px: f32 = markDrawnRadius(p, m, zoom_t, gap_px);
-    // Dashed overlay is *open* for notes, and *hover* for masses.
+    // Dashed is *open*, and nothing else.
     //
     // An open note is a dashed rim out here, and the sun at the centre of its interior is a
     // dashed rim too, so diving in continues something rather than cutting to something new.
-    // Spending dashed on note-hover as well spent the meaning — every note the cursor passed
-    // became dashed, so dashed stopped saying "this is the one you are in". Hover on a note
-    // says what it needs through the fill, redrawn last so a piled-in disc stays visible.
-    // Masses already share that fill, so hover there is the dashed overlay — and no label,
-    // because a mass is not a name.
+    // Hover — on a note or on a mass — says what it needs through the *fill*, redrawn last so a
+    // piled-in disc stays visible. Giving hover a ring of its own put a second dashed circle in
+    // the vocabulary that meant something else, and drew an outline on top when the thing worth
+    // seeing on top is the lit face.
     const hovered_note = m.is_note and p.hover_node == m.note;
     const hovered_mass = if (p.hover_cluster) |hc| !m.is_note and hc.index == m.cell else false;
     const is_open = m.is_note and m.note < p.nodes.len and p.nodes[m.note].open;
-    const is_dashed = is_open or hovered_mass;
+    const is_dashed = is_open;
     // A dashed mark is always highlight-rimmed, which is what makes dashed mean "this one".
     const border = if (is_dashed or holds_open) hot else border_rest;
 
@@ -4530,7 +4538,13 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     const fill: dvui.Color = if (m.is_note and m.note < p.nodes.len) blk: {
         const own = nodeFill(theme, p.nodes[m.note]);
         break :blk galaxy.joinFill(own, rest, m.alpha);
-    } else rest;
+    } else if (hovered_mass)
+        // A mass has no `GraphNode`, so `nodeFill`'s proximity lift never reaches it. Without
+        // this, dropping the dashed hover ring would leave a hovered mass looking like every
+        // other mass.
+        rest.lerp(hot, hover_fill_mix)
+    else
+        rest;
 
     const omit_for_sun = blk: {
         if (p.interior.nodes.len == 0) break :blk false;
@@ -5492,11 +5506,10 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
         return bg.lighten(lift * lit);
     }
     const accent = theme.color(.control, .fill_hover);
-    const base = theme.color(.control, .fill);
     const rest = if (n.open)
         accent
     else if (n.phantom)
-        galaxy.intoBg(base, theme.color(.window, .fill), 0.4)
+        galaxy.intoBg(noteRestFill(theme), theme.color(.window, .fill), phantom_fill_mix)
     else
         noteRestFill(theme);
 

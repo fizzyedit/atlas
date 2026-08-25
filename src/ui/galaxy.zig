@@ -199,17 +199,28 @@ pub const PreparedMarks = struct {
     }
 
     /// The handful under the cursor / open, in vector, after every sprite. Hovered last.
+    ///
+    /// Hover is the *face*, not a ring of its own. Only a dashed mark — an open note — draws a
+    /// distinct outline here, because dashed is what says "this is the one you are in".
+    ///
+    /// A hovered mark is redrawn as exactly what it already was, just on top of the pile it was
+    /// buried in: fill inset to the rim's inner edge, then the rim in its own resting colour.
+    /// Painting the lit face out to the full radius instead swallowed the border, so the disc
+    /// changed *shape* as well as colour under the cursor — the one mark you are looking at
+    /// being the one that stops matching its neighbours.
+    ///
+    /// The fill stops half a stroke short of `r` and the stroke is centred on `r`, so the two
+    /// meet on the stroke's inner edge with no seam and no overlap. `drawFills` gets the same
+    /// result from `fill_of_ring` against the atlas ring's 0.72 inner radius; this is the vector
+    /// spelling of the same geometry.
     pub fn drawOverlay(self: PreparedMarks) void {
         for (self.overlay) |d| {
-            fillCircle(d.c, d.r, d.face);
-            const stroke: dvui.Path.StrokeOptions = .{
-                .thickness = std.math.clamp(d.r * 0.05, 1.1, 1.8),
-                .color = d.rim,
-            };
+            const thickness = std.math.clamp(d.r * 0.05, 1.1, 1.8);
+            fillCircle(d.c, d.r - thickness * 0.5, d.face);
             if (d.overlay_dashed) {
-                strokeCircleDashed(d.c, d.r, stroke);
+                strokeCircleDashed(d.c, d.r, .{ .thickness = thickness, .color = d.rim });
             } else {
-                strokeCircle(d.c, d.r, stroke);
+                strokeCircle(d.c, d.r, .{ .thickness = thickness, .color = d.rim });
             }
         }
     }
