@@ -83,6 +83,9 @@ var place_pack_gap: ?f32 = null;
 /// links are exercised. Without it `focus_leaf` is invalid at every zoom and the whole highlight
 /// path — the thing a reader looks at after clicking a node — is never entered by the bench.
 var world_focus: i64 = -1;
+/// The note a zoom sweep points at when `--focus` is not given. Arbitrary but fixed, so the
+/// numbers stay comparable between runs; any note does, as long as it is a note.
+const sweep_centre_note: u32 = 0;
 /// `--pan-px=N`: screen pixels the `--pan` probe moves the camera per frame. 13 is a normal hand
 /// pan at 60 fps (~800 px/s); a flick is several times that, and the interesting failures are all
 /// at the fast end.
@@ -537,11 +540,18 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
         // what the reader sees after that.
         var cx: f32 = 0;
         var cy: f32 = 0;
-        if (world_focus >= 0) {
-            if (w.noteWorldPos(@intCast(world_focus))) |fp| {
-                cx = fp.x;
-                cy = fp.y;
-            }
+        // Centred on a real note, not on the world origin.
+        //
+        // At the coarse end it makes no difference — the whole vault is on screen either way. At
+        // the fine end it is the difference between measuring something and measuring nothing:
+        // adjacent notes sit a `slot` apart (224 world units on simplewiki), so by zoom 44 a
+        // 900x600 viewport spans about 20x13 units and the origin is simply empty space between
+        // notes. Every row past that reported 0 marks and a 0.03 ms frame, which reads as the
+        // renderer being free when in fact nothing was being drawn — the exact rows a zoom sweep
+        // exists to put under load.
+        if (w.noteWorldPos(if (world_focus >= 0) @intCast(world_focus) else sweep_centre_note)) |fp| {
+            cx = fp.x;
+            cy = fp.y;
         }
         const view: world_mod.View = .{ .w = vw, .h = vh, .zoom = zoom, .cx = cx, .cy = cy };
         for (0..120) |_| try w.step(view, params, 1.0 / 60.0);
