@@ -1197,7 +1197,7 @@ pub fn shutdown() void {
 /// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
 /// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
 /// text HUD and scanning every node for span every frame is pure overhead on the hot path.
-const debug_hud = true; // TEMPORARY: diagnosing the flying-note report. Revert to false.
+const debug_hud = false;
 /// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
 ///
 /// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
