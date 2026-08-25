@@ -375,7 +375,7 @@ pub fn build(
 /// slot in the pack forever. Pooled, they coarsen among themselves — and since their only edges are
 /// the folder chain, they group by directory, which is also how a person reads them: not a topic,
 /// just the unfiled drawer.
-fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_notes: usize) !u32 {
+pub fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_notes: usize) !u32 {
     const uf = try arena.alloc(u32, n_notes);
     for (uf, 0..) |*x, i| x.* = @intCast(i);
     const has_link = try arena.alloc(bool, n_notes);
@@ -439,7 +439,7 @@ fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_
 /// the layout. A chain over notes that have no links competes with nothing — it is the only signal
 /// available for them, and it makes a coalesced orphan group mean something ("titles around Ka…")
 /// instead of nothing.
-fn addOrphanChain(
+pub fn addOrphanChain(
     arena: std.mem.Allocator,
     edges: *std.ArrayListUnmanaged(Edge),
     paths: []const []const u8,
@@ -487,7 +487,7 @@ fn addOrphanChain(
 /// with none has nothing to say about grouping, and saying nothing is strictly better than saying
 /// something false — links then decide alone, which is what `folder_w`'s "folders only decide
 /// where links don't" was always meant to degrade to.
-fn hasFolders(paths: []const []const u8) bool {
+pub fn hasFolders(paths: []const []const u8) bool {
     for (paths) |path| {
         if (std.mem.indexOfAny(u8, path, "/\\") != null) return true;
     }
@@ -499,7 +499,7 @@ fn hasFolders(paths: []const []const u8) bool {
 /// same-directory notes are contiguous, sibling directories abut, and a directory sits next to its
 /// children. Weight is `folder_w` against 1.0 for a real link, so links always win where they
 /// exist and folders only decide where they don't.
-fn addPathChain(
+pub fn addPathChain(
     arena: std.mem.Allocator,
     edges: *std.ArrayListUnmanaged(Edge),
     paths: []const []const u8,

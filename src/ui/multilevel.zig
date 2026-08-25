@@ -22,7 +22,10 @@
 const std = @import("std");
 const dvui = @import("dvui");
 
-pub const Edge = struct { a: u32, b: u32 };
+/// A tie between two nodes. `w` scales the attraction along it, so callers can express that some
+/// links are better evidence of relatedness than others — a link to a 29k-degree hub says almost
+/// nothing, a link between two obscure notes says a lot. See `fold.degreeNormalised`.
+pub const Edge = struct { a: u32, b: u32, w: f32 = 1.0 };
 
 /// An edge at some coarse level, carrying how many original edges it stands for.
 const WEdge = struct { a: u32, b: u32, w: f32 };
@@ -50,6 +53,10 @@ pub const Opts = struct {
     min_iters: usize = 12,
     /// When set, the coarsening ladder is handed back instead of freed — see `Ladder`.
     keep_ladder: ?*Ladder = null,
+    /// Polled between levels and between iterations; set it to abandon the solve with
+    /// `error.Canceled`. A full-vault solve runs for seconds on a worker thread, and shutdown
+    /// must not have to wait it out — this code lives in a dylib that is about to be unloaded.
+    cancel: ?*std.atomic.Value(bool) = null,
 };
 
 /// The coarsening hierarchy the solve built on its way down.
@@ -108,7 +115,7 @@ pub fn coarsen(allocator: std.mem.Allocator, n: usize, edges: []const Edge) !Lad
     try level_edges.ensureTotalCapacity(allocator, edges.len);
     for (edges) |e| {
         if (e.a >= n or e.b >= n or e.a == e.b) continue;
-        level_edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = 1 });
+        level_edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = e.w });
     }
 
     var maps: std.ArrayList([]u32) = .empty;
@@ -162,7 +169,7 @@ pub fn solve(
     try level_edges.ensureTotalCapacity(allocator, edges.len);
     for (edges) |e| {
         if (e.a >= n or e.b >= n or e.a == e.b) continue;
-        level_edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = 1 });
+        level_edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = e.w });
     }
 
     // Masses track how many original nodes each (super)node stands for, so a heavy community
@@ -183,8 +190,38 @@ pub fn solve(
     };
     try counts.append(allocator, n);
 
+    // Level 0 is deduplicated like every level above it, where `contract` has always done this.
+    // A pair listed twice becomes one edge of twice the weight rather than two that both pull,
+    // which is both the correct reading and a large saving: it is the largest edge list in the
+    // solve, and `match` picks better pairs from it, so the ladder coarsens faster as well. On a
+    // real wiki this alone took the solve from 51 s to 22 s and produced a map 2.4x more compact
+    // with shorter links in absolute terms.
+    try dedup(allocator, &level_edges);
+
+    // Each level's edge list and masses, kept rather than rebuilt.
+    //
+    // The refine pass needs level L's edges after the solve at level L+1. Re-deriving them by
+    // contracting the *original* edges through the remaining ladder — which is what this used to
+    // do — is O(E) work plus a full sort of E per level, so O(E·L²) overall with L sorts of the
+    // entire input. On a real wiki (3.3M links, ten levels) that was the dominant cost of the
+    // whole solve: 53 s, most of it re-deriving edge lists that had already been computed on the
+    // way down. Keeping them costs the sum over levels, and levels shrink geometrically, so the
+    // total is about 2·E — roughly 80 MB at 3.3M links, freed level by level as the refine
+    // descends.
+    var level_sets: std.ArrayList([]WEdge) = .empty;
+    var level_mass: std.ArrayList([]f32) = .empty;
+    defer {
+        for (level_sets.items) |e| allocator.free(e);
+        for (level_mass.items) |m| allocator.free(m);
+        level_sets.deinit(allocator);
+        level_mass.deinit(allocator);
+    }
+    try level_sets.append(allocator, try allocator.dupe(WEdge, level_edges.items));
+    try level_mass.append(allocator, try allocator.dupe(f32, mass));
+
     var cur_n = n;
     while (cur_n > coarsest_n and ladder.items.len < max_levels) {
+        if (opts.cancel) |c| if (c.load(.monotonic)) return error.Canceled;
         const parent = try allocator.alloc(u32, cur_n);
         errdefer allocator.free(parent);
         const coarse_n = try match(allocator, cur_n, level_edges.items, parent);
@@ -204,6 +241,8 @@ pub fn solve(
 
         try ladder.append(allocator, parent);
         try counts.append(allocator, coarse_n);
+        try level_sets.append(allocator, try allocator.dupe(WEdge, level_edges.items));
+        try level_mass.append(allocator, try allocator.dupe(f32, mass));
         cur_n = coarse_n;
     }
 
@@ -211,12 +250,9 @@ pub fn solve(
     var pos = try allocator.alloc(dvui.Point, cur_n);
     defer allocator.free(pos);
     seedSpiral(pos[0..cur_n]);
-    try relax(allocator, cur_n, level_edges.items, mass, pos, opts.max_iters);
+    try relax(allocator, cur_n, level_edges.items, mass, pos, opts.max_iters, opts.cancel);
 
     // -- project back down -------------------------------------------------------------
-    // Rebuilding each level's edges on the way down is cheaper than keeping every level's list
-    // alive across the coarsening: the fine edge set is the only one that has to be exact, and
-    // it is recovered by re-contracting the original edges through the remaining ladder.
     var level = ladder.items.len;
     while (level > 0) {
         level -= 1;
@@ -243,39 +279,23 @@ pub fn solve(
         allocator.free(pos);
         pos = fine_pos;
 
-        // Edges and masses for this level, re-contracted from the original through whatever of
-        // the ladder still sits above it.
-        var fine_edges: std.ArrayList(WEdge) = .empty;
-        defer fine_edges.deinit(allocator);
-        try fine_edges.ensureTotalCapacity(allocator, edges.len);
-        for (edges) |e| {
-            if (e.a >= n or e.b >= n or e.a == e.b) continue;
-            var a: u32 = e.a;
-            var b: u32 = e.b;
-            for (ladder.items[0..level]) |m| {
-                a = m[a];
-                b = m[b];
-            }
-            if (a != b) fine_edges.appendAssumeCapacity(.{ .a = a, .b = b, .w = 1 });
-        }
-        try dedup(allocator, &fine_edges);
-
-        const fine_mass = try allocator.alloc(f32, fine_n);
-        @memset(fine_mass, 0);
-        for (0..n) |i| {
-            var idx: u32 = @intCast(i);
-            for (ladder.items[0..level]) |m| idx = m[idx];
-            fine_mass[idx] += 1;
-        }
-        allocator.free(mass);
-        mass = fine_mass;
+        // This level's edges and masses, as computed on the way down.
+        const fine_edges = level_sets.items[level];
+        const fine_mass = level_mass.items[level];
+        std.debug.assert(fine_mass.len == fine_n);
 
         // Taper: coarse levels are cheap and decide everything, fine levels are expensive and
         // only refine. Iterations fall off as the node count climbs.
         const t = @as(f32, @floatFromInt(level)) / @as(f32, @floatFromInt(@max(ladder.items.len, 1)));
         const iters_f = @as(f32, @floatFromInt(opts.min_iters)) +
             (@as(f32, @floatFromInt(opts.max_iters)) - @as(f32, @floatFromInt(opts.min_iters))) * t;
-        try relax(allocator, fine_n, fine_edges.items, mass, pos, @intFromFloat(iters_f));
+        try relax(allocator, fine_n, fine_edges, fine_mass, pos, @intFromFloat(iters_f), opts.cancel);
+
+        // Done with this level; the finer ones below still have to be held.
+        allocator.free(level_sets.items[level]);
+        level_sets.items[level] = &.{};
+        allocator.free(level_mass.items[level]);
+        level_mass.items[level] = &.{};
     }
 
     @memcpy(out[0..n], pos[0..n]);
@@ -392,12 +412,14 @@ fn relax(
     mass: []const f32,
     pos: []dvui.Point,
     iters: usize,
+    cancel: ?*std.atomic.Value(bool),
 ) !void {
     if (n < 2 or iters == 0) return;
     const force = try allocator.alloc(dvui.Point, n);
     defer allocator.free(force);
 
     for (0..iters) |it| {
+        if (cancel) |c| if (c.load(.monotonic)) return error.Canceled;
         @memset(force, .{});
         const temp = 1.0 - @as(f32, @floatFromInt(it)) / @as(f32, @floatFromInt(iters));
         const step = spacing * (0.55 * temp + 0.08);

@@ -86,6 +86,19 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
+    // The link-gravity layout that owns note positions. Needs `dvui` only because
+    // `multilevel.solve` speaks `dvui.Point`; there is nothing graphical in here.
+    const layout_tests = b.addTest(.{
+        .name = "atlas-layout-tests",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/ui/layout.zig"),
+        }),
+    });
+    layout_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+    test_step.dependOn(&b.addRunArtifact(layout_tests).step);
+
     // Scanner uses the SDK wikilink tokenizer so it and the markdown renderer can't drift.
     const scanner_tests = b.addTest(.{
         .name = "atlas-scanner-tests",

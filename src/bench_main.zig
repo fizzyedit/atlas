@@ -37,6 +37,7 @@ const world_mod = @import("ui/world.zig");
 const containment = @import("ui/containment.zig");
 const fold = @import("ui/fold.zig");
 const spatial = @import("ui/spatial.zig");
+const layout = @import("ui/layout.zig");
 const cellweb = @import("ui/cellweb.zig");
 
 /// When set (via `--svg <dir>`), every solved layout is also written there as an SVG.
@@ -67,6 +68,8 @@ var world_zoom_mul: f32 = 2.0;
 ///
 /// Off by default because it eagerly places every leaf, which is the cost lazy placement exists to
 /// avoid — seconds on a large vault.
+var want_relayout: bool = false;
+var ml_iters: usize = 90;
 var want_spatial: bool = false;
 /// `--degree-norm=F`: `fold.Options.degree_norm`, how hard a link is discounted for the popularity
 /// of its endpoints.
@@ -151,6 +154,15 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) {
             world_zoom_mul = try std.fmt.parseFloat(f32, a["--zoom-mul=".len..]);
         }
+        if (std.mem.startsWith(u8, a, "--ml-iters=")) {
+            ml_iters = try std.fmt.parseInt(usize, a["--ml-iters=".len..], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--relayout")) {
+            want_spatial = true;
+            want_relayout = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--spatial")) {
             want_spatial = true;
             world_mode = true;
@@ -227,6 +239,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--fill=")) continue;
         if (std.mem.startsWith(u8, a, "--degree-norm=")) continue;
         if (std.mem.eql(u8, a, "--spatial")) continue;
+        if (std.mem.eql(u8, a, "--relayout")) continue;
+        if (std.mem.startsWith(u8, a, "--ml-iters=")) continue;
         if (std.mem.startsWith(u8, a, "--radius-exp=")) continue;
         if (std.mem.startsWith(u8, a, "--pack-gap=")) continue;
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) continue;
@@ -508,7 +522,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             @as(f64, @floatFromInt(web_ns)) / 1e6,
         },
     );
-    try layoutReport(gpa, io, &w, edges, label);
+    try layoutReport(gpa, io, &w, edges, paths, label);
     std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6}   {s:>7} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{
         "zoom",  "marks",  "notes",   "masses",  "links",   "drawn",
         "bound", "clr ms", "topo ms", "pres ms", "lift ms", "frame ms",
@@ -665,33 +679,20 @@ var gpa_for_probe: std.mem.Allocator = undefined;
 /// Everything is sampled. Placing 284k leaves and every cell exhaustively is minutes of work and
 /// the distributions settle in the first few thousand; `ensurePlaced` is memoised, so a strided
 /// sample warms the ancestors it shares and later draws are nearly free.
-fn layoutReport(
+/// Link spread over an arbitrary set of positions.
+///
+/// Takes the positions rather than reaching into a `World`, because the whole point of the
+/// positions-first work is that there is now more than one thing that can produce them: the old
+/// `containment` placement and the new `layout.solve`. Grading both with the same code is the only
+/// way the comparison means anything.
+fn linkSpreadReport(
     gpa: std.mem.Allocator,
-    io: std.Io,
-    w: *world_mod.World,
     edges: []const fold.Edge,
-    label: []const u8,
+    pos: []const spatial.Vec2,
+    deg: []const u32,
+    ext: f64,
+    sample_cap: usize,
 ) !void {
-    const t0 = now(io);
-    const ext = @max(w.extent(), 1e-3);
-    const sample_cap: usize = 60_000;
-
-    // -- 0. degree, so link spread can be read by what kind of link it is -----------------------
-    //
-    // A hub link cannot be short, and no layout can make it short. One note holds one position, so
-    // at arity 7 at most six of a hub's neighbours can be its siblings — the other 29,442 are
-    // somewhere else by arithmetic, not by any failure of placement. Reporting one number over all
-    // links therefore buries the only part that is actually decidable: whether the *local* web,
-    // between ordinary notes, is short. Bucketing by the busier endpoint separates the two.
-    const deg = try gpa.alloc(u32, w.lad.leaf_cell.len);
-    defer gpa.free(deg);
-    @memset(deg, 0);
-    for (edges) |e| {
-        if (e.a >= deg.len or e.b >= deg.len or e.a == e.b) continue;
-        deg[e.a] += 1;
-        deg[e.b] += 1;
-    }
-
     // -- 1. link spread: how far a link has to travel ------------------------------------------
     //
     // The objective for "things that are linked should end up near each other". Note that this is
@@ -705,8 +706,8 @@ fn layoutReport(
         const stride = @max(1, edges.len / sample_cap);
         var i: usize = 0;
         while (i < edges.len) : (i += stride) {
-            const a = w.noteWorldPos(edges[i].a) orelse continue;
-            const b = w.noteWorldPos(edges[i].b) orelse continue;
+            const a = posOf(pos, edges[i].a) orelse continue;
+            const b = posOf(pos, edges[i].b) orelse continue;
             const dx = a.x - b.x;
             const dy = a.y - b.y;
             try lens.append(gpa, @sqrt(dx * dx + dy * dy));
@@ -740,8 +741,8 @@ fn layoutReport(
         while (ei < edges.len) : (ei += stride) {
             const e = edges[ei];
             if (e.a >= deg.len or e.b >= deg.len) continue;
-            const a = w.noteWorldPos(e.a) orelse continue;
-            const b = w.noteWorldPos(e.b) orelse continue;
+            const a = posOf(pos, e.a) orelse continue;
+            const b = posOf(pos, e.b) orelse continue;
             const dx = a.x - b.x;
             const dy = a.y - b.y;
             const l = @sqrt(dx * dx + dy * dy);
@@ -778,6 +779,53 @@ fn layoutReport(
             );
             lo = c + 1;
         }
+    }
+}
+
+fn posOf(pos: []const spatial.Vec2, i: u32) ?spatial.Vec2 {
+    if (i >= pos.len) return null;
+    return pos[i];
+}
+
+fn layoutReport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *world_mod.World,
+    edges: []const fold.Edge,
+    paths: []const []const u8,
+    label: []const u8,
+) !void {
+    const t0 = now(io);
+    const ext = @max(w.extent(), 1e-3);
+    const sample_cap: usize = 60_000;
+
+    // -- 0. degree, so link spread can be read by what kind of link it is -----------------------
+    //
+    // A hub link cannot be short, and no layout can make it short. One note holds one position, so
+    // at arity 7 at most six of a hub's neighbours can be its siblings — the other 29,442 are
+    // somewhere else by arithmetic, not by any failure of placement. Reporting one number over all
+    // links therefore buries the only part that is actually decidable: whether the *local* web,
+    // between ordinary notes, is short. Bucketing by the busier endpoint separates the two.
+    const deg = try gpa.alloc(u32, w.lad.leaf_cell.len);
+    defer gpa.free(deg);
+    @memset(deg, 0);
+    for (edges) |e| {
+        if (e.a >= deg.len or e.b >= deg.len or e.a == e.b) continue;
+        deg[e.a] += 1;
+        deg[e.b] += 1;
+    }
+
+    {
+        const lp = try gpa.alloc(spatial.Vec2, w.lad.leaf_cell.len);
+        defer gpa.free(lp);
+        for (lp, 0..) |*q, i| {
+            if (w.noteWorldPos(@intCast(i))) |wp| {
+                q.* = .{ .x = wp.x, .y = wp.y };
+            } else {
+                q.* = .{};
+            }
+        }
+        try linkSpreadReport(gpa, edges, lp, deg, ext, sample_cap);
     }
 
     // -- 2 & 4. sibling overlap and hexagonal order --------------------------------------------
@@ -964,7 +1012,7 @@ fn layoutReport(
     }
 
     std.debug.print("  [layout report {d:.0} ms]\n", .{ms(elapsed(io, t0))});
-    if (want_spatial) try spatialReport(gpa, io, w);
+    if (want_spatial) try spatialReport(gpa, io, w, edges, paths);
     if (svg_dir) |d| try writeWorldSvg(gpa, io, w, edges, d, label);
 }
 
@@ -975,7 +1023,13 @@ fn layoutReport(
 /// `containment` produced, so any difference is the grouping rule and nothing else. That is the
 /// whole reason this runs before a new position source lands — measuring both at once would leave
 /// a regression unattributable.
-fn spatialReport(gpa: std.mem.Allocator, io: std.Io, w: *world_mod.World) !void {
+fn spatialReport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *world_mod.World,
+    edges: []const fold.Edge,
+    paths: []const []const u8,
+) !void {
     const n_notes = w.lad.leaf_cell.len;
     if (n_notes == 0) return;
 
@@ -1011,15 +1065,50 @@ fn spatialReport(gpa: std.mem.Allocator, io: std.Io, w: *world_mod.World) !void 
         body[i] = w.lad.cells[leaf].body;
         placed += 1;
     }
-    const place_ns = elapsed(io, t_place);
+    var place_ns = elapsed(io, t_place);
 
-    const ext = @max(w.extent(), 1e-3);
+    const note_r = w.field.radius(&w.lad, w.lad.leaf_cell[0]);
+    var ext = @max(w.extent(), 1e-3);
+
+    // `--relayout`: throw the containment positions away and solve for new ones from the links.
+    // Same note radius, same metrics, same hierarchy builder — so every number below is directly
+    // comparable to the run without this flag, and the only thing that changed is where notes are.
+    var relaid: layout.Result = .{};
+    defer relaid.deinit(gpa);
+    if (want_relayout) {
+        const t_solve = now(io);
+        relaid = try layout.solve(gpa, n_notes, edges, paths, .{
+            .note_r = note_r,
+            .iters = .{ .max_iters = ml_iters },
+        });
+        place_ns = elapsed(io, t_solve);
+        @memcpy(pos, relaid.pos);
+        @memcpy(comp, relaid.comp);
+        ext = 1e-3;
+        for (pos) |q| ext = @max(ext, @sqrt(q.x * q.x + q.y * q.y));
+        std.debug.print(
+            "  relayout: {d} components, extent {d:.0}, median leaf spacing {d:.2}x note_r  [solve {d:.0} ms]\n",
+            .{ relaid.n_comp, ext, relaid.spacing, ms(place_ns) },
+        );
+
+        // The grade that matters for a *layout*: are linked notes actually near each other? Run
+        // over the new positions with the same code that graded the old ones.
+        const deg = try gpa.alloc(u32, n_notes);
+        defer gpa.free(deg);
+        @memset(deg, 0);
+        for (edges) |e| {
+            if (e.a >= deg.len or e.b >= deg.len or e.a == e.b) continue;
+            deg[e.a] += 1;
+            deg[e.b] += 1;
+        }
+        try linkSpreadReport(gpa, edges, pos, deg, ext, 60_000);
+    }
     const t_build = now(io);
     var res = try spatial.build(gpa, n_notes, pos, comp, weight, body, .{
         .arity = .seven,
         // The leaf radius `containment` would have drawn, so the two hierarchies are compared at
         // the same note size and the overlap numbers mean the same thing.
-        .note_r = w.field.radius(&w.lad, w.lad.leaf_cell[0]),
+        .note_r = note_r,
         .quant_half = ext,
     });
     defer res.deinit(gpa);
@@ -1083,7 +1172,6 @@ fn spatialReport(gpa: std.mem.Allocator, io: std.Io, w: *world_mod.World) !void 
     // inherits it — the hierarchy has nothing to work with. Curve-adjacent is used as the
     // neighbour, which is an upper bound on true nearest-neighbour distance and close to it.
     {
-        const note_r = @max(w.field.radius(&w.lad, w.lad.leaf_cell[0]), 1e-6);
         var gaps: std.ArrayListUnmanaged(f32) = .empty;
         defer gaps.deinit(gpa);
         var si: usize = 1;
