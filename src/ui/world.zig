@@ -126,10 +126,6 @@ pub const FocusLink = struct {
 /// the definition, so if the relaxation is retuned, run it and paste the number back here.
 pub const leaf_pitch: f32 = 1.48;
 
-/// How many open notes may pin a stand-in mark in one frame. A tab strip, not a vault — past this
-/// the rest simply keep showing their mass where the mass is.
-const max_pinned: usize = 16;
-
 /// Liang–Barsky clip of the segment `(ax,ay)-(bx,by)` against the rect `(rx,ry,rw,rh)`.
 /// Null when the segment misses the rect entirely.
 ///
@@ -308,6 +304,14 @@ pub const Params = struct {
     /// panel exists to answer, and answering it approximately is worse than not answering it. The
     /// exemption is bounded: one cell, so the extra scan is `O(degree)` once per frame.
     focus_leaf: u32 = fold.invalid,
+    /// Leaf of the note the camera is descending into — hovered, or already inside.
+    ///
+    /// Everything else slides from the parent's centre toward its true position, which is what
+    /// makes a split read as an expansion — and which walks the note under the cursor out of the
+    /// pane, while its links stay (they fall back to `field.pos`). Holding this leaf on the
+    /// stand-in keeps the dive attached to the disc that is actually on screen. Takes priority
+    /// over `focus_leaf`: a selected note is still the one being zoomed into.
+    aim_leaf: u32 = fold.invalid,
     /// How many *highlighted* lines the frame may draw, across every open note.
     ///
     /// Spent focused-note-first. The flat `link_scan_cap` per note was the wrong shape twice over:
@@ -873,26 +877,14 @@ pub const World = struct {
     pub fn present(self: *World, view: View, p: Params, dt: f32) !void {
         const rate = @min(1.0, dt * p.rate);
 
-        // Where each open note actually is, and which slot it occupies.
-        //
-        // Every cell that contains one is drawn *there* rather than at its own centre — see the
-        // stand-in below. Resolved once per frame; a slot compare against `[ls, le)` is then a few
-        // integer tests per mark, over a list the length of the reader's tab strip.
-        var pin_slot: [max_pinned]u32 = undefined;
-        var pin_at: [max_pinned]containment.Vec2 = undefined;
-        var pins: usize = 0;
+        // Open notes must be placed so their leaf-precision links have real endpoints, even
+        // when the leaf itself is still inside a mass and is not a mark this frame.
         {
             var li: usize = 0;
-            while (li <= p.open_leaves.len and pins < max_pinned) : (li += 1) {
+            while (li <= p.open_leaves.len) : (li += 1) {
                 const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
                 if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
-                if (li > 0 and leaf == p.focus_leaf) continue; // already pinned as the focus
-                const note = self.lad.cells[leaf].note;
-                if (note == fold.invalid or note >= self.lad.slot_of.len) continue;
                 self.field.ensurePlaced(&self.lad, leaf);
-                pin_slot[pins] = self.lad.slot_of[note];
-                pin_at[pins] = self.field.pos[leaf];
-                pins += 1;
             }
         }
 
@@ -934,39 +926,10 @@ pub const World = struct {
                         // unrelated things crossfading. Runs in reverse on merge, for free.
                         break :blk full + (p.note_r_px - full) * self.anim[id];
                     };
-                    // A cell that stands in for the focused note is drawn where that note is.
-                    //
-                    // A mark normally sits at its cell's centre, and as the camera closes in the
-                    // cell standing in for a note walks down the ladder — root, then the cell
-                    // inside that, and so on. Each of those centres is somewhere different: on the
-                    // reference corpus the largest single step is a third of the vault radius for
-                    // a typical note and two thirds at the 90th percentile, and at the zoom where
-                    // that level opens the parent's disc is most of the viewport. So tracking one
-                    // note inward meant watching it flick across the screen at every level, often
-                    // clean out of frame, which is the whole reason it could not be zoomed into.
-                    //
-                    // Containment only ever promised a child is *inside* its parent, never near its
-                    // middle, so no amount of placement tuning removes this. Leaning the stand-in
-                    // onto the thing being tracked does: the dashed mark stays put and resolves
-                    // into the note, which is the zoom-into-it the reader was reaching for.
-                    //
-                    // Only the focused note, and only its own ancestors. Everything else keeps
-                    // showing a mass where the mass is.
-                    // The focus is offered first, so a cell holding several open notes leans onto
-                    // the one the reader is actually in.
-                    var mx = self.px[id];
-                    var my = self.py[id];
-                    for (pin_slot[0..pins], pin_at[0..pins]) |slot, at| {
-                        if (slot >= c.ls and slot < c.le) {
-                            mx = at.x;
-                            my = at.y;
-                            break;
-                        }
-                    }
                     try self.marks.append(self.gpa, .{
                         .cell = id,
-                        .wx = mx,
-                        .wy = my,
+                        .wx = self.px[id],
+                        .wy = self.py[id],
                         .r = r,
                         .alpha = alpha,
                         .is_note = is_note,
@@ -990,10 +953,22 @@ pub const World = struct {
                     // back to `field.pos` when there is no mark, so the note appears to drop out
                     // from under its own connections.
                     //
-                    // Pinning it also makes the mark agree with where those links terminate, at
-                    // every point in the animation rather than only at the ends.
+                    // Pulling the *covering mass* onto the leaf was the other failure of the same
+                    // kind: a focused note sits at the edge of its parent, so every sibling then
+                    // hatched out of that edge toward the real centroid — usually already off the
+                    // pane at this zoom — and the focused links remained, pointing at the bezel.
+                    // The mass stays where it is; the aimed leaf stays on it.
+                    const aimed = k == p.aim_leaf;
                     const pinned = k == p.focus_leaf or isOpenLeaf(p, k);
-                    if (pinned) {
+                    if (aimed) {
+                        // Stay on the stand-in while the parent is still the disc under the
+                        // cursor; once it has opened, freeze wherever that left us rather than
+                        // walking the rest of the way to the leaf.
+                        if (self.anim[id] < 1 or (self.px[k] == 0 and self.py[k] == 0)) {
+                            self.px[k] = self.px[id];
+                            self.py[k] = self.py[id];
+                        }
+                    } else if (pinned) {
                         self.px[k] = own.x;
                         self.py[k] = own.y;
                     } else {
@@ -1595,6 +1570,51 @@ fn chainLinks(gpa: std.mem.Allocator, n: u32) ![]fold.Edge {
     return e;
 }
 
+const LeafOffset = struct {
+    note: u32,
+    leaf: u32,
+    parent: u32,
+    pin: containment.Vec2,
+    centroid: containment.Vec2,
+};
+
+fn farthestFromParent(w: *World) ?LeafOffset {
+    var best_off: f32 = 0;
+    var best: ?LeafOffset = null;
+    const n = @min(w.lad.leaf_cell.len, @as(usize, 800));
+    for (0..n) |note| {
+        const leaf = w.lad.leaf_cell[note];
+        if (leaf == fold.invalid or leaf >= w.lad.cells.len) continue;
+        const parent = w.lad.cells[leaf].parent;
+        if (parent == fold.invalid) continue;
+        const wp = w.noteWorldPos(@intCast(note)) orelse continue;
+        const centroid = w.field.pos[parent];
+        const off = (wp.x - centroid.x) * (wp.x - centroid.x) + (wp.y - centroid.y) * (wp.y - centroid.y);
+        if (off > best_off) {
+            best_off = off;
+            best = .{
+                .note = @intCast(note),
+                .leaf = leaf,
+                .parent = parent,
+                .pin = .{ .x = wp.x, .y = wp.y },
+                .centroid = centroid,
+            };
+        }
+    }
+    return best;
+}
+
+fn coveringMark(w: *const World, leaf: u32) ?Mark {
+    var c = leaf;
+    var guard: u8 = 0;
+    while (c != fold.invalid and guard < 64) : (guard += 1) {
+        if (w.markIndex(c)) |i| return w.marks.items[i];
+        if (c >= w.lad.cells.len) break;
+        c = w.lad.cells[c].parent;
+    }
+    return null;
+}
+
 fn settle(w: *World, view: View, p: Params, frames: usize) !void {
     for (0..frames) |_| try w.step(view, p, 1.0 / 60.0);
 }
@@ -2051,6 +2071,58 @@ test "an unheld zoom-in opens cells before the camera arrives" {
         if (o) open_mid += 1;
     }
     try testing.expect(open_mid > open_far);
+}
+
+test "a focused covering mass stays at its centroid rather than jumping to the leaf" {
+    // Pulling the mass onto the focused leaf put every sibling in flight from that edge toward
+    // the real centroid — off the pane, with the focused links still drawn to the bezel.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const hit = farthestFromParent(&w) orelse return error.TestUnexpectedResult;
+    const off2 = (hit.pin.x - hit.centroid.x) * (hit.pin.x - hit.centroid.x) +
+        (hit.pin.y - hit.centroid.y) * (hit.pin.y - hit.centroid.y);
+    try testing.expect(off2 > 0.01);
+
+    const p: Params = .{ .focus_leaf = hit.leaf, .budget = 2000 };
+    const coarse: View = .{ .w = 900, .h = 600, .zoom = 4, .cx = hit.centroid.x, .cy = hit.centroid.y };
+    try settle(&w, coarse, p, 80);
+
+    const m = coveringMark(&w, hit.leaf) orelse return error.TestUnexpectedResult;
+    const d_c = (m.wx - hit.centroid.x) * (m.wx - hit.centroid.x) + (m.wy - hit.centroid.y) * (m.wy - hit.centroid.y);
+    const d_t = (m.wx - hit.pin.x) * (m.wx - hit.pin.x) + (m.wy - hit.pin.y) * (m.wy - hit.pin.y);
+    try testing.expect(d_c < d_t);
+}
+
+test "an aimed-at note stays on its stand-in instead of sliding to the leaf" {
+    // Wheel-zoom into a note that is not open: without aim_leaf the mark interpolates toward
+    // the true leaf, which is often already off-screen, and the links remain (they fall back
+    // to field.pos). Holding the leaf on the parent pose keeps the dive under the cursor.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const hit = farthestFromParent(&w) orelse return error.TestUnexpectedResult;
+    const off2 = (hit.pin.x - hit.centroid.x) * (hit.pin.x - hit.centroid.x) +
+        (hit.pin.y - hit.centroid.y) * (hit.pin.y - hit.centroid.y);
+    try testing.expect(off2 > 0.01);
+
+    const coarse: View = .{ .w = 900, .h = 600, .zoom = 4, .cx = hit.centroid.x, .cy = hit.centroid.y };
+    try settle(&w, coarse, .{ .budget = 2000 }, 80);
+
+    const fine: View = .{ .w = 900, .h = 600, .zoom = 80, .cx = hit.centroid.x, .cy = hit.centroid.y };
+    const aimed: Params = .{ .aim_leaf = hit.leaf, .budget = 2000 };
+    for (0..8) |_| try w.step(fine, aimed, 1.0 / 60.0);
+
+    const m = coveringMark(&w, hit.leaf) orelse return error.TestUnexpectedResult;
+    const d_c = (m.wx - hit.centroid.x) * (m.wx - hit.centroid.x) + (m.wy - hit.centroid.y) * (m.wy - hit.centroid.y);
+    const d_t = (m.wx - hit.pin.x) * (m.wx - hit.pin.x) + (m.wy - hit.pin.y) * (m.wy - hit.pin.y);
+    try testing.expect(d_c < d_t);
 }
 
 test "an empty vault does not crash" {

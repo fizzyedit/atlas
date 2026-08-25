@@ -3096,7 +3096,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     p.interior.nest = .{ .steps = 0, .scale = scale, .level = vault_level, .clamped = false };
     p.interior.slot = interior_ring_gap * p.interior.nest.scale;
     p.interior.radius = extent * p.interior.nest.scale;
-    p.interior.parent = p.nodes[idx].home;
+    p.interior.parent = interiorAnchor(p, idx);
 
     // Place in world space *now*, not at the origin until the next `stepInteriorWorld`.
     // `enterInterior` calls `applyFraming` on this same stack, and `fitInteriorSun` used to
@@ -3151,6 +3151,28 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     p.interior.built_aspect = p.layout_aspect;
 }
 
+/// Where this note's interior hangs. The living stand-in first — that is the disc on screen —
+/// then the last written `home`. Not the exact containment position: that is often already off
+/// the pane at this zoom, and hanging the sun there is the interior flying down while the
+/// overview links remain.
+fn interiorAnchor(p: *Panel, idx: usize) dvui.Point {
+    if (idx >= p.nodes.len) return .{};
+    if (p.world_state) |*w| {
+        if (idx < w.lad.leaf_cell.len) {
+            var c = w.lad.leaf_cell[idx];
+            var guard: u8 = 0;
+            while (c != fold.invalid and c < w.lad.cells.len and guard < 64) : (guard += 1) {
+                if (w.markIndex(c)) |mi| {
+                    const m = w.marks.items[mi];
+                    return .{ .x = m.wx, .y = m.wy };
+                }
+                c = w.lad.cells[c].parent;
+            }
+        }
+    }
+    return p.nodes[idx].home;
+}
+
 /// Refresh the interior's world positions for this frame from `p.interior.local_pos`, mirroring
 /// `stepWorld` one level down but with no LOD to decide — every item is drawn as itself, always
 /// (see `buildInteriorWorld`'s doc comment for why there is no coalescing budget here to run).
@@ -3163,7 +3185,7 @@ fn stepInteriorWorld(p: *Panel) void {
     if (p.interior.nodes.len == 0) return;
     const id = p.interior.note_id orelse return;
     const idx = p.id_index.get(id) orelse return;
-    p.interior.parent = p.nodes[idx].home;
+    p.interior.parent = interiorAnchor(p, idx);
 
     const sun = &p.interior.nodes[0];
     sun.target = p.interior.parent;
@@ -4245,6 +4267,15 @@ fn focusNodeIndex(p: *Panel) ?u32 {
     return p.focus_node;
 }
 
+fn cellCoversLeaf(w: *const world_mod.World, cell: u32, leaf: u32) bool {
+    if (leaf == fold.invalid or cell >= w.lad.cells.len or leaf >= w.lad.cells.len) return false;
+    const note = w.lad.cells[leaf].note;
+    if (note == fold.invalid or note >= w.lad.slot_of.len) return false;
+    const slot = w.lad.slot_of[note];
+    const c = w.lad.cells[cell];
+    return slot >= c.ls and slot < c.le;
+}
+
 /// The world parameters for this frame. One definition, because `focusNode` needs the same
 /// `split_px` the LOD is about to use — deriving the camera's never-coalesce floor from a
 /// different value than the one that decides it would be a slow drift into wrongness.
@@ -4259,6 +4290,7 @@ fn worldParams(p: *Panel) world_mod.Params {
     // lights up nothing — the failure reads as "the highlight was lost" rather than as "the
     // highlight is of something else".
     var focus_leaf: u32 = fold.invalid;
+    var aim_leaf: u32 = fold.invalid;
     // Every open note's leaf, focused one first. `liftLinks` draws all of their links at leaf
     // precision, which is what stops a note's connections changing identity depending on whether it
     // happens to be the focused tab — see `world.Params.open_leaves`.
@@ -4276,6 +4308,33 @@ fn worldParams(p: *Panel) world_mod.Params {
             const lf = w.lad.leaf_cell[gi];
             if (lf == focus_leaf) continue;
             open_leaves.append(arena, lf) catch {};
+        }
+        // The note under the cursor, then the one already being descended into. Hover is last
+        // frame's, which is the disc the zoom actually stayed on. Interior wins once a dive has
+        // named a note, so a stray hover cannot steal the sun.
+        if (p.interior.t < 0.5) {
+            if (p.hover_node) |i| {
+                if (i < w.lad.leaf_cell.len) aim_leaf = w.lad.leaf_cell[i];
+            } else if (p.hover_cluster) |hc| {
+                // Pointing at a mass: keep the open note inside it on the mass, not on the
+                // leaf. Without this, a selected document jumps to its containment slot the
+                // moment the mass splits — off the pane, links still drawn to the bezel.
+                if (cellCoversLeaf(w, hc.index, focus_leaf)) {
+                    aim_leaf = focus_leaf;
+                } else {
+                    for (open_leaves.items) |lf| {
+                        if (cellCoversLeaf(w, hc.index, lf)) {
+                            aim_leaf = lf;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (p.interior.note_id) |nid| {
+            if (p.id_index.get(nid)) |gi| {
+                if (gi < w.lad.leaf_cell.len) aim_leaf = w.lad.leaf_cell[gi];
+            }
         }
     }
     // Hold the web during a fast pan or a hand-driven zoom flick, not during a click-to-focus
@@ -4301,6 +4360,7 @@ fn worldParams(p: *Panel) world_mod.Params {
         // Highlighted lines get the same allowance as the ambient web, spent focused-note-first.
         .focus_link_budget = ambientLinkBudget(p.mark_budget),
         .focus_leaf = focus_leaf,
+        .aim_leaf = aim_leaf,
         .open_leaves = open_leaves.items,
         .lift_hold = hold,
         // Only a hand-driven flick holds the open set. `user_driving` is false for the whole
