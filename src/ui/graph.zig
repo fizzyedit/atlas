@@ -4356,8 +4356,17 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     // one you are in".
     const is_dashed = m.is_note and m.note < p.nodes.len and p.nodes[m.note].open;
 
+    // Same face as a resting note. Masses used to fill with window text mixed toward the
+    // background, so a merge was notes fading to "nothing" against a disc of a different colour.
+    // A hovered note still walks to this rest fill as it is absorbed — see `m.alpha`.
+    const rest = noteRestFill(theme);
+    const fill: dvui.Color = if (m.is_note and m.note < p.nodes.len) blk: {
+        const own = nodeFill(theme, p.nodes[m.note]);
+        break :blk galaxy.joinFill(own, rest, m.alpha);
+    } else rest;
+
     return .{
-        .fill = if (m.is_note) nodeFill(theme, p.nodes[m.note]) else border_rest,
+        .fill = fill,
 
         .border = border,
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
@@ -5250,6 +5259,17 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     return @max(@min(want, gap_px * gap_radius_frac), floor);
 }
 
+/// The disc colour notes and coalesced masses share at rest.
+///
+/// A mass used to fill with window-text mixed into the background, while a note sat on a
+/// slightly lifted control fill — close enough to the window that a merge looked like notes
+/// dissolving into nothing against a tinted blob. One colour, and the dashed ring is what
+/// says "this one is many".
+fn noteRestFill(theme: dvui.Theme) dvui.Color {
+    const base = theme.color(.control, .fill);
+    return base.lighten(if (theme.dark) 6 else -6);
+}
+
 /// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the
 /// cursor. Open notes already rest at `fill_hover`, so they lift to `fill_press` instead —
 /// otherwise hovering the one node you most want feedback from would do nothing.
@@ -5274,7 +5294,7 @@ fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
     else if (n.phantom)
         galaxy.intoBg(base, theme.color(.window, .fill), 0.4)
     else
-        base.lighten(if (theme.dark) 6 else -6);
+        noteRestFill(theme);
 
     const lit = n.pointer_t;
     if (lit <= 0.002) return rest;

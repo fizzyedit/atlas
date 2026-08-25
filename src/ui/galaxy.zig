@@ -36,6 +36,19 @@ pub fn intoBg(c: dvui.Color, bg: dvui.Color, t: f32) dvui.Color {
     return out;
 }
 
+/// Walk `own` toward `rest` as a mark is absorbed (`alpha` 1 → 0).
+///
+/// This is not `intoBg`. Mixing a dying note toward the window fill paints an opaque hole
+/// over the mass it is joining. The rest colour is the mass's own fill, so the note becomes
+/// the mass rather than vanishing in front of it.
+pub fn joinFill(own: dvui.Color, rest: dvui.Color, alpha: f32) dvui.Color {
+    const a = std.math.clamp(alpha, 0, 1);
+    if (a >= 0.996) return own;
+    var out = own.lerp(rest, 1 - a);
+    out.a = 255;
+    return out;
+}
+
 /// Marks the overview may draw in a frame. Headroom is deliberate: labels, proximity and the
 /// interior all draw on top of this.
 pub const plugin_mark_budget: usize = 360;
@@ -79,13 +92,13 @@ pub const StyledMark = struct {
     /// after every other mark.
     ///
     /// For the handful of marks the reader is actually dealing with — the note under the cursor,
-    /// the notes they have open. A coalesced mass uses a dashed rim too but mixes its face toward
-    /// the background so overlapping masses stay one shade rather than stacking into a glob.
+    /// the notes they have open. Coalesced masses use a dashed atlas ring too, but keep the same
+    /// face colour as a note: overlapping opaque discs of one shade stay one shade.
     dashed: bool = false,
 };
 
 /// Shared soft-sprite stack (frustum cull + cheap dense path). Used by harness and plugin.
-/// Coalesced masses use a lighter fill + dashed ring (same language as the interior sun).
+/// Notes and coalesced masses share a fill; the dashed ring is what says a mass is many.
 ///
 /// `mix` is how far the marks sit off the background (1 = their own colour, 0 = gone), not an
 /// alpha. See `intoBg`.
@@ -152,22 +165,22 @@ pub fn drawStyledMarks(
             stats.marks += 1;
             continue;
         }
-        if (m.is_note) {
-            const face = intoBg(m.fill, bg, t);
-            if (!cheap and r > 3) {
-                sprites.add(.{
-                    .center = .{ .x = screen.x + 0.8, .y = screen.y + 1.0 },
-                    .half_size = r * 1.08,
-                    .color = dvui.Color.black.opacity(0.16 * mix),
-                    .uv = glow_uv,
-                });
-            }
+        const face = intoBg(m.fill, bg, t);
+        if (!cheap and r > 3) {
             sprites.add(.{
-                .center = screen,
-                .half_size = r,
-                .color = face,
-                .uv = disc_uv,
+                .center = .{ .x = screen.x + 0.8, .y = screen.y + 1.0 },
+                .half_size = r * 1.08,
+                .color = dvui.Color.black.opacity(0.16 * mix),
+                .uv = glow_uv,
             });
+        }
+        sprites.add(.{
+            .center = screen,
+            .half_size = r,
+            .color = face,
+            .uv = disc_uv,
+        });
+        if (m.is_note) {
             if (r > 1.5) {
                 sprites.add(.{
                     .center = screen,
@@ -177,24 +190,7 @@ pub fn drawStyledMarks(
                 });
             }
         } else {
-            // Mass: a faded *colour*, not a translucent disc. Overlapping masses used to stack
-            // into a bright glob; mixed into the background they stay one shade, and the dashed
-            // rim still carries the shape.
-            const face = intoBg(m.fill, bg, 0.28 * t);
-            if (!cheap and r > 4) {
-                sprites.add(.{
-                    .center = screen,
-                    .half_size = r * 1.15,
-                    .color = intoBg(m.fill, bg, 0.12 * t),
-                    .uv = glow_uv,
-                });
-            }
-            sprites.add(.{
-                .center = screen,
-                .half_size = r,
-                .color = face,
-                .uv = disc_uv,
-            });
+            // Same face as a note; the dashed rim is what says this disc is many.
             const rim = intoBg(m.border, bg, 0.9 * t);
             // `!cheap` is load-bearing, not a nicety.
             //
@@ -357,6 +353,22 @@ fn appendDashedSpan(
     const dx = end_pt.x - last.x;
     const dy = end_pt.y - last.y;
     if (dx * dx + dy * dy > 1e-8) try out.append(arena, end_pt);
+}
+
+test "joinFill lands on the mass fill, never the window" {
+    const rest = dvui.Color{ .r = 50, .g = 52, .b = 58, .a = 255 };
+    const own = dvui.Color{ .r = 240, .g = 160, .b = 40, .a = 255 };
+    const bg = dvui.Color{ .r = 12, .g = 12, .b = 16, .a = 255 };
+    const gone = joinFill(own, rest, 0);
+    try std.testing.expectEqual(rest.r, gone.r);
+    try std.testing.expectEqual(rest.g, gone.g);
+    try std.testing.expectEqual(rest.b, gone.b);
+    try std.testing.expectEqual(@as(u8, 255), gone.a);
+    const mid = joinFill(own, rest, 0.5);
+    try std.testing.expect(mid.r != bg.r);
+    try std.testing.expect(mid.r > rest.r and mid.r < own.r);
+    const full = joinFill(own, rest, 1);
+    try std.testing.expectEqual(own.r, full.r);
 }
 
 test "intoBg stays opaque and never walks through a third hue" {

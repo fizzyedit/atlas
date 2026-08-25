@@ -384,20 +384,20 @@ pub fn draw(
     for (w.marks.items) |m| {
         const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
         const style = dctx.style(dctx.ctx, w, m, holds_open);
-        // `Mark.alpha`, finally applied.
+        // Split and merge stay continuous through pose, not through colour.
         //
-        // This is the entire mechanism by which a split or a merge is continuous. `present` chases
-        // `anim` toward the topology decision, slides a closing cell's children in toward their
-        // parent's centre, and hands each one a mix that falls to the background as it arrives.
-        // Mixed, not translucent: overlapping children during a merge used to stack into a bright
-        // blob and then pop out. Walking the colour into the background keeps the motion and
-        // leaves the stack the same shade as one child.
-        const a = std.math.clamp(m.alpha, 0, 1);
+        // `present` chases `anim`, slides a closing cell's children in toward their parent's
+        // centre, and shrinks the parent toward a note. Notes and masses share a fill, so
+        // overlapping discs read as one object becoming several — or several becoming one.
+        // Mixing each mark toward the window fill as `alpha` fell used to punch opaque holes
+        // in the parent: `intoBg` is opaque, so a dying child painted the background *over*
+        // the mass it was joining. Colour that has to change (a hovered note, an open one)
+        // walks to the shared rest fill in `overviewMarkStyle` instead.
         buf[n] = .{
             .screen = toScreen(cam, dctx, m),
             .r_px = style.r_px,
-            .fill = galaxy.intoBg(style.fill, bg, a),
-            .border = galaxy.intoBg(style.border, bg, a),
+            .fill = style.fill,
+            .border = style.border,
             .is_note = style.is_note,
             .dying = false,
             // Ordering is `galaxy`'s problem now: it holds every dashed mark back past the sprite
