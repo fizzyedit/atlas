@@ -4874,7 +4874,8 @@ fn drawLabels(p: *Panel) void {
 fn renderTextPlated(
     font: dvui.Font,
     text: []const u8,
-    r: dvui.Rect.Physical,
+    /// Where the text should be centred, in physical pixels.
+    centre: dvui.Point.Physical,
     scale: f32,
     col: dvui.Color,
     plate: dvui.Color,
@@ -4883,14 +4884,29 @@ fn renderTextPlated(
     const eased = dvui.easing.outCubic(std.math.clamp(t, 0, 1));
     if (eased <= 0.004) return;
 
+    // `Font.textSize` reports *logical* pixels and the glyphs are drawn at `scale`, so the extent
+    // on screen is the product. Both callers used to pass the logical size straight through as
+    // physical, which centred every one of these names half a text-width off on any display with a
+    // scale above 1 — and sized the plate to a quarter of the area it was supposed to back.
+    const size = font.textSize(text);
+    const tw = size.w * scale;
+    const th = size.h * scale;
+    const r: dvui.Rect.Physical = .{
+        .x = centre.x - tw * 0.5,
+        .y = centre.y,
+        .w = tw,
+        .h = th,
+    };
+
     const s = dpiScale();
-    const pad_x = label_plate_pad_x * s;
-    const pad_y = label_plate_pad_y * s;
-    const full_w = r.w + pad_x * 2;
-    const h = r.h + pad_y * 2;
-    const cx = r.x + r.w * 0.5;
-    const w = full_w * eased;
-    const box: dvui.Rect.Physical = .{ .x = cx - w * 0.5, .y = r.y - pad_y, .w = w, .h = h };
+    const h = th + label_plate_pad_y * s * 2;
+    const w = (tw + label_plate_pad_x * s * 2) * eased;
+    const box: dvui.Rect.Physical = .{
+        .x = centre.x - w * 0.5,
+        .y = r.y - label_plate_pad_y * s,
+        .w = w,
+        .h = h,
+    };
     box.fill(.all(h * 0.5), .{ .color = plate.opacity(eased), .fade = 1 });
 
     dvui.renderText(.{
@@ -4931,18 +4947,12 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
 
     const cw = dvui.currentWindow();
     const font = dvui.Font.theme(.body).larger(label_font_delta).withWeight(.bold);
-    const size = font.textSize(n.title);
     const centre = p.camera.worldToScreen(n.pos);
     const theme = dvui.themeGet();
     renderTextPlated(
         font,
         n.title,
-        .{
-            .x = centre.x - size.w * 0.5,
-            .y = centre.y + r + label_gap_px * dpiScale(),
-            .w = size.w,
-            .h = size.h,
-        },
+        .{ .x = centre.x, .y = centre.y + r + label_gap_px * dpiScale() },
         cw.natural_scale,
         theme.color(.highlight, .fill).opacity(fade),
         theme.color(.window, .fill).opacity(label_plate_opacity * fade),
@@ -4992,17 +5002,11 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
     // be findable at a glance in a field of hundreds, and highlight colour alone was not carrying
     // it — the hue reads as emphasis only once the glyphs are heavy enough to hold it.
     const font = dvui.Font.theme(.body).larger(label_font_delta + 1).withWeight(.bold);
-    const size = font.textSize(n.title);
     const theme = dvui.themeGet();
     renderTextPlated(
         font,
         n.title,
-        .{
-            .x = centre.x - size.w * 0.5,
-            .y = centre.y + below + label_gap_px * dpiScale(),
-            .w = size.w,
-            .h = size.h,
-        },
+        .{ .x = centre.x, .y = centre.y + below + label_gap_px * dpiScale() },
         cw.natural_scale,
         theme.color(.highlight, .fill).opacity(fade),
         theme.color(.window, .fill).opacity(label_plate_opacity * fade),

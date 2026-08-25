@@ -636,6 +636,14 @@ pub const World = struct {
         return e;
     }
 
+    /// Is `cell` the leaf of one of the reader's open notes? A handful of tabs, so a linear scan.
+    fn isOpenLeaf(p: Params, cell: u32) bool {
+        for (p.open_leaves) |leaf| {
+            if (leaf == cell) return true;
+        }
+        return false;
+    }
+
     /// Rebuild the living set for this view.
     ///
     /// Two passes, deliberately. Topology first, as a **pure function of (tree, view, zoom,
@@ -874,8 +882,27 @@ pub const World = struct {
                 self.field.ensureChildren(&self.lad, id); // lazy placement pays off here
                 for (self.lad.childrenOf(id)) |k| {
                     const own = self.field.pos[k];
-                    self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
-                    self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
+                    // An open note does not travel with the split; it is already where it is.
+                    //
+                    // Every other child slides out from its parent's centre as the parent opens,
+                    // which is what makes a split read as an expansion. For the note the reader is
+                    // descending into that is exactly wrong. Its mark starts at the parent's
+                    // centre, and once the camera has closed in on the note's *true* position that
+                    // centre is off screen — so `onScreen` culls the mark, it stops being drawn,
+                    // and the reader is left zooming at nothing. Its links stay, because they fall
+                    // back to `field.pos` when there is no mark, so the note appears to drop out
+                    // from under its own connections.
+                    //
+                    // Pinning it also makes the mark agree with where those links terminate, at
+                    // every point in the animation rather than only at the ends.
+                    const pinned = k == p.focus_leaf or isOpenLeaf(p, k);
+                    if (pinned) {
+                        self.px[k] = own.x;
+                        self.py[k] = own.y;
+                    } else {
+                        self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
+                        self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
+                    }
                     self.mul[k] = self.mul[id] * self.anim[id];
                     try stack.append(self.gpa, k);
                 }
