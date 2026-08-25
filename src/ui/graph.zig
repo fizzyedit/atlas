@@ -114,11 +114,14 @@ const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
 const hover_fill_mix: f32 = 0.45;
+/// How far into a descent the overview keeps full strength before it begins to give way. The node
+/// being zoomed into has to stay solid while it grows. See the draw block in `drawPanel`.
+const overview_hold_t: f32 = 0.45;
 /// Padding around the two unconditional labels' plate, and how opaque it sits. See
 /// `renderTextPlated`.
 const label_plate_pad_x: f32 = 6;
 const label_plate_pad_y: f32 = 2;
-const label_plate_opacity: f32 = 0.25;
+const label_plate_opacity: f32 = 0.6;
 
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
@@ -1250,12 +1253,30 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
         // gives way as the interior arrives, which is what sells zooming *into* a node rather
         // than cutting to another screen.
         const t = p.interior.t;
+        // How far the overview actually gives way, which is not the same as how far in the camera
+        // is.
+        //
+        // `interior.t` is a pure function of zoom — it rises whether or not there is a cloud to
+        // arrive. So a descent toward a note whose interior was never built faded the overview out
+        // against nothing: the note went translucent, then invisible, while its links carried on
+        // being drawn from `field.pos`, and the reader was left zooming at an empty patch with no
+        // way to reach the interior that was supposed to be there. Yielding only when something is
+        // arriving makes the fade a handover rather than a countdown.
+        //
+        // And it holds at full strength through the first part of the descent. The node is the
+        // thing being zoomed *into*, so it has to stay solid while it grows — fading it from the
+        // moment the camera starts moving reads as the note dissolving and a different screen
+        // appearing behind it, which is the cut this crossfade exists to avoid.
+        const yield_t: f32 = if (p.interior.nodes.len > 0)
+            std.math.clamp((t - overview_hold_t) / (1 - overview_hold_t), 0, 1)
+        else
+            0;
         // Notes where they have separated enough to be told apart, coalesced masses where they
         // have not — decided per cell, and cross-faded, by the world's own open set. That is what
         // turns "draw every note in the vault" into "draw at most `mark_budget` marks".
         _ = profLap(&prof);
         // One hierarchy, positions derived from it. Owns the whole overview.
-        drawWorldMarks(p, 1 - t);
+        drawWorldMarks(p, 1 - yield_t);
         frame_profile.draw_edges_ns = profLap(&prof);
         frame_profile.draw_nodes_ns = 0;
         frame_profile.draw_clusters_ns = 0;
