@@ -472,6 +472,9 @@ const Interior = struct {
     parent: dvui.Point = .{},
     /// Interior lattice spacing in world units, for label reveal and bubble sizing.
     slot: f32 = 0,
+    /// Index into `Panel.nodes` of the overview node this cloud grew out of, so the sun can be
+    /// sized against the ring it is replacing. `maxInt` when there is no interior.
+    parent_node: u32 = std.math.maxInt(u32),
     /// World-space radius of the nested cloud, which is what decides how much of the panel it
     /// covers and so how far into the descent the view is.
     radius: f32 = 0,
@@ -1408,10 +1411,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
         // thing being zoomed *into*, so it has to stay solid while it grows — fading it from the
         // moment the camera starts moving reads as the note dissolving and a different screen
         // appearing behind it, which is the cut this crossfade exists to avoid.
-        const yield_t: f32 = if (p.interior.nodes.len > 0)
-            std.math.clamp((t - overview_hold_t) / (1 - overview_hold_t), 0, 1)
-        else
-            0;
+        const yield_t: f32 = interiorYieldT(p);
         // Notes where they have separated enough to be told apart, coalesced masses where they
         // have not — decided per cell, and cross-faded, by the world's own open set. That is what
         // turns "draw every note in the vault" into "draw at most `mark_budget` marks".
@@ -1446,6 +1446,22 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
 ///
 /// Whichever level owns the view (overview vs interior) gets the proximity field; the other
 /// decays so a faded backdrop doesn't keep swelling behind the cloud you are looking at.
+/// How far the overview has given way to an arriving interior. 0 = fully present, 1 = gone.
+///
+/// Not the same as `interior.t`, which is a pure function of zoom and starts rising the moment
+/// the camera does. The overview holds at full strength through `overview_hold_t` of the descent
+/// — the node being zoomed into has to stay solid while it grows — and only then yields.
+///
+/// Shared because two passes need the same answer and disagreed: the draw pass faded the overview
+/// on this curve while `updateBubbles` handed the pointer to the interior at a bare
+/// `interior.t >= 0.5`. At that point this returns 0.09, so the overview was still drawn at 91%
+/// opacity with nothing responding to the cursor — select a note, let the camera settle in that
+/// band, and hovering the vault grew nothing until you zoomed back out.
+fn interiorYieldT(p: *const Panel) f32 {
+    if (p.interior.nodes.len == 0) return 0;
+    return std.math.clamp((p.interior.t - overview_hold_t) / (1 - overview_hold_t), 0, 1);
+}
+
 fn updateBubbles(p: *Panel) void {
     if (p.nodes.len == 0) {
         p.proximity_settled = true;
@@ -1508,23 +1524,30 @@ fn updateBubbles(p: *Panel) void {
         }
     }
 
-    const inside_interior = p.interior.t >= 0.5 and p.interior.nodes.len > 0;
+    // Whatever is on screen answers the cursor. During a descent both layers are drawn for a
+    // stretch, and both should respond — the handover is a crossfade, not a switch.
+    const interior_live = p.interior.nodes.len > 0 and p.interior.t > 0;
+    const overview_live = interiorYieldT(p) < 1;
+    // Merged, flying to a click, or a flick is in progress: the shove is O(visible²) and unread
+    // at that speed. After a click-flight parks, do not keep skipping just because `zoom_speed`
+    // is still decaying — that is the "camera settles, then everything jumps" hitch.
+    const overview_busy = coalesced_only or p.camera.chasing() or
+        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps);
+
     var hover_unsettled = false;
-    if (inside_interior) {
+    if (interior_live) {
         hover_unsettled = applyProximity(p, p.interior.nodes, p.interior.slot, p.interior.radius, t_hover, p.interior_visible.items) or hover_unsettled;
-        // Do not decayProximity over the whole overview vault during interior — O(N).
-    } else if (coalesced_only or p.camera.chasing() or
-        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps))
-    {
-        // Merged, flying to a click, or a flick is in progress: the shove is O(visible²) and
-        // unread at that speed. After a click-flight parks, do not keep skipping just because
-        // `zoom_speed` is still decaying — that is the "camera settles, then everything jumps"
-        // hitch.
-    } else {
+    }
+    if (overview_live and !overview_busy) {
+        // Bounded by `p.visible` — this frame's resolved marks — not by the note count, so
+        // running it alongside the interior during the handover costs the mark budget, not the
+        // vault.
         hover_unsettled = applyProximity(p, p.nodes, p.layout_slot, p.world_radius, t_hover, p.visible.items) or hover_unsettled;
-        if (p.interior.nodes.len > 0) {
-            hover_unsettled = decayProximity(p.interior.nodes, t_hover) or hover_unsettled;
-        }
+    }
+    if (!interior_live and p.interior.nodes.len > 0) {
+        // Let the cloud behind relax. The reverse — decaying the overview while inside — stays
+        // undone deliberately: that walk is O(N) over the whole vault.
+        hover_unsettled = decayProximity(p.interior.nodes, t_hover) or hover_unsettled;
     }
 
     p.proximity_settled = !hover_unsettled;
@@ -3106,6 +3129,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     p.interior.slot = interior_ring_gap * p.interior.nest.scale;
     p.interior.radius = extent * p.interior.nest.scale;
     p.interior.parent = interiorAnchor(p, idx);
+    p.interior.parent_node = @intCast(idx);
 
     // Place in world space *now*, not at the origin until the next `stepInteriorWorld`.
     // `enterInterior` calls `applyFraming` on this same stack, and `fitInteriorSun` used to
@@ -3195,6 +3219,7 @@ fn stepInteriorWorld(p: *Panel) void {
     const id = p.interior.note_id orelse return;
     const idx = p.id_index.get(id) orelse return;
     p.interior.parent = interiorAnchor(p, idx);
+    p.interior.parent_node = @intCast(idx);
 
     const sun = &p.interior.nodes[0];
     sun.target = p.interior.parent;
@@ -4450,6 +4475,25 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
     const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
     const gap_px = p.interior.slot * p.camera.zoom;
 
+    // The sun is the overview ring, grown — so it starts as that ring, exactly.
+    //
+    // Both sizes come from `bubbleScreenRadius`, but from different inputs: the overview node is
+    // `open_screen_r` against `layout_slot * zoom`, the sun is `sun_screen_r` against
+    // `interior.slot * zoom`, each with its own cap and `gap_radius_frac` clamp. Nothing made
+    // those agree at the handover, and the overview copy is `omit`ted the same frame the sun
+    // appears, so whatever they disagreed by was a snap — the ring jumping to a different size
+    // and then growing back to the one it already had.
+    //
+    // Interpolating on `interiorYieldT` rather than on `interior.t` puts the ring's size on the
+    // very curve that fades the overview out, so size and opacity hand over together.
+    const yield_t = interiorYieldT(p);
+    const sun_r0: f32 = if (p.interior.parent_node < p.nodes.len) blk: {
+        // The *overview's* inputs, not the interior's — this is the ring the overview would be
+        // drawing for that node right now if it were not omitted.
+        const o_zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
+        break :blk bubbleScreenRadius(p.nodes[p.interior.parent_node], o_zoom_t, p.layout_slot * p.camera.zoom);
+    } else 0;
+
     const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
     for (p.interior.nodes, 0..) |node, i| {
         const kind_mul = if (i > 0 and i < p.interior.item_kind.len)
@@ -4458,7 +4502,10 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
             1.0;
         buf[i] = .{
             .screen = p.camera.worldToScreen(node.pos),
-            .r_px = bubbleScreenRadius(node, zoom_t, gap_px) * kind_mul,
+            .r_px = if (node.is_sun and sun_r0 > 0)
+                std.math.lerp(sun_r0, bubbleScreenRadius(node, zoom_t, gap_px), yield_t)
+            else
+                bubbleScreenRadius(node, zoom_t, gap_px) * kind_mul,
             .fill = nodeFill(theme, node),
             // The sun is the note you are inside — dashed, so leaving reads differently from
             // stepping between content items.
