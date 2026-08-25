@@ -858,6 +858,68 @@ fn layoutReport(
         }
     }
 
+    // -- 2b. descent travel: how far a note jumps when its group explodes -----------------------
+    //
+    // A mark is drawn at its cell's centre, and as the camera closes in the cell standing in for a
+    // note walks down the ladder — root, then the cell inside that, and so on to the leaf. Each
+    // step moves the mark from one centre to the next, and `present` animates that as a slide. The
+    // *size* of those steps is what decides whether zooming into a note reads as the note growing
+    // or as the note flying across the screen and off it.
+    //
+    // Containment bounds a step by the parent's radius, which sounds reassuring and is not: at the
+    // zoom where a cell is opening, its radius is most of the viewport. So the bound is "anywhere
+    // on screen", and only measurement says where in that range a real vault sits.
+    {
+        var worst: std.ArrayListUnmanaged(f32) = .empty;
+        defer worst.deinit(gpa);
+        const n_notes = w.lad.leaf_cell.len;
+        const stride = @max(1, n_notes / 20_000);
+        var i: usize = 0;
+        while (i < n_notes) : (i += stride) {
+            const leaf = w.lad.leaf_cell[i];
+            if (leaf == fold.invalid or leaf >= w.lad.cells.len) continue;
+            w.field.ensurePlaced(&w.lad, leaf);
+
+            // Root-down, so each step is the move the reader actually sees at that level change.
+            var chain: [64]u32 = undefined;
+            var n: usize = 0;
+            var c = leaf;
+            while (n < chain.len) {
+                chain[n] = c;
+                n += 1;
+                const parent = w.lad.cells[c].parent;
+                if (parent == fold.invalid) break;
+                c = parent;
+            }
+            var biggest: f32 = 0;
+            var k = n;
+            while (k > 1) {
+                k -= 1;
+                const a = w.field.pos[chain[k]];
+                const b = w.field.pos[chain[k - 1]];
+                const dx = a.x - b.x;
+                const dy = a.y - b.y;
+                biggest = @max(biggest, @sqrt(dx * dx + dy * dy));
+            }
+            try worst.append(gpa, biggest);
+        }
+        if (worst.items.len > 0) {
+            std.mem.sort(f32, worst.items, {}, std.sort.asc(f32));
+            var sum: f64 = 0;
+            for (worst.items) |v| sum += v;
+            const n: f64 = @floatFromInt(worst.items.len);
+            std.debug.print(
+                "  descent travel (largest single level jump, per note)   mean {d:.3}r  p50 {d:.3}r  p90 {d:.3}r  max {d:.3}r\n",
+                .{
+                    sum / n / ext,
+                    @as(f64, worst.items[worst.items.len / 2]) / ext,
+                    @as(f64, worst.items[worst.items.len * 9 / 10]) / ext,
+                    @as(f64, worst.items[worst.items.len - 1]) / ext,
+                },
+            );
+        }
+    }
+
     // -- 3. radial density profile -------------------------------------------------------------
     //
     // Equal-area rings, so a uniform layout reports eight equal numbers and the shape of the list

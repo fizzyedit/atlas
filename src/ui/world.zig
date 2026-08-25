@@ -825,6 +825,22 @@ pub const World = struct {
     /// of popping, but never lets any of that feed back into the decision above.
     pub fn present(self: *World, view: View, p: Params, dt: f32) !void {
         const rate = @min(1.0, dt * p.rate);
+
+        // Where the focused note actually is, and which slot it occupies.
+        //
+        // Every cell that contains it is drawn *there* rather than at its own centre — see the
+        // stand-in below. Resolved once per frame: a slot compare against `[ls, le)` is then two
+        // integer tests per mark.
+        var focus_slot: u32 = fold.invalid;
+        var focus_at: containment.Vec2 = .{};
+        if (p.focus_leaf != fold.invalid and p.focus_leaf < self.lad.cells.len) {
+            const note = self.lad.cells[p.focus_leaf].note;
+            if (note != fold.invalid and note < self.lad.slot_of.len) {
+                self.field.ensurePlaced(&self.lad, p.focus_leaf);
+                focus_slot = self.lad.slot_of[note];
+                focus_at = self.field.pos[p.focus_leaf];
+            }
+        }
         self.settled = true;
         var stack: std.ArrayListUnmanaged(u32) = .empty;
         defer stack.deinit(self.gpa);
@@ -864,12 +880,34 @@ pub const World = struct {
                         // unrelated things crossfading. Runs in reverse on merge, for free.
                         break :blk full + (p.note_r_px - full) * self.anim[id];
                     };
+                    // A cell that stands in for the focused note is drawn where that note is.
+                    //
+                    // A mark normally sits at its cell's centre, and as the camera closes in the
+                    // cell standing in for a note walks down the ladder — root, then the cell
+                    // inside that, and so on. Each of those centres is somewhere different: on the
+                    // reference corpus the largest single step is a third of the vault radius for
+                    // a typical note and two thirds at the 90th percentile, and at the zoom where
+                    // that level opens the parent's disc is most of the viewport. So tracking one
+                    // note inward meant watching it flick across the screen at every level, often
+                    // clean out of frame, which is the whole reason it could not be zoomed into.
+                    //
+                    // Containment only ever promised a child is *inside* its parent, never near its
+                    // middle, so no amount of placement tuning removes this. Leaning the stand-in
+                    // onto the thing being tracked does: the dashed mark stays put and resolves
+                    // into the note, which is the zoom-into-it the reader was reaching for.
+                    //
+                    // Only the focused note, and only its own ancestors. Everything else keeps
+                    // showing a mass where the mass is.
+                    const holds_focus = focus_slot != fold.invalid and
+                        focus_slot >= c.ls and focus_slot < c.le;
+                    const mx = if (holds_focus) focus_at.x else self.px[id];
+                    const my = if (holds_focus) focus_at.y else self.py[id];
                     try self.marks.append(self.gpa, .{
                         .cell = id,
-                        .wx = self.px[id],
-                        .wy = self.py[id],
-                        .x = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom,
-                        .y = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom,
+                        .wx = mx,
+                        .wy = my,
+                        .x = view.w * 0.5 + (mx - view.cx) * view.zoom,
+                        .y = view.h * 0.5 + (my - view.cy) * view.zoom,
                         .r = r,
                         .alpha = alpha,
                         .is_note = is_note,

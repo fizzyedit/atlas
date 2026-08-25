@@ -171,7 +171,7 @@ const focus_max_gap_px: f32 = 300;
 const sun_fill_opacity: f32 = 0.5;
 /// Labels use a fixed natural font size regardless of camera zoom.
 const label_font_delta: f32 = -1;
-/// Gap between a mark's rim and the focused document's name below it. See `drawFocusNoteLabel`.
+/// Gap between a mark's rim and an open document's name below it. See `drawOpenNoteLabels`.
 const label_gap_px: f32 = 6;
 /// Chase rate for a label winning or losing its slot (1/s). Deliberately slower than the
 /// pointer highlight — text popping in and out is far more distracting than a disc brightening.
@@ -4840,9 +4840,9 @@ fn drawLabels(p: *Panel) void {
         // Only notes resolved *this* frame. `label_rect` is screen space and valid for the frame
         // it was placed in, so drawing a note that has since merged away puts its name at a stale
         // screen position — which is what made labels drift and zoom independently of the field.
-        // The focused note is skipped here and drawn by `drawFocusNoteLabel` below, which uses its
-        // own styling and does not depend on the placer having found it a slot. Without this it
-        // gets both — the placed one and the highlighted one, on top of each other.
+        // Open notes are skipped here and drawn by `drawOpenNoteLabels` below, which uses its own
+        // styling and does not depend on the placer having found them a slot. Without this they get
+        // both — the placed one and the plated one, on top of each other.
         const open_idx: ?u32 = focusNodeIndex(p);
         for (p.visible.items) |v| {
             if (v.index >= p.nodes.len) continue;
@@ -4851,7 +4851,7 @@ fn drawLabels(p: *Panel) void {
             if (p.hover_node == v.index) continue; // `drawHoverLabel` owns this one
             drawLabel(p.nodes[v.index], zoom_t, fade);
         }
-        drawFocusNoteLabel(p, fade);
+        drawOpenNoteLabels(p, fade);
         drawHoverLabel(p, fade);
     }
 }
@@ -4977,41 +4977,78 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
 /// note and it looked right; with two, the graph drew the first tab's title on top of the note you
 /// had just selected, and skipped that first tab's own label at its own position. The focused note
 /// then carried two names: its placed one and the wrong highlighted one.
-fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
+/// Every open document's name, drawn last and unconditionally, one treatment for all of them.
+///
+/// The focused note used to be the only one that got this — bold, plated, always drawn — while
+/// every other open tab went through the placer with the rest of the vault. That gave them a
+/// different weight, no plate, and no guarantee of being drawn at all, so a note being *open* looked
+/// like several different things depending on which one the workbench happened to consider active.
+/// Open is one state and it gets one presentation: highlight-rimmed dashed mark out here, and a
+/// bold highlight name on a plate underneath it.
+///
+/// Positioned at whatever mark currently stands in for the note — its own if the LOD resolved it,
+/// otherwise the nearest drawn ancestor — so the name follows the thing it is naming all the way
+/// out to full coalescence instead of vanishing when the note stops being its own mark.
+fn drawOpenNoteLabels(p: *Panel, fade: f32) void {
     if (fade <= 0.02) return;
     const w = if (p.world_state) |*ws| ws else return;
-    if (w.focus_cut == fold.invalid) return;
-    const idx = focusNodeIndex(p) orelse return;
-    if (idx >= p.nodes.len) return;
-    const n = p.nodes[idx];
-    if (n.title.len == 0) return;
-
-    // Where the note currently *appears*: its own mark if it resolved, else the mass it is inside.
-    var at: ?dvui.Point.Physical = null;
-    var below: f32 = 0;
-    for (w.marks.items) |m| {
-        if (m.cell != w.focus_cut) continue;
-        at = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
-        below = m.r;
-        break;
-    }
-    const centre = at orelse return;
-
     const cw = dvui.currentWindow();
-    // A step larger and bold, against the ambient labels' `label_font_delta`. This one name has to
+    const theme = dvui.themeGet();
+    // A step larger and bold, against the ambient labels' `label_font_delta`. These names have to
     // be findable at a glance in a field of hundreds, and highlight colour alone was not carrying
     // it — the hue reads as emphasis only once the glyphs are heavy enough to hold it.
     const font = dvui.Font.theme(.body).larger(label_font_delta + 1).withWeight(.bold);
-    const theme = dvui.themeGet();
+
+    const focus_idx = focusNodeIndex(p);
+    var drawn_focus = false;
+    for (p.open_notes.items) |gi| {
+        if (gi >= p.nodes.len) continue;
+        if (focus_idx) |fi| {
+            if (fi == gi) drawn_focus = true;
+        }
+        drawOneOpenLabel(p, w, gi, font, theme, cw.natural_scale, fade);
+    }
+    // `focus_leaf` is not required to appear in the open set — a caller may set only the focus, and
+    // the note being read is exactly the one that must never be missing a name.
+    if (!drawn_focus) {
+        if (focus_idx) |fi| drawOneOpenLabel(p, w, fi, font, theme, cw.natural_scale, fade);
+    }
+}
+
+fn drawOneOpenLabel(
+    p: *Panel,
+    w: *const world_mod.World,
+    gi: u32,
+    font: dvui.Font,
+    theme: dvui.Theme,
+    scale: f32,
+    fade: f32,
+) void {
+    const n = p.nodes[gi];
+    if (n.title.len == 0) return;
+    if (gi >= w.lad.leaf_cell.len) return;
+
+    // The deepest drawn ancestor of this note's leaf — what the reader is currently looking at in
+    // its place. Walks the ladder rather than asking the cut, so it answers with what is actually
+    // on screen this frame, including mid-crossfade.
+    var cell = w.lad.leaf_cell[gi];
+    var guard: u8 = 0;
+    const found: ?u32 = while (cell != fold.invalid and guard < 64) : (guard += 1) {
+        if (w.markIndex(cell)) |mi| break mi;
+        if (cell >= w.lad.cells.len) break null;
+        cell = w.lad.cells[cell].parent;
+    } else null;
+    const mi = found orelse return;
+
+    const m = w.marks.items[mi];
+    const centre = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
     renderTextPlated(
         font,
         n.title,
-        .{ .x = centre.x, .y = centre.y + below + label_gap_px * dpiScale() },
-        cw.natural_scale,
+        .{ .x = centre.x, .y = centre.y + m.r + label_gap_px * dpiScale() },
+        scale,
         theme.color(.highlight, .fill).opacity(fade),
         theme.color(.window, .fill).opacity(label_plate_opacity * fade),
-        // Always fully open: the open document's name is not a hover affordance, it is a fact
-        // about the workspace, and it should not be caught mid-sweep by an unrelated cursor move.
         1,
     );
 }
