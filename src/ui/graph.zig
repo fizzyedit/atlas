@@ -4843,12 +4843,13 @@ fn drawLabels(p: *Panel) void {
         // Open notes are skipped here and drawn by `drawOpenNoteLabels` below, which uses its own
         // styling and does not depend on the placer having found them a slot. Without this they get
         // both — the placed one and the plated one, on top of each other.
-        const open_idx: ?u32 = focusNodeIndex(p);
         for (p.visible.items) |v| {
             if (v.index >= p.nodes.len) continue;
-            if (p.hover_node == v.index) continue;
-            if (open_idx) |oi| if (oi == v.index) continue;
             if (p.hover_node == v.index) continue; // `drawHoverLabel` owns this one
+            // *Every* open note, not just the focused one. Skipping only the focus left every
+            // other open tab with two names: the placer's, in the ambient weight and unplated,
+            // sitting just above the plated one `drawOpenNoteLabels` draws.
+            if (p.nodes[v.index].open) continue;
             drawLabel(p.nodes[v.index], zoom_t, fade);
         }
         drawOpenNoteLabels(p, fade);
