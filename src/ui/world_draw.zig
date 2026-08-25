@@ -224,11 +224,7 @@ pub fn draw(
             //
             // That guard was a cheap stand-in for "is any of this on screen", and it is wrong at
             // exactly the moment the picture changes: when a node coalesces, the cells this link
-            // was lifted onto stop being marks *that frame*, so the line was dropped outright — it
-            // vanished, and only came back once the next lift rebuilt it against the new cut and
-            // its fade rose from zero, a second or more later. The crossfade in `fadeLinks` exists
-            // to make that transition continuous and never got the chance.
-            //
+            // was lifted onto stop being marks *that frame*, so the line was dropped outright.
             // Both endpoints are still *placed* (`field.pos` survives coalescing — the cell simply
             // sits inside its parent's disc now), so the line keeps a true position throughout and
             // `clipToRect` below is the honest test of whether any of it is visible. It is also
@@ -238,9 +234,14 @@ pub fn draw(
             const a = endpoint(w, cam, dctx, scr, l.a) orelse continue;
             const b = endpoint(w, cam, dctx, scr, l.b) orelse continue;
             const seg = clipToRect(a, b, clip_rect) orelse continue;
-            const t = ambient_t * l.alpha;
-            if (t <= 0.004) continue;
-            batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, t));
+            // Dying links (`w == 0`) are the fade-out ghosts `fadeLinks` keeps so a cut change
+            // can be gentle. Mixed toward the background they are not gentle: every zoom that
+            // rebuilds the lift paints the old web in pane colour, waits, then pops the new
+            // web in at rest. Skip them. Arriving links (`alpha` rising) use the same rest
+            // colour rather than walking up from the background.
+            if (l.w == 0) continue;
+            if (ambient_t <= 0.004) continue;
+            batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, ambient_t));
             stats.links_drawn += 1;
         }
 

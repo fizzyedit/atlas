@@ -4149,12 +4149,13 @@ fn worldParams(p: *Panel) world_mod.Params {
             open_leaves.append(arena, lf) catch {};
         }
     }
-    // Hold the web while the camera is moving *fast*, with a rare forced refresh so a sustained
-    // drag still catches up. `motion_bias` is already the smoothed speed the LOD uses, so this
-    // costs nothing extra and releases at the same moment detail starts coming back.
+    // Hold the web during a fast pan or a hand-driven zoom flick, not during a click-to-focus
+    // chase and not while `zoom_speed` is merely decaying after the camera parked. That decay
+    // was the "zoom, wait, then the web changes colour" hitch: the lift froze, then dumped a
+    // new cut through `fadeLinks`, which mixed every dying line into the background.
     var hold = false;
     if ((p.motion_bias > liftHoldBias(motionSplitMax(p.mark_budget)) or
-        p.zoom_speed > zoom_hold_oct_ps * 0.5) and
+        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps * 0.5)) and
         p.lift_held < lift_hold_max_frames)
     {
         hold = true;

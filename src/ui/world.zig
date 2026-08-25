@@ -353,7 +353,7 @@ const Memo = struct { stamp: u32 = 0, of: u32 = fold.invalid };
 /// The same, for one cut cell's running per-partner weight total.
 const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
 
-/// One link's crossfade plus the frame that last saw it in the lifted set. See `World.link_fade`.
+/// One link's last-seen stamp in the lifted set. See `World.link_fade`.
 const Fade = struct { v: f32, stamp: u32 };
 
 /// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
@@ -510,17 +510,16 @@ pub const World = struct {
     /// only excuse a stale *cut* — never a stale answer to what the reader just clicked.
     lift_focus_key: u64 = 0,
     lift_valid: bool = false,
-    /// The lifted set itself, cached across frames. `links` is the per-frame *draw* list built
-    /// from this plus whatever is still fading out.
+    /// The lifted set itself, cached across frames. `links` is the per-frame *draw* list, now
+    /// the same pairs at full strength — fading them through the window fill flashed the web.
     lifted: std.ArrayListUnmanaged(LiftedLink) = .empty,
     /// The focused note's own links at leaf precision — see `FocusLink`. Rebuilt by `liftLinks`
     /// alongside `lifted`, and therefore covered by the same fingerprint early-out: a stale set is
     /// only reachable when the cut *and* the focus are unchanged, in which case it is still correct
     /// (leaf positions do not move between rebuilds).
     focus_links: std.ArrayListUnmanaged(FocusLink) = .empty,
-    /// Pair key -> crossfade, surviving across frames so a link that leaves the lifted set fades
-    /// out instead of blinking. Bounded: live links are capped by `link_budget`, and a dying entry
-    /// is dropped as soon as it is invisible.
+    /// Pair key -> last-seen stamp, so a link that left the lifted set is dropped rather than
+    /// left in `links`. Used to be a crossfade; that mix-toward-background is what flashed.
     ///
     /// The stamp is how "is this pair still in the lifted set" is answered. It used to be a second
     /// hash map built from scratch each frame — one insert per link, so ~22,000 of them at the top
@@ -1229,18 +1228,14 @@ pub const World = struct {
 
     fn fadeLinks(self: *World, p: Params, dt: f32) !void {
         try self.stepFocusGrow(p, dt);
-        const rate = @min(1.0, dt * p.rate);
 
-        // The draw list is rebuilt every frame from the cached lift plus whatever is still fading;
-        // `lifted` itself is only recomputed when the cut changes.
+        // The draw list is rebuilt every frame from the cached lift. Cut changes used to
+        // crossfade: arriving lines mixed up from the window fill, dying ones mixed down into
+        // it. With opaque `intoBg` that is a flash — the whole web walks to pane colour, sits
+        // there, then pops back — not a dissolve. Snap to the current lift instead.
         self.links.clearRetainingCapacity();
 
-        // Rise the ones that are present, and remember them so the sweep below can tell which
-        // stored entries no longer are.
         self.fade_epoch +%= 1;
-        // A stamp left over from the previous lap would read as current and keep a dead link
-        // drawn forever, so clear on the way past rather than leave it to chance. Once every
-        // 4 billion frames.
         if (self.fade_epoch == 0) {
             var reset = self.link_fade.valueIterator();
             while (reset.next()) |v| v.stamp = 0;
@@ -1252,38 +1247,18 @@ pub const World = struct {
         for (self.lifted.items) |l| {
             const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
             const gop = try self.link_fade.getOrPut(self.gpa, key);
-            const prev: f32 = if (gop.found_existing) gop.value_ptr.v else 0;
-            // The focused note's own links do not fade in. Everything else is ambient web whose
-            // arrival can be gentle, but these are the answer to a question the reader just asked
-            // — a link that eases in over half a second reads as one that was not there.
-            const next = if (l.focus) 1 else prev + (1 - prev) * rate;
-            gop.value_ptr.* = .{ .v = if (next > 0.996) 1 else next, .stamp = epoch };
-
+            gop.value_ptr.* = .{ .v = 1, .stamp = epoch };
             var out = l;
-            out.alpha = gop.value_ptr.v;
-            if (out.alpha < 1) self.settled = false;
+            out.alpha = 1;
             self.links.appendAssumeCapacity(out);
         }
 
-        // Fall the ones that are not, and re-emit them until they are gone.
         const dead = &self.sc_dead;
         dead.clearRetainingCapacity();
         var it = self.link_fade.iterator();
         while (it.next()) |kv| {
-            if (kv.value_ptr.stamp == epoch) continue; // still in the lifted set, risen above
-            const next = kv.value_ptr.v * (1 - rate);
-            if (next < 0.02) {
-                try dead.append(self.gpa, kv.key_ptr.*);
-                continue;
-            }
-            kv.value_ptr.v = next;
-            self.settled = false;
-            try self.links.append(self.gpa, .{
-                .a = @intCast(kv.key_ptr.* >> 32),
-                .b = @intCast(kv.key_ptr.* & 0xffff_ffff),
-                .w = 0,
-                .alpha = next,
-            });
+            if (kv.value_ptr.stamp == epoch) continue;
+            try dead.append(self.gpa, kv.key_ptr.*);
         }
         for (dead.items) |k| _ = self.link_fade.remove(k);
     }
@@ -1728,6 +1703,27 @@ test "links lift onto living cells" {
             if (m.cell == l.b) found_b = true;
         }
         try testing.expect(found_a and found_b);
+    }
+}
+
+test "a cut change does not leave fading links in the draw list" {
+    // The flash this pins down: dying lines mixed toward the window fill, so a zoom painted the
+    // old web in pane colour and then popped the new one in at rest. The draw list is the
+    // current lift, every line at full strength.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 }, .{}, 80);
+    try w.liftLinks(.{}, 1.0 / 60.0);
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 }, .{}, 40);
+    try w.liftLinks(.{}, 1.0 / 60.0);
+    try testing.expect(w.links.items.len > 0);
+    for (w.links.items) |l| {
+        try testing.expectEqual(@as(f32, 1), l.alpha);
+        try testing.expect(l.w > 0);
     }
 }
 
