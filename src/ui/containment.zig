@@ -293,7 +293,10 @@ pub const Field = struct {
         const centre = self.pos[cell];
         if (kids.len == 1) {
             self.pos[kids[0]] = centre;
-            if (self.opts.gravity) self.bound_r[cell] = self.radius(lad, kids[0]);
+            if (self.opts.gravity) {
+                self.bound_r[cell] = self.radius(lad, kids[0]);
+                self.growAncestors(lad, cell);
+            }
             return;
         }
 
@@ -868,11 +871,50 @@ pub const Field = struct {
         for (kids, 0..) |k, i| {
             self.pos[k] = .{ .x = centre.x + p[i].x, .y = centre.y + p[i].y };
             const d = @sqrt(p[i].x * p[i].x + p[i].y * p[i].y);
-            br = @max(br, d + self.countRadius(lad, k));
+            // `radius`, not `countRadius`. A closed cell is drawn and culled at
+            // `estimatedRadius`, which is larger than the bare area law for exclusive groups, so
+            // building the parent's bound from the area law alone guarantees the parent is too
+            // small for children nobody has looked at yet.
+            br = @max(br, d + self.radius(lad, k));
         }
         // Floor at the estimate so opening a cell cannot shrink its disc (that would flip
         // wantsSplit and flicker). A tight settle can only match the estimate, never undercut it.
         self.bound_r[cell] = @max(br, r_parent);
+        self.growAncestors(lad, cell);
+    }
+
+    /// Grow every ancestor until it contains this cell's disc.
+    ///
+    /// A parent's bound is fixed when the parent is expanded, from what its children looked like
+    /// while they were still closed. Expanding a child floors its own bound at `estimatedRadius`,
+    /// so it can come out larger than the parent allowed for — measured on real ladders at up to
+    /// 1.27x the parent's whole radius, with essentially every child growing past its parent's
+    /// assumption. Nothing told the parent, so "children live inside their parent's disc" quietly
+    /// stopped being true as the vault was explored.
+    ///
+    /// That claim is load-bearing. `world.decideTopology` culls a branch whose disc is off screen
+    /// *because* the subtree is then off screen too, and a parent that no longer contains its
+    /// child culls notes that are genuinely in view: they lose their mark, `present` stops
+    /// descending to them, and their pose is left at whatever the walk last wrote. That is the
+    /// note that vanishes and flies in from somewhere else when you zoom near it.
+    ///
+    /// Growth is monotone — a radius only ever increases — so `wantsSplit` and the cull can only
+    /// become more permissive. There is no value here that can oscillate.
+    fn growAncestors(self: *Field, lad: *const fold.Ladder, from: u32) void {
+        if (!self.opts.gravity) return;
+        var child = from;
+        var guard: u8 = 0;
+        while (guard < 64) : (guard += 1) {
+            const parent = lad.cells[child].parent;
+            if (parent == fold.invalid or parent >= self.bound_r.len) return;
+            // An unexpanded parent has no bound yet; it will read this cell's grown radius
+            // directly when its own turn comes.
+            if (!self.expanded[parent]) return;
+            const need = Vec2.dist(self.pos[parent], self.pos[child]) + self.radius(lad, child);
+            if (need <= self.bound_r[parent]) return;
+            self.bound_r[parent] = need;
+            child = parent;
+        }
     }
 
     /// Has this cell been given a position yet?
@@ -1088,6 +1130,45 @@ test "every child is contained inside its parent's disc" {
         for (lad.childrenOf(@intCast(id))) |k| {
             const d = Vec2.dist(f.pos[@intCast(id)], f.pos[k]);
             try testing.expect(d + f.radius(&lad, k) <= R * 1.001);
+        }
+    }
+}
+
+test "a child that grows on expansion still fits its parent" {
+    // The invariant `world.decideTopology` culls on, at a depth that actually strains it.
+    //
+    // A parent's bound is fixed when the parent is expanded, from what its children looked like
+    // while still closed. Expanding a child floors its own bound at `estimatedRadius`, which
+    // exceeds the bare area law for exclusive groups, so the child outgrows the allowance and
+    // nothing tells the parent. Measured before the fix: worst child reaching 1.16x its parent's
+    // radius on a chain and 1.27x on a star, with 502 of 503 cells holding an over-sized child.
+    //
+    // Depth is what exposes it — the error compounds level by level, so the 300-node star the
+    // test above uses is too shallow to show any of it.
+    const gpa = testing.allocator;
+    for ([_]u8{ 0, 1 }) |kind| {
+        const n: u32 = 3000;
+        var list: std.ArrayListUnmanaged(fold.Edge) = .empty;
+        defer list.deinit(gpa);
+        if (kind == 0) {
+            for (0..n - 1) |i| try list.append(gpa, .{ .a = @intCast(i), .b = @intCast(i + 1) });
+        } else {
+            for (1..n) |i| try list.append(gpa, .{ .a = 0, .b = @intCast(i) });
+        }
+
+        var lad = try fold.build(gpa, n, list.items, &.{}, .{});
+        defer lad.deinit(gpa);
+        var f = try init(gpa, lad.cells.len, lad.roots.len, .seven, .{});
+        defer f.deinit(gpa);
+        placeAll(&f, &lad);
+
+        for (lad.cells, 0..) |c, id| {
+            if (c.child_count == 0) continue;
+            const R = f.radius(&lad, @intCast(id));
+            for (lad.childrenOf(@intCast(id))) |k| {
+                const d = Vec2.dist(f.pos[@intCast(id)], f.pos[k]);
+                try testing.expect(d + f.radius(&lad, k) <= R * 1.001);
+            }
         }
     }
 }
