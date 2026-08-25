@@ -156,10 +156,9 @@ pub fn draw(
         if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
     }
     const prepared = galaxy.prepareStyledMarks(&dens.soft, cam, fade, buf[0..n]);
-    if (prepared) |stack| stack.drawRims();
 
-    // Web between rims and fills so it tucks under the merged field rather than riding over it
-    // or vanishing entirely behind a disc that was painted first.
+    // Web first, under every ring and fill, so overlapping discs merge on top of their
+    // connections rather than the lines cutting the outlines.
     //
     // The focused note's own links are drawn by this block too, and they are a *separate* set with
     // a separate reason to exist — so the gate has to admit either one. Keyed on the ambient list
@@ -334,6 +333,7 @@ pub fn draw(
     }
 
     if (prepared) |stack| {
+        stack.drawRims();
         stack.drawFills();
         stack.drawOverlay();
     }

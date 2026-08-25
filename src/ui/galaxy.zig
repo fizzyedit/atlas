@@ -1,8 +1,8 @@
 //! Soft-sprite marks: the one visual language the graph draws through.
 //!
-//! Notes and coalesced masses are both soft-atlas discs, drawn through one stack — every outline,
-//! then the web, then every fill — so overlapping marks merge rather than stacking as separate
-//! coins. Topology comes from `world.zig`; this file only paints what it decided.
+//! Notes and coalesced masses are both soft-atlas discs, drawn through one stack — the web,
+//! then every outline, then every fill — so overlapping marks merge rather than stacking as
+//! separate coins. Topology comes from `world.zig`; this file only paints what it decided.
 
 const std = @import("std");
 const dvui = @import("dvui");
@@ -144,7 +144,7 @@ const MarkItem = struct {
 };
 
 /// Culled, coloured marks split into the shared field and the overlay, ready for
-/// `drawRims` → (the caller's web) → `drawFills` → `drawOverlay`.
+/// (the caller's web) → `drawRims` → `drawFills` → `drawOverlay`.
 pub const PreparedMarks = struct {
     field: []const MarkItem,
     overlay: []const MarkItem,
@@ -277,9 +277,9 @@ pub fn prepareStyledMarks(
     };
 }
 
-/// Shared soft-sprite stack. Notes and masses use the same three passes: every outline, then
-/// (the caller's web, if any), then every fill. Overlapping discs of the same rest colour read
-/// as one blob; `on_top` marks are redrawn last so the one under the cursor is not buried.
+/// Shared soft-sprite stack. Notes and masses use the same three passes: the caller's web
+/// (if any), then every outline, then every fill. Overlapping discs of the same rest colour
+/// read as one blob; `on_top` marks are redrawn last so the one under the cursor is not buried.
 ///
 /// `mix` is how far the marks sit off the background (1 = their own colour, 0 = gone), not an
 /// alpha. See `intoBg`.
