@@ -114,9 +114,11 @@ const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
 /// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
 const hover_fill_mix: f32 = 0.45;
-/// Radius of the contrast outline behind the two unconditional labels, in logical pixels. See
-/// `renderTextOutlined`.
-const label_outline_px: f32 = 1.25;
+/// Padding around the two unconditional labels' plate, and how opaque it sits. See
+/// `renderTextPlated`.
+const label_plate_pad_x: f32 = 6;
+const label_plate_pad_y: f32 = 2;
+const label_plate_opacity: f32 = 0.25;
 
 /// Proximity grow: `+ grow_factor` at full hover (1.0 = double resting size).
 const grow_factor: f32 = 1.0;
@@ -4219,19 +4221,15 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px)
     else
         m.r;
-    // The ring lights with the fill, eased on the same channel, so the whole disc reads as one
-    // thing rather than a highlighted centre inside a resting outline. `holds_open` still wins
-    // outright: an open document is lit whether or not the cursor is anywhere near it.
-    const pointed: f32 = if (m.is_note and m.note < p.nodes.len)
-        std.math.clamp(p.nodes[m.note].pointer_t, 0, 1)
-    else
-        0;
-    // A dashed mark is always highlight-rimmed — that is what makes dashed mean "this one" rather
-    // than just "this one is drawn differently".
+    // The rim is reserved for *open*, and hover does not touch it.
+    //
+    // A dashed mark is always highlight-rimmed, which is what makes dashed mean "this one" rather
+    // than just "this one is drawn differently". Lighting the rim on hover as well blurred that:
+    // half the notes the cursor passed wore a partly-highlighted outline, so a highlighted rim
+    // stopped being a reliable sign of anything. Hover says what it needs to say through the fill,
+    // which is the larger surface and the one that reads at a glance anyway.
     const border = if (holds_open or (m.is_note and m.note < p.nodes.len and p.nodes[m.note].open))
         hot
-    else if (pointed > 0.002)
-        border_rest.lerp(hot, dvui.easing.outQuad(pointed))
     else
         border_rest;
 
@@ -4837,40 +4835,49 @@ fn drawLabels(p: *Panel) void {
     }
 }
 
-/// Draw a name with a ring of background-coloured copies behind it.
+/// Draw a name on a rounded plate, both easing in together.
 ///
-/// The two unconditional labels — the focused note's and the hovered one's — have to be readable
-/// wherever they land, and where they land is often on top of that note's own links. A hub's
-/// starburst is not a translucency problem that can be tuned away: dozens of lines overlap near the
-/// note, and `1 - (1 - a)^n` reaches 1.000 by about twenty-five of them whatever `a` is. Halving
-/// per-line alpha takes the composite from 1.000 to 0.999. The ink underneath is opaque and no
-/// amount of thinning changes that.
+/// Only the two unconditional labels get one — the focused note's and the hovered note's. They are
+/// drawn wherever the note happens to be rather than wherever the placer found a gap, so they land
+/// on that note's own links as often as not, and a hub's starburst is not a translucency problem
+/// that can be tuned away: dozens of lines overlap near the note and `1 - (1 - a)^n` reaches 1.000
+/// by about twenty-five of them whatever `a` is. Thinning the lines takes the composite under the
+/// text from 1.000 to 0.999.
 ///
-/// So the text carries its own contrast. Eight offset copies in the panel's background colour,
-/// then the glyphs on top — an outline rather than a plate. A plate reads as a chip and blots out
-/// the links and dots it sits on, which is why ambient labels do not get one; an outline occludes
-/// only the pixels immediately around each stroke, so the web still reads through the gaps in the
-/// letterforms. Nine `renderText` calls, for at most two labels a frame.
-fn renderTextOutlined(
+/// The ambient labels still get nothing, and the reason they were refused a plate stands — a chip
+/// behind every name blots out the web it is describing. Two of them is a different proposition:
+/// the reader is looking at exactly these, and everywhere else the web is untouched.
+///
+/// `t` drives both the sweep and the fade, so the plate opens from its own centre as the text
+/// arrives rather than snapping in at full width.
+fn renderTextPlated(
     font: dvui.Font,
     text: []const u8,
     r: dvui.Rect.Physical,
     scale: f32,
     col: dvui.Color,
-    halo: dvui.Color,
+    plate: dvui.Color,
+    t: f32,
 ) void {
-    const o = label_outline_px * dpiScale();
-    const offsets = [_][2]f32{
-        .{ -o, 0 }, .{ o, 0 },  .{ 0, -o },  .{ 0, o },
-        .{ -o, -o }, .{ o, -o }, .{ -o, o }, .{ o, o },
-    };
-    for (offsets) |d| {
-        var rr = r;
-        rr.x += d[0];
-        rr.y += d[1];
-        dvui.renderText(.{ .font = font, .text = text, .rs = .{ .r = rr, .s = scale }, .color = halo }) catch {};
-    }
-    dvui.renderText(.{ .font = font, .text = text, .rs = .{ .r = r, .s = scale }, .color = col }) catch {};
+    const eased = dvui.easing.outCubic(std.math.clamp(t, 0, 1));
+    if (eased <= 0.004) return;
+
+    const s = dpiScale();
+    const pad_x = label_plate_pad_x * s;
+    const pad_y = label_plate_pad_y * s;
+    const full_w = r.w + pad_x * 2;
+    const h = r.h + pad_y * 2;
+    const cx = r.x + r.w * 0.5;
+    const w = full_w * eased;
+    const box: dvui.Rect.Physical = .{ .x = cx - w * 0.5, .y = r.y - pad_y, .w = w, .h = h };
+    box.fill(.all(h * 0.5), .{ .color = plate.opacity(eased), .fade = 1 });
+
+    dvui.renderText(.{
+        .font = font,
+        .text = text,
+        .rs = .{ .r = r, .s = scale },
+        .color = col.opacity(eased),
+    }) catch {};
 }
 
 /// The hovered note's name, drawn last and unconditionally, just outside its halo.
@@ -4906,7 +4913,7 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
     const size = font.textSize(n.title);
     const centre = p.camera.worldToScreen(n.pos);
     const theme = dvui.themeGet();
-    renderTextOutlined(
+    renderTextPlated(
         font,
         n.title,
         .{
@@ -4917,7 +4924,10 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
         },
         cw.natural_scale,
         theme.color(.highlight, .fill).opacity(fade),
-        theme.color(.window, .fill).opacity(0.92 * fade),
+        theme.color(.window, .fill).opacity(label_plate_opacity * fade),
+        // The plate opens on the same channel the fill lights on, so approaching a note and its
+        // name arriving are one motion.
+        n.pointer_t,
     );
 }
 
@@ -4963,7 +4973,7 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
     const font = dvui.Font.theme(.body).larger(label_font_delta + 1).withWeight(.bold);
     const size = font.textSize(n.title);
     const theme = dvui.themeGet();
-    renderTextOutlined(
+    renderTextPlated(
         font,
         n.title,
         .{
@@ -4974,7 +4984,10 @@ fn drawFocusNoteLabel(p: *Panel, fade: f32) void {
         },
         cw.natural_scale,
         theme.color(.highlight, .fill).opacity(fade),
-        theme.color(.window, .fill).opacity(0.92 * fade),
+        theme.color(.window, .fill).opacity(label_plate_opacity * fade),
+        // Always fully open: the open document's name is not a hover affordance, it is a fact
+        // about the workspace, and it should not be caught mid-sweep by an unrelated cursor move.
+        1,
     );
 }
 
