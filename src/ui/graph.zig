@@ -827,6 +827,13 @@ pub const Panel = struct {
     /// Smoothed LOD coarsening factor from camera speed, 1 at rest. See `updateMotionBias`.
     motion_bias: f32 = 1,
     motion_last_center: dvui.Point = .{},
+    /// Smoothed |octaves/s| of zoom. Independent of pan so a flick-zoom can hold the LOD
+    /// without a pan having to be in progress. See `updateMotionBias`.
+    zoom_speed: f32 = 0,
+    /// Last zoom-direction that exceeded the noise floor: +1 in, -1 out. Held across still
+    /// frames so a just-finished zoom-in keeps holding topology while `zoom_speed` falls.
+    zoom_dir: i8 = 0,
+    motion_last_zoom: f32 = 0,
     /// Vault-relative note path -> graph index, rebuilt with the nodes. Lets `updateActiveDoc`
     /// and `applyOpenSet` resolve a tab without scanning every node.
     path_index: std.StringHashMapUnmanaged(u32) = .empty,
@@ -1211,15 +1218,20 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // label before the interior branch below could place any, so names vanished inside a note
     // whenever the vault behind it happened to be fully coalesced.
     const at_cluster_zoom = p.notes_at_level0 == 0 and p.nodes.len > 0 and p.interior.t < 0.5;
-    // The `true or` that used to short-circuit this was left-in debug forcing, and it made the
-    // label placer — described above as one of the heaviest per-frame costs there is — run on
-    // every frame that was not fully coalesced, including a completely idle one.
-    const labels_dirty = !at_cluster_zoom and
+    // A flick-zoom cannot be read at label resolution, and the placer is one of the heaviest
+    // per-frame costs there is. Skip it; open/hover names still draw from the notes themselves.
+    const motion_busy = p.zoom_speed > zoom_hold_oct_ps * 0.45 or p.motion_bias > 1.08;
+    const labels_dirty = !at_cluster_zoom and !motion_busy and
         (p.labels_stale or !p.labels_settled or !p.proximity_settled or
             !p.pointer_settled or !p.layout_settled or p.camera.chasing() or labelViewMoved(p));
-    if (at_cluster_zoom) {
+    if (at_cluster_zoom or motion_busy) {
         // Do not walk every note — at 100k+ that alone tanks the frame. Labels are not drawn…
         // except the open document's, which is named below regardless of what the LOD resolved.
+        if (motion_busy) {
+            for (p.label_live.items) |i| {
+                if (i < p.nodes.len and !p.nodes[i].open) p.nodes[i].label_vis = 0;
+            }
+        }
         for (p.interior.nodes) |*n| n.label_vis = 0;
         // The arrangement is unchanged but no placement was computed for it, so the next frame
         // that does draw names has to redo them.
@@ -1373,8 +1385,8 @@ fn updateBubbles(p: *Panel) void {
     if (inside_interior) {
         hover_unsettled = applyProximity(p, p.interior.nodes, p.interior.slot, p.interior.radius, t_hover, p.interior_visible.items) or hover_unsettled;
         // Do not decayProximity over the whole overview vault during interior — O(N).
-    } else if (coalesced_only) {
-        // Everything is merged: no note is drawn and none can be hovered.
+    } else if (coalesced_only or p.zoom_speed > zoom_hold_oct_ps) {
+        // Merged, or a flick is in progress: the shove is O(visible²) and unread at that speed.
     } else {
         hover_unsettled = applyProximity(p, p.nodes, p.layout_slot, p.world_radius, t_hover, p.visible.items) or hover_unsettled;
         if (p.interior.nodes.len > 0) {
@@ -3899,24 +3911,32 @@ const motion_full_speed: f32 = 2.5;
 /// snap the instant the mouse stops.
 const motion_rise_k: f32 = 14;
 const motion_fall_k: f32 = 3.5;
+/// |octaves/s| at which a zoom gesture starts holding / coarsening the LOD. A doubling in ~1.4 s
+/// is still a careful dive (splits as you go); a doubling in half a second is a flick.
+const zoom_hold_oct_ps: f32 = 0.7;
+/// |octaves/s| at which zoom-out coarsening reaches `motionSplitMax`.
+const zoom_full_oct_ps: f32 = 2.5;
+const zoom_rise_k: f32 = 20;
+const zoom_fall_k: f32 = 5;
+/// First-time cell placements allowed in one catch-up frame. Already-settled cells still open
+/// freely; this only bounds the 128-step boids settle that hitches a flick-zoom.
+const zoom_max_expand: usize = 24;
 
-/// Coarsen the LOD while the camera **pans** fast, and let it settle back as it slows.
+/// Coarsen the LOD while the camera **pans** fast or **zooms out** fast, hold it still while
+/// **zooming in** fast, and let it settle back as the gesture slows.
 ///
 /// Crossing the vault at close zoom drags the whole resolved middle of it through the frame: cells
 /// open and close, the cut churns, the web re-lifts, thousands of marks are placed — all to render
 /// detail that is a blur at that speed. A camera moving a screen-width every half second cannot be
 /// read at note level, so it does not need to be drawn at note level.
 ///
-/// **Zoom deliberately does not count**, though it used to (weighted as "an octave is about as much
-/// visual change as a screen-width of pan"). Panning fast and zooming fast are opposite requests.
-/// A pan is going *somewhere* and the detail in between is incidental; a zoom is asking for the
-/// detail itself. Feeding zoom into the bias meant the split threshold ran away from the reader at
-/// exactly the moment they reached for it: hold a trackpad zoom and the bias pinned near its
-/// maximum for the whole gesture, so nothing ever split, and releasing dropped the bias over ~0.3 s
-/// and popped every mark into existence at once. The crossfade that sells the dive — the thing this
-/// LOD is *for* — could only ever be seen by not using the zoom.
+/// Zoom used to be excluded entirely, because feeding *every* zoom into `split_px` froze the LOD
+/// for a careful trackpad dive and then dumped every mark on release. The distinction that was
+/// missing is speed. A slow zoom *is* the dive and must split; a flick is a camera move and must
+/// not. Zoom-in holds the current open set (marks grow with the camera, nothing explodes). Zoom-out
+/// coarsens, because keeping an exploded view while pulling out is the expensive direction.
 ///
-/// Raising `split_px` is the whole mechanism: it is already the rule that decides when a cell
+/// Raising `split_px` is the coarsening mechanism: it is already the rule that decides when a cell
 /// resolves, so scaling it makes fast motion behave exactly like being further out — the same
 /// coalescing, the same crossfade on the way back. No second LOD, no second code path.
 ///
@@ -3936,13 +3956,30 @@ fn updateMotionBias(p: *Panel) void {
     // which is exactly when crossing it is expensive.
     const dx = (p.camera.center.x - p.motion_last_center.x) * p.camera.zoom;
     const dy = (p.camera.center.y - p.motion_last_center.y) * p.camera.zoom;
-    const speed = @sqrt(dx * dx + dy * dy) / span / dt;
+    const pan_speed = @sqrt(dx * dx + dy * dy) / span / dt;
     p.motion_last_center = p.camera.center;
+
+    const z = @max(p.camera.zoom, 1e-9);
+    const z0 = if (p.motion_last_zoom > 0) p.motion_last_zoom else z;
+    const oct_ps = @abs(std.math.log2(z / z0)) / dt;
+    if (z > z0 * 1.0005) p.zoom_dir = 1 else if (z < z0 / 1.0005) p.zoom_dir = -1;
+    p.motion_last_zoom = z;
+    const zk = if (oct_ps > p.zoom_speed) zoom_rise_k else zoom_fall_k;
+    p.zoom_speed += (oct_ps - p.zoom_speed) * (1.0 - @exp(-zk * dt));
+    if (p.zoom_speed < 0.02) {
+        p.zoom_speed = 0;
+        p.zoom_dir = 0;
+    }
 
     // Derived from the detail slider rather than fixed: see `motionSplitMax`. At the default it is
     // the 3.5 this used to hardcode.
     const split_max = motionSplitMax(p.mark_budget);
-    const want = 1 + (split_max - 1) * std.math.clamp(speed / motion_full_speed, 0, 1);
+    var want = 1 + (split_max - 1) * std.math.clamp(pan_speed / motion_full_speed, 0, 1);
+    // Fast zoom-out coarsens now, so the exploded field is not dragged through a shrinking view.
+    if (p.zoom_dir < 0 and p.zoom_speed > zoom_hold_oct_ps) {
+        const zt = std.math.clamp(p.zoom_speed / zoom_full_oct_ps, 0, 1);
+        want = @max(want, 1 + (split_max - 1) * zt);
+    }
     const k = if (want > p.motion_bias) motion_rise_k else motion_fall_k;
     const t = 1.0 - @exp(-k * dt);
     p.motion_bias += (want - p.motion_bias) * t;
@@ -4105,7 +4142,8 @@ fn worldParams(p: *Panel) world_mod.Params {
     // drag still catches up. `motion_bias` is already the smoothed speed the LOD uses, so this
     // costs nothing extra and releases at the same moment detail starts coming back.
     var hold = false;
-    if (p.motion_bias > liftHoldBias(motionSplitMax(p.mark_budget)) and
+    if ((p.motion_bias > liftHoldBias(motionSplitMax(p.mark_budget)) or
+        p.zoom_speed > zoom_hold_oct_ps * 0.5) and
         p.lift_held < lift_hold_max_frames)
     {
         hold = true;
@@ -4124,6 +4162,8 @@ fn worldParams(p: *Panel) world_mod.Params {
         .focus_leaf = focus_leaf,
         .open_leaves = open_leaves.items,
         .lift_hold = hold,
+        .hold_topology = p.zoom_speed > zoom_hold_oct_ps and p.zoom_dir >= 0,
+        .max_expand = zoom_max_expand,
         // The LOD ladder's thresholds are screen sizes too, so they get the same treatment as
         // the bubbles — otherwise cells open at twice the apparent density on a 1x monitor and
         // the mark radii they hand back are twice as large. Scaled here rather than in

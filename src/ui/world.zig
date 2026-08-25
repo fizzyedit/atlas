@@ -272,6 +272,19 @@ pub const Params = struct {
     /// several times less work per frame. The caller is responsible for letting go periodically so
     /// the web cannot drift arbitrarily far, and for dropping it the moment the camera settles.
     lift_hold: bool = false,
+    /// Skip `decideTopology` and keep last frame's open set.
+    ///
+    /// A fast zoom-in is asking the camera to move, not the LOD to explode. Splitting on every
+    /// tick of a flick is what hitchs the frame: each new cell pays a 128-step settle, the cut
+    /// churns, the web re-lifts. Holding the open set lets marks grow with zoom (they already
+    /// scale by `view.zoom`) and defers the split until the gesture slows — which is when the
+    /// crossfade can actually be seen.
+    hold_topology: bool = false,
+    /// Cap on first-time `ensureChildren` calls this frame. 0 = unlimited.
+    ///
+    /// Catching up after a held zoom would otherwise settle hundreds of cells in one hitch.
+    /// Already-placed cells still open freely; only the boids settle is budgeted.
+    max_expand: usize = 0,
     /// Leaves of every *open* note, the focused one included.
     ///
     /// All of them get their links drawn at leaf precision, not just the focused one. They used to
@@ -461,6 +474,11 @@ pub const World = struct {
     sc_dead: std.ArrayListUnmanaged(u64) = .empty,
     sc_grow_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_grow_dead: std.ArrayListUnmanaged(u64) = .empty,
+    sc_frontier: std.ArrayListUnmanaged(u32) = .empty,
+    sc_next: std.ArrayListUnmanaged(u32) = .empty,
+    sc_vis: std.ArrayListUnmanaged(u32) = .empty,
+    sc_stack: std.ArrayListUnmanaged(u32) = .empty,
+    sc_classes: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Cell -> index into `marks` for this frame, dense and epoch-stamped.
     ///
@@ -624,6 +642,11 @@ pub const World = struct {
         self.sc_dead.deinit(self.gpa);
         self.sc_grow_live.deinit(self.gpa);
         self.sc_grow_dead.deinit(self.gpa);
+        self.sc_frontier.deinit(self.gpa);
+        self.sc_next.deinit(self.gpa);
+        self.sc_vis.deinit(self.gpa);
+        self.sc_stack.deinit(self.gpa);
+        self.sc_classes.deinit(self.gpa);
         self.lifted.deinit(self.gpa);
         self.focus_links.deinit(self.gpa);
         self.field.deinit(self.gpa);
@@ -667,6 +690,14 @@ pub const World = struct {
     /// changes" true by construction rather than by luck.
     pub fn step(self: *World, view: View, p: Params, dt: f32) !void {
         self.focus_visible = self.leafOnScreen(p.focus_leaf, view);
+        if (p.hold_topology and self.cut.items.len > 0) {
+            // Same living set, new camera. Marks grow and slide with zoom; nothing splits.
+            self.marks.clearRetainingCapacity();
+            self.bound = false;
+            self.settled = true;
+            try self.present(view, p, dt);
+            return;
+        }
         self.clearFrame();
         if (self.lad.roots.len == 0) return;
         try self.decideTopology(view, p);
@@ -692,17 +723,18 @@ pub const World = struct {
 
     /// Pass 1 — which cells are open. Reads only the ladder, the view, and the budget.
     pub fn decideTopology(self: *World, view: View, p: Params) !void {
-        var frontier: std.ArrayListUnmanaged(u32) = .empty;
-        defer frontier.deinit(self.gpa);
-        var next: std.ArrayListUnmanaged(u32) = .empty;
-        defer next.deinit(self.gpa);
-        var vis: std.ArrayListUnmanaged(u32) = .empty;
-        defer vis.deinit(self.gpa);
+        const frontier = &self.sc_frontier;
+        const next = &self.sc_next;
+        const vis = &self.sc_vis;
+        frontier.clearRetainingCapacity();
+        next.clearRetainingCapacity();
+        vis.clearRetainingCapacity();
         for (self.lad.roots) |r| try frontier.append(self.gpa, r);
 
         // Cells already settled as closed at shallower levels. This is the budget's running
         // total, and it is topological — nothing here depends on a crossfade.
         var closed: usize = 0;
+        var expanded_n: usize = 0;
         var guard: u32 = 0;
 
         while (frontier.items.len > 0 and guard < 64) : (guard += 1) {
@@ -738,8 +770,13 @@ pub const World = struct {
 
             next.clearRetainingCapacity();
             for (vis.items) |id| {
-                const will_open = self.wantsSplit(id, view, p) and
+                var will_open = self.wantsSplit(id, view, p) and
                     (cutoff == null or self.radiusClass(id) > cutoff.?);
+                // First-time placement is the hitch: 128 relax steps per cell. Already-placed
+                // cells open for free; cap only the ones that still have to settle.
+                if (will_open and p.max_expand > 0 and !self.field.expanded[id]) {
+                    if (expanded_n >= p.max_expand) will_open = false else expanded_n += 1;
+                }
                 self.open[id] = will_open;
                 if (!will_open) {
                     closed += 1;
@@ -752,7 +789,7 @@ pub const World = struct {
                 self.field.ensureChildren(&self.lad, id);
                 for (self.lad.childrenOf(id)) |k| try next.append(self.gpa, k);
             }
-            std.mem.swap(std.ArrayListUnmanaged(u32), &frontier, &next);
+            std.mem.swap(std.ArrayListUnmanaged(u32), frontier, next);
         }
     }
 
@@ -801,15 +838,15 @@ pub const World = struct {
         closed: usize,
         want_open: usize,
     ) !?u32 {
-        const classes = try self.gpa.alloc(u32, want_open);
-        defer self.gpa.free(classes);
-        var ci: usize = 0;
+        const classes_buf = &self.sc_classes;
+        classes_buf.clearRetainingCapacity();
+        try classes_buf.ensureTotalCapacity(self.gpa, want_open);
         for (vis) |id| {
             if (self.wantsSplit(id, view, p)) {
-                classes[ci] = self.radiusClass(id);
-                ci += 1;
+                classes_buf.appendAssumeCapacity(self.radiusClass(id));
             }
         }
+        const classes = classes_buf.items;
         std.mem.sort(u32, classes, {}, comptime std.sort.desc(u32));
 
         var spent = closed + vis.len;
@@ -857,8 +894,8 @@ pub const World = struct {
             }
         }
 
-        var stack: std.ArrayListUnmanaged(u32) = .empty;
-        defer stack.deinit(self.gpa);
+        const stack = &self.sc_stack;
+        stack.clearRetainingCapacity();
         for (self.lad.roots) |r| {
             self.px[r] = self.field.pos[r].x;
             self.py[r] = self.field.pos[r].y;
@@ -1949,6 +1986,38 @@ test "leaf_pitch matches the geometry it claims to describe" {
     }
     // Loose, because the relaxation makes this an empirical constant rather than an identity.
     try testing.expectApproxEqAbs(leaf_pitch, best, 0.08);
+}
+
+test "holding topology keeps the open set while zoom changes" {
+    // The hitch this pins down: a flick-zoom used to re-decide the cut every frame, settle every
+    // newly opened cell, and re-lift the web. Holding the open set is what makes that a camera
+    // move instead of a LOD explosion.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const far: View = .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 };
+    try settle(&w, far, .{}, 200);
+    const held = try gpa.dupe(bool, w.open);
+    defer gpa.free(held);
+    const n_marks = w.marks.items.len;
+    try testing.expect(n_marks > 0);
+
+    var p: Params = .{ .hold_topology = true };
+    try w.step(.{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 }, p, 1.0 / 60.0);
+    try testing.expectEqualSlices(bool, held, w.open);
+
+    // Unheld, the same zoom opens further — otherwise the hold was a no-op because nothing
+    // wanted to split.
+    p.hold_topology = false;
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 }, p, 80);
+    var opened: usize = 0;
+    for (held, w.open) |was, now| {
+        if (!was and now) opened += 1;
+    }
+    try testing.expect(opened > 0);
 }
 
 test "an empty vault does not crash" {
