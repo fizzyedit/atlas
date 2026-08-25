@@ -30,9 +30,12 @@ pub const MarkStyle = struct {
     border: dvui.Color,
     r_px: f32,
     is_note: bool,
-    /// Draw this mark as a dashed rim over an opaque face, in vector, above everything else.
-    /// For the note under the cursor and the notes the reader has open — see `galaxy.StyledMark`.
+    /// Vector dashed overlay. Open notes, hovered masses — see `galaxy.StyledMark`.
     dashed: bool = false,
+    /// Redraw after fills so a piled-in disc stays visible.
+    on_top: bool = false,
+    /// Among overlay marks, paint this one last.
+    hover: bool = false,
 };
 
 pub const DrawCtx = struct {
@@ -124,7 +127,39 @@ pub fn draw(
 
     var stats: DrawStats = .{};
 
-    // Links first so the web passes under the marks rather than over them.
+    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return stats;
+    var n: usize = 0;
+    for (w.marks.items) |m| {
+        const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
+        const style = dctx.style(dctx.ctx, w, m, holds_open);
+        // Split and merge stay continuous through pose, not through colour.
+        //
+        // `present` chases `anim`, slides a closing cell's children in toward their parent's
+        // centre, and shrinks the parent toward a note. Notes and masses share a fill, so
+        // overlapping discs read as one object becoming several — or several becoming one.
+        // Mixing each mark toward the window fill as `alpha` fell used to punch opaque holes
+        // in the parent: `intoBg` is opaque, so a dying child painted the background *over*
+        // the mass it was joining. Colour that has to change (a hovered note, an open one)
+        // walks to the shared rest fill in `overviewMarkStyle` instead.
+        buf[n] = .{
+            .screen = toScreen(cam, dctx, m),
+            .r_px = style.r_px,
+            .fill = style.fill,
+            .border = style.border,
+            .is_note = style.is_note,
+            .dying = false,
+            .dashed = style.dashed,
+            .on_top = style.on_top,
+            .hover = style.hover,
+        };
+        n += 1;
+        if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
+    }
+    const prepared = galaxy.prepareStyledMarks(&dens.soft, cam, fade, buf[0..n]);
+    if (prepared) |stack| stack.drawRims();
+
+    // Web between rims and fills so it tucks under the merged field rather than riding over it
+    // or vanishing entirely behind a disc that was painted first.
     //
     // The focused note's own links are drawn by this block too, and they are a *separate* set with
     // a separate reason to exist — so the gate has to admit either one. Keyed on the ambient list
@@ -298,35 +333,9 @@ pub fn draw(
         batch.flush();
     }
 
-    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return stats;
-    var n: usize = 0;
-    for (w.marks.items) |m| {
-        const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
-        const style = dctx.style(dctx.ctx, w, m, holds_open);
-        // Split and merge stay continuous through pose, not through colour.
-        //
-        // `present` chases `anim`, slides a closing cell's children in toward their parent's
-        // centre, and shrinks the parent toward a note. Notes and masses share a fill, so
-        // overlapping discs read as one object becoming several — or several becoming one.
-        // Mixing each mark toward the window fill as `alpha` fell used to punch opaque holes
-        // in the parent: `intoBg` is opaque, so a dying child painted the background *over*
-        // the mass it was joining. Colour that has to change (a hovered note, an open one)
-        // walks to the shared rest fill in `overviewMarkStyle` instead.
-        buf[n] = .{
-            .screen = toScreen(cam, dctx, m),
-            .r_px = style.r_px,
-            .fill = style.fill,
-            .border = style.border,
-            .is_note = style.is_note,
-            .dying = false,
-            // Mass rings, then notes, then mass fills — `galaxy` sandwiches a merge so joining
-            // notes cover the dashes and then disappear under the fill. Open notes (`dashed`)
-            // still paint last, vector, on top of everything.
-            .dashed = style.dashed,
-        };
-        n += 1;
-        if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
+    if (prepared) |stack| {
+        stack.drawFills();
+        stack.drawOverlay();
     }
-    _ = galaxy.drawStyledMarks(&dens.soft, cam, fade, buf[0..n]);
     return stats;
 }

@@ -4429,8 +4429,9 @@ fn stepWorld(p: *Panel, prof: *i96) void {
 /// (see `buildInteriorWorld`'s doc comment). Not through `world_draw.draw`: there is no `World`
 /// here, just a fixed array of positions, so a plain loop building one `StyledMark` buffer is the
 /// whole draw pass — the sun and every content item go in it together, in one
-/// `galaxy.drawStyledMarks` call, rather than the sun-then-content split the fold/containment
-/// version needed to keep the root out of its packing.
+/// `galaxy.drawStyledMarks` call (rims, then fills, then the sun / hover overlay), rather than
+/// the sun-then-content split the fold/containment version needed to keep the root out of its
+/// packing.
 fn drawInteriorMarks(p: *Panel, fade: f32) void {
     if (fade <= 0.004 or p.interior.nodes.len == 0) return;
     const dens = p.ensureDensity() orelse return;
@@ -4457,6 +4458,8 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
             .is_note = !node.is_sun,
             .dying = false,
             .dashed = node.is_sun,
+            .on_top = node.is_sun or p.hover_node == i,
+            .hover = p.hover_node == i,
         };
     }
     _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf);
@@ -4502,27 +4505,21 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
     const gap_px = p.layout_slot * p.camera.zoom;
     const radius_px: f32 = markDrawnRadius(p, m, zoom_t, gap_px);
-    // The rim is reserved for *open*, and hover does not touch it.
+    // Dashed overlay is *open* for notes, and *hover* for masses.
     //
-    // A dashed mark is always highlight-rimmed, which is what makes dashed mean "this one" rather
-    // than just "this one is drawn differently". Lighting the rim on hover as well blurred that:
-    // half the notes the cursor passed wore a partly-highlighted outline, so a highlighted rim
-    // stopped being a reliable sign of anything. Hover says what it needs to say through the fill,
-    // which is the larger surface and the one that reads at a glance anyway.
-    const border = if (holds_open or (m.is_note and m.note < p.nodes.len and p.nodes[m.note].open))
-        hot
-    else
-        border_rest;
-
-    // The dashed clearing, and the request to be painted last.
-    // Dashed means *open*, and nothing else.
-    //
-    // It is the one shape the reader carries across a zoom: an open note is a dashed rim out here,
-    // and the sun at the centre of its interior is a dashed rim too, so diving in continues
-    // something rather than cutting to something new. Spending it on hover as well spent the
-    // meaning — every note the cursor passed became dashed, so dashed stopped saying "this is the
-    // one you are in".
-    const is_dashed = m.is_note and m.note < p.nodes.len and p.nodes[m.note].open;
+    // An open note is a dashed rim out here, and the sun at the centre of its interior is a
+    // dashed rim too, so diving in continues something rather than cutting to something new.
+    // Spending dashed on note-hover as well spent the meaning — every note the cursor passed
+    // became dashed, so dashed stopped saying "this is the one you are in". Hover on a note
+    // says what it needs through the fill, redrawn last so a piled-in disc stays visible.
+    // Masses already share that fill, so hover there is the dashed overlay — and no label,
+    // because a mass is not a name.
+    const hovered_note = m.is_note and p.hover_node == m.note;
+    const hovered_mass = if (p.hover_cluster) |hc| !m.is_note and hc.index == m.cell else false;
+    const is_open = m.is_note and m.note < p.nodes.len and p.nodes[m.note].open;
+    const is_dashed = is_open or hovered_mass;
+    // A dashed mark is always highlight-rimmed, which is what makes dashed mean "this one".
+    const border = if (is_dashed or holds_open) hot else border_rest;
 
     // Same face as a resting note. Masses used to fill with window text mixed toward the
     // background, so a merge was notes fading to "nothing" against a disc of a different colour.
@@ -4540,6 +4537,8 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
         .r_px = if (m.is_note) radius_px else radius_px * massProximitySwell(p, m),
         .is_note = m.is_note,
         .dashed = is_dashed,
+        .on_top = hovered_note or hovered_mass or is_open,
+        .hover = hovered_note or hovered_mass,
     };
 }
 

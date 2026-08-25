@@ -13,8 +13,8 @@ const SoftAtlas = @This();
 /// A sprite's stroke scales with the quad, so drawn thickness is `width × radius` — one cell
 /// cannot hold a constant-looking stroke across the radius range a coalesced mass spans (roughly
 /// 14–46 px). One cell tuned for small marks reads as a fat band on a large one. Callers pick by
-/// radius (`dash_thin_from` in `galaxy.drawStyledMarks`). Masses always use these sprites; the
-/// vector dashed stroke is reserved for open/selected marks.
+/// radius (`dash_thin_from` in `galaxy.drawStyledMarks`). Masses always use these sprites in the
+/// field; the vector dashed stroke is reserved for the overlay (open notes, hovered masses).
 pub const Kind = enum { disc, glow, ring, dash_ring, dash_ring_thin };
 
 /// Normalized UV rectangle into the atlas texture.

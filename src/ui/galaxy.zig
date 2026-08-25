@@ -1,8 +1,8 @@
 //! Soft-sprite marks: the one visual language the graph draws through.
 //!
-//! Notes and coalesced masses are both soft-atlas discs, so there is a single mark language at
-//! every zoom and no dual-system handoff to pop. Topology comes from `world.zig`; this file only
-//! paints what it decided.
+//! Notes and coalesced masses are both soft-atlas discs, drawn through one stack — every outline,
+//! then the web, then every fill — so overlapping marks merge rather than stacking as separate
+//! coins. Topology comes from `world.zig`; this file only paints what it decided.
 
 const std = @import("std");
 const dvui = @import("dvui");
@@ -99,52 +99,131 @@ pub const StyledMark = struct {
     border: dvui.Color,
     is_note: bool,
     dying: bool = false,
-    /// Draw this mark as a dashed rim over a *fully opaque* face, in vector rather than sprites,
-    /// after every other mark.
+    /// Vector dashed stroke on the overlay pass. Open notes, the interior sun, a hovered mass.
     ///
-    /// Only for the handful of marks the reader is actually dealing with — an open note, the
-    /// interior sun. Coalesced masses never take this path: a screen of polyline dashes is the
-    /// 8 fps cliff. Their rings are atlas sprites, always.
+    /// Coalesced masses in the field use atlas dash sprites, never this — a screen of polyline
+    /// dashes is the 8 fps cliff. This flag is for the handful of marks the reader is dealing
+    /// with, drawn last.
     dashed: bool = false,
+    /// Redraw after the field (and after the web) so a piled-in fill stays visible.
+    on_top: bool = false,
+    /// Among overlay marks, this one is under the cursor and paints last of all.
+    hover: bool = false,
 };
 
-/// Mass fill quad as a fraction of the ring quad.
+/// Fill quad as a fraction of the ring quad. Notes and masses share this, which is what lets
+/// overlapping discs merge into one blob whose outline is still a rim.
 ///
 /// Atlas geometry: disc core is 0.90 of half-size, dash inner is 0.72 of the ring's half-size.
-/// 0.80 puts the fill against the inside of the dashes so the ring stays a visible rim, and so
-/// merging notes occupy that rim (drawn after the ring, before the fill) rather than sitting
-/// on top of the fill in the centre.
-const mass_fill_of_ring: f32 = 0.80;
+/// 0.80 puts the fill against the inside of the dashes so the ring stays a visible rim.
+const fill_of_ring: f32 = 0.80;
 /// Radius past which the narrow dash cell keeps the stroke near two screen pixels.
 const dash_thin_from: f32 = 24;
 
-/// Shared soft-sprite stack (frustum cull + cheap dense path). Used by harness and plugin.
-///
-/// Coalesced masses are two passes around the notes: dashed rings, then notes, then fills.
-/// A merging note covers the ring as it crosses the boundary and disappears under the fill
-/// as it reaches the centre — which is why note borders used to remain visible in the middle
-/// of a mass. Vector dashed strokes are reserved for `StyledMark.dashed` (open / selected).
-///
-/// `mix` is how far the marks sit off the background (1 = their own colour, 0 = gone), not an
-/// alpha. See `intoBg`.
-pub fn drawStyledMarks(
+/// Atlas rim is dashed for masses and for any mark that overlays dashed (open / hovered mass).
+pub fn rimIsDashed(m: StyledMark) bool {
+    return !m.is_note or m.dashed;
+}
+
+/// Overlay order: non-hover first (smallest on the bottom), hovered last so its fill stays
+/// visible in a pile. Used by `prepareStyledMarks`; tested as a function so a sort rewrite
+/// cannot silently bury the cursor.
+pub fn overlayBefore(a_hover: bool, a_r: f32, b_hover: bool, b_r: f32) bool {
+    if (a_hover != b_hover) return !a_hover;
+    return a_r < b_r;
+}
+
+const MarkItem = struct {
+    c: dvui.Point.Physical,
+    r: f32,
+    face: dvui.Color,
+    rim: dvui.Color,
+    dashed_rim: bool,
+    overlay_dashed: bool,
+    hover: bool,
+};
+
+/// Culled, coloured marks split into the shared field and the overlay, ready for
+/// `drawRims` → (the caller's web) → `drawFills` → `drawOverlay`.
+pub const PreparedMarks = struct {
+    field: []const MarkItem,
+    overlay: []const MarkItem,
+    tex: dvui.Texture,
+    disc_uv: SoftAtlas.UvRect,
+    ring_uv: SoftAtlas.UvRect,
+    dash_uv: SoftAtlas.UvRect,
+    dash_thin_uv: SoftAtlas.UvRect,
+    marks: u32,
+
+    /// Every outline, notes and masses together. Atlas sprites only — never `strokeCircleDashed`.
+    /// That path is a ~90-point polyline with each dash its own stroke; a field of large masses
+    /// measured out at ~8 fps with a parked camera.
+    pub fn drawRims(self: PreparedMarks) void {
+        const arena = dvui.currentWindow().arena();
+        var sprites = SpriteBatch.init(arena);
+        for (self.field) |m| {
+            const min_r: f32 = if (m.dashed_rim) 2 else 1.5;
+            if (m.r <= min_r) continue;
+            sprites.add(.{
+                .center = m.c,
+                .half_size = m.r,
+                .color = m.rim,
+                .uv = if (!m.dashed_rim)
+                    self.ring_uv
+                else if (m.r >= dash_thin_from)
+                    self.dash_thin_uv
+                else
+                    self.dash_uv,
+            });
+        }
+        sprites.flush(self.tex);
+    }
+
+    /// Every centre, inset so the rims from `drawRims` survive. Same colour discs overlapping
+    /// read as one blob.
+    pub fn drawFills(self: PreparedMarks) void {
+        const arena = dvui.currentWindow().arena();
+        var sprites = SpriteBatch.init(arena);
+        for (self.field) |m| {
+            sprites.add(.{
+                .center = m.c,
+                .half_size = m.r * fill_of_ring,
+                .color = m.face,
+                .uv = self.disc_uv,
+            });
+        }
+        sprites.flush(self.tex);
+    }
+
+    /// The handful under the cursor / open, in vector, after every sprite. Hovered last.
+    pub fn drawOverlay(self: PreparedMarks) void {
+        for (self.overlay) |d| {
+            fillCircle(d.c, d.r, d.face);
+            const stroke: dvui.Path.StrokeOptions = .{
+                .thickness = std.math.clamp(d.r * 0.07, 1.5, 2.5),
+                .color = d.rim,
+            };
+            if (d.overlay_dashed) {
+                strokeCircleDashed(d.c, d.r, stroke);
+            } else {
+                strokeCircle(d.c, d.r, stroke);
+            }
+        }
+    }
+};
+
+pub fn prepareStyledMarks(
     soft: *SoftAtlas,
     cam: *const Camera,
     mix: f32,
     marks: []const StyledMark,
-) DrawStats {
-    if (mix <= 0.01 or marks.len == 0) return .{};
-    if (!soft.ensureTexture()) return .{};
-    const tex = soft.texture() orelse return .{};
+) ?PreparedMarks {
+    if (mix <= 0.01 or marks.len == 0) return null;
+    if (!soft.ensureTexture()) return null;
+    const tex = soft.texture() orelse return null;
     const arena = dvui.currentWindow().arena();
     const bg = dvui.themeGet().color(.window, .fill);
 
-    var stats: DrawStats = .{};
-    const disc_uv = soft.uv(.disc);
-    const glow_uv = soft.uv(.glow);
-    const ring_uv = soft.uv(.ring);
-    const dash_uv = soft.uv(.dash_ring);
-    const dash_thin_uv = soft.uv(.dash_ring_thin);
     const vp = cam.viewport;
     // Select keeps off-screen siblings alive for LOD stability — do not pay to paint them.
     const pad: f32 = 40;
@@ -152,17 +231,10 @@ pub fn drawStyledMarks(
     const y0 = vp.y - pad;
     const x1 = vp.x + vp.w + pad;
     const y1 = vp.y + vp.h + pad;
-    const cheap = marks.len > 420;
 
-    const Item = struct {
-        c: dvui.Point.Physical,
-        r: f32,
-        face: dvui.Color,
-        rim: dvui.Color,
-    };
-    var masses: std.ArrayListUnmanaged(Item) = .empty;
-    var notes: std.ArrayListUnmanaged(Item) = .empty;
-    var dashed_marks: std.ArrayListUnmanaged(Item) = .empty;
+    var field: std.ArrayListUnmanaged(MarkItem) = .empty;
+    var overlay: std.ArrayListUnmanaged(MarkItem) = .empty;
+    var drawn: u32 = 0;
 
     for (marks) |m| {
         if (m.dying and m.r_px < 0.8) continue;
@@ -172,97 +244,56 @@ pub fn drawStyledMarks(
 
         const dying_t: f32 = if (m.dying) 0.35 else 1;
         const t = mix * dying_t;
-        const item: Item = .{
+        const item: MarkItem = .{
             .c = screen,
             .r = r,
             .face = intoBg(m.fill, bg, t),
             .rim = intoBg(m.border, bg, if (m.dashed) 0.95 * t else if (m.is_note) 0.85 * t else 0.9 * t),
+            .dashed_rim = rimIsDashed(m),
+            .overlay_dashed = m.dashed,
+            .hover = m.hover,
         };
-        if (m.dashed) {
-            dashed_marks.append(arena, item) catch {};
-        } else if (m.is_note) {
-            notes.append(arena, item) catch {};
-        } else {
-            masses.append(arena, item) catch {};
-        }
-        stats.marks += 1;
+        field.append(arena, item) catch {};
+        if (m.on_top) overlay.append(arena, item) catch {};
+        drawn += 1;
     }
 
-    var sprites = SpriteBatch.init(arena);
-
-    // 1. Mass rings. Atlas sprites only — never `strokeCircleDashed`. That path is a ~90-point
-    // polyline with each dash its own stroke; a field of large masses measured out at ~8 fps
-    // with a parked camera. The switch used to fire at r ≥ 14 whenever the mark count was
-    // under 420, which is exactly the zoom where masses get big and there are not yet hundreds
-    // of them.
-    for (masses.items) |m| {
-        if (m.r <= 2) continue;
-        sprites.add(.{
-            .center = m.c,
-            .half_size = m.r,
-            .color = m.rim,
-            .uv = if (m.r >= dash_thin_from) dash_thin_uv else dash_uv,
-        });
-    }
-    sprites.flush(tex);
-
-    // 2. Notes, over the rings so a joining disc covers the dashes as it crosses the boundary.
-    for (notes.items) |n| {
-        if (!cheap and n.r > 3) {
-            sprites.add(.{
-                .center = .{ .x = n.c.x + 0.8, .y = n.c.y + 1.0 },
-                .half_size = n.r * 1.08,
-                .color = dvui.Color.black.opacity(0.16 * mix),
-                .uv = glow_uv,
-            });
-        }
-        sprites.add(.{
-            .center = n.c,
-            .half_size = n.r,
-            .color = n.face,
-            .uv = disc_uv,
-        });
-        if (n.r > 1.5) {
-            sprites.add(.{
-                .center = n.c,
-                .half_size = n.r,
-                .color = n.rim,
-                .uv = ring_uv,
-            });
-        }
-    }
-    sprites.flush(tex);
-
-    // 3. Mass fills, over the notes. A note that has reached the centre is hidden; one still
-    // on the ring is not. Inset so the dashes from pass 1 remain a rim rather than being
-    // covered by a disc that is larger than they are.
-    for (masses.items) |m| {
-        sprites.add(.{
-            .center = m.c,
-            .half_size = m.r * mass_fill_of_ring,
-            .color = m.face,
-            .uv = disc_uv,
-        });
-    }
-    sprites.flush(tex);
-
-    // Last of all, over every sprite. Smallest first, so the largest — the one under the cursor —
-    // ends up on top rather than under whichever of the others the mark list happened to emit
-    // later. Vector dashes belong here and only here.
-    const BySize = struct {
-        fn less(_: void, x: Item, y: Item) bool {
-            return x.r < y.r;
+    const OverlayOrder = struct {
+        fn less(_: void, a: MarkItem, b: MarkItem) bool {
+            return overlayBefore(a.hover, a.r, b.hover, b.r);
         }
     };
-    std.mem.sort(Item, dashed_marks.items, {}, BySize.less);
-    for (dashed_marks.items) |d| {
-        fillCircle(d.c, d.r, d.face);
-        strokeCircleDashed(d.c, d.r, .{
-            .thickness = std.math.clamp(d.r * 0.07, 1.5, 2.5),
-            .color = d.rim,
-        });
-    }
-    return stats;
+    std.mem.sort(MarkItem, overlay.items, {}, OverlayOrder.less);
+
+    return .{
+        .field = field.items,
+        .overlay = overlay.items,
+        .tex = tex,
+        .disc_uv = soft.uv(.disc),
+        .ring_uv = soft.uv(.ring),
+        .dash_uv = soft.uv(.dash_ring),
+        .dash_thin_uv = soft.uv(.dash_ring_thin),
+        .marks = drawn,
+    };
+}
+
+/// Shared soft-sprite stack. Notes and masses use the same three passes: every outline, then
+/// (the caller's web, if any), then every fill. Overlapping discs of the same rest colour read
+/// as one blob; `on_top` marks are redrawn last so the one under the cursor is not buried.
+///
+/// `mix` is how far the marks sit off the background (1 = their own colour, 0 = gone), not an
+/// alpha. See `intoBg`.
+pub fn drawStyledMarks(
+    soft: *SoftAtlas,
+    cam: *const Camera,
+    mix: f32,
+    marks: []const StyledMark,
+) DrawStats {
+    const prepared = prepareStyledMarks(soft, cam, mix, marks) orelse return .{};
+    prepared.drawRims();
+    prepared.drawFills();
+    prepared.drawOverlay();
+    return .{ .marks = prepared.marks };
 }
 
 /// A crisp filled disc. The soft-atlas sprite has a feathered edge, which is right for a field of
@@ -278,6 +309,19 @@ fn fillCircle(center: dvui.Point.Physical, radius: f32, col: dvui.Color) void {
     }
     const path: dvui.Path = .{ .points = pts };
     path.fillConvex(.{ .color = col });
+}
+
+fn strokeCircle(center: dvui.Point.Physical, radius: f32, stroke: dvui.Path.StrokeOptions) void {
+    if (radius < 1) return;
+    const arena = dvui.currentWindow().arena();
+    const samples: usize = @max(@as(usize, 32), @as(usize, @intFromFloat(radius * 1.5)));
+    const pts = arena.alloc(dvui.Point.Physical, samples + 1) catch return;
+    for (pts[0..samples], 0..) |*pt, i| {
+        const a = std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(samples));
+        pt.* = .{ .x = center.x + @cos(a) * radius, .y = center.y + @sin(a) * radius };
+    }
+    pts[samples] = pts[0];
+    dvui.Path.stroke(.{ .points = pts }, stroke);
 }
 
 /// Same dash recipe as the interior document sun — vector path so large masses stay round.
@@ -384,11 +428,59 @@ test "lighter picks the brighter fill" {
     try std.testing.expectEqual(pale.b, got.b);
 }
 
-test "mass fill sits inside the dashed rim" {
+test "fill sits inside the rim for notes and masses" {
     // Atlas: disc core is 0.90 of half-size; dash inner is 0.82 − 0.10 = 0.72 of the ring
-    // half-size. Raising `mass_fill_of_ring` past this covers the dashes with the fill and
-    // the sandwich (ring, notes, fill) stops showing a rim.
-    try std.testing.expect(mass_fill_of_ring * 0.90 <= 0.72 + 0.001);
+    // half-size. Raising `fill_of_ring` past this covers the dashes with the fill and the
+    // shared stack (rims, then fills) stops showing a rim.
+    try std.testing.expect(fill_of_ring * 0.90 <= 0.72 + 0.001);
+}
+
+test "masses and open notes use a dashed rim; resting notes do not" {
+    const rest_note: StyledMark = .{ .screen = .{}, .r_px = 8, .fill = .{}, .border = .{}, .is_note = true };
+    const mass: StyledMark = .{ .screen = .{}, .r_px = 8, .fill = .{}, .border = .{}, .is_note = false };
+    const open: StyledMark = .{
+        .screen = .{},
+        .r_px = 8,
+        .fill = .{},
+        .border = .{},
+        .is_note = true,
+        .dashed = true,
+        .on_top = true,
+    };
+    const hover_note: StyledMark = .{
+        .screen = .{},
+        .r_px = 8,
+        .fill = .{},
+        .border = .{},
+        .is_note = true,
+        .on_top = true,
+        .hover = true,
+    };
+    const hover_mass: StyledMark = .{
+        .screen = .{},
+        .r_px = 8,
+        .fill = .{},
+        .border = .{},
+        .is_note = false,
+        .dashed = true,
+        .on_top = true,
+        .hover = true,
+    };
+    try std.testing.expect(!rimIsDashed(rest_note));
+    try std.testing.expect(rimIsDashed(mass));
+    try std.testing.expect(rimIsDashed(open));
+    try std.testing.expect(!rimIsDashed(hover_note));
+    try std.testing.expect(rimIsDashed(hover_mass));
+    try std.testing.expect(hover_note.on_top and hover_note.hover and !hover_note.dashed);
+    try std.testing.expect(hover_mass.on_top and hover_mass.dashed);
+    try std.testing.expect(open.on_top and !open.hover);
+}
+
+test "hovered overlay paints last, even when smaller than an open mark" {
+    try std.testing.expect(overlayBefore(false, 40, true, 10));
+    try std.testing.expect(overlayBefore(false, 10, false, 40));
+    try std.testing.expect(!overlayBefore(true, 10, false, 40));
+    try std.testing.expect(overlayBefore(true, 10, true, 40));
 }
 
 test "joinFill lands on the mass fill, never the window" {
