@@ -36,6 +36,7 @@ const bench_stats = @import("bench_stats.zig");
 const world_mod = @import("ui/world.zig");
 const containment = @import("ui/containment.zig");
 const fold = @import("ui/fold.zig");
+const spatial = @import("ui/spatial.zig");
 const cellweb = @import("ui/cellweb.zig");
 
 /// When set (via `--svg <dir>`), every solved layout is also written there as an SVG.
@@ -59,6 +60,14 @@ var world_pan: bool = false;
 /// `--zoom-mul=F`: zoom ratio between sweep steps. The default doubling can step clean over a
 /// narrow band, which is exactly how a band-shaped bug hides from this sweep.
 var world_zoom_mul: f32 = 2.0;
+/// `--spatial`: after the usual layout report, build a *spatial* hierarchy over the same leaf
+/// positions and report the same two structural numbers for it. This is the gate on the
+/// positions-first inversion: if grouping by proximity does not drop sibling overlap against
+/// grouping by links, the chunker is wrong and nothing should be built on top of it.
+///
+/// Off by default because it eagerly places every leaf, which is the cost lazy placement exists to
+/// avoid — seconds on a large vault.
+var want_spatial: bool = false;
 /// `--degree-norm=F`: `fold.Options.degree_norm`, how hard a link is discounted for the popularity
 /// of its endpoints.
 var fold_degree_norm: ?f32 = null;
@@ -142,6 +151,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) {
             world_zoom_mul = try std.fmt.parseFloat(f32, a["--zoom-mul=".len..]);
         }
+        if (std.mem.eql(u8, a, "--spatial")) {
+            want_spatial = true;
+            world_mode = true;
+        }
         if (std.mem.startsWith(u8, a, "--degree-norm=")) {
             fold_degree_norm = try std.fmt.parseFloat(f32, a["--degree-norm=".len..]);
         }
@@ -213,6 +226,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--focus=")) continue;
         if (std.mem.startsWith(u8, a, "--fill=")) continue;
         if (std.mem.startsWith(u8, a, "--degree-norm=")) continue;
+        if (std.mem.eql(u8, a, "--spatial")) continue;
         if (std.mem.startsWith(u8, a, "--radius-exp=")) continue;
         if (std.mem.startsWith(u8, a, "--pack-gap=")) continue;
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) continue;
@@ -950,7 +964,174 @@ fn layoutReport(
     }
 
     std.debug.print("  [layout report {d:.0} ms]\n", .{ms(elapsed(io, t0))});
+    if (want_spatial) try spatialReport(gpa, io, w);
     if (svg_dir) |d| try writeWorldSvg(gpa, io, w, edges, d, label);
+}
+
+/// The same two structural numbers, for a hierarchy grouped by *proximity* over the very same leaf
+/// positions.
+///
+/// One variable changes: which notes get drawn together. The positions are byte-for-byte the ones
+/// `containment` produced, so any difference is the grouping rule and nothing else. That is the
+/// whole reason this runs before a new position source lands — measuring both at once would leave
+/// a regression unattributable.
+fn spatialReport(gpa: std.mem.Allocator, io: std.Io, w: *world_mod.World) !void {
+    const n_notes = w.lad.leaf_cell.len;
+    if (n_notes == 0) return;
+
+    // Eager placement. This is exactly the cost lazy placement exists to avoid, and paying it here
+    // is the point of doing this in the bench rather than in the app.
+    const t_place = now(io);
+    const pos = try gpa.alloc(spatial.Vec2, n_notes);
+    defer gpa.free(pos);
+    const comp = try gpa.alloc(u32, n_notes);
+    defer gpa.free(comp);
+    const weight = try gpa.alloc(f32, n_notes);
+    defer gpa.free(weight);
+    const body = try gpa.alloc(f32, n_notes);
+    defer gpa.free(body);
+
+    var placed: usize = 0;
+    for (0..n_notes) |i| {
+        const leaf = w.lad.leaf_cell[i];
+        if (leaf == fold.invalid or leaf >= w.lad.cells.len) {
+            pos[i] = .{};
+            comp[i] = 0;
+            weight[i] = 0;
+            body[i] = 0;
+            continue;
+        }
+        if (w.noteWorldPos(@intCast(i))) |wp| {
+            pos[i] = .{ .x = wp.x, .y = wp.y };
+        } else {
+            pos[i] = .{};
+        }
+        comp[i] = w.lad.cells[leaf].comp;
+        weight[i] = w.lad.cells[leaf].weight;
+        body[i] = w.lad.cells[leaf].body;
+        placed += 1;
+    }
+    const place_ns = elapsed(io, t_place);
+
+    const ext = @max(w.extent(), 1e-3);
+    const t_build = now(io);
+    var res = try spatial.build(gpa, n_notes, pos, comp, weight, body, .{
+        .arity = .seven,
+        // The leaf radius `containment` would have drawn, so the two hierarchies are compared at
+        // the same note size and the overlap numbers mean the same thing.
+        .note_r = w.field.radius(&w.lad, w.lad.leaf_cell[0]),
+        .quant_half = ext,
+    });
+    defer res.deinit(gpa);
+    const build_ns = elapsed(io, t_build);
+
+    // -- sibling overlap, same definition as the fold-side report --
+    var pairs: usize = 0;
+    var overlapping: usize = 0;
+    var penetration: f64 = 0;
+    for (res.lad.cells, 0..) |c, id| {
+        if (c.child_count < 2) continue;
+        const kids = res.lad.childrenOf(@intCast(id));
+        for (kids, 0..) |ka, ai| {
+            for (kids[ai + 1 ..]) |kb| {
+                pairs += 1;
+                const dx = res.pos[ka].x - res.pos[kb].x;
+                const dy = res.pos[ka].y - res.pos[kb].y;
+                const d = @sqrt(dx * dx + dy * dy);
+                const want = res.bound_r[ka] + res.bound_r[kb];
+                if (d < want) {
+                    overlapping += 1;
+                    penetration += @as(f64, want - d) / @max(1e-6, @min(res.bound_r[ka], res.bound_r[kb]));
+                }
+            }
+        }
+    }
+
+    // -- descent travel, same definition --
+    var worst: std.ArrayListUnmanaged(f32) = .empty;
+    defer worst.deinit(gpa);
+    const stride = @max(1, n_notes / 20_000);
+    var i: usize = 0;
+    while (i < n_notes) : (i += stride) {
+        var chain: [64]u32 = undefined;
+        var cn: usize = 0;
+        var c = res.lad.leaf_cell[i];
+        while (cn < chain.len and c != fold.invalid and c < res.lad.cells.len) {
+            chain[cn] = c;
+            cn += 1;
+            c = res.lad.cells[c].parent;
+        }
+        var biggest: f32 = 0;
+        var k = cn;
+        while (k > 1) {
+            k -= 1;
+            const dx = res.pos[chain[k]].x - res.pos[chain[k - 1]].x;
+            const dy = res.pos[chain[k]].y - res.pos[chain[k - 1]].y;
+            biggest = @max(biggest, @sqrt(dx * dx + dy * dy));
+        }
+        try worst.append(gpa, biggest);
+    }
+    std.mem.sort(f32, worst.items, {}, std.sort.asc(f32));
+    var tsum: f64 = 0;
+    for (worst.items) |v| tsum += v;
+
+    // How far apart the leaves actually are, in units of the radius they are drawn at.
+    //
+    // This is the number that decides whether *any* grouping can produce non-overlapping cells.
+    // Two notes drawn at radius `r` overlap whenever they sit closer than `2r`, so if the median
+    // leaf spacing is below 2.0 here then the leaves themselves overlap and every cell above them
+    // inherits it — the hierarchy has nothing to work with. Curve-adjacent is used as the
+    // neighbour, which is an upper bound on true nearest-neighbour distance and close to it.
+    {
+        const note_r = @max(w.field.radius(&w.lad, w.lad.leaf_cell[0]), 1e-6);
+        var gaps: std.ArrayListUnmanaged(f32) = .empty;
+        defer gaps.deinit(gpa);
+        var si: usize = 1;
+        while (si < res.lad.note_at.len) : (si += 1) {
+            const a = pos[res.lad.note_at[si - 1]];
+            const b = pos[res.lad.note_at[si]];
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            try gaps.append(gpa, @sqrt(dx * dx + dy * dy));
+        }
+        if (gaps.items.len > 0) {
+            std.mem.sort(f32, gaps.items, {}, std.sort.asc(f32));
+            std.debug.print(
+                "  leaf spacing (curve-adjacent)   p50 {d:.2}x note_r   p10 {d:.2}x   (below 2.00x means leaves overlap)\n",
+                .{
+                    @as(f64, gaps.items[gaps.items.len / 2]) / note_r,
+                    @as(f64, gaps.items[gaps.items.len / 10]) / note_r,
+                },
+            );
+        }
+    }
+
+    std.debug.print("  -- spatial hierarchy over the same positions --\n", .{});
+    std.debug.print(
+        "  cells {d}  depth {d}  roots {d}   [place {d:.0} ms  build {d:.0} ms]\n",
+        .{ res.lad.cells.len, res.lad.depth, res.lad.roots.len, ms(place_ns), ms(build_ns) },
+    );
+    if (pairs > 0) {
+        std.debug.print(
+            "  sibling discs overlapping {d:.1}%   mean penetration {d:.2}x smaller radius\n",
+            .{
+                @as(f64, @floatFromInt(overlapping)) * 100.0 / @as(f64, @floatFromInt(pairs)),
+                if (overlapping > 0) penetration / @as(f64, @floatFromInt(overlapping)) else 0,
+            },
+        );
+    }
+    if (worst.items.len > 0) {
+        const wn: f64 = @floatFromInt(worst.items.len);
+        std.debug.print(
+            "  descent travel (largest single level jump, per note)   mean {d:.3}r  p50 {d:.3}r  p90 {d:.3}r  max {d:.3}r\n",
+            .{
+                tsum / wn / ext,
+                @as(f64, worst.items[worst.items.len / 2]) / ext,
+                @as(f64, worst.items[worst.items.len * 9 / 10]) / ext,
+                @as(f64, worst.items[worst.items.len - 1]) / ext,
+            },
+        );
+    }
 }
 
 /// A picture of the placed vault, so a layout idea can be looked at without launching the editor.
