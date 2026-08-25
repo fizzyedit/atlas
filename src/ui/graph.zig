@@ -938,6 +938,9 @@ pub const Panel = struct {
     /// and `first_build` stayed false because `gen` still held the previous index's generation —
     /// so the new graph inherited a Wikipedia-scale camera and a 286k-note hover index. The frame
     /// after the new world landed then walked those leftovers and crashed (simplewiki → fizzy).
+    ///
+    /// A second crash survived that reset: `label_live` kept its buffer across `arena.reset`,
+    /// and `updateLabels` memcpy'd the new names into a page that was already unmapped.
     fn dropArrangement(self: *Panel) void {
         if (self.job) |job| {
             // The in-flight solve carries the *previous* vault's snapshot, and `finishRebuild`
@@ -953,24 +956,43 @@ pub const Panel = struct {
         self.interior.clear();
         self.interior.fail_id = null;
         self.interior.fail_gen = std.math.maxInt(u64);
+        const gpa = sdk.allocator();
         // `path_index` keys are slices into the panel arena; drop them before the pages go away.
-        self.path_index.clearRetainingCapacity();
-        self.id_index.clearRetainingCapacity();
-        self.holds_open.clearRetainingCapacity();
-        self.visible.clearRetainingCapacity();
-        self.interior_visible.clearRetainingCapacity();
-        self.open_notes.clearRetainingCapacity();
-        self.label_live.clearRetainingCapacity();
-        self.interior_label_live.clearRetainingCapacity();
-        self.pointer_warm.clearRetainingCapacity();
-        self.morph_from.clearRetainingCapacity();
-        self.edge_anim.clearRetainingCapacity();
+        self.path_index.deinit(gpa);
+        self.path_index = .empty;
+        self.id_index.deinit(gpa);
+        self.id_index = .empty;
+        self.holds_open.deinit(gpa);
+        self.holds_open = .empty;
+        self.visible.deinit(gpa);
+        self.visible = .empty;
+        self.interior_visible.deinit(gpa);
+        self.interior_visible = .empty;
+        self.open_notes.deinit(gpa);
+        self.open_notes = .empty;
+        // Forget, do not free. `updateLabels` memcpy's into this buffer; after simplewiki it
+        // named a page the arena recycle below unmapped, and the first fizzy frame wrote 32
+        // bytes into the gap (SEGV in `appendSlice`). A reindex of the *same* vault keeps
+        // capacity on purpose — a different vault must not inherit the pointer.
+        self.label_live = .empty;
+        self.interior_label_live = .empty;
+        self.pointer_warm.deinit(gpa);
+        self.pointer_warm = .empty;
+        self.morph_from.deinit(gpa);
+        self.morph_from = .empty;
+        self.edge_anim.deinit(gpa);
+        self.edge_anim = .empty;
         self.nodes = &.{};
         self.edges = &.{};
         self.live_pos = &.{};
         self.at_level0 = &.{};
         self.notes_at_level0 = 0;
         self.at_level0_epoch = std.math.maxInt(u64);
+        self.labels_stale = true;
+        self.labels_settled = true;
+        self.labels_center = .{};
+        self.labels_zoom = 0;
+        self.labels_vp = .{};
         _ = self.arena.reset(.free_all);
         self.active_doc_id = 0;
         self.focus_node = fold.invalid;
@@ -2143,6 +2165,12 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         // arena can be recycled immediately.
         job.arena.deinit();
         gpa.destroy(job);
+        if (p.world_state) |*w| {
+            w.deinit();
+            p.world_state = null;
+        }
+        p.label_live = .empty;
+        p.interior_label_live = .empty;
         _ = p.arena.reset(.free_all);
         p.id_index.clearRetainingCapacity();
         p.gen = gen;
@@ -2343,7 +2371,19 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
         if (p.world_state) |*old_world| old_world.deinit();
         p.world_state = w;
         job.world = null; // adopted — `LayoutJob.deinit` must not free it too
+    } else if (p.world_state) |*old_world| {
+        // No new world (empty vault, or the worker bailed). Keeping the previous one would
+        // pair Wikipedia-scale `links` with the 15-note array this apply is about to install.
+        old_world.deinit();
+        p.world_state = null;
     }
+
+    // Same reason `dropArrangement` forgets these: `updateLabels` memcpy's into the retained
+    // buffer, and this reset is what unmaps it. `rewarmLabels` refills from the new nodes.
+    p.label_live.deinit(gpa);
+    p.label_live = .empty;
+    p.interior_label_live.deinit(gpa);
+    p.interior_label_live = .empty;
 
     _ = p.arena.reset(.free_all);
     p.id_index.clearRetainingCapacity();
@@ -4798,8 +4838,16 @@ fn updateLabels(
     // Containment's web is `world.links`, already lifted onto living cells. Feeding the classic
     // path's `vis_edges` here instead described lines that are not on screen, so the placer
     // refused slot after slot for collisions with a web that was not being drawn.
-    const containment_links: ?[]const world_mod.LiftedLink =
-        if (p.world_state) |*w| w.links.items else null;
+    //
+    // The world has to belong to *this* node array. A leftover Wikipedia world against a
+    // 15-note fizzy graph would size `seg_buf` at ~2.7 million links; the interior cloud is a
+    // different array on purpose and should scan its own (tiny) edge list instead.
+    const containment_links: ?[]const world_mod.LiftedLink = blk: {
+        if (nodes.ptr != p.nodes.ptr or nodes.len != p.nodes.len) break :blk null;
+        const w = if (p.world_state) |*ws| ws else break :blk null;
+        if (w.lad.leaf_cell.len != nodes.len) break :blk null;
+        break :blk w.links.items;
+    };
     const seg_cap = if (containment_links) |cl| cl.len else edges.len;
     const seg_buf = arena.alloc(labels.Segment, seg_cap) catch return;
     // Cell -> world position for this frame's marks, so resolving a link's two endpoints is two
@@ -6267,6 +6315,12 @@ test "dropping a vault forgets hover, interior, camera, and the previous generat
     p.fitted_vp_h = 800;
     p.world_radius = 50_000;
     p.notes_at_level0 = 40;
+    // A dangling retained buffer is the second simplewiki → fizzy crash: `updateLabels`
+    // memcpy'd eight u32s into a page `arena.reset` had already given back.
+    p.label_live.capacity = 96;
+    p.interior_label_live.capacity = 32;
+    p.labels_stale = false;
+    p.labels_zoom = 8;
 
     p.dropArrangement();
 
@@ -6285,6 +6339,10 @@ test "dropping a vault forgets hover, interior, camera, and the previous generat
     try std.testing.expectEqual(@as(f32, 0), p.world_radius);
     try std.testing.expectEqual(@as(u32, 0), p.notes_at_level0);
     try std.testing.expectEqual(@as(usize, 0), p.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), p.label_live.capacity);
+    try std.testing.expectEqual(@as(usize, 0), p.interior_label_live.capacity);
+    try std.testing.expect(p.labels_stale);
+    try std.testing.expectEqual(@as(f32, 0), p.labels_zoom);
 }
 
 test "a crushed lattice is the zoom where every note hits the same ceiling" {

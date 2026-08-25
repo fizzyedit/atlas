@@ -137,9 +137,15 @@ pub const SegGrid = struct {
             .items = &.{},
         };
 
+        // `CellWalk` is supposed to stay inside the grid, but a leftover camera / world
+        // (simplewiki → fizzy) can feed infinities here. `starts[c + 1] += 1` past `n` is
+        // a byte write into unmapped memory — the SEGV that showed up as updateLabels → memcpy.
         for (segs) |sg| {
             var it = CellWalk.init(&g, sg);
-            while (it.next()) |c| starts[c + 1] += 1;
+            while (it.next()) |c| {
+                if (c >= n) continue;
+                starts[c + 1] += 1;
+            }
         }
         for (1..n + 1) |i| starts[i] += starts[i - 1];
 
@@ -149,6 +155,7 @@ pub const SegGrid = struct {
         for (segs, 0..) |sg, i| {
             var it = CellWalk.init(&g, sg);
             while (it.next()) |c| {
+                if (c >= n) continue;
                 items[cursor[c]] = @intCast(i);
                 cursor[c] += 1;
             }
@@ -536,6 +543,7 @@ test "the segment grid accepts and rejects exactly what a linear walk does" {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const grid = SegGrid.build(arena_state.allocator(), bounds, segs) orelse return error.NoGrid;
+    try testing.expectEqual(grid.cols * grid.rows + 1, grid.starts.len);
 
     var buf: [1]Rect = undefined;
     var linear = Placer.init(buf[0..0], bounds, 2);
@@ -557,6 +565,23 @@ test "the segment grid accepts and rejects exactly what a linear walk does" {
         if (linear.fits(q) != indexed.fits(q)) disagreements += 1;
     }
     try testing.expectEqual(@as(usize, 0), disagreements);
+}
+
+test "the segment grid never writes a cell past starts" {
+    // Off-panel, inverted, and huge segments — the walk clips, and the cap in `build` is what
+    // makes a leftover Wikipedia-scale web against a tiny panel a no-op rather than an OOB store.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const bounds: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 120 };
+    const segs = [_]Segment{
+        .{ .a = .{ .x = -1e9, .y = -1e9 }, .b = .{ .x = 1e9, .y = 1e9 } },
+        .{ .a = .{ .x = 50, .y = 50 }, .b = .{ .x = 60, .y = 55 } },
+        .{ .a = .{ .x = 10_000, .y = 10_000 }, .b = .{ .x = 10_010, .y = 10_010 } },
+    };
+    const grid = SegGrid.build(arena_state.allocator(), bounds, &segs) orelse return error.NoGrid;
+    const n = grid.cols * grid.rows;
+    try testing.expectEqual(n + 1, grid.starts.len);
+    try testing.expect(grid.starts[n] <= segs.len * n);
 }
 
 test "slots are centred on / clear of the bubble" {
