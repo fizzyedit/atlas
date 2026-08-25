@@ -4267,15 +4267,6 @@ fn focusNodeIndex(p: *Panel) ?u32 {
     return p.focus_node;
 }
 
-fn cellCoversLeaf(w: *const world_mod.World, cell: u32, leaf: u32) bool {
-    if (leaf == fold.invalid or cell >= w.lad.cells.len or leaf >= w.lad.cells.len) return false;
-    const note = w.lad.cells[leaf].note;
-    if (note == fold.invalid or note >= w.lad.slot_of.len) return false;
-    const slot = w.lad.slot_of[note];
-    const c = w.lad.cells[cell];
-    return slot >= c.ls and slot < c.le;
-}
-
 /// The world parameters for this frame. One definition, because `focusNode` needs the same
 /// `split_px` the LOD is about to use — deriving the camera's never-coalesce floor from a
 /// different value than the one that decides it would be a slow drift into wrongness.
@@ -4290,7 +4281,6 @@ fn worldParams(p: *Panel) world_mod.Params {
     // lights up nothing — the failure reads as "the highlight was lost" rather than as "the
     // highlight is of something else".
     var focus_leaf: u32 = fold.invalid;
-    var aim_leaf: u32 = fold.invalid;
     // Every open note's leaf, focused one first. `liftLinks` draws all of their links at leaf
     // precision, which is what stops a note's connections changing identity depending on whether it
     // happens to be the focused tab — see `world.Params.open_leaves`.
@@ -4308,33 +4298,6 @@ fn worldParams(p: *Panel) world_mod.Params {
             const lf = w.lad.leaf_cell[gi];
             if (lf == focus_leaf) continue;
             open_leaves.append(arena, lf) catch {};
-        }
-        // The note under the cursor, then the one already being descended into. Hover is last
-        // frame's, which is the disc the zoom actually stayed on. Interior wins once a dive has
-        // named a note, so a stray hover cannot steal the sun.
-        if (p.interior.t < 0.5) {
-            if (p.hover_node) |i| {
-                if (i < w.lad.leaf_cell.len) aim_leaf = w.lad.leaf_cell[i];
-            } else if (p.hover_cluster) |hc| {
-                // Pointing at a mass: keep the open note inside it on the mass, not on the
-                // leaf. Without this, a selected document jumps to its containment slot the
-                // moment the mass splits — off the pane, links still drawn to the bezel.
-                if (cellCoversLeaf(w, hc.index, focus_leaf)) {
-                    aim_leaf = focus_leaf;
-                } else {
-                    for (open_leaves.items) |lf| {
-                        if (cellCoversLeaf(w, hc.index, lf)) {
-                            aim_leaf = lf;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if (p.interior.note_id) |nid| {
-            if (p.id_index.get(nid)) |gi| {
-                if (gi < w.lad.leaf_cell.len) aim_leaf = w.lad.leaf_cell[gi];
-            }
         }
     }
     // Hold the web during a fast pan or a hand-driven zoom flick, not during a click-to-focus
@@ -4360,7 +4323,6 @@ fn worldParams(p: *Panel) world_mod.Params {
         // Highlighted lines get the same allowance as the ambient web, spent focused-note-first.
         .focus_link_budget = ambientLinkBudget(p.mark_budget),
         .focus_leaf = focus_leaf,
-        .aim_leaf = aim_leaf,
         .open_leaves = open_leaves.items,
         .lift_hold = hold,
         // Only a hand-driven flick holds the open set. `user_driving` is false for the whole

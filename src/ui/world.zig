@@ -304,14 +304,6 @@ pub const Params = struct {
     /// panel exists to answer, and answering it approximately is worse than not answering it. The
     /// exemption is bounded: one cell, so the extra scan is `O(degree)` once per frame.
     focus_leaf: u32 = fold.invalid,
-    /// Leaf of the note the camera is descending into — hovered, or already inside.
-    ///
-    /// Everything else slides from the parent's centre toward its true position, which is what
-    /// makes a split read as an expansion — and which walks the note under the cursor out of the
-    /// pane, while its links stay (they fall back to `field.pos`). Holding this leaf on the
-    /// stand-in keeps the dive attached to the disc that is actually on screen. Takes priority
-    /// over `focus_leaf`: a selected note is still the one being zoomed into.
-    aim_leaf: u32 = fold.invalid,
     /// How many *highlighted* lines the frame may draw, across every open note.
     ///
     /// Spent focused-note-first. The flat `link_scan_cap` per note was the wrong shape twice over:
@@ -673,14 +665,6 @@ pub const World = struct {
         return e;
     }
 
-    /// Is `cell` the leaf of one of the reader's open notes? A handful of tabs, so a linear scan.
-    fn isOpenLeaf(p: Params, cell: u32) bool {
-        for (p.open_leaves) |leaf| {
-            if (leaf == cell) return true;
-        }
-        return false;
-    }
-
     /// Rebuild the living set for this view.
     ///
     /// Two passes, deliberately. Topology first, as a **pure function of (tree, view, zoom,
@@ -942,39 +926,12 @@ pub const World = struct {
                 self.field.ensureChildren(&self.lad, id); // lazy placement pays off here
                 for (self.lad.childrenOf(id)) |k| {
                     const own = self.field.pos[k];
-                    // An open note does not travel with the split; it is already where it is.
-                    //
-                    // Every other child slides out from its parent's centre as the parent opens,
-                    // which is what makes a split read as an expansion. For the note the reader is
-                    // descending into that is exactly wrong. Its mark starts at the parent's
-                    // centre, and once the camera has closed in on the note's *true* position that
-                    // centre is off screen — so `onScreen` culls the mark, it stops being drawn,
-                    // and the reader is left zooming at nothing. Its links stay, because they fall
-                    // back to `field.pos` when there is no mark, so the note appears to drop out
-                    // from under its own connections.
-                    //
-                    // Pulling the *covering mass* onto the leaf was the other failure of the same
-                    // kind: a focused note sits at the edge of its parent, so every sibling then
-                    // hatched out of that edge toward the real centroid — usually already off the
-                    // pane at this zoom — and the focused links remained, pointing at the bezel.
-                    // The mass stays where it is; the aimed leaf stays on it.
-                    const aimed = k == p.aim_leaf;
-                    const pinned = k == p.focus_leaf or isOpenLeaf(p, k);
-                    if (aimed) {
-                        // Stay on the stand-in while the parent is still the disc under the
-                        // cursor; once it has opened, freeze wherever that left us rather than
-                        // walking the rest of the way to the leaf.
-                        if (self.anim[id] < 1 or (self.px[k] == 0 and self.py[k] == 0)) {
-                            self.px[k] = self.px[id];
-                            self.py[k] = self.py[id];
-                        }
-                    } else if (pinned) {
-                        self.px[k] = own.x;
-                        self.py[k] = own.y;
-                    } else {
-                        self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
-                        self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
-                    }
+                    // Same pose for every child: the layout, crossfaded from the parent as it
+                    // opens. Special-casing the hovered or focused leaf glued it back onto the
+                    // parent centre while its neighbours kept travelling — one note "coalescing"
+                    // as you zoom into it, edges still drawn at the true slot.
+                    self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
+                    self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
                     self.mul[k] = self.mul[id] * self.anim[id];
                     try stack.append(self.gpa, k);
                 }
@@ -1570,40 +1527,6 @@ fn chainLinks(gpa: std.mem.Allocator, n: u32) ![]fold.Edge {
     return e;
 }
 
-const LeafOffset = struct {
-    note: u32,
-    leaf: u32,
-    parent: u32,
-    pin: containment.Vec2,
-    centroid: containment.Vec2,
-};
-
-fn farthestFromParent(w: *World) ?LeafOffset {
-    var best_off: f32 = 0;
-    var best: ?LeafOffset = null;
-    const n = @min(w.lad.leaf_cell.len, @as(usize, 800));
-    for (0..n) |note| {
-        const leaf = w.lad.leaf_cell[note];
-        if (leaf == fold.invalid or leaf >= w.lad.cells.len) continue;
-        const parent = w.lad.cells[leaf].parent;
-        if (parent == fold.invalid) continue;
-        const wp = w.noteWorldPos(@intCast(note)) orelse continue;
-        const centroid = w.field.pos[parent];
-        const off = (wp.x - centroid.x) * (wp.x - centroid.x) + (wp.y - centroid.y) * (wp.y - centroid.y);
-        if (off > best_off) {
-            best_off = off;
-            best = .{
-                .note = @intCast(note),
-                .leaf = leaf,
-                .parent = parent,
-                .pin = .{ .x = wp.x, .y = wp.y },
-                .centroid = centroid,
-            };
-        }
-    }
-    return best;
-}
-
 fn coveringMark(w: *const World, leaf: u32) ?Mark {
     var c = leaf;
     var guard: u8 = 0;
@@ -2073,58 +1996,6 @@ test "an unheld zoom-in opens cells before the camera arrives" {
     try testing.expect(open_mid > open_far);
 }
 
-test "a focused covering mass stays at its centroid rather than jumping to the leaf" {
-    // Pulling the mass onto the focused leaf put every sibling in flight from that edge toward
-    // the real centroid — off the pane, with the focused links still drawn to the bezel.
-    const gpa = testing.allocator;
-    const links = try chainLinks(gpa, 4000);
-    defer gpa.free(links);
-    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
-    defer w.deinit();
-
-    const hit = farthestFromParent(&w) orelse return error.TestUnexpectedResult;
-    const off2 = (hit.pin.x - hit.centroid.x) * (hit.pin.x - hit.centroid.x) +
-        (hit.pin.y - hit.centroid.y) * (hit.pin.y - hit.centroid.y);
-    try testing.expect(off2 > 0.01);
-
-    const p: Params = .{ .focus_leaf = hit.leaf, .budget = 2000 };
-    const coarse: View = .{ .w = 900, .h = 600, .zoom = 4, .cx = hit.centroid.x, .cy = hit.centroid.y };
-    try settle(&w, coarse, p, 80);
-
-    const m = coveringMark(&w, hit.leaf) orelse return error.TestUnexpectedResult;
-    const d_c = (m.wx - hit.centroid.x) * (m.wx - hit.centroid.x) + (m.wy - hit.centroid.y) * (m.wy - hit.centroid.y);
-    const d_t = (m.wx - hit.pin.x) * (m.wx - hit.pin.x) + (m.wy - hit.pin.y) * (m.wy - hit.pin.y);
-    try testing.expect(d_c < d_t);
-}
-
-test "an aimed-at note stays on its stand-in instead of sliding to the leaf" {
-    // Wheel-zoom into a note that is not open: without aim_leaf the mark interpolates toward
-    // the true leaf, which is often already off-screen, and the links remain (they fall back
-    // to field.pos). Holding the leaf on the parent pose keeps the dive under the cursor.
-    const gpa = testing.allocator;
-    const links = try chainLinks(gpa, 4000);
-    defer gpa.free(links);
-    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
-    defer w.deinit();
-
-    const hit = farthestFromParent(&w) orelse return error.TestUnexpectedResult;
-    const off2 = (hit.pin.x - hit.centroid.x) * (hit.pin.x - hit.centroid.x) +
-        (hit.pin.y - hit.centroid.y) * (hit.pin.y - hit.centroid.y);
-    try testing.expect(off2 > 0.01);
-
-    const coarse: View = .{ .w = 900, .h = 600, .zoom = 4, .cx = hit.centroid.x, .cy = hit.centroid.y };
-    try settle(&w, coarse, .{ .budget = 2000 }, 80);
-
-    const fine: View = .{ .w = 900, .h = 600, .zoom = 80, .cx = hit.centroid.x, .cy = hit.centroid.y };
-    const aimed: Params = .{ .aim_leaf = hit.leaf, .budget = 2000 };
-    for (0..8) |_| try w.step(fine, aimed, 1.0 / 60.0);
-
-    const m = coveringMark(&w, hit.leaf) orelse return error.TestUnexpectedResult;
-    const d_c = (m.wx - hit.centroid.x) * (m.wx - hit.centroid.x) + (m.wy - hit.centroid.y) * (m.wy - hit.centroid.y);
-    const d_t = (m.wx - hit.pin.x) * (m.wx - hit.pin.x) + (m.wy - hit.pin.y) * (m.wy - hit.pin.y);
-    try testing.expect(d_c < d_t);
-}
-
 test "resolved notes keep their layout position when zoom increases" {
     // Once a note is drawn as itself, further zoom is a camera move, not another placement.
     const gpa = testing.allocator;
@@ -2156,25 +2027,55 @@ test "resolved notes keep their layout position when zoom increases" {
 
     try settle(&w, .{ .w = 900, .h = 600, .zoom = 160, .cx = at.x, .cy = at.y }, p, 200);
     const late_field = w.field.pos[cell];
-    const late_mark = coveringMark(&w, cell);
+    const late_mark = coveringMark(&w, cell) orelse return error.TestUnexpectedResult;
 
     const df = (late_field.x - mid_field.x) * (late_field.x - mid_field.x) +
         (late_field.y - mid_field.y) * (late_field.y - mid_field.y);
-    std.debug.print("\nnote cell={d} field delta2={d:.6} mid_mark=({d:.3},{d:.3}) late_mark={any}\n", .{
-        cell,
-        df,
-        mid_mark.wx,
-        mid_mark.wy,
-        if (late_mark) |m| m else null,
-    });
-    if (late_mark) |m| {
-        const dm = (m.wx - mid_mark.wx) * (m.wx - mid_mark.wx) + (m.wy - mid_mark.wy) * (m.wy - mid_mark.wy);
-        std.debug.print("mark delta2={d:.6} is_note={any} cell={d}->{d}\n", .{ dm, m.is_note, mid_mark.cell, m.cell });
-        try testing.expect(dm < 0.01);
-    } else {
-        return error.TestUnexpectedResult;
-    }
+    const dm = (late_mark.wx - mid_mark.wx) * (late_mark.wx - mid_mark.wx) +
+        (late_mark.wy - mid_mark.wy) * (late_mark.wy - mid_mark.wy);
+    try testing.expect(dm < 0.01);
     try testing.expect(df < 1e-8);
+}
+
+test "the note you zoom into does not leave its neighbours" {
+    // Gluing the hovered/focused leaf to the parent centroid while siblings kept interpolating
+    // toward their layout slots made one note look like it was coalescing as you zoomed into it.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 40, .cx = 0, .cy = 0 }, .{ .budget = 2000 }, 200);
+
+    var a: ?Mark = null;
+    var b: ?Mark = null;
+    for (w.marks.items) |m| {
+        if (!m.is_note) continue;
+        if (a == null) {
+            a = m;
+            continue;
+        }
+        const da = a.?;
+        const d = (m.wx - da.wx) * (m.wx - da.wx) + (m.wy - da.wy) * (m.wy - da.wy);
+        if (d > 0.01 and (b == null or d < (b.?.wx - da.wx) * (b.?.wx - da.wx) + (b.?.wy - da.wy) * (b.?.wy - da.wy))) {
+            b = m;
+        }
+    }
+    const first = a orelse return error.TestUnexpectedResult;
+    const neighbor = b orelse return error.TestUnexpectedResult;
+    const at = w.field.pos[first.cell];
+    const rel_x = neighbor.wx - first.wx;
+    const rel_y = neighbor.wy - first.wy;
+
+    const focused: Params = .{ .focus_leaf = first.cell, .budget = 2000 };
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 160, .cx = at.x, .cy = at.y }, focused, 200);
+
+    const late_a = coveringMark(&w, first.cell) orelse return error.TestUnexpectedResult;
+    const late_b = coveringMark(&w, neighbor.cell) orelse return error.TestUnexpectedResult;
+    const dx = (late_b.wx - late_a.wx) - rel_x;
+    const dy = (late_b.wy - late_a.wy) - rel_y;
+    try testing.expect(dx * dx + dy * dy < 0.01);
 }
 
 test "an empty vault does not crash" {
