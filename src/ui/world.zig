@@ -478,6 +478,7 @@ pub const World = struct {
     sc_vis: std.ArrayListUnmanaged(u32) = .empty,
     sc_stack: std.ArrayListUnmanaged(u32) = .empty,
     sc_classes: std.ArrayListUnmanaged(u32) = .empty,
+    sc_slots: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Cell -> index into `marks` for this frame, dense and epoch-stamped.
     ///
@@ -645,6 +646,7 @@ pub const World = struct {
         self.sc_vis.deinit(self.gpa);
         self.sc_stack.deinit(self.gpa);
         self.sc_classes.deinit(self.gpa);
+        self.sc_slots.deinit(self.gpa);
         self.lifted.deinit(self.gpa);
         self.focus_links.deinit(self.gpa);
         self.field.deinit(self.gpa);
@@ -702,6 +704,17 @@ pub const World = struct {
         self.cut.clearRetainingCapacity();
         @memset(self.open, false);
         self.bound = false;
+        // Assume rest, and let this frame's `present` say otherwise.
+        //
+        // Nothing else ever set this back to true. `settled` starts true, goes false the first
+        // time any cell crossfades or a focus link grows, and stayed false for the life of the
+        // `World` — so `wantsRepaintFor`'s `!w.settled` clause was true forever after the first
+        // animation and the panel repainted at full rate with a parked camera and nothing moving.
+        // It also hid `max_expand`'s deferred splits: those only ever caught up *because* frames
+        // kept arriving. A deferred cell is already sitting at its closed pose, so nothing about
+        // it animates and nothing would ask for the next frame — see the gate in
+        // `decideTopology`, which now reports the deferral instead of relying on this bug.
+        self.settled = true;
         // `marks` is gone, so the cell -> mark index that points into it is too. `present` stamps a
         // fresh one; until it does, `markIndex` must answer "no mark" rather than hand out an index
         // into an array that no longer has it — which on a frame `step` returns early from (a world
@@ -713,6 +726,24 @@ pub const World = struct {
 
     /// Pass 1 — which cells are open. Reads only the ladder, the view, and the budget.
     pub fn decideTopology(self: *World, view: View, p: Params) !void {
+        // The notes the reader has open, as slots into `note_at`.
+        //
+        // Every cell holds a contiguous `[ls, le)` range of those slots, so "does this cell
+        // contain an open note" is two integer compares — cheap enough to ask of every cell on
+        // the frontier, which is what keeps the chain below honest.
+        const open_slots = &self.sc_slots;
+        open_slots.clearRetainingCapacity();
+        {
+            var li: usize = 0;
+            while (li <= p.open_leaves.len) : (li += 1) {
+                const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
+                if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
+                const note = self.lad.cells[leaf].note;
+                if (note == fold.invalid or note >= self.lad.slot_of.len) continue;
+                try open_slots.append(self.gpa, self.lad.slot_of[note]);
+            }
+        }
+
         const frontier = &self.sc_frontier;
         const next = &self.sc_next;
         const vis = &self.sc_vis;
@@ -760,12 +791,38 @@ pub const World = struct {
 
             next.clearRetainingCapacity();
             for (vis.items) |id| {
-                var will_open = self.wantsSplit(id, view, p) and
-                    (cutoff == null or self.radiusClass(id) > cutoff.?);
+                // A note you have open never coalesces.
+                //
+                // This is a *topology* guarantee, not a drawing trick. Without it the budget's
+                // radius cutoff moves as you zoom and can close an ancestor of the note you are
+                // zooming into: the leaf stops being its own mark, its pose slides back to the
+                // mass centre, and the note flies away from under the cursor just as you try to
+                // enter it. Nothing else on screen moves, because nothing else shares that
+                // cell's radius class — which is what made it look like one node misbehaving
+                // rather than a rule.
+                //
+                // Pinning the *pose* instead, which is what this used to do, cannot fix it: the
+                // note is then drawn somewhere its own mark no longer is, so its links terminate
+                // off the disc and the mass it belongs to still slides out from under it. The
+                // decision has to change, and then pose, links, label and camera all agree by
+                // construction.
+                //
+                // Costs at most depth x arity extra cells per open note against a budget in the
+                // thousands, bounded by the tab strip.
+                const holds_open_note = self.containsOpenSlot(id, open_slots.items);
+                var will_open = holds_open_note or (self.wantsSplit(id, view, p) and
+                    (cutoff == null or self.radiusClass(id) > cutoff.?));
                 // First-time placement is the hitch: 128 relax steps per cell. Already-placed
                 // cells open for free; cap only the ones that still have to settle.
-                if (will_open and p.max_expand > 0 and !self.field.expanded[id]) {
-                    if (expanded_n >= p.max_expand) will_open = false else expanded_n += 1;
+                if (will_open and !holds_open_note and p.max_expand > 0 and !self.field.expanded[id]) {
+                    if (expanded_n >= p.max_expand) {
+                        will_open = false;
+                        // Deferred, not decided. A cell held back here is already at its closed
+                        // pose, so no crossfade will ask for the frame that would let it open on
+                        // the next pass — without this the field parks one or more generations
+                        // short of the budget and stays there until the pointer moves.
+                        self.settled = false;
+                    } else expanded_n += 1;
                 }
                 self.open[id] = will_open;
                 if (!will_open) {
@@ -801,6 +858,21 @@ pub const World = struct {
         const sy = view.h * 0.5 + (y - view.cy) * view.zoom;
         const m = sr + p.cull_pad_px;
         return sx >= -m and sx <= view.w + m and sy >= -m and sy <= view.h + m;
+    }
+
+    /// Does this cell hold one of the reader's open notes?
+    ///
+    /// `Cell.ls`/`le` bound a contiguous run of `note_at`, so a cell contains a note exactly when
+    /// that note's slot falls in the range. A leaf holding the note answers false: there is
+    /// nothing left to split, and forcing `open` on a childless cell would only cost the walk.
+    fn containsOpenSlot(self: *const World, id: u32, slots: []const u32) bool {
+        if (slots.len == 0) return false;
+        const c = self.lad.cells[id];
+        if (c.child_count == 0) return false;
+        for (slots) |s| {
+            if (s >= c.ls and s < c.le) return true;
+        }
+        return false;
     }
 
     fn wantsSplit(self: *const World, id: u32, view: View, p: Params) bool {
@@ -1774,6 +1846,87 @@ test "a splitting mass shrinks toward a note's size as it fades" {
         }
     }
     try testing.expect(saw_smaller);
+}
+
+test "the note you have open never coalesces, and never moves" {
+    // The symptom: zoom toward the note you are reading and it flies off, alone, while every
+    // other disc around it stays put — so you can never get close enough to enter it.
+    //
+    // The cause is the budget's radius cutoff, which moves with the zoom and can close an
+    // ancestor of that one leaf. The leaf stops being its own mark and its pose slides back down
+    // the chain toward the mass centre. Only that note moves, because only its ancestor happened
+    // to sit at the class the cutoff landed on.
+    //
+    // Both halves are asserted here: the leaf is its own mark at every zoom, and it is drawn at
+    // its resting position rather than somewhere along the way to it.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const leaf = w.lad.leaf_cell[2000];
+    w.field.ensurePlaced(&w.lad, leaf);
+    const own = w.field.pos[leaf];
+
+    // Tight enough that the cutoff is doing real work at every step.
+    const p: Params = .{ .budget = 120, .focus_leaf = leaf };
+    var zoom: f32 = 4;
+    while (zoom <= 400) : (zoom *= 1.4) {
+        const view: View = .{ .w = 900, .h = 600, .zoom = zoom, .cx = own.x, .cy = own.y };
+        try settle(&w, view, p, 300);
+
+        const mi = w.markIndex(leaf) orelse return error.TestUnexpectedResult;
+        const m = w.marks.items[mi];
+        try testing.expect(m.is_note);
+        try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
+        try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+    }
+}
+
+test "a parked camera comes to rest" {
+    // `settled` is what lets the panel stop asking for frames. It starts true, and *only* the
+    // per-frame reset in `clearFrame` ever puts it back — without that, the first crossfade in
+    // the life of a `World` pinned the flag false forever and Atlas repainted at full rate with
+    // nothing moving and no camera input.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 3000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 3000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 12, .cx = 0, .cy = 0 };
+    const p: Params = .{ .budget = 140 };
+    try settle(&w, view, p, 300);
+    try testing.expect(w.settled);
+
+    // A view change starts animating again, and then rests again.
+    const nearer: View = .{ .w = 900, .h = 600, .zoom = 48, .cx = 0, .cy = 0 };
+    try w.step(nearer, p, 1.0 / 60.0);
+    try settle(&w, nearer, p, 300);
+    try testing.expect(w.settled);
+}
+
+test "a split deferred by max_expand asks for another frame" {
+    // `max_expand` holds first-time placements back so a fast zoom does not settle hundreds of
+    // cells in one hitch. A held-back cell is already sitting at its closed pose, so nothing
+    // about it animates — if the deferral is not reported, the field parks short of the budget
+    // and stays there until something else happens to request a frame.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 3000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 3000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 64, .cx = 0, .cy = 0 };
+    const capped: Params = .{ .budget = 400, .max_expand = 1 };
+    try w.step(view, capped, 1.0 / 60.0);
+    try testing.expect(!w.settled);
+
+    // Uncapped, the same view reaches a resting state.
+    const free: Params = .{ .budget = 400 };
+    try settle(&w, view, free, 600);
+    try testing.expect(w.settled);
 }
 
 test "topology does not depend on animation state" {
