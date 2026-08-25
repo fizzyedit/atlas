@@ -124,6 +124,24 @@ pub fn zoomAtScreen(self: *Camera, factor: f32, focal: dvui.Point.Physical) void
 /// A camera pose — where `fitBounds` would land, without committing to it.
 pub const Pose = struct { center: dvui.Point, zoom: f32 };
 
+/// Pose that applies `new_zoom` while keeping `world` at its current screen position.
+///
+/// Zooming around a point always moves `center` (that is how the point stays put). It does
+/// **not** slide `world` to the middle of the viewport — that is `poseForBounds`, and it is
+/// what made diving into a note at the edge of the panel yank the whole view.
+pub fn poseZoomAround(self: *const Camera, world: dvui.Point, new_zoom: f32) Pose {
+    const z = self.clamp(new_zoom);
+    const screen = self.worldToScreen(world);
+    const o = self.screenOrigin();
+    return .{
+        .zoom = z,
+        .center = .{
+            .x = world.x - (screen.x - o.x) / z,
+            .y = world.y - (screen.y - o.y) / z,
+        },
+    };
+}
+
 /// Compute the pose that makes `bounds` (world AABB) fill the viewport with `padding`
 /// screen pixels. Pure — callers snap (`fitBounds`) or retarget (`center_target`/`zoom_target`).
 pub fn poseForBounds(self: *const Camera, bounds: dvui.Rect, padding: f32) Pose {
@@ -248,6 +266,25 @@ test "round-trip holds across zooms" {
         try testing.expectApproxEqAbs(world.x, back.x, 1e-4);
         try testing.expectApproxEqAbs(world.y, back.y, 1e-4);
     }
+}
+
+test "poseZoomAround keeps the world point on screen and off the viewport centre" {
+    const vp: dvui.Rect.Physical = .{ .x = 0, .y = 0, .w = 800, .h = 600 };
+    var c = camAt(.{ .x = 0, .y = 0 }, 1.0, vp);
+    const world: dvui.Point = .{ .x = 200, .y = -100 };
+    const before = c.worldToScreen(world);
+    // Not in the middle of the pane — that is the whole point of pinning rather than fitting.
+    try testing.expect(@abs(before.x - 400) > 50);
+    const pose = c.poseZoomAround(world, 4.0);
+    c.center = pose.center;
+    c.zoom = pose.zoom;
+    const after = c.worldToScreen(world);
+    try testing.expectApproxEqAbs(before.x, after.x, 1e-3);
+    try testing.expectApproxEqAbs(before.y, after.y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.zoom, 1e-5);
+    // Fitting would have put this point at the viewport centre; pinning must not.
+    const origin = c.screenOrigin();
+    try testing.expect(@abs(after.x - origin.x) > 50);
 }
 
 test "zoomAtScreen keeps the focal world point fixed" {

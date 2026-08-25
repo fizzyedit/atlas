@@ -1944,7 +1944,7 @@ fn applyTrackpadPinch(p: *Panel, vp: dvui.Rect.Physical) void {
     if (!vp.contains(cursor)) return;
     p.fling_x.cancel();
     p.fling_y.cancel();
-    p.camera.zoomAtScreen(ratio, descentZoomFocal(p, ratio, cursor));
+    p.camera.zoomAtScreen(ratio, cursor);
     cameraTakenOver(p);
     dvui.refresh(null, @src(), dvui.parentGet().data().id);
 }
@@ -2816,10 +2816,9 @@ fn updateInterior(p: *Panel, st: anytype) void {
         };
     }
 
-    // The actual `fitInteriorSun` call is deferred to `applyInteriorFramingIfNeeded`, run later in
-    // the frame after `stepWorld`/`stepInteriorWorld` have refreshed `p.nodes[idx].home` and
-    // `p.interior.parent` for *this* frame — see that function's doc comment for why calling it
-    // from here, before those run, pinned the camera to a one-frame-stale sun position.
+    // The actual `zoomInteriorPinned` call is deferred to `applyInteriorFramingIfNeeded`, run later
+    // in the frame after `stepWorld`/`stepInteriorWorld` have refreshed `p.nodes[idx].home` and
+    // `p.interior.parent` for *this* frame — see that function's doc comment.
     p.interior.t_prev = p.interior.t;
     p.interior.t = t;
 }
@@ -3567,63 +3566,26 @@ fn maybeFitCamera(p: *Panel) void {
     p.fitted_vp_h = vp.h;
 }
 
+/// Re-run `applyFraming` for an in-progress descent, once this frame's positions are current.
+///
+/// Must run *after* `stepWorld`/`stepInteriorWorld`, not from inside `updateInterior` (which runs
+/// before both). Click-to-enter pins the camera to this frame's sun *screen* position (see
+/// `zoomInteriorPinned`); calling that from `updateInterior` used last frame's sun and left a
+/// one-frame lag that could freeze in as a small offset.
+fn applyInteriorFramingIfNeeded(p: *Panel) void {
+    if (p.framing != .interior) return;
+    // Recomputing a pin from a mid-chase camera walks the sun around the pane: each frame's
+    // `poseZoomAround` uses the drifted screen position as the new pin.
+    if (p.camera.chasing()) return;
+    if (!p.layout_settled or p.interior.t < 0.98) {
+        applyFraming(p);
+    }
+}
+
 /// Re-derive the camera pose for the current `framing`. Called whenever the thing the pose was
 /// derived *from* has moved underneath it: the panel resized, or the index rebuilt and the
 /// layout re-solved. Idempotent — re-running it against unchanged inputs retargets to where the
 /// camera already is, and `chase` then does nothing.
-/// Re-run `applyFraming` for an in-progress descent, once this frame's positions are current.
-///
-/// Must run *after* `stepWorld`/`stepInteriorWorld`, not from inside `updateInterior` (which runs
-/// before both). `fitInteriorSun` pins the camera to `p.interior.nodes[0].target`, which is only
-/// fresh once `stepInteriorWorld` has copied this frame's `p.nodes[idx].home` into it; calling it
-/// from `updateInterior` instead pins the camera to *last* frame's sun position. Harmless while
-/// the parent note is sitting still, but a visible one-frame lag while it's still easing — and if
-/// framing happens to stop being re-applied (settled, `t` past its threshold) on exactly such a
-/// frame, that lag freezes in as a small permanent-looking offset between the sun and the node the
-/// reader actually clicked.
-fn applyInteriorFramingIfNeeded(p: *Panel) void {
-    if (p.framing == .interior and
-        (!p.layout_settled or p.camera.chasing() or p.interior.t < 0.98))
-    {
-        applyFraming(p);
-        return;
-    }
-    // Hand-driven descent never sets `.interior` (a wheel tick is `.free`). Zooming around the
-    // cursor then grows the cloud from wherever the node sat — often the bottom of the panel —
-    // so the field slides off the nearest edge while the overview links keep pointing at it.
-    // While `t` is still rising, drift the sun toward the viewport centre; once we have arrived,
-    // leave the camera alone so the reader can pan around inside.
-    driftSunIntoView(p);
-}
-
-/// How hard to pull the camera onto the sun during a hand descent, 0 = leave it, 1 = snap.
-///
-/// Zero while backing out or before the cloud has started to show; eases in so a glance-zoom
-/// over a node does not yank the view.
-fn descentCenterPull(t: f32, t_prev: f32) f32 {
-    if (!(t > t_prev) or t <= 0.15 or t >= 0.98) return 0;
-    const u = std.math.clamp((t - 0.15) / (0.98 - 0.15), 0, 1);
-    return u * u;
-}
-
-fn driftSunIntoView(p: *Panel) void {
-    const k = descentCenterPull(p.interior.t, p.interior.t_prev);
-    if (k <= 0 or p.interior.nodes.len == 0) return;
-    const sun = p.interior.nodes[0].pos;
-    p.camera.center.x += (sun.x - p.camera.center.x) * k;
-    p.camera.center.y += (sun.y - p.camera.center.y) * k;
-    p.camera.syncTargets();
-}
-
-/// During a hand descent, zoom around the sun rather than the cursor so the cloud grows in
-/// place instead of off the nearest edge. Cursor-zoom again once we have arrived, and always
-/// when zooming out.
-fn descentZoomFocal(p: *const Panel, factor: f32, cursor: dvui.Point.Physical) dvui.Point.Physical {
-    if (factor <= 1 or p.interior.nodes.len == 0) return cursor;
-    if (descentCenterPull(p.interior.t, 0) <= 0) return cursor;
-    return p.camera.worldToScreen(p.interior.nodes[0].pos);
-}
-
 fn applyFraming(p: *Panel) void {
     switch (p.framing) {
         .free => {},
@@ -3632,10 +3594,10 @@ fn applyFraming(p: *Panel) void {
             // Require the note still open — a closed tab must not keep pinning the camera to a
             // descent that no longer has a document behind it.
             if (noteOpen(p, id) and p.interior.nodes.len > 0) {
-                // Keep the exit sun where the doc node was: zoom to the interior cloud, but pin
-                // the camera centre on the sun/parent. `fitToNodes` would recenter on the AABB
-                // centroid and slide the sun off the point you zoomed into.
-                fitInteriorSun(p, .{ .animate = true });
+                // Zoom into the cloud around the sun's current screen position. Centering the
+                // sun in the pane (`fitInteriorSun`) is what the extents button is for — doing
+                // it on enter yanked every dive onto the middle of the panel.
+                zoomInteriorPinned(p, .{ .animate = true });
             } else {
                 p.framing = .extents;
                 fitToNodes(p, .{ .animate = true });
@@ -3676,37 +3638,52 @@ fn fitMaxGapPx(vp: dvui.Rect.Physical) f32 {
     return @max(fit_max_gap_px * dpiScale(), short * fit_max_gap_frac);
 }
 
-/// Zoom to the open note's interior while keeping the sun (parent doc node) fixed on screen.
-/// That is what makes zooming *into* a node feel literal: headings bloom around the same point
-/// the overview bubble occupied, and the sun is still the exit back out.
-fn fitInteriorSun(p: *Panel, mode: FitMode) void {
-    if (p.interior.nodes.len == 0) return;
-    // Sun is interior root (index 0) and equals `interior.parent` by construction.
-    const sun = p.interior.nodes[0].pos;
-    // The cloud's own radius, not `interior.slot`. Slot is the nested ring gap — tiny on a
-    // large document, large on a two-item one — and using it here as if it were the overview
-    // lattice spacing did two things, both wrong:
-    //
-    //   * `@max(slot, 1)` plus every heading still sitting on the sun (see `buildInteriorWorld`)
-    //     fitted a 1-wu disc, so the first chase zoomed far past the real field.
-    //   * `fitMaxGapPx / slot` is the overview dinner-plate stop. On a small interior, slot is
-    //     a big fraction of the cloud, so that cap forbade the camera from zooming in far enough
-    //     for the field to fill the panel. It sat as a blob at the note's screen position, and
-    //     any further wheel zoom grew it off the nearest edge.
+/// Zoom that frames the interior cloud in the pane. Shared by the pin (enter) and the
+/// centre-on-sun (extents button) paths — they disagree about *where* the camera sits, not
+/// about how close it is.
+///
+/// Uses the cloud's own radius, not `interior.slot`. Slot is the nested ring gap, and treating
+/// it as the overview lattice spacing did two things, both wrong: `@max(slot, 1)` plus every
+/// heading still sitting on the sun fitted a 1-wu disc; `fitMaxGapPx / slot` is the overview
+/// dinner-plate stop and forbade small interiors from filling the panel.
+fn interiorFitZoom(p: *const Panel) f32 {
     const max_r = @max(p.interior.radius, 1e-3);
+    const sun = p.interior.nodes[0].pos;
     const bounds: dvui.Rect = .{
         .x = sun.x - max_r,
         .y = sun.y - max_r,
         .w = max_r * 2,
         .h = max_r * 2,
     };
-    const pad = fitPadPx(p.camera.viewport);
-    const pose = p.camera.poseForBounds(bounds, pad);
+    return p.camera.poseForBounds(bounds, fitPadPx(p.camera.viewport)).zoom;
+}
+
+/// Zoom into the open note's interior without moving the sun on screen.
+///
+/// That is what makes zooming *into* a node feel literal: headings bloom around the same point
+/// the overview bubble occupied, wherever that was in the pane. The extents button still has
+/// `fitInteriorSun` if the reader wants the cloud centred.
+fn zoomInteriorPinned(p: *Panel, mode: FitMode) void {
+    if (p.interior.nodes.len == 0) return;
+    const pose = p.camera.poseZoomAround(p.interior.nodes[0].pos, interiorFitZoom(p));
+    if (mode.animate) {
+        p.camera.retarget(pose);
+    } else {
+        p.camera.center = pose.center;
+        p.camera.zoom = pose.zoom;
+        p.camera.syncTargets();
+    }
+}
+
+/// Put the interior in the middle of the pane and zoom to fit. The extents button, not enter.
+fn fitInteriorSun(p: *Panel, mode: FitMode) void {
+    if (p.interior.nodes.len == 0) return;
+    const sun = p.interior.nodes[0].pos;
     p.camera.center_target = sun;
-    p.camera.zoom_target = pose.zoom;
+    p.camera.zoom_target = interiorFitZoom(p);
     if (!mode.animate) {
         p.camera.center = sun;
-        p.camera.zoom = pose.zoom;
+        p.camera.zoom = p.camera.zoom_target;
     }
 }
 
@@ -5991,7 +5968,7 @@ fn handleInput(p: *Panel, st: anytype) void {
     if (zoomed_this_frame and zoom_factor != 1.0) {
         p.fling_x.cancel();
         p.fling_y.cancel();
-        p.camera.zoomAtScreen(zoom_factor, descentZoomFocal(p, zoom_factor, zoom_focal));
+        p.camera.zoomAtScreen(zoom_factor, zoom_focal);
         cameraTakenOver(p);
         dvui.refresh(null, @src(), id);
     }
@@ -6414,12 +6391,4 @@ test "an interior fit uses the cloud radius, not the overview dinner-plate cap" 
     // The un-capped fit covers most of the pane; the dinner-plate zoom does not.
     try std.testing.expect(fit_zoom * radius * 2 > vp_short * 0.5);
     try std.testing.expect(dinner_plate * radius * 2 < vp_short * 0.5);
-}
-
-test "the camera only pulls onto the sun while a hand descent is still arriving" {
-    try std.testing.expectEqual(@as(f32, 0), descentCenterPull(0.1, 0.05));
-    try std.testing.expectEqual(@as(f32, 0), descentCenterPull(0.4, 0.5)); // backing out
-    try std.testing.expectEqual(@as(f32, 0), descentCenterPull(0.99, 0.9));
-    try std.testing.expect(descentCenterPull(0.6, 0.4) > 0);
-    try std.testing.expect(descentCenterPull(0.9, 0.8) > descentCenterPull(0.5, 0.4));
 }
