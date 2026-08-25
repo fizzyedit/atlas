@@ -350,9 +350,6 @@ const Memo = struct { stamp: u32 = 0, of: u32 = fold.invalid };
 /// The same, for one cut cell's running per-partner weight total.
 const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
 
-/// One link's last-seen stamp in the lifted set. See `World.link_fade`.
-const Fade = struct { v: f32, stamp: u32 };
-
 /// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
 ///
 /// A strict total order — the `(a, b)` tie-break is the pair identity, so no two distinct links
@@ -471,7 +468,6 @@ pub const World = struct {
     sc_acc: std.AutoHashMapUnmanaged(u64, f32) = .empty,
     sc_focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    sc_dead: std.ArrayListUnmanaged(u64) = .empty,
     sc_grow_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
     sc_grow_dead: std.ArrayListUnmanaged(u64) = .empty,
     sc_frontier: std.ArrayListUnmanaged(u32) = .empty,
@@ -523,8 +519,6 @@ pub const World = struct {
     /// hash map built from scratch each frame — one insert per link, so ~22,000 of them at the top
     /// of the quality slider, to answer a question this table can answer itself by recording which
     /// frame last touched each entry.
-    link_fade: std.AutoHashMapUnmanaged(u64, Fade) = .empty,
-    fade_epoch: u32 = 0,
     /// Per-link reach-out progress for the focused note's own links.
     ///
     /// Keyed by the **unordered** leaf pair, which is what lets the reader ride an edge. Following
@@ -704,7 +698,6 @@ pub const World = struct {
     pub fn deinit(self: *World) void {
         self.marks.deinit(self.gpa);
         self.links.deinit(self.gpa);
-        self.link_fade.deinit(self.gpa);
         self.focus_grow.deinit(self.gpa);
         self.cut.deinit(self.gpa);
         self.web.deinit(self.gpa);
@@ -720,7 +713,6 @@ pub const World = struct {
         self.sc_acc.deinit(self.gpa);
         self.sc_focus_pairs.deinit(self.gpa);
         self.sc_edge_seen.deinit(self.gpa);
-        self.sc_dead.deinit(self.gpa);
         self.sc_grow_live.deinit(self.gpa);
         self.sc_grow_dead.deinit(self.gpa);
         self.sc_frontier.deinit(self.gpa);
@@ -1329,38 +1321,23 @@ pub const World = struct {
     fn fadeLinks(self: *World, p: Params, dt: f32) !void {
         try self.stepFocusGrow(p, dt);
 
-        // The draw list is rebuilt every frame from the cached lift. Cut changes used to
-        // crossfade: arriving lines mixed up from the window fill, dying ones mixed down into
-        // it. With opaque `intoBg` that is a flash — the whole web walks to pane colour, sits
-        // there, then pops back — not a dissolve. Snap to the current lift instead.
+        // The draw list is the current lift, at full strength.
+        //
+        // Cut changes used to crossfade: arriving lines mixed up from the window fill, dying ones
+        // mixed down into it. With opaque `intoBg` that is a flash — the whole web walks to pane
+        // colour, sits there, then pops back — not a dissolve, so the fade was dropped.
+        //
+        // The bookkeeping behind it was not. A per-link stamp map was still being written for
+        // every lifted link, then walked end to end and pruned, every frame — a hash `getOrPut`
+        // up to 35,000 times plus a full iteration, to produce a value nothing read: every entry
+        // was stamped `1` and every link drawn at `alpha = 1`. It is a straight copy now.
         self.links.clearRetainingCapacity();
-
-        self.fade_epoch +%= 1;
-        if (self.fade_epoch == 0) {
-            var reset = self.link_fade.valueIterator();
-            while (reset.next()) |v| v.stamp = 0;
-            self.fade_epoch = 1;
-        }
-        const epoch = self.fade_epoch;
-
         try self.links.ensureUnusedCapacity(self.gpa, self.lifted.items.len);
         for (self.lifted.items) |l| {
-            const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
-            const gop = try self.link_fade.getOrPut(self.gpa, key);
-            gop.value_ptr.* = .{ .v = 1, .stamp = epoch };
             var out = l;
             out.alpha = 1;
             self.links.appendAssumeCapacity(out);
         }
-
-        const dead = &self.sc_dead;
-        dead.clearRetainingCapacity();
-        var it = self.link_fade.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.stamp == epoch) continue;
-            try dead.append(self.gpa, kv.key_ptr.*);
-        }
-        for (dead.items) |k| _ = self.link_fade.remove(k);
     }
 
     pub fn liftLinks(self: *World, p: Params, dt: f32) !void {
