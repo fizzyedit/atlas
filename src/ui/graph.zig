@@ -4111,7 +4111,7 @@ fn worldParams(p: *Panel) world_mod.Params {
 /// Notes only. A coalesced mass is a *new aggregate* — the old world had no single thing that
 /// became it, so there is no honest position to come from, and inventing one would slide a ring in
 /// from somewhere it never was.
-fn applyMorph(p: *Panel, w: *world_mod.World, view: world_mod.View) void {
+fn applyMorph(p: *Panel, w: *world_mod.World) void {
     if (p.morph_t >= 1) return;
     p.morph_t += @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0) / morph_s;
     if (p.morph_t >= 1) {
@@ -4127,10 +4127,6 @@ fn applyMorph(p: *Panel, w: *world_mod.World, view: world_mod.View) void {
         const from = p.morph_from.get(p.nodes[m.note].note_id) orelse continue;
         m.wx = from.x + (m.wx - from.x) * e;
         m.wy = from.y + (m.wy - from.y) * e;
-        // Screen coordinates are derived from the world ones by `present`, so they have to be
-        // re-derived here or hit-testing and labels would aim at where the note is *going*.
-        m.x = view.w * 0.5 + (m.wx - view.cx) * view.zoom;
-        m.y = view.h * 0.5 + (m.wy - view.cy) * view.zoom;
     }
     dvui.refresh(null, @src(), dvui.parentGet().data().id);
 }
@@ -4152,7 +4148,7 @@ fn stepWorld(p: *Panel, prof: *i96) void {
     // raising the mark budget doesn't leave the web pinned at a cap the marks have outgrown.
     const params = worldParams(p);
     w.step(view, params, dvui.secondsSinceLastFrame()) catch return;
-    applyMorph(p, w, view);
+    applyMorph(p, w);
     updateHoldsOpen(p, w);
     frame_profile.world_step_ns = profLap(prof);
     syncNodesFromWorld(p, w);

@@ -68,6 +68,9 @@ pub fn build(b: *std.Build) void {
         // Positions derived from the fold ladder: children inside the parent's disc, one rule,
         // no force solve. Plain `Vec2`, so it stays headless too.
         .{ "atlas-containment-tests", "src/ui/containment.zig" },
+        // The drawing hierarchy built *from* positions rather than the other way round: Hilbert
+        // order, gap-defined chunking, true bottom-up bounds. Plain `Vec2`, headless.
+        .{ "atlas-spatial-tests", "src/ui/spatial.zig" },
         // The living set: budgeted, view-culled, level-uniform select over the fold ladder,
         // emitting screen-space marks. Replaces quadlod + quad_agents + lod.
         .{ "atlas-world-tests", "src/ui/world.zig" },

@@ -45,11 +45,15 @@ pub const Mark = struct {
     cell: u32,
     /// Animated world position. The caller applies its own camera transform, so there is exactly
     /// one place that knows how world maps to screen.
+    ///
+    /// There used to be a screen position here too, computed from `View` alongside these. Nothing
+    /// ever read it — `world_draw` transforms `wx`/`wy` itself, because it is the only place that
+    /// knows the caller's `toWorld` nesting — while *two* places wrote it and had to keep it in
+    /// step: `present`, and `applyMorph` afterwards. A field that is written twice and read never
+    /// is a desync waiting for a third writer.
     wx: f32,
     wy: f32,
-    /// Screen position (viewport-relative, origin top-left) and radius in pixels.
-    x: f32,
-    y: f32,
+    /// Radius in screen pixels.
     r: f32,
     alpha: f32,
     /// A real note (draw filled) rather than a coalesced mass (draw dashed).
@@ -924,8 +928,6 @@ pub const World = struct {
                         .cell = id,
                         .wx = mx,
                         .wy = my,
-                        .x = view.w * 0.5 + (mx - view.cx) * view.zoom,
-                        .y = view.h * 0.5 + (my - view.cy) * view.zoom,
                         .r = r,
                         .alpha = alpha,
                         .is_note = is_note,
