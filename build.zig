@@ -52,6 +52,18 @@ pub fn build(b: *std.Build) void {
     // records out, with no filesystem, no database, and no dvui, which is the whole reason
     // they're separate files from the plumbing that uses them.
     const test_step = b.step("test", "Run atlas's unit tests");
+
+    // `graph.zig` lives on the plugin module (it needs `core` / `fizzy_sdk` / `dvui`). Testing
+    // that module is how its tests run — today, that the vault-switch drop forgets hover,
+    // interior, camera, and the previous generation, which is what made simplewiki → fizzy a
+    // SEGV. The test is field-reset only and does not need a window.
+    {
+        const graph_tests = b.addTest(.{
+            .name = "atlas-graph-tests",
+            .root_module = plugin.module,
+        });
+        test_step.dependOn(&b.addRunArtifact(graph_tests).step);
+    }
     inline for (.{
         .{ "atlas-resolve-tests", "src/index/resolve.zig" },
         .{ "atlas-schema-tests", "src/index/schema.zig" },

@@ -924,6 +924,94 @@ pub const Panel = struct {
         self.* = undefined;
     }
 
+    /// Forget the live arrangement so a different vault cannot be drawn as a continuation of this one.
+    ///
+    /// Indices, note ids, the camera pose and the interior cloud all name things in *this* vault.
+    /// Switching folders used to empty `nodes` and drop the world, and stop there. Hover still
+    /// indexed the old array, leftover zoom on a much smaller vault read as "inside a note",
+    /// and `first_build` stayed false because `gen` still held the previous index's generation —
+    /// so the new graph inherited a Wikipedia-scale camera and a 286k-note hover index. The frame
+    /// after the new world landed then walked those leftovers and crashed (simplewiki → fizzy).
+    fn dropArrangement(self: *Panel) void {
+        if (self.job) |job| {
+            // The in-flight solve carries the *previous* vault's snapshot, and `finishRebuild`
+            // would happily adopt it — which is how the old graph appeared to stay live, then swap.
+            job.cancel.store(true, .release);
+            job.deinit(sdk.allocator());
+            self.job = null;
+        }
+        if (self.world_state) |*w| {
+            w.deinit();
+            self.world_state = null;
+        }
+        self.interior.clear();
+        self.interior.fail_id = null;
+        self.interior.fail_gen = std.math.maxInt(u64);
+        // `path_index` keys are slices into the panel arena; drop them before the pages go away.
+        self.path_index.clearRetainingCapacity();
+        self.id_index.clearRetainingCapacity();
+        self.holds_open.clearRetainingCapacity();
+        self.visible.clearRetainingCapacity();
+        self.interior_visible.clearRetainingCapacity();
+        self.open_notes.clearRetainingCapacity();
+        self.label_live.clearRetainingCapacity();
+        self.interior_label_live.clearRetainingCapacity();
+        self.pointer_warm.clearRetainingCapacity();
+        self.morph_from.clearRetainingCapacity();
+        self.edge_anim.clearRetainingCapacity();
+        self.nodes = &.{};
+        self.edges = &.{};
+        self.live_pos = &.{};
+        self.at_level0 = &.{};
+        self.notes_at_level0 = 0;
+        self.at_level0_epoch = std.math.maxInt(u64);
+        _ = self.arena.reset(.free_all);
+        self.active_doc_id = 0;
+        self.focus_node = fold.invalid;
+        self.focus_claim = fold.invalid;
+        self.focus_claim_frames = 0;
+        self.hover_node = null;
+        self.hover_cluster = null;
+        self.hover_cluster_prev = null;
+        self.hover_cluster_t = 0;
+        self.press_node = null;
+        self.world_epoch = self.layout_epoch -% 1;
+        self.world_radius = 0;
+        self.world_bounds = .{};
+        self.layout_slot = 0;
+        self.note_count = 0;
+        self.framing = .extents;
+        self.fitted_vp_w = 0;
+        self.fitted_vp_h = 0;
+        self.open_hash = std.math.maxInt(u64);
+        // So `finishRebuild` treats the next solve as a first build: snap the camera, do not
+        // morph from the previous vault, do not `applyFraming` a leftover `.free` pose.
+        self.gen = std.math.maxInt(u64);
+        self.pending_gen = std.math.maxInt(u64);
+        self.pending_quiet_s = 0;
+        self.since_rebuild_s = 1e9;
+        self.morph_t = 1;
+        self.force_rebuild = false;
+        self.rebuild_waiting = false;
+        self.lift_held = 0;
+        self.motion_bias = 1;
+        self.zoom_speed = 0;
+        self.zoom_dir = 0;
+        // Current zoom/center name a place in the previous vault. `updateInterior` runs before
+        // the first-build fit and reads zoom against the *new* note count, so a leftover
+        // Wikipedia close-up on a fifteen-note vault is "deep inside a note".
+        self.camera.center = .{};
+        self.camera.zoom = 1;
+        self.camera.syncTargets();
+        self.camera.user_driving = false;
+        self.camera.zoom_floor = Camera.min_zoom;
+        self.fling_x = .{};
+        self.fling_y = .{};
+        self.drag_active = false;
+        self.moved_since_press = false;
+        self.gesture_active = false;
+    }
+
     fn ensureDensity(self: *Panel) ?*galaxy.Density {
         if (self.density == null) {
             self.density = galaxy.Density.init(sdk.allocator()) catch return null;
@@ -1862,38 +1950,16 @@ const aspect_hysteresis: f32 = 0.18;
 fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     // A different vault is a different graph, not a newer version of this one.
     //
-    // Nothing tracked the vault's identity here, so switching folders left the previous vault's
-    // nodes in place: the panel went on drawing that graph as if it belonged to the folder just
-    // opened, and — because the spinner is gated on having no nodes — showed no sign that anything
-    // was loading. Dropping the arrangement makes the switch honest and puts the progress spinner
-    // back.
+    // `vault_key` is what makes the switch detectable. The first version of this block emptied
+    // `nodes` and dropped the world, which put the spinner back — and left hover, the interior
+    // cloud, the camera pose and `gen` naming the previous vault. On simplewiki → fizzy that was
+    // a SEGV: the 15-note world built, then the rest of the frame walked a 286k-note hover index
+    // and a leftover close-up zoom that read as "inside a note". `dropArrangement` forgets all of
+    // that so the next solve is a first build.
     const vault_key: u64 = if (st.vault_root) |root| std.hash.Wyhash.hash(0, root) else 0;
     if (p.vault_key != vault_key) {
         p.vault_key = vault_key;
-        // Drop any solve still in flight. It carries the *previous* vault's snapshot, and
-        // `finishRebuild` would happily adopt it — repopulating the panel with the old vault's
-        // graph after the switch, which is why the old one appeared to stay live and then swap.
-        if (p.job) |job| {
-            job.cancel.store(true, .release);
-            job.deinit(sdk.allocator());
-            p.job = null;
-        }
-        p.nodes = &.{};
-        p.edges = &.{};
-        p.visible.clearRetainingCapacity();
-        p.open_notes.clearRetainingCapacity();
-        p.path_index.clearRetainingCapacity();
-        p.id_index.clearRetainingCapacity();
-        p.active_doc_id = 0;
-        p.notes_at_level0 = 0;
-        p.at_level0 = &.{};
-        if (p.world_state) |*w| {
-            w.deinit();
-            p.world_state = null;
-        }
-        p.world_epoch = p.layout_epoch -% 1;
-        p.framing = .extents;
-        p.open_hash = std.math.maxInt(u64);
+        p.dropArrangement();
     }
 
     const gen = st.generation.load(.acquire);
@@ -4087,6 +4153,11 @@ fn focusNodeIndex(p: *Panel) ?u32 {
         } else {
             p.focus_claim_frames +|= 1;
             p.focus_node = p.focus_claim;
+            if (p.focus_node >= p.nodes.len) {
+                p.focus_claim = fold.invalid;
+                p.focus_node = fold.invalid;
+                return null;
+            }
             return p.focus_node;
         }
     }
@@ -6146,4 +6217,48 @@ pub fn wantsRepaintFor(p: *Panel) bool {
         // whatever value it arrived at.
         (p.framing == .interior and p.interior.nodes.len > 0 and p.interior.t < 0.98 and
             @abs(p.interior.t - p.interior.t_prev) > 0.0005);
+}
+
+test "dropping a vault forgets hover, interior, camera, and the previous generation" {
+    // No window, no world, no job — just the fields a folder switch used to leave live, which
+    // is what made simplewiki → fizzy a SEGV: the new 15-note world landed, then the rest of
+    // the frame walked Wikipedia's hover index / interior / zoom against it.
+    var p = Panel.init(std.testing.allocator);
+    defer {
+        p.interior.arena.deinit();
+        p.arena.deinit();
+    }
+
+    p.gen = 7;
+    p.hover_node = 123456;
+    p.hover_cluster = .{ .level = 1, .index = 99, .alpha = 1 };
+    p.interior.note_id = 42;
+    p.interior.t = 0.9;
+    p.focus_claim = 99;
+    p.focus_node = 99;
+    p.camera.zoom = 8;
+    p.camera.center = .{ .x = 400, .y = -120 };
+    p.framing = .free;
+    p.fitted_vp_w = 1200;
+    p.fitted_vp_h = 800;
+    p.world_radius = 50_000;
+    p.notes_at_level0 = 40;
+
+    p.dropArrangement();
+
+    try std.testing.expectEqual(std.math.maxInt(u64), p.gen);
+    try std.testing.expect(p.hover_node == null);
+    try std.testing.expect(p.hover_cluster == null);
+    try std.testing.expect(p.interior.note_id == null);
+    try std.testing.expectEqual(@as(f32, 0), p.interior.t);
+    try std.testing.expectEqual(@as(usize, 0), p.interior.nodes.len);
+    try std.testing.expectEqual(fold.invalid, p.focus_node);
+    try std.testing.expectEqual(fold.invalid, p.focus_claim);
+    try std.testing.expectEqual(@as(f32, 1), p.camera.zoom);
+    try std.testing.expectEqual(@as(f32, 0), p.camera.center.x);
+    try std.testing.expect(p.framing == .extents);
+    try std.testing.expectEqual(@as(f32, 0), p.fitted_vp_w);
+    try std.testing.expectEqual(@as(f32, 0), p.world_radius);
+    try std.testing.expectEqual(@as(u32, 0), p.notes_at_level0);
+    try std.testing.expectEqual(@as(usize, 0), p.nodes.len);
 }
