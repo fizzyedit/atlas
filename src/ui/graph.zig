@@ -172,7 +172,8 @@ const sun_fill_opacity: f32 = 0.5;
 /// Labels use a fixed natural font size regardless of camera zoom.
 const label_font_delta: f32 = -1;
 /// Gap between a mark's rim and an open document's name below it. See `drawOpenNoteLabels`.
-const label_gap_px: f32 = 6;
+/// Clear space between a disc's edge and its name's plate, in logical pixels.
+const label_gap_px: f32 = 9;
 /// Chase rate for a label winning or losing its slot (1/s). Deliberately slower than the
 /// pointer highlight — text popping in and out is far more distracting than a disc brightening.
 const label_chase_k: f32 = 9;
@@ -4220,6 +4221,22 @@ fn identityToWorld(_: *anyopaque, local: dvui.Point) dvui.Point {
     return local;
 }
 
+/// The radius a mark is actually drawn at, on screen, this frame.
+///
+/// `world` reports a flat size for every mark because it is headless: it knows nothing about which
+/// note is open or where the cursor is. A note's disc, though, rests larger when it is open and
+/// swells further under the pointer, so for anything that resolved to its own note the panel's
+/// size is the real one and `Mark.r` is only a floor.
+///
+/// Anything positioning itself *against* a disc has to ask this rather than read `Mark.r`, or it
+/// places itself against a circle that is not the one on screen. The open-note labels did exactly
+/// that and sat inside their own discs, which is the size difference between `base_screen_r` and
+/// `open_screen_r` plus the whole proximity swell.
+fn markDrawnRadius(p: *Panel, m: world_mod.Mark, zoom_t: f32, gap_px: f32) f32 {
+    if (m.is_note and m.note < p.nodes.len) return bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px);
+    return m.r;
+}
+
 /// A note is drawn at exactly the radius `updateLabels` reserves for it and `nodeAtAim`
 /// hit-tests against. `world` reports a flat note size because it is headless and knows nothing
 /// about hover or open tabs; the panel does, so the panel decides. Keeping the three in sync is
@@ -4234,10 +4251,7 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     const hot = theme.color(.highlight, .fill);
     const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
     const gap_px = p.layout_slot * p.camera.zoom;
-    const radius_px: f32 = if (m.is_note and m.note < p.nodes.len)
-        bubbleScreenRadius(p.nodes[m.note], zoom_t, gap_px)
-    else
-        m.r;
+    const radius_px: f32 = markDrawnRadius(p, m, zoom_t, gap_px);
     // The rim is reserved for *open*, and hover does not touch it.
     //
     // A dashed mark is always highlight-rimmed, which is what makes dashed mean "this one" rather
@@ -4871,8 +4885,12 @@ fn drawLabels(p: *Panel) void {
 fn renderTextPlated(
     font: dvui.Font,
     text: []const u8,
-    /// Where the text should be centred, in physical pixels.
-    centre: dvui.Point.Physical,
+    /// Centre of the disc this name belongs to, in physical pixels.
+    anchor: dvui.Point.Physical,
+    /// That disc's radius *as drawn* — see `markDrawnRadius`.
+    radius_px: f32,
+    /// Where the label is allowed to go; a name that would leave it flips to the other side.
+    bounds: dvui.Rect.Physical,
     scale: f32,
     col: dvui.Color,
     plate: dvui.Color,
@@ -4888,19 +4906,35 @@ fn renderTextPlated(
     const size = font.textSize(text);
     const tw = size.w * scale;
     const th = size.h * scale;
-    const r: dvui.Rect.Physical = .{
-        .x = centre.x - tw * 0.5,
-        .y = centre.y,
-        .w = tw,
-        .h = th,
-    };
 
     const s = dpiScale();
     const h = th + label_plate_pad_y * s * 2;
     const w = (tw + label_plate_pad_x * s * 2) * eased;
+
+    // Above by preference, below only when there is no room.
+    //
+    // A name under a disc sits on whatever the disc is sitting on — in a dense field that is the
+    // next row of notes and the links running between them. Above, the name is far more often
+    // against empty sky, and the eye reads a title over a marker the way a caption sits over a
+    // point on a map. The flip is a fallback for notes near the top edge, not the normal case, so
+    // the label stays on one side for the whole time a note is hovered unless the view moves.
+    //
+    // `label_gap_px` is the gap to the *plate*, which is what is visible; the text sits
+    // `label_plate_pad_y` further in on each side.
+    const clear = radius_px + label_gap_px * s;
+    const above_plate_y = anchor.y - clear - h;
+    const fits_above = above_plate_y >= bounds.y;
+    const plate_y = if (fits_above) above_plate_y else anchor.y + clear;
+
+    const r: dvui.Rect.Physical = .{
+        .x = anchor.x - tw * 0.5,
+        .y = plate_y + label_plate_pad_y * s,
+        .w = tw,
+        .h = th,
+    };
     const box: dvui.Rect.Physical = .{
-        .x = centre.x - w * 0.5,
-        .y = r.y - label_plate_pad_y * s,
+        .x = anchor.x - w * 0.5,
+        .y = plate_y,
         .w = w,
         .h = h,
     };
@@ -4949,7 +4983,9 @@ fn drawHoverLabel(p: *Panel, fade: f32) void {
     renderTextPlated(
         font,
         n.title,
-        .{ .x = centre.x, .y = centre.y + r + label_gap_px * dpiScale() },
+        .{ .x = centre.x, .y = centre.y },
+        r,
+        p.camera.viewport,
         cw.natural_scale,
         theme.color(.highlight, .fill).opacity(fade),
         theme.color(.window, .fill).opacity(label_plate_opacity * fade),
@@ -5039,10 +5075,14 @@ fn drawOneOpenLabel(
 
     const m = w.marks.items[mi];
     const centre = p.camera.worldToScreen(.{ .x = m.wx, .y = m.wy });
+    const zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), @as(f32, 1));
+    const r = markDrawnRadius(p, m, zoom_t, p.layout_slot * p.camera.zoom);
     renderTextPlated(
         font,
         n.title,
-        .{ .x = centre.x, .y = centre.y + m.r + label_gap_px * dpiScale() },
+        .{ .x = centre.x, .y = centre.y },
+        r,
+        p.camera.viewport,
         scale,
         theme.color(.highlight, .fill).opacity(fade),
         theme.color(.window, .fill).opacity(label_plate_opacity * fade),
