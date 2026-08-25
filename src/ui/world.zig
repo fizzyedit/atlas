@@ -1884,6 +1884,44 @@ test "the note you have open never coalesces, and never moves" {
     }
 }
 
+test "zooming in never un-resolves a note" {
+    // Half of the "it flies away as I zoom toward it" bug. The other half is in `graph.zig`:
+    // `split_px` is scaled by the motion bias, and zooming about a point moves the camera centre,
+    // which used to register as a pan and inflate it. This pins the half that lives here -- at a
+    // fixed `split_px`, resolution is monotone in zoom, so once a note is drawn as itself it stays
+    // that way however much further you go in. Anything that makes the LOD non-monotone would
+    // reintroduce the symptom no matter what the bias does.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const leaf = w.lad.leaf_cell[2000];
+    w.field.ensurePlaced(&w.lad, leaf);
+    const own = w.field.pos[leaf];
+
+    const p: Params = .{ .budget = 400 };
+    var resolved = false;
+    var zoom: f32 = 4;
+    while (zoom <= 600) : (zoom *= 1.25) {
+        const view: View = .{ .w = 900, .h = 600, .zoom = zoom, .cx = own.x, .cy = own.y };
+        try settle(&w, view, p, 300);
+        if (w.markIndex(leaf)) |mi| {
+            resolved = true;
+            const m = w.marks.items[mi];
+            try testing.expect(m.is_note);
+            // And at its resting position, not part-way along a crossfade from a mass centre.
+            try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
+            try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+        } else {
+            // Coalesced is fine before it first resolves, never after.
+            try testing.expect(!resolved);
+        }
+    }
+    try testing.expect(resolved);
+}
+
 test "a parked camera comes to rest" {
     // `settled` is what lets the panel stop asking for frames. It starts true, and *only* the
     // per-frame reset in `clearFrame` ever puts it back — without that, the first crossfade in

@@ -1528,20 +1528,22 @@ fn updateBubbles(p: *Panel) void {
     // stretch, and both should respond — the handover is a crossfade, not a switch.
     const interior_live = p.interior.nodes.len > 0 and p.interior.t > 0;
     const overview_live = interiorYieldT(p) < 1;
-    // Merged, flying to a click, or a flick is in progress: the shove is O(visible²) and unread
-    // at that speed. After a click-flight parks, do not keep skipping just because `zoom_speed`
-    // is still decaying — that is the "camera settles, then everything jumps" hitch.
-    const overview_busy = coalesced_only or p.camera.chasing() or
-        (p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps);
-
     var hover_unsettled = false;
     if (interior_live) {
         hover_unsettled = applyProximity(p, p.interior.nodes, p.interior.slot, p.interior.radius, t_hover, p.interior_visible.items) or hover_unsettled;
     }
-    if (overview_live and !overview_busy) {
-        // Bounded by `p.visible` — this frame's resolved marks — not by the note count, so
-        // running it alongside the interior during the handover costs the mark budget, not the
-        // vault.
+    if (overview_live) {
+        // Unconditional, including while the camera is moving.
+        //
+        // This was gated on "merged, flying to a click, or a flick in progress" because the
+        // neighbour shove is O(visible²) and unread at that speed. That reason no longer applies
+        // to the overview: the shove is skipped for it outright — see `drawn_from_world` in
+        // `applyProximity` — because overview marks are drawn from the world's own positions, so
+        // a shove there moves nothing anyone can see. What is left is one linear pass over
+        // `p.visible`, this frame's resolved marks, chasing `hover_t`. That is cheap, it is the
+        // whole of the swell the reader actually sees, and gating it only meant the vault went
+        // inert whenever the camera was moving — which is precisely when the cursor is being used
+        // to aim.
         hover_unsettled = applyProximity(p, p.nodes, p.layout_slot, p.world_radius, t_hover, p.visible.items) or hover_unsettled;
     }
     if (!interior_live and p.interior.nodes.len > 0) {
@@ -4165,7 +4167,26 @@ fn updateMotionBias(p: *Panel) void {
     // Derived from the detail slider rather than fixed: see `motionSplitMax`. At the default it is
     // the 3.5 this used to hardcode.
     const split_max = motionSplitMax(p.mark_budget);
-    var want = 1 + (split_max - 1) * std.math.clamp(pan_speed / motion_full_speed, 0, 1);
+
+    // Zooming in never coarsens.
+    //
+    // `pan_speed` is centre motion, and zooming about a point *always* moves the centre — that is
+    // how the point under the cursor stays put (`Camera.poseZoomAround`). So diving toward a note
+    // that is not dead centre registers as a pan, in proportion to how far off centre it sat, and
+    // inflates `split_px` (see `worldParams`). `hold_topology` hides that while the flick is fast;
+    // the moment the zoom slows enough to release the hold, topology is re-decided against a
+    // `split_px` the still-decaying bias has left inflated. The note being dived into coalesces,
+    // its pose slides back down the chain to its mass centre, and it flies away — then drifts back
+    // as the bias settles. *Which* note it happened to was a function of where it sat relative to
+    // the viewport centre, which is exactly why it read as one node misbehaving.
+    //
+    // Coarsening exists to bound cost while the view moves fast. Zooming in *reduces* the cells on
+    // screen, so there is nothing to bound — and the other coarsening term below is already
+    // zoom-out only, for the same kind of reason.
+    var want: f32 = 1;
+    if (p.zoom_dir <= 0) {
+        want = 1 + (split_max - 1) * std.math.clamp(pan_speed / motion_full_speed, 0, 1);
+    }
     // Fast zoom-out coarsens now, so the exploded field is not dragged through a shrinking view.
     if (p.zoom_dir < 0 and p.zoom_speed > zoom_hold_oct_ps) {
         const zt = std.math.clamp(p.zoom_speed / zoom_full_oct_ps, 0, 1);
