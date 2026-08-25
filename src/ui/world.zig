@@ -569,6 +569,46 @@ pub const World = struct {
         var scored_opts = fold_opts;
         scored_opts.degree_norm = 0;
 
+        var placed = try placementPositions(gpa, n_notes, scored, paths, scored_opts, place_opts);
+        defer placed.deinit(gpa);
+        return buildFrom(gpa, n_notes, scored, .{ .pos = placed.pos, .comp = placed.comp }, scored_opts, place_opts);
+    }
+
+    /// Where every note is, and which component it belongs to.
+    ///
+    /// The layout's whole output, and the only thing the hierarchy below needs from it. Passing it
+    /// in rather than deriving it is what lets the expensive part be computed once and reused
+    /// across rebuilds — `World.init` runs on every save, so a position source that costs seconds
+    /// cannot live inside it.
+    pub const Positions = struct {
+        pos: []const spatial.Vec2,
+        comp: []const u32,
+    };
+
+    /// Build a world from positions someone else decided.
+    pub fn initFrom(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        links: []const fold.Edge,
+        positions: Positions,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+    ) !World {
+        const scored = try fold.degreeNormalised(gpa, n_notes, links, fold_opts.degree_norm);
+        defer gpa.free(scored);
+        var scored_opts = fold_opts;
+        scored_opts.degree_norm = 0;
+        return buildFrom(gpa, n_notes, scored, positions, scored_opts, place_opts);
+    }
+
+    fn buildFrom(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        scored: []const fold.Edge,
+        positions: Positions,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+    ) !World {
         // -- positions first, hierarchy second ---------------------------------------------
         //
         // The drawing hierarchy is built from where the notes *are*, not from the link coarsening
@@ -582,7 +622,7 @@ pub const World = struct {
         // away notes that were plainly on screen. A spatial cell's bound *is* `max over children
         // of (distance + child bound)`, computed bottom-up once, so the claim is arithmetic rather
         // than something `growAncestors` has to keep repairing.
-        var spat = try spatialOverPlacement(gpa, n_notes, scored, paths, scored_opts, place_opts);
+        var spat = try spatialFrom(gpa, n_notes, scored, positions, fold_opts, place_opts);
         errdefer spat.deinit(gpa);
         var lad = spat.lad;
         spat.lad = .{}; // ownership moves to the `World` below
@@ -618,7 +658,7 @@ pub const World = struct {
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
-        // The same array the coarsening used, so the drawn web cannot disagree with the hierarchy
+        // The same array the layout used, so the drawn web cannot disagree with the hierarchy
         // about which links matter.
         w.web = try cellweb.build(gpa, &w.lad, scored);
         if (fold_opts.cancel) |c| {
@@ -635,60 +675,89 @@ pub const World = struct {
         return w;
     }
 
-    /// Place the vault with `fold` + `containment`, then group those positions by proximity.
+    /// Where `fold` + `containment` would put the notes.
     ///
-    /// Transitional by design: the position source is the part still to be replaced (by a
-    /// link-gravity solve), and keeping it behind one function is what makes that a local change.
-    /// The hierarchy handed back is `fold.Ladder`-shaped, so `cellweb` and everything in this file
-    /// is unchanged by where it came from.
-    fn spatialOverPlacement(
+    /// Transitional: this is the position source still to be replaced by a link-gravity solve.
+    /// Keeping it behind one function, returning nothing but positions, is what makes that a
+    /// local change — and what lets the caller substitute a cached or persisted set instead.
+    pub const Placement = struct {
+        pos: []spatial.Vec2 = &.{},
+        comp: []u32 = &.{},
+
+        pub fn deinit(self: *Placement, gpa: std.mem.Allocator) void {
+            gpa.free(self.pos);
+            gpa.free(self.comp);
+            self.* = .{};
+        }
+    };
+
+    pub fn placementPositions(
         gpa: std.mem.Allocator,
         n_notes: usize,
         scored: []const fold.Edge,
         paths: []const []const u8,
         fold_opts: fold.Options,
         place_opts: containment.Options,
-    ) !spatial.Result {
+    ) !Placement {
+        var out: Placement = .{};
+        errdefer out.deinit(gpa);
+        out.pos = try gpa.alloc(spatial.Vec2, n_notes);
+        out.comp = try gpa.alloc(u32, n_notes);
+
         var src_lad = try fold.build(gpa, n_notes, scored, paths, fold_opts);
         defer src_lad.deinit(gpa);
         var src_field = try containment.init(gpa, src_lad.cells.len, src_lad.roots.len, fold_opts.arity, place_opts);
         defer src_field.deinit(gpa);
         // Eager, where the LOD's own use is lazy. Every note needs a position before any of them
-        // can be grouped by one, and this is the cost that buys it — about 34 ms at 284k notes.
+        // can be grouped by one, and this is the cost that buys it.
         containment.placeAll(&src_field, &src_lad);
 
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const pos = try arena.alloc(spatial.Vec2, n_notes);
-        const comp = try arena.alloc(u32, n_notes);
-        const weight = try arena.alloc(f32, n_notes);
-        const body = try arena.alloc(f32, n_notes);
-
-        // The quantisation square, from the placement's own extent. Step 3 persists this instead:
-        // keyed against a box that moves, one new outlier renumbers every Hilbert key in the vault
-        // and the whole hierarchy churns, which is the opposite of what an incremental rebuild
-        // wants.
-        var half: f32 = 1e-3;
         for (0..n_notes) |i| {
             const leaf = if (i < src_lad.leaf_cell.len) src_lad.leaf_cell[i] else fold.invalid;
             if (leaf == fold.invalid or leaf >= src_lad.cells.len) {
-                pos[i] = .{};
-                comp[i] = 0;
-                weight[i] = 0;
-                body[i] = 0;
+                out.pos[i] = .{};
+                out.comp[i] = 0;
                 continue;
             }
             const p = src_field.pos[leaf];
-            const c = src_lad.cells[leaf];
-            pos[i] = .{ .x = p.x, .y = p.y };
-            comp[i] = c.comp;
-            weight[i] = c.weight;
-            body[i] = c.body;
-            half = @max(half, @max(@abs(p.x), @abs(p.y)));
+            out.pos[i] = .{ .x = p.x, .y = p.y };
+            out.comp[i] = src_lad.cells[leaf].comp;
         }
+        return out;
+    }
 
-        return spatial.build(gpa, n_notes, pos, comp, weight, body, .{
+    /// Group positions by proximity into the ladder `world` and `cellweb` run on.
+    fn spatialFrom(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        scored: []const fold.Edge,
+        positions: Positions,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+    ) !spatial.Result {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Per note: incident link weight, and file size. Summed up the tree for `Cell.weight` and
+        // `Cell.body`, which drive mass sizing and the interior's berth. Taken straight from the
+        // link array rather than from a `fold` cell, so the hierarchy no longer needs one to exist.
+        const weight = try arena.alloc(f32, n_notes);
+        @memset(weight, 0);
+        for (scored) |e| {
+            if (e.a < n_notes) weight[e.a] += e.w;
+            if (e.b < n_notes) weight[e.b] += e.w;
+        }
+        const body = try arena.alloc(f32, n_notes);
+        for (body, 0..) |*b, i| b.* = if (fold_opts.bodies.len == n_notes) fold_opts.bodies[i] else 0;
+
+        // The quantisation square, from the positions' own extent. Persisting it is what keeps a
+        // rebuild stable: keyed against a box that moves, one new outlier renumbers every Hilbert
+        // key in the vault and the whole hierarchy churns.
+        var half: f32 = 1e-3;
+        for (positions.pos) |q| half = @max(half, @max(@abs(q.x), @abs(q.y)));
+
+        return spatial.build(gpa, n_notes, positions.pos, positions.comp, weight, body, .{
             .arity = fold_opts.arity,
             .note_r = place_opts.note_r,
             .quant_half = half,
