@@ -1944,7 +1944,7 @@ fn applyTrackpadPinch(p: *Panel, vp: dvui.Rect.Physical) void {
     if (!vp.contains(cursor)) return;
     p.fling_x.cancel();
     p.fling_y.cancel();
-    p.camera.zoomAtScreen(ratio, cursor);
+    p.camera.zoomAtScreen(ratio, descentZoomFocal(p, ratio, cursor));
     cameraTakenOver(p);
     dvui.refresh(null, @src(), dvui.parentGet().data().id);
 }
@@ -3099,6 +3099,10 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     p.interior.radius = extent * p.interior.nest.scale;
     p.interior.parent = p.nodes[idx].home;
 
+    // Place in world space *now*, not at the origin until the next `stepInteriorWorld`.
+    // `enterInterior` calls `applyFraming` on this same stack, and `fitInteriorSun` used to
+    // see every heading still sitting on the sun — a 1-wu cloud — and aim at a zoom that
+    // threw the real field off the panel.
     const nodes = try arena.alloc(GraphNode, n);
     nodes[0] = .{
         .note_id = items[0].id,
@@ -3116,6 +3120,7 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         .alpha = 1,
     };
     for (items[1..], 1..) |it, i| {
+        const world = interior.toWorld(local_pos[i], p.interior.nest, p.interior.parent);
         nodes[i] = .{
             .note_id = it.id,
             // Line for `revealPosition` on click — every content kind has one now, not just
@@ -3126,9 +3131,9 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
             .title = interiorItemLabel(arena, it, src_lines),
             .phantom = false,
             .degree = interiorItemDegree(it),
-            .target = p.interior.parent,
-            .home = p.interior.parent,
-            .pos = p.interior.parent,
+            .target = world,
+            .home = world,
+            .pos = world,
             .target_radius = radiusFor(interiorItemDegree(it), false, false),
             .radius = radiusFor(interiorItemDegree(it), false, false),
             // No coalescing in this layout — every item is always drawn as itself.
@@ -3581,7 +3586,42 @@ fn applyInteriorFramingIfNeeded(p: *Panel) void {
         (!p.layout_settled or p.camera.chasing() or p.interior.t < 0.98))
     {
         applyFraming(p);
+        return;
     }
+    // Hand-driven descent never sets `.interior` (a wheel tick is `.free`). Zooming around the
+    // cursor then grows the cloud from wherever the node sat — often the bottom of the panel —
+    // so the field slides off the nearest edge while the overview links keep pointing at it.
+    // While `t` is still rising, drift the sun toward the viewport centre; once we have arrived,
+    // leave the camera alone so the reader can pan around inside.
+    driftSunIntoView(p);
+}
+
+/// How hard to pull the camera onto the sun during a hand descent, 0 = leave it, 1 = snap.
+///
+/// Zero while backing out or before the cloud has started to show; eases in so a glance-zoom
+/// over a node does not yank the view.
+fn descentCenterPull(t: f32, t_prev: f32) f32 {
+    if (!(t > t_prev) or t <= 0.15 or t >= 0.98) return 0;
+    const u = std.math.clamp((t - 0.15) / (0.98 - 0.15), 0, 1);
+    return u * u;
+}
+
+fn driftSunIntoView(p: *Panel) void {
+    const k = descentCenterPull(p.interior.t, p.interior.t_prev);
+    if (k <= 0 or p.interior.nodes.len == 0) return;
+    const sun = p.interior.nodes[0].pos;
+    p.camera.center.x += (sun.x - p.camera.center.x) * k;
+    p.camera.center.y += (sun.y - p.camera.center.y) * k;
+    p.camera.syncTargets();
+}
+
+/// During a hand descent, zoom around the sun rather than the cursor so the cloud grows in
+/// place instead of off the nearest edge. Cursor-zoom again once we have arrived, and always
+/// when zooming out.
+fn descentZoomFocal(p: *const Panel, factor: f32, cursor: dvui.Point.Physical) dvui.Point.Physical {
+    if (factor <= 1 or p.interior.nodes.len == 0) return cursor;
+    if (descentCenterPull(p.interior.t, 0) <= 0) return cursor;
+    return p.camera.worldToScreen(p.interior.nodes[0].pos);
 }
 
 fn applyFraming(p: *Panel) void {
@@ -3641,18 +3681,19 @@ fn fitMaxGapPx(vp: dvui.Rect.Physical) f32 {
 /// the overview bubble occupied, and the sun is still the exit back out.
 fn fitInteriorSun(p: *Panel, mode: FitMode) void {
     if (p.interior.nodes.len == 0) return;
-    const slot = @max(p.interior.slot, 1);
     // Sun is interior root (index 0) and equals `interior.parent` by construction.
-    const sun = p.interior.nodes[0].target;
-
-    var max_r: f32 = slot;
-    for (p.interior.nodes) |n| {
-        const dx = n.target.x - sun.x;
-        const dy = n.target.y - sun.y;
-        max_r = @max(max_r, @sqrt(dx * dx + dy * dy));
-    }
-    // Square bounds centred on the sun so poseForBounds does not drift toward a lopsided heading
-    // cluster. Zoom still fits the furthest heading; pan stays locked on the exit.
+    const sun = p.interior.nodes[0].pos;
+    // The cloud's own radius, not `interior.slot`. Slot is the nested ring gap — tiny on a
+    // large document, large on a two-item one — and using it here as if it were the overview
+    // lattice spacing did two things, both wrong:
+    //
+    //   * `@max(slot, 1)` plus every heading still sitting on the sun (see `buildInteriorWorld`)
+    //     fitted a 1-wu disc, so the first chase zoomed far past the real field.
+    //   * `fitMaxGapPx / slot` is the overview dinner-plate stop. On a small interior, slot is
+    //     a big fraction of the cloud, so that cap forbade the camera from zooming in far enough
+    //     for the field to fill the panel. It sat as a blob at the note's screen position, and
+    //     any further wheel zoom grew it off the nearest edge.
+    const max_r = @max(p.interior.radius, 1e-3);
     const bounds: dvui.Rect = .{
         .x = sun.x - max_r,
         .y = sun.y - max_r,
@@ -3660,13 +3701,7 @@ fn fitInteriorSun(p: *Panel, mode: FitMode) void {
         .h = max_r * 2,
     };
     const pad = fitPadPx(p.camera.viewport);
-    var pose = p.camera.poseForBounds(bounds, pad);
-    const max_gap = fitMaxGapPx(p.camera.viewport);
-    if (slot * pose.zoom > max_gap) {
-        pose.zoom = p.camera.clamp(@min(pose.zoom, max_gap / slot));
-    }
-    // Centre is the sun, not the AABB midpoint poseForBounds computed (same here, but keep the
-    // invariant explicit so a future non-square berth cannot slide it).
+    const pose = p.camera.poseForBounds(bounds, pad);
     p.camera.center_target = sun;
     p.camera.zoom_target = pose.zoom;
     if (!mode.animate) {
@@ -5957,7 +5992,7 @@ fn handleInput(p: *Panel, st: anytype) void {
     if (zoomed_this_frame and zoom_factor != 1.0) {
         p.fling_x.cancel();
         p.fling_y.cancel();
-        p.camera.zoomAtScreen(zoom_factor, zoom_focal);
+        p.camera.zoomAtScreen(zoom_factor, descentZoomFocal(p, zoom_factor, zoom_focal));
         cameraTakenOver(p);
         dvui.refresh(null, @src(), id);
     }
@@ -6363,4 +6398,29 @@ test "hover is allowed to fill past the lattice gap toward the screen cap" {
     try std.testing.expectApproxEqAbs(@as(f32, 26), hoverSizeCap(gap_cap, screen_cap, 0.5), 1e-5);
     // An already-open lattice must not shrink on hover.
     try std.testing.expectEqual(@as(f32, 60), hoverSizeCap(60, 48, 1));
+}
+
+test "an interior fit uses the cloud radius, not the overview dinner-plate cap" {
+    // A two-item note has a tiny local extent, so `interior.slot` is large relative to the
+    // cloud. Capping zoom at `fitMaxGapPx / slot` then forbade the camera from going close
+    // enough for the field to fill the panel — it sat as a blob at the note, and any further
+    // wheel zoom grew it off the nearest edge.
+    const radius: f32 = 26.88; // berth at vault level 3
+    const slot: f32 = 21.5; // 1.6 * berth / extent for a 2-item note
+    const vp_short: f32 = 800;
+    const pad: f32 = vp_short * fit_pad_frac;
+    const fit_zoom = (vp_short - pad * 2) / (2 * radius);
+    const dinner_plate = fit_max_gap_px / slot;
+    try std.testing.expect(dinner_plate < fit_zoom);
+    // The un-capped fit covers most of the pane; the dinner-plate zoom does not.
+    try std.testing.expect(fit_zoom * radius * 2 > vp_short * 0.5);
+    try std.testing.expect(dinner_plate * radius * 2 < vp_short * 0.5);
+}
+
+test "the camera only pulls onto the sun while a hand descent is still arriving" {
+    try std.testing.expectEqual(@as(f32, 0), descentCenterPull(0.1, 0.05));
+    try std.testing.expectEqual(@as(f32, 0), descentCenterPull(0.4, 0.5)); // backing out
+    try std.testing.expectEqual(@as(f32, 0), descentCenterPull(0.99, 0.9));
+    try std.testing.expect(descentCenterPull(0.6, 0.4) > 0);
+    try std.testing.expect(descentCenterPull(0.9, 0.8) > descentCenterPull(0.5, 0.4));
 }
