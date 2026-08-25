@@ -91,14 +91,28 @@ pub const StyledMark = struct {
     /// Draw this mark as a dashed rim over a *fully opaque* face, in vector rather than sprites,
     /// after every other mark.
     ///
-    /// For the handful of marks the reader is actually dealing with — the note under the cursor,
-    /// the notes they have open. Coalesced masses use a dashed atlas ring too, but keep the same
-    /// face colour as a note: overlapping opaque discs of one shade stay one shade.
+    /// Only for the handful of marks the reader is actually dealing with — an open note, the
+    /// interior sun. Coalesced masses never take this path: a screen of polyline dashes is the
+    /// 8 fps cliff. Their rings are atlas sprites, always.
     dashed: bool = false,
 };
 
+/// Mass fill quad as a fraction of the ring quad.
+///
+/// Atlas geometry: disc core is 0.90 of half-size, dash inner is 0.72 of the ring's half-size.
+/// 0.80 puts the fill against the inside of the dashes so the ring stays a visible rim, and so
+/// merging notes occupy that rim (drawn after the ring, before the fill) rather than sitting
+/// on top of the fill in the centre.
+const mass_fill_of_ring: f32 = 0.80;
+/// Radius past which the narrow dash cell keeps the stroke near two screen pixels.
+const dash_thin_from: f32 = 24;
+
 /// Shared soft-sprite stack (frustum cull + cheap dense path). Used by harness and plugin.
-/// Notes and coalesced masses share a fill; the dashed ring is what says a mass is many.
+///
+/// Coalesced masses are two passes around the notes: dashed rings, then notes, then fills.
+/// A merging note covers the ring as it crosses the boundary and disappears under the fill
+/// as it reaches the centre — which is why note borders used to remain visible in the middle
+/// of a mass. Vector dashed strokes are reserved for `StyledMark.dashed` (open / selected).
 ///
 /// `mix` is how far the marks sit off the background (1 = their own colour, 0 = gone), not an
 /// alpha. See `intoBg`.
@@ -114,17 +128,12 @@ pub fn drawStyledMarks(
     const arena = dvui.currentWindow().arena();
     const bg = dvui.themeGet().color(.window, .fill);
 
-    var sprites = SpriteBatch.init(arena);
-
     var stats: DrawStats = .{};
     const disc_uv = soft.uv(.disc);
     const glow_uv = soft.uv(.glow);
     const ring_uv = soft.uv(.ring);
     const dash_uv = soft.uv(.dash_ring);
     const dash_thin_uv = soft.uv(.dash_ring_thin);
-    // Radius past which the narrow dash cell keeps the stroke near two screen pixels. A sprite's
-    // stroke scales with the quad, so one cell cannot serve the whole mass radius range.
-    const dash_thin_from: f32 = 24;
     const vp = cam.viewport;
     // Select keeps off-screen siblings alive for LOD stability — do not pay to paint them.
     const pad: f32 = 40;
@@ -134,12 +143,15 @@ pub fn drawStyledMarks(
     const y1 = vp.y + vp.h + pad;
     const cheap = marks.len > 420;
 
-    // Large masses get a vector dashed stroke after the sprite flush — atlas dashes stay cheap
-    // for small marks; path strokes stay round when the mark is big on screen.
-    const Dash = struct { c: dvui.Point.Physical, r: f32, col: dvui.Color };
-    var vector_dashes: std.ArrayListUnmanaged(Dash) = .empty;
-    const Dashed = struct { c: dvui.Point.Physical, r: f32, face: dvui.Color, rim: dvui.Color };
-    var dashed_marks: std.ArrayListUnmanaged(Dashed) = .empty;
+    const Item = struct {
+        c: dvui.Point.Physical,
+        r: f32,
+        face: dvui.Color,
+        rim: dvui.Color,
+    };
+    var masses: std.ArrayListUnmanaged(Item) = .empty;
+    var notes: std.ArrayListUnmanaged(Item) = .empty;
+    var dashed_marks: std.ArrayListUnmanaged(Item) = .empty;
 
     for (marks) |m| {
         if (m.dying and m.r_px < 0.8) continue;
@@ -149,92 +161,89 @@ pub fn drawStyledMarks(
 
         const dying_t: f32 = if (m.dying) 0.35 else 1;
         const t = mix * dying_t;
+        const item: Item = .{
+            .c = screen,
+            .r = r,
+            .face = intoBg(m.fill, bg, t),
+            .rim = intoBg(m.border, bg, if (m.dashed) 0.95 * t else if (m.is_note) 0.85 * t else 0.9 * t),
+        };
         if (m.dashed) {
-            // Drawn the expensive way, and it looks it: a crisp filled circle and a vector dashed
-            // rim, no atlas sprite. The standing rejection of path-stroked dashed rings is about
-            // *thousands* of masses — 4,000 measured at ~8 fps — and says nothing about the two or
-            // three marks the reader is actually dealing with. The sprite's feathered edge is
-            // obvious on a mark you are looking straight at, and its glow pass reads as a second
-            // ring around the first.
-            dashed_marks.append(arena, .{
-                .c = screen,
-                .r = r,
-                .face = intoBg(m.fill, bg, t),
-                .rim = intoBg(m.border, bg, 0.95 * t),
-            }) catch {};
-            stats.marks += 1;
-            continue;
+            dashed_marks.append(arena, item) catch {};
+        } else if (m.is_note) {
+            notes.append(arena, item) catch {};
+        } else {
+            masses.append(arena, item) catch {};
         }
-        const face = intoBg(m.fill, bg, t);
-        if (!cheap and r > 3) {
+        stats.marks += 1;
+    }
+
+    var sprites = SpriteBatch.init(arena);
+
+    // 1. Mass rings. Atlas sprites only — never `strokeCircleDashed`. That path is a ~90-point
+    // polyline with each dash its own stroke; a field of large masses measured out at ~8 fps
+    // with a parked camera. The switch used to fire at r ≥ 14 whenever the mark count was
+    // under 420, which is exactly the zoom where masses get big and there are not yet hundreds
+    // of them.
+    for (masses.items) |m| {
+        if (m.r <= 2) continue;
+        sprites.add(.{
+            .center = m.c,
+            .half_size = m.r,
+            .color = m.rim,
+            .uv = if (m.r >= dash_thin_from) dash_thin_uv else dash_uv,
+        });
+    }
+    sprites.flush(tex);
+
+    // 2. Notes, over the rings so a joining disc covers the dashes as it crosses the boundary.
+    for (notes.items) |n| {
+        if (!cheap and n.r > 3) {
             sprites.add(.{
-                .center = .{ .x = screen.x + 0.8, .y = screen.y + 1.0 },
-                .half_size = r * 1.08,
+                .center = .{ .x = n.c.x + 0.8, .y = n.c.y + 1.0 },
+                .half_size = n.r * 1.08,
                 .color = dvui.Color.black.opacity(0.16 * mix),
                 .uv = glow_uv,
             });
         }
         sprites.add(.{
-            .center = screen,
-            .half_size = r,
-            .color = face,
+            .center = n.c,
+            .half_size = n.r,
+            .color = n.face,
             .uv = disc_uv,
         });
-        if (m.is_note) {
-            if (r > 1.5) {
-                sprites.add(.{
-                    .center = screen,
-                    .half_size = r,
-                    .color = intoBg(m.border, bg, 0.85 * t),
-                    .uv = ring_uv,
-                });
-            }
-        } else {
-            // Same face as a note; the dashed rim is what says this disc is many.
-            const rim = intoBg(m.border, bg, 0.9 * t);
-            // `!cheap` is load-bearing, not a nicety.
-            //
-            // The vector path allocates a ~90-point polyline per ring and strokes each dash as its
-            // own path, so a screen full of large masses is tens of thousands of path strokes a
-            // frame — 4,000 masses at a 4,000 mark budget measured out at ~8 fps with a *parked*
-            // camera. This is the "path-stroked dashed rings at scale" cliff the design notes
-            // already list as rejected; it survived here because `cheap` gated the shadow and the
-            // glow but never this.
-            //
-            // Above the threshold the atlas dash sprite carries every mass instead: one batched
-            // quad each, no draw call of its own. It is slightly softer on a very large ring, which
-            // is a trade worth making the moment there are hundreds of them — nobody is examining
-            // the roundness of one rim in a field of four thousand.
-            if (r >= 14 and !cheap) {
-                vector_dashes.append(arena, .{ .c = screen, .r = r, .col = rim }) catch {};
-            } else if (r > 2) {
-                sprites.add(.{
-                    .center = screen,
-                    .half_size = r,
-                    .color = rim,
-                    .uv = if (r >= dash_thin_from) dash_thin_uv else dash_uv,
-                });
-            }
+        if (n.r > 1.5) {
+            sprites.add(.{
+                .center = n.c,
+                .half_size = n.r,
+                .color = n.rim,
+                .uv = ring_uv,
+            });
         }
-        stats.marks += 1;
     }
     sprites.flush(tex);
 
-    for (vector_dashes.items) |d| {
-        strokeCircleDashed(d.c, d.r, .{
-            .thickness = std.math.clamp(d.r * 0.08, 1.25, 2.25),
-            .color = d.col,
+    // 3. Mass fills, over the notes. A note that has reached the centre is hidden; one still
+    // on the ring is not. Inset so the dashes from pass 1 remain a rim rather than being
+    // covered by a disc that is larger than they are.
+    for (masses.items) |m| {
+        sprites.add(.{
+            .center = m.c,
+            .half_size = m.r * mass_fill_of_ring,
+            .color = m.face,
+            .uv = disc_uv,
         });
     }
+    sprites.flush(tex);
+
     // Last of all, over every sprite. Smallest first, so the largest — the one under the cursor —
     // ends up on top rather than under whichever of the others the mark list happened to emit
-    // later.
+    // later. Vector dashes belong here and only here.
     const BySize = struct {
-        fn less(_: void, x: Dashed, y: Dashed) bool {
+        fn less(_: void, x: Item, y: Item) bool {
             return x.r < y.r;
         }
     };
-    std.mem.sort(Dashed, dashed_marks.items, {}, BySize.less);
+    std.mem.sort(Item, dashed_marks.items, {}, BySize.less);
     for (dashed_marks.items) |d| {
         fillCircle(d.c, d.r, d.face);
         strokeCircleDashed(d.c, d.r, .{
@@ -353,6 +362,13 @@ fn appendDashedSpan(
     const dx = end_pt.x - last.x;
     const dy = end_pt.y - last.y;
     if (dx * dx + dy * dy > 1e-8) try out.append(arena, end_pt);
+}
+
+test "mass fill sits inside the dashed rim" {
+    // Atlas: disc core is 0.90 of half-size; dash inner is 0.82 − 0.10 = 0.72 of the ring
+    // half-size. Raising `mass_fill_of_ring` past this covers the dashes with the fill and
+    // the sandwich (ring, notes, fill) stops showing a rim.
+    try std.testing.expect(mass_fill_of_ring * 0.90 <= 0.72 + 0.001);
 }
 
 test "joinFill lands on the mass fill, never the window" {

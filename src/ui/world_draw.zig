@@ -400,9 +400,9 @@ pub fn draw(
             .border = style.border,
             .is_note = style.is_note,
             .dying = false,
-            // Ordering is `galaxy`'s problem now: it holds every dashed mark back past the sprite
-            // pass and sorts them by size, so the largest — the one under the cursor — lands on
-            // top. Nothing here has to be deferred or held in a slot.
+            // Mass rings, then notes, then mass fills — `galaxy` sandwiches a merge so joining
+            // notes cover the dashes and then disappear under the fill. Open notes (`dashed`)
+            // still paint last, vector, on top of everything.
             .dashed = style.dashed,
         };
         n += 1;

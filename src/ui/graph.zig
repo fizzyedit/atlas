@@ -4304,6 +4304,7 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
             .border = if (node.is_sun) hot else border_rest,
             .is_note = !node.is_sun,
             .dying = false,
+            .dashed = node.is_sun,
         };
     }
     _ = galaxy.drawStyledMarks(&dens.soft, &p.camera, fade, buf);
