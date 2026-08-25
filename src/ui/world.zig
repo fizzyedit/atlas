@@ -122,6 +122,10 @@ pub const FocusLink = struct {
 /// the definition, so if the relaxation is retuned, run it and paste the number back here.
 pub const leaf_pitch: f32 = 1.48;
 
+/// How many open notes may pin a stand-in mark in one frame. A tab strip, not a vault — past this
+/// the rest simply keep showing their mass where the mass is.
+const max_pinned: usize = 16;
+
 /// Liang–Barsky clip of the segment `(ax,ay)-(bx,by)` against the rect `(rx,ry,rw,rh)`.
 /// Null when the segment misses the rect entirely.
 ///
@@ -826,22 +830,29 @@ pub const World = struct {
     pub fn present(self: *World, view: View, p: Params, dt: f32) !void {
         const rate = @min(1.0, dt * p.rate);
 
-        // Where the focused note actually is, and which slot it occupies.
+        // Where each open note actually is, and which slot it occupies.
         //
-        // Every cell that contains it is drawn *there* rather than at its own centre — see the
-        // stand-in below. Resolved once per frame: a slot compare against `[ls, le)` is then two
-        // integer tests per mark.
-        var focus_slot: u32 = fold.invalid;
-        var focus_at: containment.Vec2 = .{};
-        if (p.focus_leaf != fold.invalid and p.focus_leaf < self.lad.cells.len) {
-            const note = self.lad.cells[p.focus_leaf].note;
-            if (note != fold.invalid and note < self.lad.slot_of.len) {
-                self.field.ensurePlaced(&self.lad, p.focus_leaf);
-                focus_slot = self.lad.slot_of[note];
-                focus_at = self.field.pos[p.focus_leaf];
+        // Every cell that contains one is drawn *there* rather than at its own centre — see the
+        // stand-in below. Resolved once per frame; a slot compare against `[ls, le)` is then a few
+        // integer tests per mark, over a list the length of the reader's tab strip.
+        var pin_slot: [max_pinned]u32 = undefined;
+        var pin_at: [max_pinned]containment.Vec2 = undefined;
+        var pins: usize = 0;
+        {
+            var li: usize = 0;
+            while (li <= p.open_leaves.len and pins < max_pinned) : (li += 1) {
+                const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
+                if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
+                if (li > 0 and leaf == p.focus_leaf) continue; // already pinned as the focus
+                const note = self.lad.cells[leaf].note;
+                if (note == fold.invalid or note >= self.lad.slot_of.len) continue;
+                self.field.ensurePlaced(&self.lad, leaf);
+                pin_slot[pins] = self.lad.slot_of[note];
+                pin_at[pins] = self.field.pos[leaf];
+                pins += 1;
             }
         }
-        self.settled = true;
+
         var stack: std.ArrayListUnmanaged(u32) = .empty;
         defer stack.deinit(self.gpa);
         for (self.lad.roots) |r| {
@@ -898,10 +909,17 @@ pub const World = struct {
                     //
                     // Only the focused note, and only its own ancestors. Everything else keeps
                     // showing a mass where the mass is.
-                    const holds_focus = focus_slot != fold.invalid and
-                        focus_slot >= c.ls and focus_slot < c.le;
-                    const mx = if (holds_focus) focus_at.x else self.px[id];
-                    const my = if (holds_focus) focus_at.y else self.py[id];
+                    // The focus is offered first, so a cell holding several open notes leans onto
+                    // the one the reader is actually in.
+                    var mx = self.px[id];
+                    var my = self.py[id];
+                    for (pin_slot[0..pins], pin_at[0..pins]) |slot, at| {
+                        if (slot >= c.ls and slot < c.le) {
+                            mx = at.x;
+                            my = at.y;
+                            break;
+                        }
+                    }
                     try self.marks.append(self.gpa, .{
                         .cell = id,
                         .wx = mx,
