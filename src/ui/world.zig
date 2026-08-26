@@ -1461,7 +1461,19 @@ pub const World = struct {
         // overshoot bounded without a sort or a second pass. Uses last frame's count, because this
         // frame's is not known until the walk below has finished, and a frame of lag on a cull
         // threshold is not observable.
-        const ghost_cap = @max(p.link_budget / 2, 1);
+        // Hard ceiling, not just a raised threshold.
+        //
+        // A soft threshold only sheds the faintest, and it is applied a frame late — which is fine
+        // for the drift of an ordinary pan and useless for the case that actually hurts. Clicking a
+        // link flies the camera, `lift_hold` holds the web for the flight, and when the hold
+        // releases a whole new cut lands at once: every line of the old web departs on a single
+        // frame. Fading all of them triples the drawn set exactly when the camera is moving
+        // fastest, which is the hitch.
+        //
+        // Past the cap a departing link is retired outright. Nothing is lost by it: a fade says
+        // "this is the same web, changing", and when the entire web has been replaced that is not
+        // true — there is no continuity to draw, and snapping is both honest and free.
+        const ghost_cap = @max(p.link_budget / 8, 1);
         const retire_at: f32 = if (self.ghosts_prev > ghost_cap) 0.25 else 0.02;
         var ghosts: usize = 0;
 
@@ -1471,7 +1483,7 @@ pub const World = struct {
         while (it.next()) |kv| {
             if (kv.value_ptr.stamp == epoch) continue;
             const v = kv.value_ptr.v * (1 - rate);
-            if (v <= retire_at) {
+            if (v <= retire_at or ghosts >= ghost_cap) {
                 try dead.append(self.gpa, kv.key_ptr.*);
                 continue;
             }
