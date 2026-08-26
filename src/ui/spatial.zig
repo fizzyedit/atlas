@@ -193,10 +193,12 @@ fn keyOf(k: Keyed) u64 {
     return k.key;
 }
 
-/// Median distance between notes that are adjacent along the curve.
+/// Median distance between notes that are adjacent along the curve, **within one component**.
 ///
 /// A stand-in for median nearest-neighbour distance — curve-adjacent is an upper bound on it and
-/// close, and it costs the sort this file already does rather than a spatial query.
+/// close, and it costs the sort this file already does rather than a spatial query. Island jumps
+/// are skipped: component-major order puts a packing gap between islands, and that gap is the
+/// distance the packer chose, not a leaf spacing.
 ///
 /// This is the number that decides whether any grouping can produce non-overlapping cells. Two
 /// notes drawn at radius `r` overlap whenever they sit closer than `2r`, so a layout whose median
@@ -227,9 +229,18 @@ pub fn medianSpacing(gpa: std.mem.Allocator, pos: []const Vec2, comp: []const u3
     const sorted = radix.sortByKey(Keyed, keyOf, keyed, scratch);
 
     const gaps = try arena.alloc(f32, sorted.len - 1);
-    for (gaps, 1..) |*g, i| g.* = dist(pos[sorted[i - 1].note], pos[sorted[i].note]);
-    std.mem.sort(f32, gaps, {}, std.sort.asc(f32));
-    return gaps[gaps.len / 2];
+    var n_gaps: usize = 0;
+    for (1..sorted.len) |i| {
+        // Component-major order puts a packing jump between islands. That gap is the distance
+        // the packer chose, not a leaf spacing, and folding it into the median is how a vault
+        // of many small islands reported a huge "leaf" pitch and then scaled its clusters away.
+        if (comp[sorted[i].note] != comp[sorted[i - 1].note]) continue;
+        gaps[n_gaps] = dist(pos[sorted[i - 1].note], pos[sorted[i].note]);
+        n_gaps += 1;
+    }
+    if (n_gaps == 0) return 0;
+    std.mem.sort(f32, gaps[0..n_gaps], {}, std.sort.asc(f32));
+    return gaps[n_gaps / 2];
 }
 
 const LevelResult = struct { cells: []u32, pos: []Vec2 };

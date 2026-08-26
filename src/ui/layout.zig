@@ -24,17 +24,22 @@
 //!
 //! Two things happen after the solve that the solver cannot do for itself:
 //!
-//!   * **Components are solved separately and then packed as discs.** `multilevel`'s repulsion is
-//!     cut off at a few times the node spacing, so it cannot hold two unconnected islands apart —
-//!     they would drift through each other and a proximity hierarchy would then put them in the
-//!     same cell. Packing is the only place the "islands never share a cell" guarantee can be
-//!     re-established, because it is the only place that knows the islands are separate.
-//!   * **The result is scaled so the median leaf spacing is `spacing` note radii.** `multilevel`
-//!     emits unit space; the rest of Atlas is calibrated in note radii. This is not a unit
-//!     conversion — it is the step that decides whether leaves overlap at all. Two notes drawn at
-//!     radius `r` overlap whenever they are closer than `2r`, so anything below `spacing = 2.0`
-//!     guarantees overlapping leaves no matter what the hierarchy above does. The old layout sat
-//!     at 0.95, which is why sibling overlap was immovable by every knob we tried.
+//!   * **Each component is scaled to world units before anything is packed.** `multilevel` emits
+//!     unit space (~one note per unit); the rest of Atlas is calibrated in note radii. The scale
+//!     is chosen so the component's own median leaf spacing is `spacing` note radii — that is
+//!     what keeps two notes drawn at radius `r` from overlapping (`< 2r` is overlap by
+//!     construction; the old layout sat at 0.95x and sibling overlap was immovable). It has to
+//!     happen *per island, before packing*: mixing unit-space cluster radii with a world-space
+//!     island margin, then scaling the whole map by the leaf median, multiplies every gap by
+//!     `note_r` and sits a linked pair on top of itself while the next island lands tens of
+//!     leaf-spacings away. A Wikipedia-scale vault is one component, so it never hit this; a
+//!     personal vault of a few dozen notes is almost all islands, and did.
+//!   * **Components are then packed as discs.** `multilevel`'s repulsion is cut off at a few
+//!     times the node spacing, so it cannot hold two unconnected islands apart — they would
+//!     drift through each other and a proximity hierarchy would then put them in the same cell.
+//!     Packing is the only place the "islands never share a cell" guarantee can be re-established,
+//!     because it is the only place that knows the islands are separate. Radii and the gap
+//!     between them are world units, same as the positions.
 
 const std = @import("std");
 const dvui = @import("dvui");
@@ -117,13 +122,13 @@ pub fn solve(
     var aug: std.ArrayListUnmanaged(Edge) = .empty;
     try aug.ensureTotalCapacity(arena, weighted.len + n_notes);
     aug.appendSliceAssumeCapacity(weighted);
-    // Deliberately `addOrphanChain` and not `addPathChain`: a chain over *every* note would fuse
+    // Deliberately the orphan drawer and not `addPathChain`: a chain over *every* note would fuse
     // the whole vault into one component and there would be nothing left to pack.
     //
     // Guarded on having a path per note because the chain sorts orphans *by* path — a short or
     // absent path array reads out of bounds, and synthetic corpora supply none.
     if (paths.len == n_notes) {
-        try fold.addOrphanChain(arena, &aug, paths, links, n_notes, opts.folder_w);
+        try fold.addOrphanDrawer(arena, &aug, paths, links, n_notes, opts.folder_w);
     }
     const edges = aug.items;
 
@@ -185,22 +190,26 @@ pub fn solve(
             rmax = @max(rmax, @sqrt(q.x * q.x + q.y * q.y));
         }
         radii[c] = rmax;
+
+        // Unit space → world, using this island's own leaves. A later global scale would
+        // recouple island gaps into the median and undo the point of packing in world units.
+        const target = opts.spacing * opts.note_r;
+        const med = if (members.len == n_notes)
+            try spatial.medianSpacing(gpa, out.pos, out.comp)
+        else
+            try componentMedian(gpa, arena, out.pos, members);
+        if (med > 0 and target > 0) {
+            const s = target / med;
+            for (members) |note| {
+                out.pos[note].x *= s;
+                out.pos[note].y *= s;
+            }
+            radii[c] *= s;
+        }
     }
 
     try packComponents(arena, out, notes_csr, radii, centres, opts);
-
-    // -- world scale --------------------------------------------------------------------
-    // Recentre first so the scale below is about the same origin the whole app assumes, then set
-    // the scale from the measured median spacing rather than from any nominal unit.
     recentre(out.pos);
-    const med = try spatial.medianSpacing(gpa, out.pos, out.comp);
-    if (med > 0) {
-        const s = opts.spacing * opts.note_r / med;
-        for (out.pos) |*p| {
-            p.x *= s;
-            p.y *= s;
-        }
-    }
     out.spacing = if (opts.note_r > 0)
         (try spatial.medianSpacing(gpa, out.pos, out.comp)) / opts.note_r
     else
@@ -242,11 +251,11 @@ fn packComponents(
     var acc: f32 = 0;
     for (order, 0..) |c, i| {
         const rr = radii[c];
-        // The `+ margin` is what makes the discs *disjoint* rather than tangent. Without it the
-        // anchor and the first component placed around it touch exactly, and a proximity
-        // hierarchy is then free to put a note from each into one cell — which is precisely the
-        // island guarantee this pack exists to provide. One note pitch is enough, and being
-        // additive rather than folded into `acc` it costs the vault one pitch of extent in total.
+        // World units, same as `rr`. One leaf pitch between the outer notes of two islands is
+        // what keeps a proximity hierarchy from putting a note of each in one cell; being
+        // additive rather than folded into `acc` it costs the vault one pitch of extent in
+        // total. The same expression used to run against unit-space radii (~0.5) and then get
+        // scaled by ~`note_r` with the rest of the map, so the gap landed at `note_r` pitches.
         const margin = opts.spacing * opts.note_r;
         const rad = if (i == 0) 0 else @sqrt(acc) + rr + margin;
         acc += rr * rr * (if (i == 0) 1 else opts.pack_gap);
@@ -257,6 +266,28 @@ fn packComponents(
             out.pos[note].y += centres[c].y;
         }
     }
+}
+
+/// Median leaf spacing of one component, from its members' already-written positions.
+fn componentMedian(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    pos: []const Vec2,
+    members: []const u32,
+) !f32 {
+    if (members.len < 2) return 0;
+    if (members.len == 2) return dist(pos[members[0]], pos[members[1]]);
+    const tmp = try arena.alloc(Vec2, members.len);
+    const keys = try arena.alloc(u32, members.len);
+    @memset(keys, 0);
+    for (members, tmp) |note, *p| p.* = pos[note];
+    return spatial.medianSpacing(gpa, tmp, keys);
+}
+
+fn dist(a: Vec2, b: Vec2) f32 {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return @sqrt(dx * dx + dy * dy);
 }
 
 /// Put the centre of the content at the origin.
@@ -386,6 +417,53 @@ test "unconnected islands land in disjoint discs" {
             try testing.expect(@sqrt(dx * dx + dy * dy) > rad[a] + rad[b]);
         }
     }
+}
+
+test "a handful of islands keep their leaves apart without emptying the map" {
+    // The fizzy-vault shape: a few tiny components, no giant. Packing used to mix the solver's
+    // unit space with a world-space island margin and then scale the whole map by the leaf
+    // median, which sat each linked pair on top of itself (so they coalesced at every zoom
+    // the budget would otherwise have resolved) and threw the next island tens of leaf-spacings
+    // away. A Wikipedia-scale vault is one component and never hit this.
+    const note_r: f32 = 4;
+    const spacing: f32 = 2.6;
+    const pitch = spacing * note_r;
+    const edges = [_]Edge{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 2, .b = 3 },
+        .{ .a = 4, .b = 5 },
+    };
+    const paths = [_][]const u8{ "a.md", "b.md", "c.md", "d.md", "e.md", "f.md" };
+    var res = try solve(testing.allocator, 6, &edges, &paths, .{ .note_r = note_r, .spacing = spacing });
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 3), res.n_comp);
+
+    const pair_d = [_]f32{
+        dist(res.pos[0], res.pos[1]),
+        dist(res.pos[2], res.pos[3]),
+        dist(res.pos[4], res.pos[5]),
+    };
+    for (pair_d) |d| {
+        try testing.expect(d > pitch * 0.5);
+        try testing.expect(d < pitch * 2.5);
+    }
+
+    var ctr: [3]Vec2 = @splat(.{});
+    for (0..3) |g| {
+        ctr[g] = .{
+            .x = (res.pos[g * 2].x + res.pos[g * 2 + 1].x) * 0.5,
+            .y = (res.pos[g * 2].y + res.pos[g * 2 + 1].y) * 0.5,
+        };
+    }
+    var max_island: f32 = 0;
+    for (0..3) |a| {
+        for (a + 1..3) |b| {
+            max_island = @max(max_island, dist(ctr[a], ctr[b]));
+        }
+    }
+    // One-to-two leaf pitches of air between small islands, not the ~50x blow-up mixed units
+    // produced. Fit-to-extents then lands at a zoom where a two-note parent clears split_px.
+    try testing.expect(max_island < pitch * 8);
 }
 
 test "the content is centred on the origin" {

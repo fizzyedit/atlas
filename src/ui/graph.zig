@@ -1016,11 +1016,12 @@ pub const Panel = struct {
         self.interior_visible = .empty;
         self.open_notes.deinit(gpa);
         self.open_notes = .empty;
-        // Forget, do not free. `updateLabels` memcpy's into this buffer; after simplewiki it
-        // named a page the arena recycle below unmapped, and the first fizzy frame wrote 32
-        // bytes into the gap (SEGV in `appendSlice`). A reindex of the *same* vault keeps
-        // capacity on purpose — a different vault must not inherit the pointer.
+        // gpa-allocated (`rewarmLabels` / `updateLabels`). Zeroing without `deinit` leaked the
+        // buffer; leaving capacity set after `arena.reset` was the simplewiki→fizzy SEGV
+        // (`updateLabels` memcpy'd into an unmapped page). Free, then forget.
+        self.label_live.deinit(gpa);
         self.label_live = .empty;
+        self.interior_label_live.deinit(gpa);
         self.interior_label_live = .empty;
         self.pointer_warm.deinit(gpa);
         self.pointer_warm = .empty;
@@ -1189,27 +1190,21 @@ pub fn panelTimings(p: *const Panel) PanelStats {
     return s;
 }
 
-/// Join any layout worker still running and drop the living world. Must happen before a `Panel`
+/// Join any layout worker and forget the live arrangement. Must happen before a `Panel`
 /// (or the plugin library backing its worker's code) goes away — `LayoutJob` isn't exported, so
 /// this is the only place outside this file that can reach into one to join it; any other owner
 /// of a `Panel` (the vault simulator window) calls this too rather than reimplementing it.
+///
+/// This is the full `dropArrangement`, not a partial teardown. `setProjectFolder` always fires
+/// close then open, even for the folder that is already open. Joining the worker and freeing
+/// `world` / `path_index` / `label_live` while leaving `nodes`, `vault_key` and `gen` in place
+/// is how a second click on the same recent crashed in `finishRebuild` — `clear`/`put` on a
+/// deinited map, memcpy into an unmapped label buffer.
 pub fn shutdownPanel(p: *Panel) void {
-    if (p.job) |job| {
-        // Ask first, then join. `deinit` joins unconditionally, and the world build inside the
-        // solve is tens of seconds on a large vault — without this, quitting mid-build waits it
-        // out with a frozen window.
-        job.cancel.store(true, .release);
-        job.deinit(sdk.allocator());
-        p.job = null;
-    }
-    p.path_index.deinit(sdk.allocator());
-    p.holds_open.deinit(sdk.allocator());
-    p.label_live.deinit(sdk.allocator());
-    p.interior_label_live.deinit(sdk.allocator());
-    if (p.world_state) |*w| {
-        w.deinit();
-        p.world_state = null;
-    }
+    p.dropArrangement();
+    // So the subsequent `onFolderOpen` of the *same* folder still looks like a vault switch
+    // and does not skip `dropArrangement` on a matching `vault_key`.
+    p.vault_key = 0;
 }
 
 /// Join any layout worker still running. Must be called before the plugin's library can be
@@ -6557,10 +6552,6 @@ test "dropping a vault forgets hover, interior, camera, and the previous generat
     p.fitted_vp_h = 800;
     p.world_radius = 50_000;
     p.notes_at_level0 = 40;
-    // A dangling retained buffer is the second simplewiki → fizzy crash: `updateLabels`
-    // memcpy'd eight u32s into a page `arena.reset` had already given back.
-    p.label_live.capacity = 96;
-    p.interior_label_live.capacity = 32;
     p.labels_stale = false;
     p.labels_zoom = 8;
 
@@ -6585,6 +6576,29 @@ test "dropping a vault forgets hover, interior, camera, and the previous generat
     try std.testing.expectEqual(@as(usize, 0), p.interior_label_live.capacity);
     try std.testing.expect(p.labels_stale);
     try std.testing.expectEqual(@as(f32, 0), p.labels_zoom);
+}
+
+test "closing a folder leaves the panel safe to rebuild into" {
+    // `setProjectFolder` always fires onFolderClose then onFolderOpen, even for the folder
+    // that is already open. shutdown used to deinit `path_index`/`label_live` without
+    // emptying them, and skip `dropArrangement` because `vault_key` still matched — so the
+    // next `finishRebuild` walked freed maps (SEGV).
+    var p = Panel.init(std.testing.allocator);
+    defer {
+        p.interior.arena.deinit();
+        p.arena.deinit();
+    }
+    p.vault_key = 0x1234;
+    p.gen = 7;
+    shutdownPanel(&p);
+    shutdownPanel(&p);
+    try std.testing.expectEqual(@as(u64, 0), p.vault_key);
+    try std.testing.expectEqual(std.math.maxInt(u64), p.gen);
+    try std.testing.expectEqual(@as(usize, 0), p.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), p.label_live.capacity);
+    try std.testing.expectEqual(@as(u32, 0), p.path_index.count());
+    p.path_index.clearRetainingCapacity();
+    p.id_index.clearRetainingCapacity();
 }
 
 test "a crushed lattice is the zoom where every note hits the same ceiling" {

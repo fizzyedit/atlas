@@ -288,7 +288,7 @@ pub fn build(
         } else {
             // Flat vault: no folder tree to express, but the notes with *no links at all* still
             // need something to group on, and their titles are the only information there is.
-            try addOrphanChain(arena, &edges, paths, links, n_notes, opts.folder_w);
+            try addOrphanDrawer(arena, &edges, paths, links, n_notes, opts.folder_w);
         }
     }
 
@@ -439,7 +439,7 @@ pub fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge
 /// the layout. A chain over notes that have no links competes with nothing — it is the only signal
 /// available for them, and it makes a coalesced orphan group mean something ("titles around Ka…")
 /// instead of nothing.
-pub fn addOrphanChain(
+pub fn addOrphanDrawer(
     arena: std.mem.Allocator,
     edges: *std.ArrayListUnmanaged(Edge),
     paths: []const []const u8,
@@ -460,6 +460,27 @@ pub fn addOrphanChain(
     }
     if (orphans.items.len < 2) return;
 
+    // A star, not a chain.
+    //
+    // These notes link to nothing, so any topology given to them is invented — the only honest
+    // claim is "all of these are unplaced", and a star says exactly that and nothing more. A path
+    // says something else: that each note belongs beside the two it happens to sort between.
+    //
+    // It is also the difference between a drawer and a thread. A force layout settles a star of
+    // `k` nodes into a disc of radius ~sqrt(k), and a path of `k` into a line. Measured on a flat
+    // 284k vault, 2,817 orphans chained came out at radius 1,269 — a twelfth the density of the
+    // real vault, and packed outside it, which set the whole extent. The 281k notes that *do*
+    // link to each other were then squeezed into the innermost ring: 97.6% of the vault in an
+    // eighth of its area, which is why nothing on the map looked related to anything near it.
+    if (!hasFolders(paths)) {
+        // Nothing to group by. `hasFolders` exists because lexicographic order in a flat vault is
+        // not folder structure, it is the alphabet — chaining it wired `Mitsuhiro Toda` to
+        // `Mitsuhiro Kawamoto` and called it a relationship.
+        const hub = orphans.items[0];
+        for (orphans.items[1..]) |b| try edges.append(arena, .{ .a = hub, .b = b, .w = w });
+        return;
+    }
+
     const ByPath = struct {
         paths: []const []const u8,
         pub fn lessThan(self: @This(), a: u32, b: u32) bool {
@@ -468,9 +489,28 @@ pub fn addOrphanChain(
     };
     std.mem.sortUnstable(u32, orphans.items, ByPath{ .paths = paths }, ByPath.lessThan);
 
-    for (orphans.items[1..], 0..) |b, i| {
-        try edges.append(arena, .{ .a = orphans.items[i], .b = b, .w = w });
+    // One star per directory, and the directory representatives strung together in path order —
+    // so a folder's orphans sit together, sibling folders abut, and the whole drawer stays one
+    // component that packs as a single disc.
+    var prev_rep: ?u32 = null;
+    var i: usize = 0;
+    while (i < orphans.items.len) {
+        const rep = orphans.items[i];
+        const dir = dirOf(paths[rep]);
+        var j = i + 1;
+        while (j < orphans.items.len and std.mem.eql(u8, dirOf(paths[orphans.items[j]]), dir)) : (j += 1) {
+            try edges.append(arena, .{ .a = rep, .b = orphans.items[j], .w = w });
+        }
+        if (prev_rep) |pv| try edges.append(arena, .{ .a = pv, .b = rep, .w = w });
+        prev_rep = rep;
+        i = j;
     }
+}
+
+/// Everything before the last path separator; empty for a note at the vault root.
+fn dirOf(path: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return path[0..0];
+    return path[0..cut];
 }
 
 /// Whether these paths describe a folder tree at all.
@@ -1068,7 +1108,7 @@ test "a flat vault gets no folder chain" {
 
 test "orphans on a flat vault group by title, not by note id" {
     // The folder chain is suppressed on a flat vault (it would group everything alphabetically),
-    // which leaves unlinked notes with no signal at all. `addOrphanChain` restores exactly the
+    // which leaves unlinked notes with no signal at all. `addOrphanDrawer` restores exactly the
     // ordering the folder chain used to supply, scoped to notes that have nothing to compete with.
     const gpa = testing.allocator;
 

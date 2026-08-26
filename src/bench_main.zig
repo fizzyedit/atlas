@@ -473,6 +473,86 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     var lay = try layout.solve(gpa, n, edges, paths, .{ .note_r = place_opts.note_r });
     const solve_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
     var w = try world_mod.World.initFrom(gpa, n, edges, .{ .pos = lay.pos, .comp = lay.comp }, fold_opts, place_opts);
+    {
+        // Which islands the vault's extent is actually made of.
+        const cnt = try gpa.alloc(u32, lay.n_comp);
+        defer gpa.free(cnt);
+        const cx = try gpa.alloc(f64, lay.n_comp);
+        defer gpa.free(cx);
+        const cy = try gpa.alloc(f64, lay.n_comp);
+        defer gpa.free(cy);
+        @memset(cnt, 0);
+        @memset(cx, 0);
+        @memset(cy, 0);
+        for (lay.pos, lay.comp) |q, c| {
+            cnt[c] += 1;
+            cx[c] += q.x;
+            cy[c] += q.y;
+        }
+        for (cx, cy, cnt) |*a, *b, k| {
+            if (k == 0) continue;
+            a.* /= @floatFromInt(k);
+            b.* /= @floatFromInt(k);
+        }
+        const rad = try gpa.alloc(f32, lay.n_comp);
+        defer gpa.free(rad);
+        @memset(rad, 0);
+        for (lay.pos, lay.comp) |q, c| {
+            const dx = q.x - @as(f32, @floatCast(cx[c]));
+            const dy = q.y - @as(f32, @floatCast(cy[c]));
+            rad[c] = @max(rad[c], @sqrt(dx * dx + dy * dy));
+        }
+        const ord = try gpa.alloc(u32, lay.n_comp);
+        defer gpa.free(ord);
+        for (ord, 0..) |*o, i| o.* = @intCast(i);
+        const ByR = struct {
+            r: []const f32,
+            pub fn lessThan(self: @This(), a: u32, b: u32) bool {
+                return self.r[a] > self.r[b];
+            }
+        };
+        std.mem.sort(u32, ord, ByR{ .r = rad }, ByR.lessThan);
+        // Density profile of the giant component on its own, so the drawer and the packing
+        // cannot flatter or distort it.
+        var big: u32 = 0;
+        for (cnt, 0..) |k, c| if (k > cnt[big]) { big = @intCast(c); };
+        {
+            var hist: [8]u32 = @splat(0);
+            var tot: u32 = 0;
+            for (lay.pos, lay.comp) |q, c| {
+                if (c != big) continue;
+                const dx = q.x - @as(f32, @floatCast(cx[big]));
+                const dy = q.y - @as(f32, @floatCast(cy[big]));
+                const t = @sqrt(dx * dx + dy * dy) / @max(rad[big], 1e-6);
+                // Equal-area rings: the k-th ring ends at sqrt((k+1)/8).
+                var k: usize = 0;
+                while (k < 7 and t > @sqrt(@as(f32, @floatFromInt(k + 1)) / 8.0)) : (k += 1) {}
+                hist[k] += 1;
+                tot += 1;
+            }
+            var rs: std.ArrayListUnmanaged(f32) = .empty;
+            defer rs.deinit(gpa);
+            for (lay.pos, lay.comp) |q, c| {
+                if (c != big) continue;
+                const dx = q.x - @as(f32, @floatCast(cx[big]));
+                const dy = q.y - @as(f32, @floatCast(cy[big]));
+                rs.append(gpa, @sqrt(dx * dx + dy * dy)) catch {};
+            }
+            std.mem.sort(f32, rs.items, {}, std.sort.asc(f32));
+            const L = rs.items.len;
+            std.debug.print("  giant radius  p50 {d:.0}  p90 {d:.0}  p99 {d:.0}  p99.9 {d:.0}  max {d:.0}  (n {d})\n", .{
+                rs.items[L / 2], rs.items[L * 9 / 10], rs.items[L * 99 / 100], rs.items[L * 999 / 1000], rs.items[L - 1], L,
+            });
+            std.debug.print("  giant component density (equal-area rings):  ", .{});
+            for (hist) |h| std.debug.print("{d:>5.1}", .{@as(f64, @floatFromInt(h)) * 100.0 / @as(f64, @floatFromInt(@max(tot, 1)))});
+            std.debug.print("  %\n", .{});
+        }
+        std.debug.print("  components {d}; widest:", .{lay.n_comp});
+        for (ord[0..@min(ord.len, 5)]) |c| {
+            std.debug.print("  n={d} r={d:.0}", .{ cnt[c], rad[c] });
+        }
+        std.debug.print("\n", .{});
+    }
     lay.deinit(gpa);
     defer w.deinit();
     const build_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
@@ -841,6 +921,115 @@ fn layoutReport(
             }
         }
         try linkSpreadReport(gpa, edges, lp, deg, ext, sample_cap);
+    }
+
+    // -- 1b. co-citation distance: is *nearby* the same as *related*? ---------------------------
+    //
+    // `link spread` grades the links that exist. It says nothing about the far commoner case —
+    // two notes with no link between them that are plainly about the same thing because they
+    // point at the same handful of others. That is what makes a map browsable: drifting across it
+    // should pass through things that belong together, not just things that are wired together.
+    //
+    // Measured as: pairs sharing at least `cocite_min` neighbours and *not* directly linked, how
+    // far apart do they sit, against random pairs as the null. Equal medians mean the layout has
+    // captured none of it.
+    //
+    // Hubs are excluded as intermediaries. Two notes both linking to *United States* have nothing
+    // in common; only a shared neighbour that is itself selective is evidence, which is the same
+    // argument `degreeNormalised` makes about a link's weight.
+    {
+        const deg_cap: u32 = 128;
+        const cocite_min: u32 = 3;
+        const pos = try gpa.alloc(spatial.Vec2, w.lad.leaf_cell.len);
+        defer gpa.free(pos);
+        for (pos, 0..) |*q, i| {
+            if (w.noteWorldPos(@intCast(i))) |wp| {
+                q.* = .{ .x = wp.x, .y = wp.y };
+            } else {
+                q.* = .{};
+            }
+        }
+        const starts = try gpa.alloc(u32, deg.len + 1);
+        defer gpa.free(starts);
+        @memset(starts, 0);
+        for (edges) |e| {
+            if (e.a >= deg.len or e.b >= deg.len or e.a == e.b) continue;
+            starts[e.a + 1] += 1;
+            starts[e.b + 1] += 1;
+        }
+        for (1..starts.len) |i| starts[i] += starts[i - 1];
+        const adj = try gpa.alloc(u32, edges.len * 2);
+        defer gpa.free(adj);
+        const cur = try gpa.alloc(u32, deg.len);
+        defer gpa.free(cur);
+        @memcpy(cur, starts[0..deg.len]);
+        for (edges) |e| {
+            if (e.a >= deg.len or e.b >= deg.len or e.a == e.b) continue;
+            adj[cur[e.a]] = e.b;
+            cur[e.a] += 1;
+            adj[cur[e.b]] = e.a;
+            cur[e.b] += 1;
+        }
+
+        const shared = try gpa.alloc(u32, deg.len);
+        defer gpa.free(shared);
+        @memset(shared, 0);
+        var touched: std.ArrayListUnmanaged(u32) = .empty;
+        defer touched.deinit(gpa);
+        var near: std.ArrayListUnmanaged(f32) = .empty;
+        defer near.deinit(gpa);
+
+        const stride = @max(1, deg.len / 4000);
+        var u: usize = 0;
+        while (u < deg.len) : (u += stride) {
+            if (deg[u] == 0 or deg[u] > deg_cap) continue;
+            const pu = posOf(pos, @intCast(u)) orelse continue;
+            for (starts[u]..starts[u + 1]) |ka| {
+                const v = adj[ka];
+                if (deg[v] > deg_cap) continue; // a hub shared by both says nothing
+                for (starts[v]..starts[v + 1]) |kb| {
+                    const t = adj[kb];
+                    if (t == u) continue;
+                    if (shared[t] == 0) touched.append(gpa, t) catch continue;
+                    shared[t] += 1;
+                }
+            }
+            for (touched.items) |t| {
+                if (shared[t] >= cocite_min) direct: {
+                    for (starts[u]..starts[u + 1]) |k| if (adj[k] == t) break :direct;
+                    const pt = posOf(pos, t) orelse break :direct;
+                    const dx = pu.x - pt.x;
+                    const dy = pu.y - pt.y;
+                    near.append(gpa, @sqrt(dx * dx + dy * dy)) catch {};
+                }
+                shared[t] = 0;
+            }
+            touched.clearRetainingCapacity();
+        }
+
+        if (near.items.len > 0) {
+            std.mem.sort(f32, near.items, {}, std.sort.asc(f32));
+            // Null model: the same count of arbitrary pairs, walked with a coprime stride so the
+            // sample is spread rather than local.
+            var rnd: std.ArrayListUnmanaged(f32) = .empty;
+            defer rnd.deinit(gpa);
+            var i: usize = 0;
+            while (i < near.items.len and i < 60_000) : (i += 1) {
+                const a = (i * 7919) % pos.len;
+                const b = (i * 104729 + 5000) % pos.len;
+                if (a == b) continue;
+                const dx = pos[a].x - pos[b].x;
+                const dy = pos[a].y - pos[b].y;
+                rnd.append(gpa, @sqrt(dx * dx + dy * dy)) catch {};
+            }
+            std.mem.sort(f32, rnd.items, {}, std.sort.asc(f32));
+            const nm = @as(f64, near.items[near.items.len / 2]) / ext;
+            const rm = if (rnd.items.len > 0) @as(f64, rnd.items[rnd.items.len / 2]) / ext else 0;
+            std.debug.print(
+                "  co-citation    n {d}  median {d:.3}r   random pairs {d:.3}r   ratio {d:.2}x closer\n",
+                .{ near.items.len, nm, rm, if (nm > 1e-6) rm / nm else 0 },
+            );
+        }
     }
 
     // -- 2 & 4. sibling overlap and hexagonal order --------------------------------------------
@@ -1308,6 +1497,12 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     // every frame there is nothing to reuse, and if it replaces a handful there is everything to.
     var churn_sum: f64 = 0;
     var churn_n: usize = 0;
+    var prev_links: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer prev_links.deinit(gpa_for_probe);
+    var link_churn_sum: f64 = 0;
+    var link_churn_n: usize = 0;
+    var n_min: usize = std.math.maxInt(usize);
+    var n_max: usize = 0;
     var prev_cut: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer prev_cut.deinit(gpa_for_probe);
 
@@ -1372,10 +1567,46 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
             churn_sum += frac;
             churn_n += 1;
         }
+        // How much of the *drawn web* changes frame to frame.
+        //
+        // Distinct from cut churn, and the number that decides whether links visibly pop. A cut
+        // change of one cell rebuilds the whole lift, and the lift is a budgeted top-K — so a
+        // small change to the candidate set can re-rank across the budget boundary and swap many
+        // links at once. Nothing fades them any more, so whatever changes here is a pop.
+        n_min = @min(n_min, w.links.items.len);
+        n_max = @max(n_max, w.links.items.len);
+        if (prev_links.count() > 0) {
+            // Set difference both ways, counted over distinct keys. Subtracting counts would
+            // underflow whenever two lifted links share a cell pair, which they can.
+            var cur_keys: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer cur_keys.deinit(gpa_for_probe);
+            for (w.links.items) |l| {
+                try cur_keys.put(gpa_for_probe, (@as(u64, l.a) << 32) | @as(u64, l.b), {});
+            }
+            var entered: usize = 0;
+            var it_cur = cur_keys.keyIterator();
+            while (it_cur.next()) |k| {
+                if (!prev_links.contains(k.*)) entered += 1;
+            }
+            var left: usize = 0;
+            var it_prev = prev_links.keyIterator();
+            while (it_prev.next()) |k| {
+                if (!cur_keys.contains(k.*)) left += 1;
+            }
+            link_churn_sum += @as(f64, @floatFromInt(entered + left)) /
+                @as(f64, @floatFromInt(@max(1, cur_keys.count())));
+            link_churn_n += 1;
+        }
+        prev_links.clearRetainingCapacity();
+        for (w.links.items) |l| {
+            try prev_links.put(gpa_for_probe, (@as(u64, l.a) << 32) | @as(u64, l.b), {});
+        }
+
         prev_cut.clearRetainingCapacity();
         for (w.cut.items) |c| try prev_cut.put(gpa_for_probe, c, {});
     }
     const churn = if (churn_n > 0) churn_sum / @as(f64, @floatFromInt(churn_n)) else 0;
+    const link_churn = if (link_churn_n > 0) link_churn_sum / @as(f64, @floatFromInt(link_churn_n)) else 0;
 
     var sorted = samples;
     std.mem.sort(f64, &sorted, {}, std.sort.asc(f64));
@@ -1389,13 +1620,16 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
         }
     }.f;
     std.debug.print(
-        "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}  cut churn {d:.1}%\n" ++
+        "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}  cut churn {d:.1}%  web churn {d:.1}%  drawn {d}..{d}\n" ++
             "         ms/frame: step {d:.2} | lift focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n",
         .{
             if (px_per_frame == 0) "park" else "pan ",
             sum / @as(f64, frames), sorted[frames / 2], sorted[frames * 95 / 100], sorted[frames - 1],
             pr.recomputes,          pr.calls,
             churn * 100,
+            link_churn * 100,
+            n_min,
+            n_max,
             per(step_ns),           per(pr.focus_ns),
             per(pr.scan_ns),
             per(pr.build_ns),       per(pr.sort_ns),

@@ -2301,6 +2301,44 @@ test "leaf_pitch is the spacing the layout actually produces" {
     try testing.expectApproxEqAbs(leaf_pitch, res.spacing, 0.25);
 }
 
+test "a small island vault resolves every note at overview zoom" {
+    // Budget is hundreds and the vault is six notes. The only reason this used to coalesce at
+    // the fitted view is the layout sitting each linked pair on one point, so the parent disc
+    // never cleared split_px and fit-to-extents framed empty ocean between the islands.
+    const gpa = testing.allocator;
+    const note_r: f32 = 4;
+    const edges = [_]fold.Edge{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 2, .b = 3 },
+        .{ .a = 4, .b = 5 },
+    };
+    const paths = [_][]const u8{ "a.md", "b.md", "c.md", "d.md", "e.md", "f.md" };
+    var lay = try layout.solve(gpa, 6, &edges, &paths, .{ .note_r = note_r });
+    defer lay.deinit(gpa);
+
+    var w = try World.initFrom(
+        gpa,
+        6,
+        &edges,
+        .{ .pos = lay.pos, .comp = lay.comp },
+        .{},
+        .{ .note_r = note_r },
+    );
+    defer w.deinit();
+
+    const e = w.extent();
+    const view: View = .{
+        .w = 900,
+        .h = 600,
+        .zoom = @min(900, 600) / (2 * @max(e, 1e-3)),
+        .cx = 0,
+        .cy = 0,
+    };
+    try settle(&w, view, .{ .budget = 360 }, 120);
+    try testing.expectEqual(@as(usize, 6), w.noteMarks());
+    for (w.marks.items) |m| try testing.expect(m.is_note);
+}
+
 test "holding topology keeps the open set while zoom changes" {
     // The hitch this pins down: a flick-zoom used to re-decide the cut every frame, settle every
     // newly opened cell, and re-lift the web. Holding the open set is what makes that a camera
