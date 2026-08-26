@@ -463,6 +463,10 @@ pub const World = struct {
     fade_epoch: u32 = 0,
     /// Links that were fading out last frame — see the retire threshold in `fadeLinks`.
     ghosts_prev: usize = 0,
+    /// Per cell: stamped when it is an ancestor of one of the reader's open notes. See
+    /// `markOpenChains`.
+    open_chain: []u32,
+    open_chain_epoch: u32 = 0,
     /// Scratch for the keys `fadeLinks` retires.
     sc_dead: std.ArrayListUnmanaged(u64) = .empty,
     /// Per-cell memo for `cutOf`, valid only while `cut[i].stamp == cut_epoch`. The stamp exists
@@ -657,6 +661,7 @@ pub const World = struct {
             .cut_of = try gpa.alloc(Memo, n_cells),
             .side = try gpa.alloc(SideAcc, n_cells),
             .mark_of = try gpa.alloc(Memo, n_cells),
+            .open_chain = try gpa.alloc(u32, n_cells),
         };
         @memset(w.anim, 0);
         @memset(w.px, 0);
@@ -670,6 +675,7 @@ pub const World = struct {
         // 0 can never match the epoch of the first accumulation.
         @memset(w.side, .{});
         @memset(w.mark_of, .{});
+        @memset(w.open_chain, 0);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
@@ -795,6 +801,7 @@ pub const World = struct {
         self.gpa.free(self.cut_of);
         self.gpa.free(self.side);
         self.gpa.free(self.mark_of);
+        self.gpa.free(self.open_chain);
         self.side_hit.deinit(self.gpa);
         self.sc_acc.deinit(self.gpa);
         self.sc_focus_pairs.deinit(self.gpa);
@@ -886,23 +893,7 @@ pub const World = struct {
 
     /// Pass 1 — which cells are open. Reads only the ladder, the view, and the budget.
     pub fn decideTopology(self: *World, view: View, p: Params) !void {
-        // The notes the reader has open, as slots into `note_at`.
-        //
-        // Every cell holds a contiguous `[ls, le)` range of those slots, so "does this cell
-        // contain an open note" is two integer compares — cheap enough to ask of every cell on
-        // the frontier, which is what keeps the chain below honest.
-        const open_slots = &self.sc_slots;
-        open_slots.clearRetainingCapacity();
-        {
-            var li: usize = 0;
-            while (li <= p.open_leaves.len) : (li += 1) {
-                const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
-                if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
-                const note = self.lad.cells[leaf].note;
-                if (note == fold.invalid or note >= self.lad.slot_of.len) continue;
-                try open_slots.append(self.gpa, self.lad.slot_of[note]);
-            }
-        }
+        self.markOpenChains(p);
 
         const frontier = &self.sc_frontier;
         const next = &self.sc_next;
@@ -937,7 +928,7 @@ pub const World = struct {
             // position -- carry on converging on empty space.
             vis.clearRetainingCapacity();
             for (frontier.items) |id| {
-                if (self.restOnScreen(id, view, p) or self.containsOpenSlot(id, open_slots.items)) {
+                if (self.restOnScreen(id, view, p) or self.containsOpenSlot(id)) {
                     try vis.append(self.gpa, id);
                 } else {
                     // Still part of the cut, so a link leaving the viewport keeps a target. This
@@ -983,7 +974,7 @@ pub const World = struct {
                 //
                 // Costs at most depth x arity extra cells per open note against a budget in the
                 // thousands, bounded by the tab strip.
-                const holds_open_note = self.containsOpenSlot(id, open_slots.items);
+                const holds_open_note = self.containsOpenSlot(id);
                 var will_open = holds_open_note or (self.wantsSplit(id, view, p) and
                     (cutoff == null or self.radiusClass(id) > cutoff.?));
                 // First-time placement is the hitch: 128 relax steps per cell. Already-placed
@@ -1039,14 +1030,42 @@ pub const World = struct {
     /// `Cell.ls`/`le` bound a contiguous run of `note_at`, so a cell contains a note exactly when
     /// that note's slot falls in the range. A leaf holding the note answers false: there is
     /// nothing left to split, and forcing `open` on a childless cell would only cost the walk.
-    fn containsOpenSlot(self: *const World, id: u32, slots: []const u32) bool {
-        if (slots.len == 0) return false;
-        const c = self.lad.cells[id];
-        if (c.child_count == 0) return false;
-        for (slots) |s| {
-            if (s >= c.ls and s < c.le) return true;
+    /// Mark every cell on the path from an open note up to its root.
+    ///
+    /// The set of cells that must not coalesce is exactly the ancestors of the reader's open
+    /// notes, and there are `depth` of them per note — eight or so. Walking down to mark them
+    /// costs that; asking each cell in turn whether it contains any open note costs `cells x
+    /// tabs`, at every level, every frame.
+    ///
+    /// Which is what it did. The check was a linear scan over the open set, and the open set grows
+    /// all session as the reader clicks through the map — so the graph started fast and got slower
+    /// the more of it you had visited, and a relaunch "fixed" it. Stamped rather than cleared, so
+    /// a frame costs nothing to invalidate.
+    fn markOpenChains(self: *World, p: Params) void {
+        self.open_chain_epoch +%= 1;
+        if (self.open_chain_epoch == 0) {
+            @memset(self.open_chain, 0);
+            self.open_chain_epoch = 1;
         }
-        return false;
+        const epoch = self.open_chain_epoch;
+        var li: usize = 0;
+        while (li <= p.open_leaves.len) : (li += 1) {
+            const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
+            if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
+            // From the leaf's *parent*: a leaf has nothing to split, and forcing `open` on a
+            // childless cell only costs the walk.
+            var c = self.lad.cells[leaf].parent;
+            var guard: u8 = 0;
+            while (c != fold.invalid and c < self.open_chain.len and guard < 64) : (guard += 1) {
+                if (self.open_chain[c] == epoch) break; // this ancestry is already marked
+                self.open_chain[c] = epoch;
+                c = self.lad.cells[c].parent;
+            }
+        }
+    }
+
+    fn containsOpenSlot(self: *const World, id: u32) bool {
+        return id < self.open_chain.len and self.open_chain[id] == self.open_chain_epoch;
     }
 
     fn wantsSplit(self: *const World, id: u32, view: View, p: Params) bool {

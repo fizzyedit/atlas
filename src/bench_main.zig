@@ -1605,6 +1605,13 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
         prev_cut.clearRetainingCapacity();
         for (w.cut.items) |c| try prev_cut.put(gpa_for_probe, c, {});
     }
+    // The worst frame, broken out. A mean hides a hitch by definition — what the reader feels is
+    // the one frame that took 35 ms, and the only useful question about it is which phase did.
+    var worst: usize = 0;
+    for (samples, 0..) |x, i| {
+        if (x > samples[worst]) worst = i;
+    }
+
     const churn = if (churn_n > 0) churn_sum / @as(f64, @floatFromInt(churn_n)) else 0;
     const link_churn = if (link_churn_n > 0) link_churn_sum / @as(f64, @floatFromInt(link_churn_n)) else 0;
 
@@ -1621,7 +1628,8 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
     }.f;
     std.debug.print(
         "    {s}  mean {d:.2}  p50 {d:.2}  p95 {d:.2}  max {d:.2} ms/frame   lift rebuilt {d}/{d}  cut churn {d:.1}%  web churn {d:.1}%  drawn {d}..{d}\n" ++
-            "         ms/frame: step {d:.2} | lift focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n",
+            "         ms/frame: step {d:.2} | lift focus {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}   links {d}\n" ++
+            "         worst frame {d:.2} ms: topo {d:.2}  present {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}  lifted {d}  cut {d}  marks {d}\n",
         .{
             if (px_per_frame == 0) "park" else "pan ",
             sum / @as(f64, frames), sorted[frames / 2], sorted[frames * 95 / 100], sorted[frames - 1],
@@ -1635,6 +1643,16 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
             per(pr.build_ns),       per(pr.sort_ns),
             per(pr.fade_ns),
             w.links.items.len,
+            samples[worst],
+            detail[worst].topo,
+            detail[worst].pres,
+            detail[worst].scan,
+            detail[worst].build,
+            detail[worst].sort,
+            detail[worst].fade,
+            detail[worst].lifted,
+            detail[worst].cut,
+            detail[worst].marks,
         },
     );
 
