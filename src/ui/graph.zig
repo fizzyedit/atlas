@@ -68,7 +68,7 @@ const open_node_r: f32 = 34;
 ///
 /// They are **physical** pixels on a 2x (hidpi) screen, because that is the machine they were
 /// dialled in on and the numbers worth keeping are the ones that were actually looked at.
-const tuned_scale: f32 = 2;
+
 
 /// Converts a tuned constant to the reader's screen. 1 on a hidpi display, 0.5 on an ordinary one.
 ///
@@ -79,9 +79,7 @@ const tuned_scale: f32 = 2;
 /// themselves to the display. The bubbles, the hover falloff and the world LOD thresholds did
 /// not, so they drew at their tuned size on a 2x screen and at twice that everywhere else — a
 /// 1x monitor showed nodes twice as large as intended, against labels that were the right size.
-fn dpiScale() f32 {
-    return dvui.currentWindow().natural_scale / tuned_scale;
-}
+const dpiScale = galaxy.dpiScale;
 
 /// On-screen bubble radii — constant across zoom, like pixi's `/ canvas.scale` buttons.
 /// See `tuned_scale` for the unit.

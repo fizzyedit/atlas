@@ -55,6 +55,17 @@ pub const DrawCtx = struct {
 
 pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, links_drawn: u32 = 0 };
 
+/// How wide a web line is drawn, in the same tuned units everything else on the panel uses.
+///
+/// Scaled by the display, which it was not: the thickness went to `LineBatch` as a raw physical
+/// pixel count, so on a 2x screen the whole web was drawn half a logical pixel wide. A quad
+/// narrower than a pixel never covers one — the rasteriser gives it partial coverage that shifts
+/// as the line moves sub-pixel, and the blend against the background makes that read as the web
+/// shimmering. The colour was never the problem: `intoBg` returns an opaque mix, so a line is a
+/// solid colour and its *coverage* is what was flickering.
+const web_px: f32 = 1.0;
+const focus_web_px: f32 = 1.8;
+
 /// Ambient-web mix. Constant, not a function of how many lines are on screen.
 ///
 /// Density used to walk this toward the background as the viewport filled, so a zoom that
@@ -283,7 +294,7 @@ pub fn draw(
             // true observation about a broken target, not about crossfading.
             const t = ambient_t * std.math.clamp(l.alpha, 0, 1);
             if (t <= 0.004) continue;
-            batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, t));
+            batch.add(seg.a, seg.b, web_px * galaxy.dpiScale(), galaxy.intoBg(border_rest, bg, t));
             stats.links_drawn += 1;
         }
 
@@ -321,7 +332,7 @@ pub fn draw(
             // them means each pixel is one colour.
             if (fgrow < 0.996 and ambient_t > 0.004) {
                 if (clipToRect(tip, b, clip_rect)) |rest| {
-                    batch.add(rest.a, rest.b, 1.0, galaxy.intoBg(border_rest, bg, ambient_t));
+                    batch.add(rest.a, rest.b, web_px * galaxy.dpiScale(), galaxy.intoBg(border_rest, bg, ambient_t));
                     stats.links_drawn += 1;
                 }
             }
@@ -333,7 +344,7 @@ pub fn draw(
         if (focus_t > 0.004) {
             const lit = galaxy.intoBg(lit_base, bg, focus_t);
             for (lit_segs.items) |seg| {
-                batch.add(seg.a, seg.b, 1.8, lit);
+                batch.add(seg.a, seg.b, focus_web_px * galaxy.dpiScale(), lit);
                 stats.links_drawn += 1;
             }
         }

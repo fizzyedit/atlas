@@ -13,6 +13,18 @@ pub const SoftAtlas = batch2d.SoftAtlas;
 pub const SpriteBatch = batch2d.SpriteBatch;
 pub const LineBatch = batch2d.LineBatch;
 
+/// The display scale the panel's sizes are tuned against.
+///
+/// Every on-screen size in the graph — bubble radii, hover falloff, label gaps, line widths — is
+/// written in these units and multiplied by `dpiScale` at use. Lives here because `graph` and
+/// `world_draw` both need it and neither may import the other; two copies of the constant is how
+/// the web ended up drawn at half the width of everything around it.
+pub const tuned_scale: f32 = 2;
+
+pub fn dpiScale() f32 {
+    return dvui.currentWindow().natural_scale / tuned_scale;
+}
+
 /// The surface the graph is actually drawn on.
 ///
 /// `.content.fill`, because that is what Fizzy fills the window with (`Editor.zig`, `window_color`)
