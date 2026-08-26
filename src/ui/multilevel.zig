@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const dvui = @import("dvui");
+const radix = @import("radix.zig");
 
 /// A tie between two nodes. `w` scales the attraction along it, so callers can express that some
 /// links are better evidence of relatedness than others — a link to a 29k-degree hub says almost
@@ -36,6 +37,10 @@ const coarsest_n: usize = 40;
 /// Give up if a coarsening pass cannot shrink the graph by at least this fraction. A graph with
 /// no matchable structure left (a star, say) would otherwise loop forever making no progress.
 const min_shrink: f32 = 0.9;
+/// Most nodes one coarse group may stand for. Pairs are the ideal; the leftover fold in `match`
+/// may push a group to this, and no further — an uncapped fold lets a hub absorb every note
+/// pendant to it in one level, which coarsens fast and throws away the structure underneath.
+const group_max: u32 = 4;
 const max_levels: usize = 32;
 
 /// Unit-space spacing the solve aims for at every level. Density is held constant across levels
@@ -360,7 +365,58 @@ fn match(allocator: std.mem.Allocator, n: usize, edges: []const WEdge, parent: [
         if (best) |j| parent[j] = next;
         next += 1;
     }
-    return next;
+
+    // Second pass: fold the leftovers into a neighbour's group.
+    //
+    // Heavy-edge matching only pairs a node with an *unmatched* neighbour, and on a scale-free
+    // graph that stalls badly. Hubs are claimed in the first few steps, and the thousands of
+    // notes pendant to them then find every neighbour already taken and become groups of one, so
+    // the level barely shrinks. Measured on a 284k-note vault: 281k -> 192k -> 143k -> 115k ->
+    // 99k, each step worse than the last, until `min_shrink` gave up. The "coarsest" graph the
+    // solve then started from still had 99k nodes and 1.7M edges, and every level on the way back
+    // down cost nearly as much as the finest — which is most of why a solve took twenty seconds.
+    //
+    // Letting a leftover join a group that is already formed is what unblocks it, capped at
+    // `group_max` so one hub cannot swallow its entire neighbourhood into a single supernode and
+    // flatten the structure the ladder exists to find.
+    const size = try allocator.alloc(u32, next);
+    defer allocator.free(size);
+    @memset(size, 0);
+    for (0..n) |i| size[parent[i]] += 1;
+    for (0..n) |i| {
+        if (size[parent[i]] != 1) continue;
+        var best: ?u32 = null;
+        var best_w: f32 = -1;
+        for (starts[i]..starts[i + 1]) |k| {
+            const j = adj[k];
+            if (j == i or parent[j] == parent[i]) continue;
+            if (size[parent[j]] >= group_max) continue;
+            if (w[k] > best_w) {
+                best_w = w[k];
+                best = j;
+            }
+        }
+        const j = best orelse continue;
+        size[parent[i]] -= 1;
+        parent[i] = parent[j];
+        size[parent[i]] += 1;
+    }
+
+    // Compact: the fold above leaves holes in the numbering, and the caller takes the count as
+    // the next level's node count.
+    const remap = try allocator.alloc(u32, next);
+    defer allocator.free(remap);
+    @memset(remap, none);
+    var out: u32 = 0;
+    for (0..n) |i| {
+        const g = parent[i];
+        if (remap[g] == none) {
+            remap[g] = out;
+            out += 1;
+        }
+        parent[i] = remap[g];
+    }
+    return out;
 }
 
 /// Rewrite `edges` in terms of `parent`, dropping self-loops and summing duplicates.
@@ -377,20 +433,24 @@ fn contract(allocator: std.mem.Allocator, edges: *std.ArrayList(WEdge), parent: 
     try dedup(allocator, edges);
 }
 
+fn edgeKey(e: WEdge) u64 {
+    return (@as(u64, e.a) << 32) | @as(u64, e.b);
+}
+
 fn dedup(allocator: std.mem.Allocator, edges: *std.ArrayList(WEdge)) !void {
-    _ = allocator;
     for (edges.items) |*e| {
         const a = @min(e.a, e.b);
         const b = @max(e.a, e.b);
         e.a = a;
         e.b = b;
     }
-    std.mem.sort(WEdge, edges.items, {}, struct {
-        fn less(_: void, x: WEdge, y: WEdge) bool {
-            if (x.a != y.a) return x.a < y.a;
-            return x.b < y.b;
-        }
-    }.less);
+    // Radix, not a comparison sort. This runs once per coarsening level over the whole edge set
+    // — 2.7M pairs at the finest — and `std.mem.sort` on that is hundreds of milliseconds a level.
+    // The key is the canonicalised pair, which is exactly what the dedup below scans for.
+    const scratch = try allocator.alloc(WEdge, edges.items.len);
+    defer allocator.free(scratch);
+    const sorted = radix.sortByKey(WEdge, edgeKey, edges.items, scratch);
+    if (sorted.ptr != edges.items.ptr) @memcpy(edges.items, sorted);
     var w: usize = 0;
     for (edges.items) |e| {
         if (w > 0 and edges.items[w - 1].a == e.a and edges.items[w - 1].b == e.b) {
@@ -418,6 +478,28 @@ fn relax(
     const force = try allocator.alloc(dvui.Point, n);
     defer allocator.free(force);
 
+    // Per-thread accumulators for the spring pass, allocated once for the whole relax rather than
+    // per iteration. Null when the level is small enough to run on one thread.
+    var scratch: ?[][]dvui.Point = null;
+    defer if (scratch) |bufs| {
+        for (bufs) |b| allocator.free(b);
+        allocator.free(bufs);
+    };
+    if (edges.len >= attract_thread_min) {
+        const want = std.Thread.getCpuCount() catch 1;
+        const threads = @min(@max(want, 1), repel_threads_max);
+        if (threads > 1) {
+            const bufs = try allocator.alloc([]dvui.Point, threads);
+            var made: usize = 0;
+            errdefer {
+                for (bufs[0..made]) |b| allocator.free(b);
+                allocator.free(bufs);
+            }
+            while (made < threads) : (made += 1) bufs[made] = try allocator.alloc(dvui.Point, n);
+            scratch = bufs;
+        }
+    }
+
     for (0..iters) |it| {
         if (cancel) |c| if (c.load(.monotonic)) return error.Canceled;
         @memset(force, .{});
@@ -426,25 +508,9 @@ fn relax(
 
         var grid = try Grid.init(allocator, pos, n, repulse_cut);
         defer grid.deinit(allocator);
-        grid.repel(pos, force, mass);
+        grid.repel(n, pos, force, mass);
 
-        for (edges) |e| {
-            const dx = pos[e.b].x - pos[e.a].x;
-            const dy = pos[e.b].y - pos[e.a].y;
-            const d = @sqrt(dx * dx + dy * dy);
-            if (d < 1e-4) continue;
-            // LinLog: long links pull hard, short ones barely at all, which is what keeps a
-            // cluster from collapsing to a point once it is already together.
-            const mag = spring_k * e.w * @log(1.0 + d / spacing);
-            const fx = (dx / d) * mag;
-            const fy = (dy / d) * mag;
-            // Divided by mass: a supernode standing for a whole community should not be flung
-            // around by one link the way a single note is.
-            force[e.a].x += fx / mass[e.a];
-            force[e.a].y += fy / mass[e.a];
-            force[e.b].x -= fx / mass[e.b];
-            force[e.b].y -= fy / mass[e.b];
-        }
+        attract(edges, mass, pos, force, scratch);
 
         for (0..n) |i| {
             var fx = force[i].x - pos[i].x * gravity_k;
@@ -457,6 +523,73 @@ fn relax(
             pos[i].x += fx;
             pos[i].y += fy;
         }
+    }
+}
+
+/// Edge count below which the spring pass stays on one thread.
+const attract_thread_min: usize = 200_000;
+
+/// Springs along every link, in parallel when there are enough of them.
+///
+/// Unlike repulsion this writes *both* endpoints, and an edge range does not own its nodes — so
+/// each thread accumulates into a buffer of its own and the buffers are summed afterwards. The
+/// partition is by edge index and fixed, so the reduction always adds the same partial sums in
+/// the same order: the answer does not move between runs, which `solve` is required to guarantee.
+///
+/// Measured at 284k notes this was 1.94 s of a 3.45 s solve once repulsion had been bounded and
+/// threaded — the whole ladder walks 420M edges.
+fn attract(
+    edges: []const WEdge,
+    mass: []const f32,
+    pos: []const dvui.Point,
+    force: []dvui.Point,
+    scratch: ?[][]dvui.Point,
+) void {
+    const bufs = scratch orelse {
+        attractRange(edges, mass, pos, force);
+        return;
+    };
+    const threads = bufs.len;
+    const chunk = (edges.len + threads - 1) / threads;
+    var handles: [repel_threads_max]std.Thread = undefined;
+    var spawned: usize = 0;
+    while (spawned < threads) : (spawned += 1) {
+        const lo = spawned * chunk;
+        if (lo >= edges.len) break;
+        const hi = @min(lo + chunk, edges.len);
+        @memset(bufs[spawned], .{});
+        handles[spawned] = std.Thread.spawn(.{}, attractRange, .{ edges[lo..hi], mass, pos, bufs[spawned] }) catch {
+            attractRange(edges[lo..hi], mass, pos, bufs[spawned]);
+            spawned += 1;
+            break;
+        };
+    }
+    for (handles[0..spawned]) |h| h.join();
+    for (bufs[0..spawned]) |b| {
+        for (force, b) |*f, add| {
+            f.x += add.x;
+            f.y += add.y;
+        }
+    }
+}
+
+fn attractRange(edges: []const WEdge, mass: []const f32, pos: []const dvui.Point, force: []dvui.Point) void {
+    for (edges) |e| {
+        const dx = pos[e.b].x - pos[e.a].x;
+        const dy = pos[e.b].y - pos[e.a].y;
+        const d = @sqrt(dx * dx + dy * dy);
+        if (d < 1e-4) continue;
+        // LinLog: long links pull hard, short ones barely at all, which is what keeps a cluster
+        // from collapsing to a point once it is already together.
+        const mag = spring_k * e.w * @log(1.0 + d / spacing);
+        const fx = (dx / d) * mag;
+        const fy = (dy / d) * mag;
+        // Divided by mass: a supernode standing for a whole community should not be flung around
+        // by one link the way a single note is.
+        force[e.a].x += fx / mass[e.a];
+        force[e.a].y += fy / mass[e.a];
+        force[e.b].x -= fx / mass[e.b];
+        force[e.b].y -= fy / mass[e.b];
     }
 }
 
@@ -528,29 +661,138 @@ const Grid = struct {
         return @as(usize, @intCast(cy)) * g.cols + @as(usize, @intCast(cx));
     }
 
-    fn repel(g: Grid, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
-        const offsets = [_][2]isize{ .{ 1, 0 }, .{ -1, 1 }, .{ 0, 1 }, .{ 1, 1 } };
-        for (0..g.rows) |cy| {
-            for (0..g.cols) |cx| {
-                const c = cy * g.cols + cx;
-                const mine = g.items[g.starts[c]..g.starts[c + 1]];
-                for (mine, 0..) |ia, k| {
-                    for (mine[k + 1 ..]) |ib| pairForce(pos, force, mass, ia, ib);
-                }
-                for (offsets) |off| {
-                    const nx = @as(isize, @intCast(cx)) + off[0];
-                    const ny = @as(isize, @intCast(cy)) + off[1];
-                    if (nx < 0 or ny < 0 or nx >= g.cols or ny >= g.rows) continue;
+    /// Short-range repulsion, with the work per cell bounded.
+    ///
+    /// A uniform grid is only linear while occupancy is uniform, and a force layout of a real
+    /// vault is the opposite of uniform: it *builds* dense cores, which is the point. Measured at
+    /// 284k notes, the grid was 265x266 with an average of 4 notes per cell — and a maximum of
+    /// 739, with 499 cells over 64. The all-pairs walk inside a cell is quadratic in occupancy, so
+    /// those few hundred cells produced `sum(b^2)` = 49.5M and, with the neighbour offsets, about
+    /// 250M pair evaluations per iteration. That was 579 ms of a 592 ms iteration: repulsion was
+    /// 98% of the solve, and attraction over all 2.7M links was 11 ms of it.
+    ///
+    /// So a crowded cell is sampled rather than enumerated: at most `repel_cell_cap` partners,
+    /// taken at a fixed stride, with the force scaled by how many were skipped. The expected force
+    /// is unchanged — it is the same sum, estimated from an evenly spaced subset — and the
+    /// direction is averaged over nine cells' worth of samples, which is far more than a layout
+    /// needs. Work becomes `n * 9 * min(occupancy, cap)` no matter how tight the cores get.
+    ///
+    /// The stride and its offset come from the node index, never a PRNG: `solve` is required to be
+    /// a pure function of the graph, and a sampled force that moved between runs would break that
+    /// as surely as a random seed would.
+    /// Split the node range across cores.
+    ///
+    /// Safe because `repelRange` writes `force[i]` for its own `i` and nothing else — the
+    /// reaction on a partner lands when that partner's own index comes round, which is what the
+    /// per-node form above bought. Ranges are disjoint, so there is no sharing to guard, and the
+    /// result does not depend on how the threads interleave: each slot is written by exactly one
+    /// thread computing exactly the same sum it would have computed alone. `solve` stays a pure
+    /// function of the graph.
+    fn repel(g: Grid, n: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
+        const want = std.Thread.getCpuCount() catch 1;
+        const threads = @min(@max(want, 1), repel_threads_max);
+        // Below this the split costs more than it saves, and the coarse levels of the ladder are
+        // all below it.
+        // Exact below the size where the sampling is worth anything.
+        //
+        // The cap bounds the quadratic tail of a *crowded* grid. On a small graph every cell is
+        // crowded relative to a cap of two, so sampling there is not bounding a tail, it is
+        // throwing away most of the force — two hundred unlinked notes stopped pushing each other
+        // apart and piled up, which `disconnected nodes do not stack on the origin` catches.
+        const cap: usize = if (n < repel_exact_max) std.math.maxInt(usize) else repel_cell_cap;
+        if (threads <= 1 or n < repel_thread_min) {
+            g.repelRange(0, n, cap, pos, force, mass);
+            return;
+        }
+        var handles: [repel_threads_max]std.Thread = undefined;
+        const chunk = (n + threads - 1) / threads;
+        var spawned: usize = 0;
+        while (spawned < threads) : (spawned += 1) {
+            const lo = spawned * chunk;
+            if (lo >= n) break;
+            const hi = @min(lo + chunk, n);
+            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, lo, hi, cap, pos, force, mass }) catch break;
+        }
+        // Whatever failed to spawn is done on this thread, so a thread-starved system is slower
+        // rather than wrong.
+        if (spawned < threads) {
+            const lo = spawned * chunk;
+            if (lo < n) g.repelRange(lo, n, cap, pos, force, mass);
+        }
+        for (handles[0..spawned]) |h| h.join();
+    }
+
+    fn repelRange(g: Grid, from: usize, to: usize, cap: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
+        for (from..to) |i| {
+            const p = pos[i];
+            const cx0 = std.math.clamp(@as(isize, @intFromFloat(@floor((p.x - g.min_x) / g.cell))), 0, @as(isize, @intCast(g.cols - 1)));
+            const cy0 = std.math.clamp(@as(isize, @intFromFloat(@floor((p.y - g.min_y) / g.cell))), 0, @as(isize, @intCast(g.rows - 1)));
+            var dy: isize = -1;
+            while (dy <= 1) : (dy += 1) {
+                const ny = cy0 + dy;
+                if (ny < 0 or ny >= g.rows) continue;
+                var dx: isize = -1;
+                while (dx <= 1) : (dx += 1) {
+                    const nx = cx0 + dx;
+                    if (nx < 0 or nx >= g.cols) continue;
                     const nc = @as(usize, @intCast(ny)) * g.cols + @as(usize, @intCast(nx));
-                    const theirs = g.items[g.starts[nc]..g.starts[nc + 1]];
-                    for (mine) |ia| {
-                        for (theirs) |ib| pairForce(pos, force, mass, ia, ib);
+                    const bucket = g.items[g.starts[nc]..g.starts[nc + 1]];
+                    if (bucket.len <= cap) {
+                        for (bucket) |j| {
+                            if (j != i) pairForceOn(pos, force, mass, @intCast(i), j, 1);
+                        }
+                        continue;
+                    }
+                    const stride = bucket.len / cap;
+                    const scale = @as(f32, @floatFromInt(bucket.len)) / @as(f32, @floatFromInt(cap));
+                    var k: usize = i % stride;
+                    var taken: usize = 0;
+                    while (k < bucket.len and taken < cap) : ({
+                        k += stride;
+                        taken += 1;
+                    }) {
+                        const j = bucket[k];
+                        if (j != i) pairForceOn(pos, force, mass, @intCast(i), j, scale);
                     }
                 }
             }
         }
     }
 };
+
+/// Partners examined in one cell before the rest are sampled. See `Grid.repel`.
+const repel_cell_cap: usize = 2;
+/// Cores the repulsion pass will use, and the node count below which it stays single-threaded.
+const repel_threads_max: usize = 16;
+const repel_thread_min: usize = 20_000;
+/// Node count below which repulsion is exact — see `Grid.repel`.
+const repel_exact_max: usize = 20_000;
+
+/// One partner's repulsion, applied to `ia` only.
+///
+/// The reaction lands when `ib`'s own turn comes round, which is what lets a crowded cell be
+/// sampled from each side independently. `scale` stands for the partners this one was drawn in
+/// place of.
+fn pairForceOn(pos: []const dvui.Point, force: []dvui.Point, mass: []const f32, ia: u32, ib: u32, scale: f32) void {
+    const i: usize = ia;
+    const j: usize = ib;
+    var dx = pos[i].x - pos[j].x;
+    var dy = pos[i].y - pos[j].y;
+    var d2 = dx * dx + dy * dy;
+    if (d2 < 1e-8) {
+        const jt = jitter(@min(i, j) * 31 + @max(i, j));
+        dx = jt[0] * 1e-3;
+        dy = jt[1] * 1e-3;
+        d2 = dx * dx + dy * dy;
+    }
+    const d = @sqrt(d2);
+    if (d > repulse_cut) return;
+    const soft = @max(d, spacing * 0.35);
+    const m = @sqrt(mass[i] * mass[j]);
+    const mag = repulse_k * m / (soft * soft) * (1.0 - d / repulse_cut) * scale;
+    force[i].x += (dx / d) * mag / mass[i];
+    force[i].y += (dy / d) * mag / mass[i];
+}
 
 fn pairForce(pos: []const dvui.Point, force: []dvui.Point, mass: []const f32, ia: u32, ib: u32) void {
     const i: usize = ia;
