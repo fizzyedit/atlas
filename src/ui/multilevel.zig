@@ -506,9 +506,11 @@ fn relax(
         const temp = 1.0 - @as(f32, @floatFromInt(it)) / @as(f32, @floatFromInt(iters));
         const step = spacing * (0.55 * temp + 0.08);
 
-        var grid = try Grid.init(allocator, pos, n, repulse_cut);
+        var grid = try Grid.init(allocator, pos, n);
         defer grid.deinit(allocator);
-        grid.repel(n, pos, force, mass);
+        var pyr = try Pyramid.build(allocator, grid, n, pos, mass);
+        defer pyr.deinit(allocator);
+        grid.repel(pyr, n, pos, force, mass);
 
         attract(edges, mass, pos, force, scratch);
 
@@ -595,6 +597,122 @@ fn attractRange(edges: []const WEdge, mass: []const f32, pos: []const dvui.Point
 
 /// Bucket grid sized to the repulsion cutoff — the same trick `layout_full` uses, kept local so
 /// this file has no dependency on it.
+/// One entry on the Barnes-Hut descent stack.
+const Cellref = struct { level: u8, x: u32, y: u32 };
+
+/// Opening angle. A cell is used whole when its width over its distance is below this; wider than
+/// that and the traversal descends into it. 0.7 is the usual compromise — smaller is more exact
+/// and visits more cells, larger is faster and blurs nearby structure.
+const bh_theta: f32 = 2.0;
+
+/// Levels of aggregation above the base grid, capped so a pathological extent cannot allocate
+/// without bound. Eight doublings reach 256x the base cell, which covers any vault the base cell
+/// is sized for.
+const bh_levels_max: usize = 12;
+
+/// A pyramid of cell aggregates over the base grid — Barnes-Hut on a regular subdivision.
+///
+/// Repulsion used to stop at `repulse_cut`, a few node spacings. That is what collapsed the vault
+/// into a core: springs pull at *any* distance while nothing pushed back beyond a hair's breadth,
+/// so the graph fell inward until only local repulsion held it apart. Measured on simplewiki, 90%
+/// of the notes ended up inside 6% of the map's area, and two notes sharing three neighbours sat
+/// only 1.7x closer together than two notes picked at random — which is the map failing at the one
+/// thing it is for.
+///
+/// Widening the cutoff fixes the shape and costs the earth: at 24x the reach the solve went from
+/// 1.0 s to 13.4 s, because the work per node grows with the *area* it must look at. This gives
+/// the same global reach for a cost that grows with its logarithm instead: distant crowds are one
+/// force from their centre of mass, and only what is close enough to matter is looked at
+/// individually.
+const Pyramid = struct {
+    /// Level 0 is the base grid's own cells; each level above is 2x2 of the one below.
+    com_x: [bh_levels_max][]f32 = undefined,
+    com_y: [bh_levels_max][]f32 = undefined,
+    mass: [bh_levels_max][]f32 = undefined,
+    cols: [bh_levels_max]usize = undefined,
+    rows: [bh_levels_max]usize = undefined,
+    cell: [bh_levels_max]f32 = undefined,
+    levels: usize = 0,
+    min_x: f32 = 0,
+    min_y: f32 = 0,
+
+    fn build(allocator: std.mem.Allocator, g: Grid, n: usize, pos: []const dvui.Point, mass: []const f32) !Pyramid {
+        var p: Pyramid = .{ .min_x = g.min_x, .min_y = g.min_y };
+        errdefer p.deinit(allocator);
+
+        // Level 0: centre of mass per base cell, straight from the points.
+        p.cols[0] = g.cols;
+        p.rows[0] = g.rows;
+        p.cell[0] = g.cell;
+        p.levels = 1;
+        const n0 = g.cols * g.rows;
+        p.com_x[0] = try allocator.alloc(f32, n0);
+        p.com_y[0] = try allocator.alloc(f32, n0);
+        p.mass[0] = try allocator.alloc(f32, n0);
+        @memset(p.com_x[0], 0);
+        @memset(p.com_y[0], 0);
+        @memset(p.mass[0], 0);
+        for (0..n) |i| {
+            const c = g.cellOf(pos[i]);
+            const m = mass[i];
+            p.com_x[0][c] += pos[i].x * m;
+            p.com_y[0][c] += pos[i].y * m;
+            p.mass[0][c] += m;
+        }
+        for (p.com_x[0], p.com_y[0], p.mass[0]) |*x, *y, m| {
+            if (m <= 0) continue;
+            x.* /= m;
+            y.* /= m;
+        }
+
+        // Each level above: 2x2 of the level below, mass-weighted.
+        while (p.levels < bh_levels_max and (p.cols[p.levels - 1] > 1 or p.rows[p.levels - 1] > 1)) {
+            const k = p.levels;
+            const pc = p.cols[k - 1];
+            const pr = p.rows[k - 1];
+            const cc = (pc + 1) / 2;
+            const cr = (pr + 1) / 2;
+            p.cols[k] = cc;
+            p.rows[k] = cr;
+            p.cell[k] = p.cell[k - 1] * 2;
+            const nk = cc * cr;
+            p.com_x[k] = try allocator.alloc(f32, nk);
+            p.com_y[k] = try allocator.alloc(f32, nk);
+            p.mass[k] = try allocator.alloc(f32, nk);
+            @memset(p.com_x[k], 0);
+            @memset(p.com_y[k], 0);
+            @memset(p.mass[k], 0);
+            for (0..pr) |y| {
+                for (0..pc) |x| {
+                    const src = y * pc + x;
+                    const m = p.mass[k - 1][src];
+                    if (m <= 0) continue;
+                    const dst = (y / 2) * cc + (x / 2);
+                    p.com_x[k][dst] += p.com_x[k - 1][src] * m;
+                    p.com_y[k][dst] += p.com_y[k - 1][src] * m;
+                    p.mass[k][dst] += m;
+                }
+            }
+            for (p.com_x[k], p.com_y[k], p.mass[k]) |*x, *y, m| {
+                if (m <= 0) continue;
+                x.* /= m;
+                y.* /= m;
+            }
+            p.levels += 1;
+        }
+        return p;
+    }
+
+    fn deinit(p: *Pyramid, allocator: std.mem.Allocator) void {
+        for (0..p.levels) |k| {
+            allocator.free(p.com_x[k]);
+            allocator.free(p.com_y[k]);
+            allocator.free(p.mass[k]);
+        }
+        p.levels = 0;
+    }
+};
+
 const Grid = struct {
     cell: f32,
     min_x: f32,
@@ -606,7 +724,17 @@ const Grid = struct {
 
     const max_cells: usize = 1 << 21;
 
-    fn init(allocator: std.mem.Allocator, pos: []const dvui.Point, n: usize, cell: f32) !Grid {
+    /// Points per base cell the grid aims for.
+    ///
+    /// The cell used to be `repulse_cut` wide, because repulsion stopped there and a 3x3
+    /// neighbourhood was the whole interaction. Barnes-Hut has no cutoff, so that size means
+    /// nothing to it — and once the vault spread out it meant 593,000 mostly-empty cells for
+    /// 281,000 points, every one of them walked by the prefix sum and by every level of the
+    /// pyramid, every iteration. Sizing to the density instead leaves the cell doing the one job
+    /// it still has: holding the handful of points close enough to be worth a pair each.
+    const target_per_cell: f32 = 6;
+
+    fn init(allocator: std.mem.Allocator, pos: []const dvui.Point, n: usize) !Grid {
         var min_x: f32 = std.math.floatMax(f32);
         var min_y: f32 = std.math.floatMax(f32);
         var max_x: f32 = -std.math.floatMax(f32);
@@ -617,7 +745,10 @@ const Grid = struct {
             max_x = @max(max_x, p.x);
             max_y = @max(max_y, p.y);
         }
-        const c = @max(cell, 1e-3);
+        // Sized after the bounding box is known, so the grid tracks the layout as it expands
+        // rather than being fixed by a constant from a force model that no longer has a cutoff.
+        const area = @max((max_x - min_x) * (max_y - min_y), 1e-6);
+        const c = @max(@sqrt(area * target_per_cell / @as(f32, @floatFromInt(@max(n, 1)))), 1e-3);
         var cols = @as(usize, @intFromFloat(@floor((max_x - min_x) / c))) + 1;
         var rows = @as(usize, @intFromFloat(@floor((max_y - min_y) / c))) + 1;
         if (cols * rows > max_cells) {
@@ -688,7 +819,7 @@ const Grid = struct {
     /// result does not depend on how the threads interleave: each slot is written by exactly one
     /// thread computing exactly the same sum it would have computed alone. `solve` stays a pure
     /// function of the graph.
-    fn repel(g: Grid, n: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
+    fn repel(g: Grid, p: Pyramid, n: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
         const want = std.Thread.getCpuCount() catch 1;
         const threads = @min(@max(want, 1), repel_threads_max);
         // Below this the split costs more than it saves, and the coarse levels of the ladder are
@@ -701,7 +832,7 @@ const Grid = struct {
         // apart and piled up, which `disconnected nodes do not stack on the origin` catches.
         const cap: usize = if (n < repel_exact_max) std.math.maxInt(usize) else repel_cell_cap;
         if (threads <= 1 or n < repel_thread_min) {
-            g.repelRange(0, n, cap, pos, force, mass);
+            g.repelRange(p, 0, n, cap, pos, force, mass);
             return;
         }
         var handles: [repel_threads_max]std.Thread = undefined;
@@ -711,52 +842,148 @@ const Grid = struct {
             const lo = spawned * chunk;
             if (lo >= n) break;
             const hi = @min(lo + chunk, n);
-            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, lo, hi, cap, pos, force, mass }) catch break;
+            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, pos, force, mass }) catch break;
         }
         // Whatever failed to spawn is done on this thread, so a thread-starved system is slower
         // rather than wrong.
         if (spawned < threads) {
             const lo = spawned * chunk;
-            if (lo < n) g.repelRange(lo, n, cap, pos, force, mass);
+            if (lo < n) g.repelRange(p, lo, n, cap, pos, force, mass);
         }
         for (handles[0..spawned]) |h| h.join();
     }
 
-    fn repelRange(g: Grid, from: usize, to: usize, cap: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
-        for (from..to) |i| {
-            const p = pos[i];
-            const cx0 = std.math.clamp(@as(isize, @intFromFloat(@floor((p.x - g.min_x) / g.cell))), 0, @as(isize, @intCast(g.cols - 1)));
-            const cy0 = std.math.clamp(@as(isize, @intFromFloat(@floor((p.y - g.min_y) / g.cell))), 0, @as(isize, @intCast(g.rows - 1)));
-            var dy: isize = -1;
-            while (dy <= 1) : (dy += 1) {
-                const ny = cy0 + dy;
-                if (ny < 0 or ny >= g.rows) continue;
-                var dx: isize = -1;
-                while (dx <= 1) : (dx += 1) {
-                    const nx = cx0 + dx;
-                    if (nx < 0 or nx >= g.cols) continue;
-                    const nc = @as(usize, @intCast(ny)) * g.cols + @as(usize, @intCast(nx));
-                    const bucket = g.items[g.starts[nc]..g.starts[nc + 1]];
-                    if (bucket.len <= cap) {
-                        for (bucket) |j| {
-                            if (j != i) pairForceOn(pos, force, mass, @intCast(i), j, 1);
-                        }
-                        continue;
-                    }
-                    const stride = bucket.len / cap;
-                    const scale = @as(f32, @floatFromInt(bucket.len)) / @as(f32, @floatFromInt(cap));
-                    var k: usize = i % stride;
-                    var taken: usize = 0;
-                    while (k < bucket.len and taken < cap) : ({
-                        k += stride;
-                        taken += 1;
-                    }) {
-                        const j = bucket[k];
-                        if (j != i) pairForceOn(pos, force, mass, @intCast(i), j, scale);
+    /// Every partner in one base cell, sampled if the cell is crowded.
+    ///
+    /// The sampling is unchanged from the uniform-grid version: a fixed stride, the force scaled
+    /// by what was skipped, deterministic in the node index so `solve` stays a pure function of
+    /// the graph. It matters more here, not less — Barnes-Hut bounds how many *cells* are visited
+    /// and says nothing about how many points sit in the one you are standing in.
+    fn repelBucket(
+        i: u32,
+        bucket: []const u32,
+        cap: usize,
+        pos: []const dvui.Point,
+        force: []dvui.Point,
+        mass: []const f32,
+    ) void {
+        if (bucket.len <= cap) {
+            for (bucket) |j| {
+                if (j != i) pairForceOn(pos, force, mass, i, j, 1);
+            }
+            return;
+        }
+        const stride = bucket.len / cap;
+        const scale = @as(f32, @floatFromInt(bucket.len)) / @as(f32, @floatFromInt(cap));
+        var k: usize = @as(usize, i) % stride;
+        var taken: usize = 0;
+        while (k < bucket.len and taken < cap) : ({
+            k += stride;
+            taken += 1;
+        }) {
+            const j = bucket[k];
+            if (j != i) pairForceOn(pos, force, mass, i, j, scale);
+        }
+    }
+
+    /// Barnes-Hut traversal for one node: coarse cells whole, near cells individually.
+    ///
+    /// Starts at the top of the pyramid and descends only where the opening angle demands it, so a
+    /// distant community costs one force and the handful of notes actually beside this one cost a
+    /// pair each. Force is mass-proportional — `repulse_k * m_j / d^2`, with `m_i` cancelling
+    /// against the integrator's division — which is what makes a cell's whole contribution equal
+    /// its total mass at its centre, exactly.
+    fn repelFar(
+        g: Grid,
+        p: Pyramid,
+        i: u32,
+        cap: usize,
+        pos: []const dvui.Point,
+        force: []dvui.Point,
+        mass: []const f32,
+        stack: *[bh_levels_max * 4]Cellref,
+    ) void {
+        const me = pos[i];
+        var fx: f32 = 0;
+        var fy: f32 = 0;
+        var top: usize = 0;
+
+        const kt = p.levels - 1;
+        for (0..p.rows[kt]) |y| {
+            for (0..p.cols[kt]) |x| {
+                if (top < stack.len) {
+                    stack[top] = .{ .level = @intCast(kt), .x = @intCast(x), .y = @intCast(y) };
+                    top += 1;
+                }
+            }
+        }
+
+        while (top > 0) {
+            top -= 1;
+            const node = stack[top];
+            const k: usize = node.level;
+            const idx = @as(usize, node.y) * p.cols[k] + @as(usize, node.x);
+            const m = p.mass[k][idx];
+            if (m <= 0) continue;
+
+            const dx = me.x - p.com_x[k][idx];
+            const dy = me.y - p.com_y[k][idx];
+            const d2 = dx * dx + dy * dy;
+
+            // Close enough to matter individually, or already at the base grid: pair up.
+            if (k == 0) {
+                const bucket = g.items[g.starts[idx]..g.starts[idx + 1]];
+                repelBucket(i, bucket, cap, pos, force, mass);
+                continue;
+            }
+            const d = @sqrt(d2);
+            if (p.cell[k] < d * bh_theta) {
+                const soft = @max(d, spacing * 0.35);
+                const mag = repulse_k * m / (soft * soft);
+                fx += (dx / @max(d, 1e-6)) * mag;
+                fy += (dy / @max(d, 1e-6)) * mag;
+                continue;
+            }
+            // Too wide to stand in for its contents: open it.
+            const cx0 = @as(usize, node.x) * 2;
+            const cy0 = @as(usize, node.y) * 2;
+            const kc = k - 1;
+            for (0..2) |oy| {
+                for (0..2) |ox| {
+                    const cx = cx0 + ox;
+                    const cy = cy0 + oy;
+                    if (cx >= p.cols[kc] or cy >= p.rows[kc]) continue;
+                    if (top < stack.len) {
+                        stack[top] = .{ .level = @intCast(kc), .x = @intCast(cx), .y = @intCast(cy) };
+                        top += 1;
                     }
                 }
             }
         }
+        force[i].x += fx;
+        force[i].y += fy;
+    }
+
+    fn repelRange(
+        g: Grid,
+        p: Pyramid,
+        from: usize,
+        to: usize,
+        cap: usize,
+        pos: []const dvui.Point,
+        force: []dvui.Point,
+        mass: []const f32,
+    ) void {
+        // Walked in cell order, not index order.
+        //
+        // `g.items` is the points grouped by base cell, so consecutive entries are neighbours in
+        // space and their descents through the pyramid are nearly the same walk — the same coarse
+        // cells, in the same order, already in cache. Iterating raw indices instead sends every
+        // node down an unrelated path and turns a traversal into a pointer chase. Ranges over
+        // `items` are still disjoint in `i`, since it is a permutation, so the threading argument
+        // above is unchanged.
+        var stack: [bh_levels_max * 4]Cellref = undefined;
+        for (g.items[from..to]) |i| repelFar(g, p, i, cap, pos, force, mass, &stack);
     }
 };
 
