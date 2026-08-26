@@ -51,6 +51,7 @@ const Visible = struct {
 };
 const fold = @import("fold.zig");
 const spatial = @import("spatial.zig");
+const layout = @import("layout.zig");
 const proximity = @import("proximity.zig");
 const resolve = @import("../index/resolve.zig");
 
@@ -172,29 +173,6 @@ const camera_chase_k: f32 = 7;
 /// Half-width of the focus frame, in lattice slots: one note plus a readable ring around it.
 const focus_context_slots: f32 = 3.5;
 /// How far above the resolve zoom to sit, so the note is comfortably a note and not on the cusp.
-/// One note's last known place in the vault. See `Panel.layout_cache`.
-const CachedPos = struct { x: f32, y: f32, comp: u32 };
-
-/// A cached position as the worker sees it, with whether there was one at all.
-const Seed = struct { x: f32 = 0, y: f32 = 0, comp: u32 = 0, ok: bool = false };
-
-/// Neighbours admitted per changed note, and the ceiling on the whole free set.
-///
-/// Both are hub guards. A note linked to *France* has 29,448 neighbours; without a cap, editing
-/// it would unpin all of them and the "local" settle would be a whole-vault solve wearing a
-/// different name.
-const dirty_neighbour_cap: u16 = 24;
-const dirty_free_max: usize = 4096;
-/// Iterations for the settle. Small: the free set is a neighbourhood, and this runs on the
-/// rebuild path that a save waits on.
-const dirty_relax_iters: usize = 24;
-
-/// How much of the vault has to carry a cached position for the solve to be skipped.
-///
-/// Below this the vault has changed enough that patching new notes into an old arrangement would
-/// leave the layout describing a graph that no longer exists, so it is re-solved. Above it, the
-/// arrangement is still substantially the same one and a save should be instant.
-const layout_reuse_min: f32 = 0.85;
 
 const focus_resolve_margin: f32 = 1.15;
 const focus_padding_px: f32 = 56;
@@ -606,9 +584,6 @@ const LayoutJob = struct {
     /// takes its place from the world on the first `syncNodesFromWorld`. Lives in `arena`.
     precomputed: ?[]const dvui.Point = null,
 
-    /// Last build's position for each note, parallel to graph indices; `.ok == false` where the
-    /// note is new to this build. Lives in `arena`. Null means "no cache" — solve from scratch.
-    seed: ?[]const Seed = null,
 
     /// Placement inputs, copied from the panel at spawn so the worker never reads live state.
     place_opts: containment.Options = .{},
@@ -632,61 +607,6 @@ const LayoutJob = struct {
     /// frame (`liftLinks` hashmaps, list growth), so an arena would grow without bound for as long
     /// as the graph is on screen.
     world: ?world_mod.World = null,
-
-    /// Unpin the edit and settle it against a frozen vault.
-    ///
-    /// The free set is: every note whose own links changed since the last build (`changed`),
-    /// every note new to this build, and their link neighbours — capped, because a link to a hub
-    /// must not free the hub's whole neighbourhood. Linking one note to *France* would otherwise
-    /// unpin 29,448 notes and turn a keystroke into a whole-vault solve, which is the cost this
-    /// exists to avoid.
-    fn relaxEdit(job: *LayoutJob, a: std.mem.Allocator, pos: []spatial.Vec2, seed: []const Seed) !void {
-        const n = job.n;
-        if (n < 2) return;
-
-        const pinned = try a.alloc(bool, n);
-        @memset(pinned, true);
-        var free_n: usize = 0;
-
-        // Seeds of the edit: what actually changed, plus anything with no previous position.
-        for (0..n) |i| {
-            const changed = i < job.changed.len and job.changed[i];
-            const fresh = i < seed.len and !seed[i].ok;
-            if (!changed and !fresh) continue;
-            if (pinned[i]) {
-                pinned[i] = false;
-                free_n += 1;
-            }
-        }
-        if (free_n == 0) return;
-
-        // One hop out, so an edit settles against its neighbourhood rather than dragging a note
-        // into a gap its neighbours have not made for it.
-        const admitted = try a.alloc(u16, n);
-        @memset(admitted, 0);
-        const Admit = struct {
-            fn one(src: usize, dst: usize, pin: []bool, adm: []u16, count: *usize) void {
-                if (!pin[src] and pin[dst] and adm[src] < dirty_neighbour_cap) {
-                    adm[src] += 1;
-                    pin[dst] = false;
-                    count.* += 1;
-                }
-            }
-        };
-        for (job.layout_edges) |e| {
-            if (e.a >= n or e.b >= n or e.a == e.b) continue;
-            if (free_n >= dirty_free_max) break;
-            Admit.one(e.a, e.b, pinned, admitted, &free_n);
-            Admit.one(e.b, e.a, pinned, admitted, &free_n);
-        }
-
-        // `relaxDirty` speaks `dvui.Point`; the hierarchy speaks `spatial.Vec2`. Same two floats,
-        // different types, so the copy is the conversion.
-        const work = try a.alloc(dvui.Point, n);
-        for (work, pos) |*w, q| w.* = .{ .x = q.x, .y = q.y };
-        try layout_full.relaxDirty(a, n, job.layout_edges, work, pinned, dirty_relax_iters);
-        for (pos, work) |*q, w| q.* = .{ .x = w.x, .y = w.y };
-    }
 
     fn run(job: *LayoutJob) void {
         job.solve() catch |e| {
@@ -756,59 +676,28 @@ const LayoutJob = struct {
 
         const t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
         const fold_opts: fold.Options = .{ .cancel = &job.cancel, .bodies = bodies };
-        if (job.seed) |seed| {
-            // The vault is substantially the one that was already laid out, so reuse it. Notes
-            // that are new to this build take the average of whichever of their neighbours
-            // already have a place, which puts a new note next to what it links to rather than
-            // at the origin; a note linked to nothing known lands at the vault centre and is
-            // carried outward by the next full solve.
-            const pos = try a.alloc(spatial.Vec2, job.n);
-            const comp = try a.alloc(u32, job.n);
-            const acc = try a.alloc(u32, job.n);
-            @memset(acc, 0);
-            for (seed, pos, comp) |sd, *q, *c| {
-                q.* = .{ .x = sd.x, .y = sd.y };
-                c.* = sd.comp;
-            }
-            for (links) |e| {
-                if (e.a >= job.n or e.b >= job.n) continue;
-                if (!seed[e.a].ok and seed[e.b].ok) {
-                    pos[e.a].x += seed[e.b].x;
-                    pos[e.a].y += seed[e.b].y;
-                    comp[e.a] = seed[e.b].comp;
-                    acc[e.a] += 1;
-                }
-                if (!seed[e.b].ok and seed[e.a].ok) {
-                    pos[e.b].x += seed[e.a].x;
-                    pos[e.b].y += seed[e.a].y;
-                    comp[e.b] = seed[e.a].comp;
-                    acc[e.b] += 1;
-                }
-            }
-            for (seed, pos, acc) |sd, *q, k| {
-                if (sd.ok or k == 0) continue;
-                const inv = 1.0 / @as(f32, @floatFromInt(k));
-                q.x *= inv;
-                q.y *= inv;
-            }
 
-            // Let the edit settle, and only the edit.
-            //
-            // Reuse on its own is completely static: link two notes that both already have a
-            // place and *nothing* moves, because nothing is recomputed — the new edge is drawn
-            // across whatever distance already separated them, and the arrangement stops
-            // describing the graph. Re-solving the whole vault is the other extreme and costs
-            // seconds on every save.
-            //
-            // So the notes whose links changed, their neighbours, and anything new are unpinned
-            // and allowed to settle against a frozen vault. Everything else keeps the position
-            // the reader already knew.
-            try job.relaxEdit(a, pos, seed);
-
-            job.world = try world_mod.World.initFrom(gpa, job.n, links, .{ .pos = pos, .comp = comp }, fold_opts, place);
-        } else {
-            job.world = try world_mod.World.init(gpa, job.n, links, path_arg, fold_opts, place);
-        }
+        // Solve the whole vault, every time.
+        //
+        // This used to reuse the previous build's positions and settle only what the edit
+        // touched, because a rebuild runs on every save and a solve cost six to twenty-two
+        // seconds. It now costs under one, which removes the reason — and reuse had a cost of its
+        // own that no amount of tuning fixes: an incrementally settled vault is not the vault a
+        // fresh open produces, so the map you closed was not the map you reopened. Solving from
+        // the graph every time makes the arrangement a pure function of the vault again.
+        var lay = try layout.solve(gpa, job.n, links, path_arg, .{
+            .note_r = place.note_r,
+            .cancel = &job.cancel,
+        });
+        defer lay.deinit(gpa);
+        job.world = try world_mod.World.initFrom(
+            gpa,
+            job.n,
+            links,
+            .{ .pos = lay.pos, .comp = lay.comp },
+            fold_opts,
+            place,
+        );
         // Kept (not a temporary diagnostic): this is how long "Building map…" is on screen, it is
         // the largest remaining cost in opening a vault, and it is the number to watch if that
         // wait ever grows. Logged from the worker, same as the indexer's own scan summary.
@@ -1017,14 +906,6 @@ pub const Panel = struct {
     /// since that arena only survives a rebuild, not a frame.
     interior_visible: std.ArrayList(Visible) = .empty,
 
-    /// Where each note was last laid out, by note id.
-    ///
-    /// The layout is the expensive half of a rebuild and `World.init` runs on *every* save, so
-    /// re-solving per save is not affordable — measured at 6-22 s on a 284k vault against the
-    /// ~2 s the rest of the rebuild costs. Keyed by id rather than by index because
-    /// `finishRebuild` reallocates `p.nodes` in id order and indices shift whenever a note is
-    /// added or removed; an index-keyed cache would silently hand notes each other's positions.
-    layout_cache: std.AutoHashMapUnmanaged(i64, CachedPos) = .empty,
     /// Per node, whether it is being drawn as itself this frame. Read by the edge pass, which
     /// has no business drawing a link to a note that has been merged into a marker. Lives in the
     /// panel arena, so it is sized with the arrangement.
@@ -1087,7 +968,6 @@ pub const Panel = struct {
         self.open_notes.deinit(sdk.allocator());
         self.morph_from.deinit(sdk.allocator());
         self.interior_visible.deinit(sdk.allocator());
-        self.layout_cache.deinit(sdk.allocator());
         self.pointer_warm.deinit(sdk.allocator());
         self.edge_anim.deinit(sdk.allocator());
         self.id_index.deinit(sdk.allocator());
@@ -1132,10 +1012,6 @@ pub const Panel = struct {
         self.holds_open = .empty;
         self.visible.deinit(gpa);
         self.visible = .empty;
-        // Note ids name notes in *this* vault. Carried across a switch they would seed the new
-        // vault with the old one's arrangement wherever two ids happened to collide.
-        self.layout_cache.deinit(gpa);
-        self.layout_cache = .empty;
         self.interior_visible.deinit(gpa);
         self.interior_visible = .empty;
         self.open_notes.deinit(gpa);
@@ -2472,23 +2348,6 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     // notes takes minutes, and while it runs `p.job` never completes, `rebuildIfNeeded` returns
     // early every frame, and the panel goes on redrawing whatever arrangement last *finished* —
     // which reads exactly like "changing the note count does nothing."
-    // Carry the previous arrangement across, so a save reuses it instead of re-solving.
-    if (p.layout_cache.count() > 0) {
-        const seed = try arena.alloc(Seed, n);
-        var hits: usize = 0;
-        for (job.order, 0..) |si, gi| {
-            if (gi >= n or si >= snap.nodes.len) break;
-            if (p.layout_cache.get(snap.nodes[si].id)) |c| {
-                seed[gi] = .{ .x = c.x, .y = c.y, .comp = c.comp, .ok = true };
-                hits += 1;
-            } else {
-                seed[gi] = .{};
-            }
-        }
-        const covered = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(@max(n, 1)));
-        if (covered >= layout_reuse_min) job.seed = seed;
-    }
-
     const StateT = @typeInfo(@TypeOf(st)).pointer.child;
     if (@hasDecl(StateT, "packedPositions")) {
         if (st.packedPositions()) |pos| {
@@ -2529,28 +2388,6 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     const snap = job.snap;
     const n = job.n;
     const first_build = job.first_build;
-
-    // Record where this build put everything, so the next one does not have to solve it again.
-    //
-    // Rebuilt wholesale rather than merged: a note that has gone from the vault should leave the
-    // cache with it, or a vault that churns accumulates positions for notes nobody can reach and
-    // the coverage test that decides whether to reuse stops describing the vault in front of it.
-    if (job.world) |*w| {
-        p.layout_cache.clearRetainingCapacity();
-        p.layout_cache.ensureTotalCapacity(gpa, @intCast(n)) catch {};
-        for (job.order, 0..) |si, gi| {
-            if (gi >= n or si >= snap.nodes.len) break;
-            if (gi >= w.lad.leaf_cell.len) break;
-            const leaf = w.lad.leaf_cell[gi];
-            if (leaf == fold.invalid or leaf >= w.lad.cells.len) continue;
-            const q = w.field.pos[leaf];
-            p.layout_cache.put(gpa, snap.nodes[si].id, .{
-                .x = q.x,
-                .y = q.y,
-                .comp = w.lad.cells[leaf].comp,
-            }) catch {};
-        }
-    }
 
     // Same carry the prep pass took — `p.nodes` has not moved since, because the panel's arena
     // is only recycled on the line below.

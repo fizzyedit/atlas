@@ -83,9 +83,6 @@ pub fn build(b: *std.Build) void {
         // The drawing hierarchy built *from* positions rather than the other way round: Hilbert
         // order, gap-defined chunking, true bottom-up bounds. Plain `Vec2`, headless.
         .{ "atlas-spatial-tests", "src/ui/spatial.zig" },
-        // The living set: budgeted, view-culled, level-uniform select over the fold ladder,
-        // emitting screen-space marks. Replaces quadlod + quad_agents + lod.
-        .{ "atlas-world-tests", "src/ui/world.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],
@@ -97,6 +94,20 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // The living set: budgeted, view-culled, level-uniform select over the derived ladder,
+    // emitting screen-space marks. Needs `dvui` because it reads `leaf_pitch` from the layout,
+    // which speaks `dvui.Point` through `multilevel`; nothing here is graphical either.
+    const world_tests = b.addTest(.{
+        .name = "atlas-world-tests",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/ui/world.zig"),
+        }),
+    });
+    world_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+    test_step.dependOn(&b.addRunArtifact(world_tests).step);
 
     // The link-gravity layout that owns note positions. Needs `dvui` only because
     // `multilevel.solve` speaks `dvui.Point`; there is nothing graphical in here.

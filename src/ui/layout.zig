@@ -46,13 +46,21 @@ const spatial = @import("spatial.zig");
 pub const Vec2 = spatial.Vec2;
 pub const Edge = fold.Edge;
 
+/// Target distance between neighbouring notes, in note radii.
+///
+/// Above 2.0 because two discs of radius `r` overlap whenever they sit closer than `2r` — the
+/// margin above that is what keeps the *tenth* percentile clear, not just the median. `world`
+/// exports this as `leaf_pitch`: it is now a chosen number that the solve is calibrated to hit,
+/// where it used to be an empirical measurement of `containment`'s settle.
+pub const default_spacing: f32 = 2.6;
+
 pub const Options = struct {
     /// World radius one note draws at. Positions come out scaled against this.
     note_r: f32 = 1.0,
     /// Target median distance between neighbouring notes, in note radii. Must exceed 2.0 or
     /// adjacent notes overlap by construction — see the module header. The margin above 2.0 is
     /// what keeps the *tenth* percentile clear, not just the median.
-    spacing: f32 = 2.6,
+    spacing: f32 = default_spacing,
     /// Exponent on the degree normalisation; 0 disables it, 0.5 is the Salton cosine.
     degree_norm: f32 = 0.5,
     /// Tie strength along the orphan folder chain, against ~1.0 for a real link.

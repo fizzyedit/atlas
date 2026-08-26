@@ -467,9 +467,16 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     if (place_pack_gap) |v| place_opts.pack_gap = v;
     var fold_opts: fold.Options = .{};
     if (fold_degree_norm) |v| fold_opts.degree_norm = v;
-    var w = try world_mod.World.init(gpa, n, edges, paths, fold_opts, place_opts);
+    // The same two stages the panel runs: solve for positions, then group them. Building through
+    // `World.init` instead would measure a path the app no longer takes — which is how this sweep
+    // once came to report parameters nothing shipped with.
+    var lay = try layout.solve(gpa, n, edges, paths, .{ .note_r = place_opts.note_r });
+    const solve_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
+    var w = try world_mod.World.initFrom(gpa, n, edges, .{ .pos = lay.pos, .comp = lay.comp }, fold_opts, place_opts);
+    lay.deinit(gpa);
     defer w.deinit();
     const build_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
+    std.debug.print("  layout solve {d} ms of that\n", .{ms(solve_ns)});
 
     const budget: usize = world_budget;
     // Mirror the panel exactly, through the same function it calls — see

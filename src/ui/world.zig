@@ -41,6 +41,7 @@ pub const fold = @import("fold.zig");
 const containment = @import("containment.zig");
 const cellweb = @import("cellweb.zig");
 const spatial = @import("spatial.zig");
+const layout = @import("layout.zig");
 
 pub const Mark = struct {
     cell: u32,
@@ -115,17 +116,17 @@ pub const FocusLink = struct {
 
 /// Centre-to-centre distance between two ring-adjacent leaves, in units of `note_r`.
 ///
-/// A caller that needs notes a specific world distance apart — to match an existing lattice, say —
-/// divides that pitch by this to get `note_r`.
+/// World distance between neighbouring notes, in `note_r`.
 ///
-/// Measured, not derived. It used to be read off the ring construction: a cell of `arity` leaves
-/// has radius `√arity · note_r`, its ring sat at `√arity · fill − note_r`, and adjacent slots were
-/// one uniform step apart. There is no ring any more — `containment.ensureChildren` settles its
-/// children by relaxation, so the spacing is a property of that settle and of how much personal
-/// space a leaf asks for, and it is deliberately *not* uniform from cell to cell. This is the
-/// pitch of the canonical full cell, which is what the scale calibration needs; the test below is
-/// the definition, so if the relaxation is retuned, run it and paste the number back here.
-pub const leaf_pitch: f32 = 1.48;
+/// A caller that needs notes a specific distance apart — to match an existing lattice, say —
+/// divides that pitch by this to get `note_r`. Everything downstream is calibrated in those
+/// units: camera fit, zoom thresholds, `interiorWant`, label placement.
+///
+/// It used to be a *measurement*: `containment` settled its children by relaxation, so the pitch
+/// was whatever that settle happened to produce, and the constant had to be re-derived by test
+/// whenever the relaxation was retuned. The layout chooses its own spacing now and normalises to
+/// it, so this is simply that choice, and the two cannot drift apart.
+pub const leaf_pitch: f32 = layout.default_spacing;
 
 /// Liang–Barsky clip of the segment `(ax,ay)-(bx,by)` against the rect `(rx,ry,rw,rh)`.
 /// Null when the segment misses the rect entirely.
@@ -2273,34 +2274,31 @@ test "the cell-web lift matches a brute-force note-level lift" {
     }
 }
 
-test "leaf_pitch matches the geometry it claims to describe" {
+test "leaf_pitch is the spacing the layout actually produces" {
     // A caller matching an existing lattice divides its slot spacing by `leaf_pitch` to get
     // `note_r`. If the constant drifts from the real geometry the whole vault comes out at the
-    // wrong scale — which reads as a speck at the centre of the view, with every LOD transition
-    // crammed into a sliver of the zoom range.
+    // wrong scale — a speck at the centre of the view, with every LOD transition crammed into a
+    // sliver of the zoom range.
+    //
+    // This used to measure `containment`'s relaxation and paste the number back, because the
+    // spacing was whatever that settle happened to produce. The layout picks its spacing and
+    // normalises to it now, so the assertion is that the two agree — and that the pitch clears
+    // `2.0`, below which discs of radius `note_r` overlap by construction.
+    try testing.expectEqual(layout.default_spacing, leaf_pitch);
+    try testing.expect(leaf_pitch > 2.0);
+
     const gpa = testing.allocator;
-    const edges = try gpa.alloc(fold.Edge, 6);
+    const n: u32 = 600;
+    const edges = try gpa.alloc(fold.Edge, n - 1);
     defer gpa.free(edges);
-    for (0..6) |i| edges[i] = .{ .a = 0, .b = @intCast(i + 1) };
+    for (edges, 0..) |*e, i| e.* = .{ .a = @intCast(i), .b = @intCast(i + 1) };
+    const paths = try gpa.alloc([]const u8, n);
+    defer gpa.free(paths);
+    for (paths) |*q| q.* = "";
 
-    var lad = try fold.build(gpa, 7, edges, &.{}, .{ .arity = .seven });
-    defer lad.deinit(gpa);
-    var f = try containment.init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 1 });
-    defer f.deinit(gpa);
-    containment.placeAll(&f, &lad);
-
-    // nearest neighbour distance among the leaves of a full cell
-    var best: f32 = std.math.floatMax(f32);
-    for (lad.cells, 0..) |a, ia| {
-        if (a.note == fold.invalid) continue;
-        for (lad.cells, 0..) |b, ib| {
-            if (ib <= ia or b.note == fold.invalid) continue;
-            const d = containment.Vec2.dist(f.pos[ia], f.pos[ib]);
-            if (d > 1e-4) best = @min(best, d);
-        }
-    }
-    // Loose, because the relaxation makes this an empirical constant rather than an identity.
-    try testing.expectApproxEqAbs(leaf_pitch, best, 0.08);
+    var res = try layout.solve(gpa, n, edges, paths, .{ .note_r = 4 });
+    defer res.deinit(gpa);
+    try testing.expectApproxEqAbs(leaf_pitch, res.spacing, 0.25);
 }
 
 test "holding topology keeps the open set while zoom changes" {
