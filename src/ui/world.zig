@@ -351,6 +351,12 @@ const Memo = struct { stamp: u32 = 0, of: u32 = fold.invalid };
 /// The same, for one cut cell's running per-partner weight total.
 const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
 
+/// How fast a link ramps in or out, in units of 1/s. See `fadeLinks`.
+const link_fade_rate: f32 = 30;
+
+/// One link's crossfade and the epoch it was last seen in the lifted set.
+const Fade = struct { v: f32 = 0, stamp: u32 = 0 };
+
 /// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
 ///
 /// A strict total order — the `(a, b)` tie-break is the pair identity, so no two distinct links
@@ -451,6 +457,14 @@ pub const World = struct {
     /// they were culled. This *is* the drawn set's topology, and `liftLinks` reads nothing else.
     /// It replaces a per-note `owner` array whose every frame cost an `O(notes)` fill.
     cut: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per drawn link: how far in or out it is. Keyed by the cell pair, which is the identity the
+    /// lift produces — see `fadeLinks`.
+    link_fade: std.AutoHashMapUnmanaged(u64, Fade) = .empty,
+    fade_epoch: u32 = 0,
+    /// Links that were fading out last frame — see the retire threshold in `fadeLinks`.
+    ghosts_prev: usize = 0,
+    /// Scratch for the keys `fadeLinks` retires.
+    sc_dead: std.ArrayListUnmanaged(u64) = .empty,
     /// Per-cell memo for `cutOf`, valid only while `cut[i].stamp == cut_epoch`. The stamp exists
     /// so a new frame costs nothing to invalidate — no 341k-entry memset.
     ///
@@ -770,6 +784,8 @@ pub const World = struct {
         self.links.deinit(self.gpa);
         self.focus_grow.deinit(self.gpa);
         self.cut.deinit(self.gpa);
+        self.link_fade.deinit(self.gpa);
+        self.sc_dead.deinit(self.gpa);
         self.web.deinit(self.gpa);
         self.gpa.free(self.anim);
         self.gpa.free(self.px);
@@ -1391,23 +1407,86 @@ pub const World = struct {
     fn fadeLinks(self: *World, p: Params, dt: f32) !void {
         try self.stepFocusGrow(p, dt);
 
-        // The draw list is the current lift, at full strength.
+        // Links ramp in and out instead of blinking.
         //
-        // Cut changes used to crossfade: arriving lines mixed up from the window fill, dying ones
-        // mixed down into it. With opaque `intoBg` that is a flash — the whole web walks to pane
-        // colour, sits there, then pops back — not a dissolve, so the fade was dropped.
+        // Membership of the drawn web is a budgeted top-K over the cut, so panning replaces part
+        // of it every time the cut moves — measured on simplewiki at 8-11% of ~10,000 lines per
+        // frame at close zoom. That is a thousand lines appearing or vanishing between frames, and
+        // with nothing driving `LiftedLink.alpha` every one of them was a hard pop.
         //
-        // The bookkeeping behind it was not. A per-link stamp map was still being written for
-        // every lifted link, then walked end to end and pruned, every frame — a hash `getOrPut`
-        // up to 35,000 times plus a full iteration, to produce a value nothing read: every entry
-        // was stamped `1` and every link drawn at `alpha = 1`. It is a straight copy now.
+        // This existed and was removed, for a reason that was true at the time: a dying line was
+        // mixed toward `.window.fill`, which is *not* the surface the graph is drawn on, so a fade
+        // did not end at the background — the web walked to a different colour, sat there, and
+        // popped back. `galaxy.panelFill` is the real backdrop now, so mixing toward it genuinely
+        // reaches invisible and the fade does what it says.
+        //
+        // Departed links are kept and drawn while they fade, which is why they are appended here
+        // rather than only in `lifted`: the lift is the *current* set, and a line on its way out is
+        // by definition not in it any more.
+        // Deliberately much faster than the mark crossfade, and bounded.
+        //
+        // A departing link is still drawn while it fades, so the drawn set is the budget *plus*
+        // whatever is on its way out. At the mark rate that tail ran about 23 frames, and a pan
+        // churning ~900 lines a frame stacked 20,000 ghosts on top of a 10,000-line budget — three
+        // times the work the budget exists to bound. Six frames is still a dissolve rather than a
+        // blink, and holds the overshoot to well under half the budget.
+        const rate = @min(1.0, dt * link_fade_rate);
+        self.fade_epoch +%= 1;
+        if (self.fade_epoch == 0) {
+            var reset = self.link_fade.valueIterator();
+            while (reset.next()) |v| v.stamp = 0;
+            self.fade_epoch = 1;
+        }
+        const epoch = self.fade_epoch;
+
         self.links.clearRetainingCapacity();
         try self.links.ensureUnusedCapacity(self.gpa, self.lifted.items.len);
         for (self.lifted.items) |l| {
+            const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
+            const gop = try self.link_fade.getOrPut(self.gpa, key);
+            const prev: f32 = if (gop.found_existing) gop.value_ptr.v else 0;
+            var v = prev + (1 - prev) * rate;
+            if (v > 0.996) v = 1 else self.settled = false;
+            gop.value_ptr.* = .{ .v = v, .stamp = epoch };
             var out = l;
-            out.alpha = 1;
+            out.alpha = v;
             self.links.appendAssumeCapacity(out);
         }
+
+        // Retire early when the tail is running long.
+        //
+        // The drawn set is the budget plus whatever is fading out of it, so a pan that churns hard
+        // enough can carry more ghosts than live links. Raising the retire threshold when that
+        // happens sheds the faintest of them — the ones nearest invisible anyway — and keeps the
+        // overshoot bounded without a sort or a second pass. Uses last frame's count, because this
+        // frame's is not known until the walk below has finished, and a frame of lag on a cull
+        // threshold is not observable.
+        const ghost_cap = @max(p.link_budget / 2, 1);
+        const retire_at: f32 = if (self.ghosts_prev > ghost_cap) 0.25 else 0.02;
+        var ghosts: usize = 0;
+
+        const dead = &self.sc_dead;
+        dead.clearRetainingCapacity();
+        var it = self.link_fade.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.stamp == epoch) continue;
+            const v = kv.value_ptr.v * (1 - rate);
+            if (v <= retire_at) {
+                try dead.append(self.gpa, kv.key_ptr.*);
+                continue;
+            }
+            kv.value_ptr.* = .{ .v = v, .stamp = epoch };
+            self.settled = false;
+            ghosts += 1;
+            try self.links.append(self.gpa, .{
+                .a = @intCast(kv.key_ptr.* >> 32),
+                .b = @truncate(kv.key_ptr.*),
+                .w = 0,
+                .alpha = v,
+            });
+        }
+        for (dead.items) |k| _ = self.link_fade.remove(k);
+        self.ghosts_prev = ghosts;
     }
 
     pub fn liftLinks(self: *World, p: Params, dt: f32) !void {
@@ -1864,10 +1943,15 @@ test "links lift onto living cells" {
     }
 }
 
-test "a cut change does not leave fading links in the draw list" {
-    // The flash this pins down: dying lines mixed toward the window fill, so a zoom painted the
-    // old web in pane colour and then popped the new one in at rest. The draw list is the
-    // current lift, every line at full strength.
+test "a cut change ramps links instead of blinking them" {
+    // Membership of the drawn web is a budgeted top-K over the cut, so any camera move replaces
+    // part of it — measured on a real vault at 8-11% of ten thousand lines per frame. Without a
+    // ramp every one of those is a hard pop, which is what "the connections keep disappearing and
+    // reappearing" is.
+    //
+    // Two properties, and the second is the one a previous fix got wrong: a link must be *mid*
+    // ramp right after the cut changes, and the ramp must finish — a web that settles anywhere
+    // other than full strength is the flash that had this removed.
     const gpa = testing.allocator;
     const links = try chainLinks(gpa, 2500);
     defer gpa.free(links);
@@ -1876,8 +1960,24 @@ test "a cut change does not leave fading links in the draw list" {
 
     try settle(&w, .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 }, .{}, 80);
     try w.liftLinks(.{}, 1.0 / 60.0);
-    try settle(&w, .{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 }, .{}, 40);
+    const near: View = .{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 };
+    try settle(&w, near, .{}, 40);
     try w.liftLinks(.{}, 1.0 / 60.0);
+
+    try testing.expect(w.links.items.len > 0);
+    var ramping: usize = 0;
+    for (w.links.items) |l| {
+        try testing.expect(l.alpha > 0 and l.alpha <= 1);
+        if (l.alpha < 1) ramping += 1;
+    }
+    try testing.expect(ramping > 0);
+
+    // And it converges: hold the camera still and every survivor reaches full strength, with the
+    // ghosts retired rather than left on screen at some fraction forever.
+    for (0..90) |_| {
+        try w.step(near, .{}, 1.0 / 60.0);
+        try w.liftLinks(.{}, 1.0 / 60.0);
+    }
     try testing.expect(w.links.items.len > 0);
     for (w.links.items) |l| {
         try testing.expectEqual(@as(f32, 1), l.alpha);

@@ -273,14 +273,17 @@ pub fn draw(
             const a = endpoint(w, cam, dctx, scr, l.a) orelse continue;
             const b = endpoint(w, cam, dctx, scr, l.b) orelse continue;
             const seg = clipToRect(a, b, clip_rect) orelse continue;
-            // Dying links (`w == 0`) are the fade-out ghosts `fadeLinks` keeps so a cut change
-            // can be gentle. Mixed toward the background they are not gentle: every zoom that
-            // rebuilds the lift paints the old web in pane colour, waits, then pops the new
-            // web in at rest. Skip them. Arriving links (`alpha` rising) use the same rest
-            // colour rather than walking up from the background.
-            if (l.w == 0) continue;
-            if (ambient_t <= 0.004) continue;
-            batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, ambient_t));
+            // `alpha` carries the arrival and departure ramp — see `world.fadeLinks`. Mixing it
+            // into `ambient_t` walks the line between the web's ink and the panel colour, and
+            // because `panelFill` is the surface actually behind it, zero really is invisible.
+            //
+            // Dying links used to be skipped outright here, on the grounds that fading them was
+            // worse than blinking them: the mix targeted `.window.fill`, which is not the graph's
+            // backdrop, so a fade ended on a *different colour* instead of on nothing. That was a
+            // true observation about a broken target, not about crossfading.
+            const t = ambient_t * std.math.clamp(l.alpha, 0, 1);
+            if (t <= 0.004) continue;
+            batch.add(seg.a, seg.b, 1.0, galaxy.intoBg(border_rest, bg, t));
             stats.links_drawn += 1;
         }
 

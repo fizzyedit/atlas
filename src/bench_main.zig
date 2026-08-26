@@ -855,7 +855,7 @@ fn linkSpreadReport(
         var lo: u32 = 0;
         for (cuts, 0..) |c, bi| {
             if (b_n[bi] == 0) {
-                lo = c + 1;
+                lo = c +| 1; // the last cut is `maxInt`, and there is no bucket after it to name
                 continue;
             }
             const bn: f64 = @floatFromInt(b_n[bi]);
@@ -872,7 +872,7 @@ fn linkSpreadReport(
                     b_sum[bi] / bn / ext,    @as(f64, @floatFromInt(b_far[bi])) * 100.0 / bn,
                 },
             );
-            lo = c + 1;
+            lo = c +| 1; // the last cut is `maxInt`, and there is no bucket after it to name
         }
     }
 }
