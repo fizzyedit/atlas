@@ -1469,6 +1469,63 @@ fn enforceAspectEnvelope(pos: []dvui.Point, aspect: f32) void {
     }
 }
 
+/// Relax a *part* of an existing arrangement, holding the rest still.
+///
+/// The incremental half of the layout. A rebuild that reuses last build's positions is fast and
+/// completely static: link two notes that both already have a place and nothing moves, because
+/// nothing recomputes — the new edge is simply drawn across whatever distance already separated
+/// them. Re-solving the whole vault instead is correct and unaffordable, since a rebuild runs on
+/// every save.
+///
+/// So the notes whose links changed, and their neighbours, are unpinned and allowed to settle
+/// against a frozen vault. Pinned nodes still push and pull — they are in `edges` and in the
+/// repulsion grid — they just are not integrated, so the edit stays local and everything the
+/// reader was not editing keeps the position they already knew.
+///
+/// `iters` is small on purpose: this runs on the rebuild path, and the free set is a
+/// neighbourhood rather than a vault.
+pub fn relaxDirty(
+    allocator: std.mem.Allocator,
+    n: usize,
+    edges: []const Edge,
+    pos: []dvui.Point,
+    pinned: []const bool,
+    iters: usize,
+) !void {
+    if (n < 2 or iters == 0) return;
+    var adj = try allocator.alloc(std.ArrayList(usize), n);
+    defer {
+        for (adj) |*list| list.deinit(allocator);
+        allocator.free(adj);
+    }
+    for (adj) |*list| list.* = .empty;
+    for (edges) |e| {
+        if (e.a >= n or e.b >= n or e.a == e.b) continue;
+        try adj[e.a].append(allocator, e.b);
+        try adj[e.b].append(allocator, e.a);
+    }
+    for (adj) |*list| std.mem.sort(usize, list.items, {}, std.sort.asc(usize));
+
+    // The same scale the full solve works in, so a relaxed neighbourhood settles at the same
+    // density as the vault around it rather than at one of its own.
+    const slot = slotSpacingFor(n);
+    try relaxLocal(
+        allocator,
+        n,
+        edges,
+        &.{}, // no second-hop pairs: those shape a whole-vault solve, not a local settle
+        adj,
+        pos,
+        pinned,
+        slot,
+        slot / snap_div,
+        slot * slot * 0.32,
+        slot * repulse_cutoff_slots,
+        null,
+        iters,
+    );
+}
+
 /// Short force pass used after an envelope stretch: restore local spring lengths / repulsion so
 /// clusters round out again while the overall outline mostly keeps the pane's proportions.
 fn relaxLocal(

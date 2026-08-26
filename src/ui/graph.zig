@@ -113,9 +113,6 @@ const max_node_screen_r: f32 = 48;
 /// large the instant the descent begins, not snap down to some other resting size and grow back.
 const sun_screen_r: f32 = max_node_screen_r;
 const max_sun_screen_r: f32 = 58;
-/// How far the hovered node's fill travels toward the highlight colour. See `nodeFill`.
-const hover_fill_mix: f32 = 0.45;
-
 /// How far a phantom's disc sits toward the panel behind it (1 = a normal note, 0 = gone).
 ///
 /// A phantom is a wikilink with no file, and reading as lighter-weight than a real note is the
@@ -180,6 +177,17 @@ const CachedPos = struct { x: f32, y: f32, comp: u32 };
 
 /// A cached position as the worker sees it, with whether there was one at all.
 const Seed = struct { x: f32 = 0, y: f32 = 0, comp: u32 = 0, ok: bool = false };
+
+/// Neighbours admitted per changed note, and the ceiling on the whole free set.
+///
+/// Both are hub guards. A note linked to *France* has 29,448 neighbours; without a cap, editing
+/// it would unpin all of them and the "local" settle would be a whole-vault solve wearing a
+/// different name.
+const dirty_neighbour_cap: u16 = 24;
+const dirty_free_max: usize = 4096;
+/// Iterations for the settle. Small: the free set is a neighbourhood, and this runs on the
+/// rebuild path that a save waits on.
+const dirty_relax_iters: usize = 24;
 
 /// How much of the vault has to carry a cached position for the solve to be skipped.
 ///
@@ -625,6 +633,61 @@ const LayoutJob = struct {
     /// as the graph is on screen.
     world: ?world_mod.World = null,
 
+    /// Unpin the edit and settle it against a frozen vault.
+    ///
+    /// The free set is: every note whose own links changed since the last build (`changed`),
+    /// every note new to this build, and their link neighbours — capped, because a link to a hub
+    /// must not free the hub's whole neighbourhood. Linking one note to *France* would otherwise
+    /// unpin 29,448 notes and turn a keystroke into a whole-vault solve, which is the cost this
+    /// exists to avoid.
+    fn relaxEdit(job: *LayoutJob, a: std.mem.Allocator, pos: []spatial.Vec2, seed: []const Seed) !void {
+        const n = job.n;
+        if (n < 2) return;
+
+        const pinned = try a.alloc(bool, n);
+        @memset(pinned, true);
+        var free_n: usize = 0;
+
+        // Seeds of the edit: what actually changed, plus anything with no previous position.
+        for (0..n) |i| {
+            const changed = i < job.changed.len and job.changed[i];
+            const fresh = i < seed.len and !seed[i].ok;
+            if (!changed and !fresh) continue;
+            if (pinned[i]) {
+                pinned[i] = false;
+                free_n += 1;
+            }
+        }
+        if (free_n == 0) return;
+
+        // One hop out, so an edit settles against its neighbourhood rather than dragging a note
+        // into a gap its neighbours have not made for it.
+        const admitted = try a.alloc(u16, n);
+        @memset(admitted, 0);
+        const Admit = struct {
+            fn one(src: usize, dst: usize, pin: []bool, adm: []u16, count: *usize) void {
+                if (!pin[src] and pin[dst] and adm[src] < dirty_neighbour_cap) {
+                    adm[src] += 1;
+                    pin[dst] = false;
+                    count.* += 1;
+                }
+            }
+        };
+        for (job.layout_edges) |e| {
+            if (e.a >= n or e.b >= n or e.a == e.b) continue;
+            if (free_n >= dirty_free_max) break;
+            Admit.one(e.a, e.b, pinned, admitted, &free_n);
+            Admit.one(e.b, e.a, pinned, admitted, &free_n);
+        }
+
+        // `relaxDirty` speaks `dvui.Point`; the hierarchy speaks `spatial.Vec2`. Same two floats,
+        // different types, so the copy is the conversion.
+        const work = try a.alloc(dvui.Point, n);
+        for (work, pos) |*w, q| w.* = .{ .x = q.x, .y = q.y };
+        try layout_full.relaxDirty(a, n, job.layout_edges, work, pinned, dirty_relax_iters);
+        for (pos, work) |*q, w| q.* = .{ .x = w.x, .y = w.y };
+    }
+
     fn run(job: *LayoutJob) void {
         job.solve() catch |e| {
             job.fail = e;
@@ -728,6 +791,20 @@ const LayoutJob = struct {
                 q.x *= inv;
                 q.y *= inv;
             }
+
+            // Let the edit settle, and only the edit.
+            //
+            // Reuse on its own is completely static: link two notes that both already have a
+            // place and *nothing* moves, because nothing is recomputed — the new edge is drawn
+            // across whatever distance already separated them, and the arrangement stops
+            // describing the graph. Re-solving the whole vault is the other extreme and costs
+            // seconds on every save.
+            //
+            // So the notes whose links changed, their neighbours, and anything new are unpinned
+            // and allowed to settle against a frozen vault. Everything else keeps the position
+            // the reader already knew.
+            try job.relaxEdit(a, pos, seed);
+
             job.world = try world_mod.World.initFrom(gpa, job.n, links, .{ .pos = pos, .comp = comp }, fold_opts, place);
         } else {
             job.world = try world_mod.World.init(gpa, job.n, links, path_arg, fold_opts, place);
@@ -4729,8 +4806,8 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     } else if (hovered_mass)
         // A mass has no `GraphNode`, so `nodeFill`'s proximity lift never reaches it. Without
         // this, dropping the dashed hover ring would leave a hovered mass looking like every
-        // other mass.
-        rest.lerp(hot, hover_fill_mix)
+        // other mass. Same control hover as a note — highlight is only for the open set.
+        theme.color(.control, .fill_hover)
     else
         rest;
 
@@ -5681,69 +5758,41 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
 
 /// The disc colour notes and coalesced masses share at rest.
 ///
-/// The lighter of content and control fill, so the disc sits off whichever surface the panel
-/// inherited. Mixing or lifting control used to land too close to the window and the merge
-/// read as notes dissolving into the pane.
+/// Theme control fill — the same dark surface a control uses, so an idle disc matches the
+/// chrome rather than a lifted panel colour. Hover walks to `fill_hover`. Open notes share
+/// `selectedFill` with the interior sun; highlight is the dashed rim, not the face.
 fn noteRestFill(theme: dvui.Theme) dvui.Color {
-    // Lifted off the panel, not picked from the palette.
-    //
-    // This used to be the lighter of `.content.fill` and `.control.fill`, on the reasoning that a
-    // disc should sit off whichever surface the panel inherited. In Fizzy Dark those are
-    // rgb(42, 44, 54) and rgb(28, 29, 36), so the lighter one *is* `.content.fill` — which is
-    // exactly the surface the panel is painted with. The fill therefore matched the background
-    // precisely and every note rendered as a bare outline with nothing inside it.
-    //
-    // Deriving it from the panel colour makes the relationship hold in any theme instead of
-    // depending on which way two palette entries happen to be ordered.
-    const bg = galaxy.panelFill(theme);
-    return bg.lighten(if (theme.dark) 9 else -9);
+    return theme.color(.control, .fill);
 }
 
-/// Resting fill, then the same `fill` → `fill_hover` lift a `ButtonWidget` does under the
-/// cursor. Open notes already rest at `fill_hover`, so they lift to `fill_press` instead —
-/// otherwise hovering the one node you most want feedback from would do nothing.
-///
-/// The sun is different: it fills with the graph/content background so edges passing under it
-/// are occluded, but the disc itself reads hollow — only the dashed ring announces it.
+/// Face of the open note and of the interior sun — the same colour, so diving in does not
+/// recolour the disc. Semi-transparent content fill: the web shows through, and the dashed
+/// highlight rim is what says "this one".
+fn selectedFill(theme: dvui.Theme, pointer_t: f32) dvui.Color {
+    const bg = theme.color(.content, .fill).opacity(sun_fill_opacity);
+    const lit = dvui.easing.outQuad(std.math.clamp(pointer_t, 0, 1));
+    if (lit <= 0.002) return bg;
+    // Barely lift so pointer feedback exists without filling the hollow look back in.
+    const lift: f32 = if (theme.dark) 10 else -8;
+    return bg.lighten(lift * lit);
+}
+
+/// Resting fill is control fill. Under the pointer, the same `fill` → `fill_hover` lift a
+/// `ButtonWidget` does. Open notes use `selectedFill`, matching the interior sun.
 fn nodeFill(theme: dvui.Theme, n: GraphNode) dvui.Color {
-    if (n.is_sun) {
-        // Half-transparent: the sun is a hole back out to the vault, so the web behind it
-        // should show through rather than be occluded by a solid disc.
-        const bg = theme.color(.content, .fill).opacity(sun_fill_opacity);
-        const lit = dvui.easing.outQuad(std.math.clamp(n.pointer_t, 0, 1));
-        if (lit <= 0.002) return bg;
-        // Barely lift so pointer feedback exists without filling the hollow look back in.
-        const lift: f32 = if (theme.dark) 10 else -8;
-        return bg.lighten(lift * lit);
-    }
-    const accent = theme.color(.control, .fill_hover);
-    const rest = if (n.open)
-        accent
-    else if (n.phantom)
-        galaxy.intoBg(noteRestFill(theme), galaxy.panelFill(theme), phantom_fill_mix)
+    if (n.is_sun or n.open) return selectedFill(theme, n.pointer_t);
+
+    const bg = galaxy.panelFill(theme);
+    const rest = if (n.phantom)
+        galaxy.intoBg(noteRestFill(theme), bg, phantom_fill_mix)
     else
         noteRestFill(theme);
 
     const lit = n.pointer_t;
     if (lit <= 0.002) return rest;
-    // The highlight colour, not a lifted control fill.
-    //
-    // A `fill` → `fill_hover` step is the right feedback for a button in a row of buttons, where
-    // position already says which one you are on. In a field of thousands of near-identical discs
-    // it says almost nothing: the lift is a few percent of luminance against neighbours that are
-    // already every shade the proximity swell makes them. The highlight is the colour this panel
-    // already uses to mean "this is the one" — the focused note's links, the focused note's name —
-    // so hover joins that vocabulary instead of inventing a quieter one.
-    const target = theme.color(.highlight, .fill);
-    // Phantoms stay mixed toward the background; keep that while still letting them light up.
-    const to = if (n.phantom) galaxy.intoBg(target, galaxy.panelFill(theme), 0.55) else target;
-    // Part way, not all the way.
-    //
-    // Going fully to the highlight makes the disc the same colour as the things that mean
-    // "selected" — including its own label, which then becomes unreadable sitting on top of it.
-    // Mixed, the node still clearly lifts out of the field while staying a node rather than
-    // turning into a solid chip of accent.
-    return rest.lerp(to, hover_fill_mix * dvui.easing.outQuad(std.math.clamp(lit, 0, 1)));
+    const hover = theme.color(.control, .fill_hover);
+    const to = if (n.phantom) galaxy.intoBg(hover, bg, 0.55) else hover;
+    return rest.lerp(to, dvui.easing.outQuad(std.math.clamp(lit, 0, 1)));
 }
 
 /// Floating round "zoom to fit" button in the bottom-right of the graph viewport.
