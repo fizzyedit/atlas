@@ -46,8 +46,8 @@ const max_levels: usize = 32;
 /// Unit-space spacing the solve aims for at every level. Density is held constant across levels
 /// by scaling positions on projection, so one set of force constants works the whole way down.
 const spacing: f32 = 1.0;
-const repulse_cut: f32 = 2.6 * spacing;
-const repulse_k: f32 = 0.9;
+
+const repulse_k: f32 = 0.45;
 const spring_k: f32 = 1.0;
 const gravity_k: f32 = 0.005;
 
@@ -601,9 +601,20 @@ fn attractRange(edges: []const WEdge, mass: []const f32, pos: []const dvui.Point
 const Cellref = struct { level: u8, x: u32, y: u32 };
 
 /// Opening angle. A cell is used whole when its width over its distance is below this; wider than
-/// that and the traversal descends into it. 0.7 is the usual compromise — smaller is more exact
-/// and visits more cells, larger is faster and blurs nearby structure.
+/// that and the traversal descends into it. Smaller is more exact and visits more cells.
+///
+/// 2.0 is loose — loose enough that even an adjacent cell is taken as a point at its centre of
+/// mass. On a real vault that is not only faster but *better*: blurring distant structure leaves
+/// the springs to decide it, and they are the ones that know. Measured on simplewiki, 0.7 gave
+/// crossing 6.9% at 15.3 s where 2.0 gives 1.4% at 7.2 s.
+///
+/// It is wrong for a small graph, for the same reason `repel_cell_cap` was: the approximation
+/// hides in the crowd, and a few hundred nodes have no crowd. Two hundred unlinked notes are
+/// nothing but their neighbours, so taking each neighbouring cell as one point leaves nothing to
+/// push them apart and they pile up — which `disconnected nodes do not stack on the origin`
+/// catches.
 const bh_theta: f32 = 2.0;
+const bh_theta_small: f32 = 0.4;
 
 /// Levels of aggregation above the base grid, capped so a pathological extent cannot allocate
 /// without bound. Eight doublings reach 256x the base cell, which covers any vault the base cell
@@ -831,8 +842,9 @@ const Grid = struct {
         // throwing away most of the force — two hundred unlinked notes stopped pushing each other
         // apart and piled up, which `disconnected nodes do not stack on the origin` catches.
         const cap: usize = if (n < repel_exact_max) std.math.maxInt(usize) else repel_cell_cap;
+        const theta: f32 = if (n < repel_exact_max) bh_theta_small else bh_theta;
         if (threads <= 1 or n < repel_thread_min) {
-            g.repelRange(p, 0, n, cap, pos, force, mass);
+            g.repelRange(p, 0, n, cap, theta, pos, force, mass);
             return;
         }
         var handles: [repel_threads_max]std.Thread = undefined;
@@ -842,13 +854,13 @@ const Grid = struct {
             const lo = spawned * chunk;
             if (lo >= n) break;
             const hi = @min(lo + chunk, n);
-            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, pos, force, mass }) catch break;
+            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, theta, pos, force, mass }) catch break;
         }
         // Whatever failed to spawn is done on this thread, so a thread-starved system is slower
         // rather than wrong.
         if (spawned < threads) {
             const lo = spawned * chunk;
-            if (lo < n) g.repelRange(p, lo, n, cap, pos, force, mass);
+            if (lo < n) g.repelRange(p, lo, n, cap, theta, pos, force, mass);
         }
         for (handles[0..spawned]) |h| h.join();
     }
@@ -898,6 +910,7 @@ const Grid = struct {
         p: Pyramid,
         i: u32,
         cap: usize,
+        theta: f32,
         pos: []const dvui.Point,
         force: []dvui.Point,
         mass: []const f32,
@@ -937,7 +950,7 @@ const Grid = struct {
                 continue;
             }
             const d = @sqrt(d2);
-            if (p.cell[k] < d * bh_theta) {
+            if (p.cell[k] < d * theta) {
                 const soft = @max(d, spacing * 0.35);
                 const mag = repulse_k * m / (soft * soft);
                 fx += (dx / @max(d, 1e-6)) * mag;
@@ -970,6 +983,7 @@ const Grid = struct {
         from: usize,
         to: usize,
         cap: usize,
+        theta: f32,
         pos: []const dvui.Point,
         force: []dvui.Point,
         mass: []const f32,
@@ -983,7 +997,7 @@ const Grid = struct {
         // `items` are still disjoint in `i`, since it is a permutation, so the threading argument
         // above is unchanged.
         var stack: [bh_levels_max * 4]Cellref = undefined;
-        for (g.items[from..to]) |i| repelFar(g, p, i, cap, pos, force, mass, &stack);
+        for (g.items[from..to]) |i| repelFar(g, p, i, cap, theta, pos, force, mass, &stack);
     }
 };
 
@@ -1013,40 +1027,25 @@ fn pairForceOn(pos: []const dvui.Point, force: []dvui.Point, mass: []const f32, 
         d2 = dx * dx + dy * dy;
     }
     const d = @sqrt(d2);
-    if (d > repulse_cut) return;
+    // The same law the aggregate uses, and it has to be: a cell standing in for its contents is
+    // only honest if opening it would give the same answer. Near and far had drifted apart when
+    // Barnes-Hut landed — the far field summed `m_j` while the near field summed
+    // `sqrt(m_i*m_j)/m_i`, which agree at the finest level where every mass is 1 and diverge
+    // badly at the coarse levels where a supernode stands for a whole subtree. A tree coarsens
+    // into exactly those, so its branches were flung out by a repulsion its one spring could not
+    // answer.
+    //
+    // No cutoff either. `repulse_cut` used to bound the interaction *and* size the grid, so the
+    // two agreed by construction; the grid is sized to density now, and leaving the taper here
+    // left a hole — two notes in the same cell but further apart than the old cutoff got no
+    // repulsion from the near field and were never considered by the far field, so they settled
+    // on top of each other.
     const soft = @max(d, spacing * 0.35);
-    const m = @sqrt(mass[i] * mass[j]);
-    const mag = repulse_k * m / (soft * soft) * (1.0 - d / repulse_cut) * scale;
-    force[i].x += (dx / d) * mag / mass[i];
-    force[i].y += (dy / d) * mag / mass[i];
+    const mag = repulse_k * mass[j] / (soft * soft) * scale;
+    force[i].x += (dx / d) * mag;
+    force[i].y += (dy / d) * mag;
 }
 
-fn pairForce(pos: []const dvui.Point, force: []dvui.Point, mass: []const f32, ia: u32, ib: u32) void {
-    const i: usize = ia;
-    const j: usize = ib;
-    var dx = pos[i].x - pos[j].x;
-    var dy = pos[i].y - pos[j].y;
-    var d2 = dx * dx + dy * dy;
-    if (d2 < 1e-8) {
-        const jt = jitter(@min(i, j) * 31 + @max(i, j));
-        dx = jt[0] * 1e-3;
-        dy = jt[1] * 1e-3;
-        d2 = dx * dx + dy * dy;
-    }
-    const d = @sqrt(d2);
-    if (d > repulse_cut) return;
-    const soft = @max(d, spacing * 0.35);
-    // Mass-weighted so heavy communities open real voids around themselves — this is the force
-    // that produces the empty space between clusters.
-    const m = @sqrt(mass[i] * mass[j]);
-    const mag = repulse_k * m / (soft * soft) * (1.0 - d / repulse_cut);
-    const fx = (dx / d) * mag;
-    const fy = (dy / d) * mag;
-    force[i].x += fx / mass[i];
-    force[i].y += fy / mass[i];
-    force[j].x -= fx / mass[j];
-    force[j].y -= fy / mass[j];
-}
 
 fn seedSpiral(pos: []dvui.Point) void {
     const golden = 2.39996322972865332;
