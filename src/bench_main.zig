@@ -472,6 +472,18 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     // once came to report parameters nothing shipped with.
     var lay = try layout.solve(gpa, n, edges, paths, .{ .note_r = place_opts.note_r });
     const solve_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
+    {
+        const mp = multilevel.prof;
+        const msf = struct {
+            fn f(ns: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            }
+        }.f;
+        std.debug.print(
+            "  solve ms: grid {d:.0}  pyramid {d:.0}  traverse {d:.0}  attract {d:.0}  integrate {d:.0}  coarsen {d:.0}   (sum {d:.0})\n",
+            .{ msf(mp.grid_ns), msf(mp.pyramid_ns), msf(mp.traverse_ns), msf(mp.attract_ns), msf(mp.integrate_ns), msf(mp.coarsen_ns), msf(mp.total()) },
+        );
+    }
     var w = try world_mod.World.initFrom(gpa, n, edges, .{ .pos = lay.pos, .comp = lay.comp }, fold_opts, place_opts);
     {
         // Which islands the vault's extent is actually made of.

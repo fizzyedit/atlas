@@ -28,6 +28,38 @@ const radix = @import("radix.zig");
 /// nothing, a link between two obscure notes says a lot. See `fold.degreeNormalised`.
 pub const Edge = struct { a: u32, b: u32, w: f32 = 1.0 };
 
+/// Where a solve spent its time. Accumulated across every component and every level, reset by the
+/// caller. Counting nanoseconds costs nothing against the work being counted, and every speed-up
+/// in this file so far has come from finding out which phase was actually large — twice after
+/// optimising the wrong one first.
+pub const Prof = struct {
+    grid_ns: u64 = 0,
+    pyramid_ns: u64 = 0,
+    traverse_ns: u64 = 0,
+    attract_ns: u64 = 0,
+    integrate_ns: u64 = 0,
+    coarsen_ns: u64 = 0,
+
+    pub fn total(self: Prof) u64 {
+        return self.grid_ns + self.pyramid_ns + self.traverse_ns + self.attract_ns +
+            self.integrate_ns + self.coarsen_ns;
+    }
+};
+pub var prof: Prof = .{};
+
+fn pnow() i128 {
+    // Inert under test: the clock reads `dvui.io`, which a headless test never initialises, so
+    // asking it there is a segfault rather than a measurement.
+    if (@import("builtin").is_test) return 0;
+    return std.Io.Clock.boot.now(dvui.io).nanoseconds;
+}
+
+fn plap(mark: *i128) u64 {
+    const t = pnow();
+    defer mark.* = t;
+    return @intCast(t - mark.*);
+}
+
 /// An edge at some coarse level, carrying how many original edges it stands for.
 const WEdge = struct { a: u32, b: u32, w: f32 };
 
@@ -229,6 +261,7 @@ pub fn solve(
         if (opts.cancel) |c| if (c.load(.monotonic)) return error.Canceled;
         const parent = try allocator.alloc(u32, cur_n);
         errdefer allocator.free(parent);
+        var ct = pnow();
         const coarse_n = try match(allocator, cur_n, level_edges.items, parent);
         if (@as(f32, @floatFromInt(coarse_n)) > @as(f32, @floatFromInt(cur_n)) * min_shrink) {
             allocator.free(parent);
@@ -248,6 +281,7 @@ pub fn solve(
         try counts.append(allocator, coarse_n);
         try level_sets.append(allocator, try allocator.dupe(WEdge, level_edges.items));
         try level_mass.append(allocator, try allocator.dupe(f32, mass));
+        prof.coarsen_ns += plap(&ct);
         cur_n = coarse_n;
     }
 
@@ -255,7 +289,7 @@ pub fn solve(
     var pos = try allocator.alloc(dvui.Point, cur_n);
     defer allocator.free(pos);
     seedSpiral(pos[0..cur_n]);
-    try relax(allocator, cur_n, level_edges.items, mass, pos, opts.max_iters, opts.cancel);
+    try relax(allocator, n, cur_n, level_edges.items, mass, pos, opts.max_iters, opts.cancel);
 
     // -- project back down -------------------------------------------------------------
     var level = ladder.items.len;
@@ -294,7 +328,7 @@ pub fn solve(
         const t = @as(f32, @floatFromInt(level)) / @as(f32, @floatFromInt(@max(ladder.items.len, 1)));
         const iters_f = @as(f32, @floatFromInt(opts.min_iters)) +
             (@as(f32, @floatFromInt(opts.max_iters)) - @as(f32, @floatFromInt(opts.min_iters))) * t;
-        try relax(allocator, fine_n, fine_edges, fine_mass, pos, @intFromFloat(iters_f), opts.cancel);
+        try relax(allocator, n, fine_n, fine_edges, fine_mass, pos, @intFromFloat(iters_f), opts.cancel);
 
         // Done with this level; the finer ones below still have to be held.
         allocator.free(level_sets.items[level]);
@@ -467,6 +501,8 @@ fn dedup(allocator: std.mem.Allocator, edges: *std.ArrayList(WEdge)) !void {
 /// attraction along edges, a whisper of gravity to keep the cloud from drifting.
 fn relax(
     allocator: std.mem.Allocator,
+    /// Nodes in the whole component, not just this level — see `bh_near_cells`.
+    n_total: usize,
     n: usize,
     edges: []const WEdge,
     mass: []const f32,
@@ -506,13 +542,18 @@ fn relax(
         const temp = 1.0 - @as(f32, @floatFromInt(it)) / @as(f32, @floatFromInt(iters));
         const step = spacing * (0.55 * temp + 0.08);
 
+        var pt = pnow();
         var grid = try Grid.init(allocator, pos, n);
         defer grid.deinit(allocator);
+        prof.grid_ns += plap(&pt);
         var pyr = try Pyramid.build(allocator, grid, n, pos, mass);
         defer pyr.deinit(allocator);
-        grid.repel(pyr, n, pos, force, mass);
+        prof.pyramid_ns += plap(&pt);
+        grid.repel(pyr, n_total, n, pos, force, mass);
+        prof.traverse_ns += plap(&pt);
 
         attract(edges, mass, pos, force, scratch);
+        prof.attract_ns += plap(&pt);
 
         for (0..n) |i| {
             var fx = force[i].x - pos[i].x * gravity_k;
@@ -525,11 +566,13 @@ fn relax(
             pos[i].x += fx;
             pos[i].y += fy;
         }
+        prof.integrate_ns += plap(&pt);
     }
 }
 
-/// Edge count below which the spring pass stays on one thread.
-const attract_thread_min: usize = 200_000;
+/// Edge count below which the spring pass stays on one thread. Low for the same reason as
+/// `repel_thread_min`: the coarse levels are small and run the most iterations.
+const attract_thread_min: usize = 20_000;
 
 /// Springs along every link, in parallel when there are enough of them.
 ///
@@ -608,13 +651,31 @@ const Cellref = struct { level: u8, x: u32, y: u32 };
 /// the springs to decide it, and they are the ones that know. Measured on simplewiki, 0.7 gave
 /// crossing 6.9% at 15.3 s where 2.0 gives 1.4% at 7.2 s.
 ///
-/// It is wrong for a small graph, for the same reason `repel_cell_cap` was: the approximation
-/// hides in the crowd, and a few hundred nodes have no crowd. Two hundred unlinked notes are
-/// nothing but their neighbours, so taking each neighbouring cell as one point leaves nothing to
-/// push them apart and they pile up — which `disconnected nodes do not stack on the origin`
-/// catches.
+/// Loose is only safe because of `bh_near_cells`. On its own it takes even an adjacent cell as a
+/// point at its centre of mass, and a node's immediate neighbours are the ones that must not be
+/// approximated — two hundred unlinked notes are *nothing but* their neighbours, so aggregating
+/// them left nothing to push them apart and they piled up on the origin.
+///
+/// The first fix for that keyed the angle off the node count, which was wrong in an instructive
+/// way: every coarse level of a large solve has few nodes, and those are the levels the iteration
+/// taper spends the most passes on. Tightening the angle there took the traversal from 1.3 s to
+/// 4.8 s on simplewiki without helping any real vault. Distinguishing "close" from "small" is what
+/// was actually needed.
 const bh_theta: f32 = 2.0;
-const bh_theta_small: f32 = 0.4;
+
+/// Base cells within this radius are always opened, whatever the angle says.
+///
+/// A guaranteed-exact near field: the nodes close enough to overlap are always paired
+/// individually, and everything beyond is free to be a centre of mass. Widening it is what buys
+/// non-overlapping discs — on a 1,365-note tree, 2.5 leaves 21.8% of sibling discs overlapping
+/// and 6.0 leaves 14.0% — and it costs the square of itself, so a 284k vault cannot have it.
+///
+/// Keyed on the size of the *problem*, not of the level. An earlier version keyed the opening
+/// angle on the level's node count, which sounds the same and is not: every coarse level of a
+/// large solve is small, and those are the levels the iteration taper runs hardest, so it made a
+/// big vault pay for exactness it could not use. A small vault is small at every level, and can.
+const bh_near_cells: f32 = 2.5;
+const bh_near_cells_small: f32 = 6.0;
 
 /// Levels of aggregation above the base grid, capped so a pathological extent cannot allocate
 /// without bound. Eight doublings reach 256x the base cell, which covers any vault the base cell
@@ -830,7 +891,7 @@ const Grid = struct {
     /// result does not depend on how the threads interleave: each slot is written by exactly one
     /// thread computing exactly the same sum it would have computed alone. `solve` stays a pure
     /// function of the graph.
-    fn repel(g: Grid, p: Pyramid, n: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
+    fn repel(g: Grid, p: Pyramid, n_total: usize, n: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
         const want = std.Thread.getCpuCount() catch 1;
         const threads = @min(@max(want, 1), repel_threads_max);
         // Below this the split costs more than it saves, and the coarse levels of the ladder are
@@ -842,9 +903,9 @@ const Grid = struct {
         // throwing away most of the force — two hundred unlinked notes stopped pushing each other
         // apart and piled up, which `disconnected nodes do not stack on the origin` catches.
         const cap: usize = if (n < repel_exact_max) std.math.maxInt(usize) else repel_cell_cap;
-        const theta: f32 = if (n < repel_exact_max) bh_theta_small else bh_theta;
+        const near: f32 = if (n_total < repel_exact_max) bh_near_cells_small else bh_near_cells;
         if (threads <= 1 or n < repel_thread_min) {
-            g.repelRange(p, 0, n, cap, theta, pos, force, mass);
+            g.repelRange(p, 0, n, cap, near, pos, force, mass);
             return;
         }
         var handles: [repel_threads_max]std.Thread = undefined;
@@ -854,13 +915,13 @@ const Grid = struct {
             const lo = spawned * chunk;
             if (lo >= n) break;
             const hi = @min(lo + chunk, n);
-            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, theta, pos, force, mass }) catch break;
+            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, near, pos, force, mass }) catch break;
         }
         // Whatever failed to spawn is done on this thread, so a thread-starved system is slower
         // rather than wrong.
         if (spawned < threads) {
             const lo = spawned * chunk;
-            if (lo < n) g.repelRange(p, lo, n, cap, theta, pos, force, mass);
+            if (lo < n) g.repelRange(p, lo, n, cap, near, pos, force, mass);
         }
         for (handles[0..spawned]) |h| h.join();
     }
@@ -910,13 +971,14 @@ const Grid = struct {
         p: Pyramid,
         i: u32,
         cap: usize,
-        theta: f32,
+        near: f32,
         pos: []const dvui.Point,
         force: []dvui.Point,
         mass: []const f32,
         stack: *[bh_levels_max * 4]Cellref,
     ) void {
         const me = pos[i];
+        const near_exact = p.cell[0] * near;
         var fx: f32 = 0;
         var fy: f32 = 0;
         var top: usize = 0;
@@ -950,7 +1012,7 @@ const Grid = struct {
                 continue;
             }
             const d = @sqrt(d2);
-            if (p.cell[k] < d * theta) {
+            if (p.cell[k] < d * bh_theta and d > near_exact) {
                 const soft = @max(d, spacing * 0.35);
                 const mag = repulse_k * m / (soft * soft);
                 fx += (dx / @max(d, 1e-6)) * mag;
@@ -983,7 +1045,7 @@ const Grid = struct {
         from: usize,
         to: usize,
         cap: usize,
-        theta: f32,
+        near: f32,
         pos: []const dvui.Point,
         force: []dvui.Point,
         mass: []const f32,
@@ -997,15 +1059,20 @@ const Grid = struct {
         // `items` are still disjoint in `i`, since it is a permutation, so the threading argument
         // above is unchanged.
         var stack: [bh_levels_max * 4]Cellref = undefined;
-        for (g.items[from..to]) |i| repelFar(g, p, i, cap, theta, pos, force, mass, &stack);
+        for (g.items[from..to]) |i| repelFar(g, p, i, cap, near, pos, force, mass, &stack);
     }
 };
 
 /// Partners examined in one cell before the rest are sampled. See `Grid.repel`.
 const repel_cell_cap: usize = 2;
 /// Cores the repulsion pass will use, and the node count below which it stays single-threaded.
+///
+/// The floor is low on purpose. "Small level, not worth a thread" is the wrong instinct in a
+/// multilevel solve: the iteration taper gives the *coarse* levels the most passes — up to
+/// `max_iters` against `min_iters` at the finest — so a level with a tenth of the nodes can cost
+/// more than the one below it. Leaving those serial left most of the solve on one core.
 const repel_threads_max: usize = 16;
-const repel_thread_min: usize = 20_000;
+const repel_thread_min: usize = 2_000;
 /// Node count below which repulsion is exact — see `Grid.repel`.
 const repel_exact_max: usize = 20_000;
 
