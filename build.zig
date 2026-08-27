@@ -83,6 +83,8 @@ pub fn build(b: *std.Build) void {
         // The drawing hierarchy built *from* positions rather than the other way round: Hilbert
         // order, gap-defined chunking, true bottom-up bounds. Plain `Vec2`, headless.
         .{ "atlas-spatial-tests", "src/ui/spatial.zig" },
+        // Modularity clustering over plain `Edge` pairs — no dvui, no vault types.
+        .{ "atlas-louvain-tests", "src/ui/louvain.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],

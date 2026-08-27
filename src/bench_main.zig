@@ -37,6 +37,7 @@ const world_mod = @import("ui/world.zig");
 const containment = @import("ui/containment.zig");
 const fold = @import("ui/fold.zig");
 const spatial = @import("ui/spatial.zig");
+const louvain = @import("ui/louvain.zig");
 const layout = @import("ui/layout.zig");
 const cellweb = @import("ui/cellweb.zig");
 
@@ -69,6 +70,8 @@ var world_zoom_mul: f32 = 2.0;
 /// Off by default because it eagerly places every leaf, which is the cost lazy placement exists to
 /// avoid — seconds on a large vault.
 var want_relayout: bool = false;
+var want_cluster: bool = false;
+var cluster_resolution: f64 = 1.0;
 var ml_iters: usize = 90;
 var want_spatial: bool = false;
 /// `--degree-norm=F`: `fold.Options.degree_norm`, how hard a link is discounted for the popularity
@@ -161,6 +164,15 @@ pub fn main(init: std.process.Init) !void {
             ml_iters = try std.fmt.parseInt(usize, a["--ml-iters=".len..], 10);
             continue;
         }
+        if (std.mem.eql(u8, a, "--cluster")) {
+            want_cluster = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--resolution=")) {
+            cluster_resolution = try std.fmt.parseFloat(f64, a["--resolution=".len..]);
+            want_cluster = true;
+            continue;
+        }
         if (std.mem.eql(u8, a, "--relayout")) {
             want_spatial = true;
             want_relayout = true;
@@ -243,6 +255,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, a, "--degree-norm=")) continue;
         if (std.mem.eql(u8, a, "--spatial")) continue;
         if (std.mem.eql(u8, a, "--relayout")) continue;
+        if (std.mem.eql(u8, a, "--cluster")) continue;
+        if (std.mem.startsWith(u8, a, "--resolution=")) continue;
         if (std.mem.startsWith(u8, a, "--ml-iters=")) continue;
         if (std.mem.startsWith(u8, a, "--radius-exp=")) continue;
         if (std.mem.startsWith(u8, a, "--pack-gap=")) continue;
@@ -455,7 +469,80 @@ fn timeOneEdit(gpa: std.mem.Allocator, io: std.Io, db: *Db, indexer: *Indexer) !
 /// This exists because the budget cannot be judged from a live window: a bug that only shows at
 /// zooms you do not happen to stop at looks fine by eye. The sweep prints estimate against actual
 /// at every step, which is how two separate bounds bugs were caught in the classic path.
+/// Can a hierarchy of communities hold the links inside it?
+///
+/// The question a region layout stands or falls on. Nested regions are fast, deterministic, free
+/// of overlap by construction and update only where the structure changed — and none of that is
+/// worth anything if the links keep crossing between regions, because the map then says nothing
+/// about what is near what.
+///
+/// Reported per level of the dendrogram, because a region layout uses every level: what stays
+/// inside a community at that scale is what the reader sees as short at that zoom. Compared
+/// against `fold`'s own ladder at the closest granularity, since that is the hierarchy this
+/// would replace and it is the one that measured 58% of links crossing a quarter of the vault.
+fn clusterReport(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.Edge) !void {
+    const ledges = try gpa.alloc(louvain.Edge, edges.len);
+    defer gpa.free(ledges);
+    for (ledges, edges) |*d, e| d.* = .{ .a = e.a, .b = e.b, .w = e.w };
+
+    const t0 = now(io);
+    var res = try louvain.cluster(gpa, n, ledges, .{ .resolution = cluster_resolution });
+    defer res.deinit(gpa);
+    const cluster_ns = elapsed(io, t0);
+
+    std.debug.print("\n  -- modularity clustering --  [{d:.0} ms, {d} levels]\n", .{ ms(cluster_ns), res.levels.len });
+    for (res.levels, res.counts, res.q, 0..) |lvl, cnt, q, i| {
+        const intra = louvain.intraFraction(n, ledges, lvl);
+        var largest: usize = 0;
+        {
+            const sizes = try gpa.alloc(u32, cnt);
+            defer gpa.free(sizes);
+            @memset(sizes, 0);
+            for (lvl) |c| sizes[c] += 1;
+            for (sizes) |x| largest = @max(largest, x);
+        }
+        std.debug.print(
+            "     L{d}  communities {d:>7}  links inside {d:>5.1}%  Q {d:.3}  largest {d} ({d:.1}% of vault)\n",
+            .{ i, cnt, intra * 100, q, largest, @as(f64, @floatFromInt(largest)) * 100.0 / @as(f64, @floatFromInt(@max(n, 1))) },
+        );
+    }
+
+    // The same measure over `fold`'s ladder, level by level, as the baseline to beat.
+    var lad = try fold.build(gpa, n, edges, &.{}, .{});
+    defer lad.deinit(gpa);
+    const at_level = try gpa.alloc(u32, n);
+    defer gpa.free(at_level);
+    std.debug.print("  -- fold ladder, same measure --\n", .{});
+    var step: u32 = 1;
+    while (step <= 8) : (step += 1) {
+        var distinct = std.AutoHashMap(u32, void).init(gpa);
+        defer distinct.deinit();
+        for (0..n) |i| {
+            var c = lad.leaf_cell[i];
+            var up: u32 = 0;
+            while (up < step and c != fold.invalid and c < lad.cells.len) : (up += 1) {
+                const par = lad.cells[c].parent;
+                if (par == fold.invalid) break;
+                c = par;
+            }
+            at_level[i] = c;
+            distinct.put(c, {}) catch {};
+        }
+        var inside: f64 = 0;
+        var total: f64 = 0;
+        for (edges) |e| {
+            if (e.a >= n or e.b >= n or e.a == e.b) continue;
+            total += e.w;
+            if (at_level[e.a] == at_level[e.b]) inside += e.w;
+        }
+        if (total <= 0) break;
+        std.debug.print("     up {d}  cells {d:>7}  links inside {d:>5.1}%\n", .{ step, distinct.count(), inside / total * 100 });
+    }
+    std.debug.print("\n", .{});
+}
+
 fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.Edge, paths: []const []const u8, label: []const u8) !void {
+    if (want_cluster) try clusterReport(gpa, io, n, edges);
     // Timed, because this is what every republish costs: the layout job rebuilds the whole World
     // — `fold.build` over every note, `cellweb` over every link — each time the index bumps the
     // generation, including for a one-note edit.
