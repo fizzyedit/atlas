@@ -85,6 +85,8 @@ pub fn build(b: *std.Build) void {
         .{ "atlas-spatial-tests", "src/ui/spatial.zig" },
         // Modularity clustering over plain `Edge` pairs — no dvui, no vault types.
         .{ "atlas-louvain-tests", "src/ui/louvain.zig" },
+        // Layout-shape grade: classifier, Procrustes displacement, bimodality. Headless.
+        .{ "atlas-shape-metrics-tests", "src/ui/shape_metrics.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],
@@ -260,7 +262,7 @@ pub fn build(b: *std.Build) void {
         bench.root_module.addImport("content_graph", cg_for_bench);
         const run_bench = b.addRunArtifact(bench);
         if (b.args) |a| run_bench.addArgs(a);
-        b.step("bench", "Scan/resolve timings, --stats structure, --world LOD sweep").dependOn(&run_bench.step);
+        b.step("bench", "Scan/resolve timings, --stats, --world, --shapes, --stability").dependOn(&run_bench.step);
     }
 
     // MediaWiki dump -> a vault of markdown notes with the wikilinks intact. Standalone: it needs

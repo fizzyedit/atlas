@@ -41,6 +41,7 @@ pub const fold = @import("fold.zig");
 const containment = @import("containment.zig");
 const cellweb = @import("cellweb.zig");
 const spatial = @import("spatial.zig");
+const radix = @import("radix.zig");
 const layout = @import("layout.zig");
 
 pub const Mark = struct {
@@ -81,6 +82,32 @@ pub const LiftedLink = struct {
     /// At least one endpoint is a note drawn as *itself* rather than inside a mass, which makes
     /// this link exempt from the budget — see the `keep` calculation in `liftLinks`.
     essential: bool = false,
+    /// This is the heaviest line incident to one of its two cells, and so the one line that keeps
+    /// that cell from being drawn as though it had no connections at all.
+    ///
+    /// Truncation is by weight over the *whole* frame, and a peripheral group's links are light —
+    /// a handful of ordinary mentions — so a hub-to-hub aggregate in the middle of the map outbids
+    /// every one of them. The group is then drawn as a cluster of notes with no lines whatsoever,
+    /// which reads as "nothing links here", and zooming in one step makes a dozen connections
+    /// appear out of nothing. That is a lie about the graph, and a worse one than showing too few
+    /// lines: absence is a claim, and the budget was making it by accident.
+    ///
+    /// At most one per drawn cell, so this reserves no more than the cut's size out of a budget
+    /// that is already `links_per_cell` times it.
+    anchor: bool = false,
+    /// This pair leaves its neighbourhood: its two cells do not share a parent.
+    ///
+    /// Reported, not ranked on. The territories plan calls for a highway layer — "most of 3.5M
+    /// edges are streets inside a place, a few are routes between places" — and that is true of the
+    /// *note-level* edge set. It is not true of the lifted one: a link inside a mass is aggregated
+    /// into that mass and never becomes a line, so by the time the web is drawn, coalescing has
+    /// already thrown the streets away. Measured on simplewiki at overview, 88-96% of lifted
+    /// candidates are already cross-parent, and ranking them first moved the drawn set from 96% to
+    /// 99% — a no-op. The highway layer exists; `cellweb` aggregation is what builds it.
+    ///
+    /// Kept because the sweep's `chwy%` / `hwy%` columns are what said so, and the next person to
+    /// reach for this idea should be able to see the same numbers rather than build it again.
+    highway: bool = false,
     /// 0..1 crossfade. Links enter and leave the lifted set as the cut changes under a pan, and
     /// without this they blink. Driven by the same rate as the mark crossfade.
     alpha: f32 = 1,
@@ -326,7 +353,19 @@ pub const Params = struct {
     /// web — it costs draw time and shows nothing, since every cell appears joined to every
     /// other. Keeping the heaviest links keeps the structure that carries information.
     link_budget: usize = 900,
-
+    /// Ambient lines per drawn cell, as a second cap on `link_budget`.
+    ///
+    /// `link_budget` is a flat count, so at overview the same ten thousand lines are spread over
+    /// whatever the cut happens to hold — on simplewiki that is ~1,450 masses carrying ~7 lines
+    /// each, which is not a web, it is a wash. Worse, the drawn set is then a top-K cut a long way
+    /// down a jittering ranking, so most of what is drawn is near the boundary and swaps out as
+    /// soon as anything moves. Capping by the size of the *cut* keeps line density per drawn thing
+    /// roughly constant as you zoom, which is what cartographic generalisation does — a country
+    /// view draws motorways, not every alley — and it shortens the ranking's tail so far fewer
+    /// links sit near the cut at all.
+    ///
+    /// Set high enough to be inert by default; the panel supplies the real value.
+    links_per_cell: usize = 1_000_000,
     /// The ambient link budget that goes with a given mark budget.
     ///
     /// Lives here, on `Params`, rather than in the panel, because the `--world` bench builds its
@@ -348,6 +387,9 @@ pub const Params = struct {
 /// random probe into megabytes, and the lift does one per neighbour.
 const Memo = struct { stamp: u32 = 0, of: u32 = fold.invalid };
 
+/// The heaviest line incident to one cell this frame, for the anchor pass in `liftLinks`.
+const Anchor = struct { stamp: u32 = 0, link: u32 = 0, w: f32 = 0 };
+
 /// The same, for one cut cell's running per-partner weight total.
 const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
 
@@ -355,7 +397,35 @@ const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
 const link_fade_rate: f32 = 30;
 
 /// One link's crossfade and the epoch it was last seen in the lifted set.
-const Fade = struct { v: f32 = 0, stamp: u32 = 0 };
+/// One link's crossfade, keyed by its `(a, b)` cell pair. Held in a **key-sorted array**, not a
+/// hash map — see `fadeLinks` for why.
+const Fade = struct { key: u64, v: f32 };
+
+fn fadeKey(f: Fade) u64 {
+    return f.key;
+}
+
+/// One candidate's key beside where it lives in `lifted`.
+const KeyIdx = struct { key: u64, idx: u32 };
+
+fn keyIdxKey(k: KeyIdx) u64 {
+    return k.key;
+}
+
+/// A lifted link's identity. `a < b` by construction (the build packs `min`/`max`), so this is the
+/// same packing the accumulator keyed on and two lists of it can be merged directly.
+fn linkKey(l: LiftedLink) u64 {
+    return (@as(u64, l.a) << 32) | @as(u64, l.b);
+}
+
+/// How much heavier a newcomer must be to evict a link that is already on screen.
+///
+/// The drawn web is a budgeted top-K over a ranking that jitters as the cut moves, so links sitting
+/// near the budget boundary swap in and out between frames — measured at 8-11% of the web per frame
+/// while panning, which is a thousand lines flickering. Weight alone has no memory of what is
+/// already drawn; this gives it one. A newcomer still wins if it is genuinely heavier, so the web
+/// still tracks the graph — it just stops trading places with links it is tied with.
+const incumbent_bonus: f32 = 1.35;
 
 /// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
 ///
@@ -366,7 +436,14 @@ const Fade = struct { v: f32 = 0, stamp: u32 = 0 };
 fn heavier(x: LiftedLink, y: LiftedLink) bool {
     if (x.focus != y.focus) return x.focus;
     if (x.essential != y.essential) return x.essential;
-    if (x.w != y.w) return x.w > y.w;
+    // Before weight, so a light line that is some cell's only line outranks a heavy one that is
+    // merely another of many. See `LiftedLink.anchor`.
+    if (x.anchor != y.anchor) return x.anchor;
+    // `alpha` here is what the link was drawn at last frame, stamped before selection — see
+    // `stampIncumbency`. A link at zero is one the reader has never seen.
+    const wx = if (x.alpha > 0) x.w * incumbent_bonus else x.w;
+    const wy = if (y.alpha > 0) y.w * incumbent_bonus else y.w;
+    if (wx != wy) return wx > wy;
     // deterministic tie-break, so a parked camera keeps the same web
     if (x.a != y.a) return x.a < y.a;
     return x.b < y.b;
@@ -459,10 +536,27 @@ pub const World = struct {
     cut: std.ArrayListUnmanaged(u32) = .empty,
     /// Per drawn link: how far in or out it is. Keyed by the cell pair, which is the identity the
     /// lift produces — see `fadeLinks`.
-    link_fade: std.AutoHashMapUnmanaged(u64, Fade) = .empty,
-    fade_epoch: u32 = 0,
+    /// Every link with a non-zero crossfade — drawn or departing — sorted by `linkKey`.
+    fades: std.ArrayListUnmanaged(Fade) = .empty,
+    /// Double buffer for the merge that rewrites `fades`, and radix scratch for the key sort.
+    sc_fades_next: std.ArrayListUnmanaged(Fade) = .empty,
+    sc_lift_scratch: std.ArrayListUnmanaged(LiftedLink) = .empty,
+    /// Key-plus-index view of the candidate set, for the incumbency stamp — see `stampIncumbency`.
+    sc_keys: std.ArrayListUnmanaged(KeyIdx) = .empty,
+    sc_keys_scratch: std.ArrayListUnmanaged(KeyIdx) = .empty,
     /// Links that were fading out last frame — see the retire threshold in `fadeLinks`.
     ghosts_prev: usize = 0,
+    /// Furthest any note sits from the origin, from the positions this world was built on. Zero
+    /// when unknown, which sends `extent` back to the cell-radius estimate.
+    note_extent: f32 = 0,
+    /// How many lifted pairs the last rebuild had to choose from, before `link_budget` truncated
+    /// them. The ratio of this to the budget is how arbitrary the drawn web's membership is: a cut
+    /// that keeps most of what it is offered is stable, one that keeps a fifth is a coin toss
+    /// re-thrown every time the ranking jitters.
+    last_candidates: usize = 0,
+    /// How many of those were routes rather than streets — the number that says whether ranking
+    /// routes first is a choice or a no-op.
+    last_cand_highway: usize = 0,
     /// Per cell: stamped when it is an ancestor of one of the reader's open notes. See
     /// `markOpenChains`.
     open_chain: []u32,
@@ -476,6 +570,10 @@ pub const World = struct {
     /// memo hit was two cache misses into two megabyte-sized arrays instead of one, and the lift
     /// does this once per neighbour — 52,000 times on a hard pan frame at the coalesce boundary.
     cut_of: []Memo,
+    /// Per cell: the heaviest lifted line touching it this frame. Stamped, so a new frame costs
+    /// nothing to invalidate.
+    anchor_of: []Anchor,
+    anchor_epoch: u32 = 0,
     cut_epoch: u32 = 0,
     /// Scratch for the lift and the crossfades, kept across frames rather than rebuilt inside it.
     ///
@@ -659,6 +757,7 @@ pub const World = struct {
             .mul = try gpa.alloc(f32, n_cells),
             .open = try gpa.alloc(bool, n_cells),
             .cut_of = try gpa.alloc(Memo, n_cells),
+            .anchor_of = try gpa.alloc(Anchor, n_cells),
             .side = try gpa.alloc(SideAcc, n_cells),
             .mark_of = try gpa.alloc(Memo, n_cells),
             .open_chain = try gpa.alloc(u32, n_cells),
@@ -671,6 +770,7 @@ pub const World = struct {
         // Zeroed once here so the first frame's `cut_epoch` of 1 cannot collide with uninitialised
         // memory and read a stale memo as valid.
         @memset(w.cut_of, .{});
+        @memset(w.anchor_of, .{});
         // Same contract: `side_epoch` and `mark_epoch` are bumped *before* each use, so a stamp of
         // 0 can never match the epoch of the first accumulation.
         @memset(w.side, .{});
@@ -678,6 +778,9 @@ pub const World = struct {
         @memset(w.open_chain, 0);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
+        }
+        for (positions.pos) |q| {
+            w.note_extent = @max(w.note_extent, @sqrt(q.x * q.x + q.y * q.y));
         }
         // The same array the layout used, so the drawn web cannot disagree with the hierarchy
         // about which links matter.
@@ -790,7 +893,11 @@ pub const World = struct {
         self.links.deinit(self.gpa);
         self.focus_grow.deinit(self.gpa);
         self.cut.deinit(self.gpa);
-        self.link_fade.deinit(self.gpa);
+        self.fades.deinit(self.gpa);
+        self.sc_fades_next.deinit(self.gpa);
+        self.sc_lift_scratch.deinit(self.gpa);
+        self.sc_keys.deinit(self.gpa);
+        self.sc_keys_scratch.deinit(self.gpa);
         self.sc_dead.deinit(self.gpa);
         self.web.deinit(self.gpa);
         self.gpa.free(self.anim);
@@ -799,6 +906,7 @@ pub const World = struct {
         self.gpa.free(self.mul);
         self.gpa.free(self.open);
         self.gpa.free(self.cut_of);
+        self.gpa.free(self.anchor_of);
         self.gpa.free(self.side);
         self.gpa.free(self.mark_of);
         self.gpa.free(self.open_chain);
@@ -825,7 +933,15 @@ pub const World = struct {
     ///
     /// A disc, not a per-axis box, because the island pack is a disc: `pack_aspect` defaults to 1.
     /// Framing and bounding the vault as a circle is then exact rather than a conservative cover.
+    /// How far the vault actually reaches, in world units.
+    ///
+    /// Measured from the leaf positions at build time, not from the root cells' radii. A cell's
+    /// radius is `note_r · count^radius_exp` until the cell is opened — a *count-based estimate*,
+    /// and on a dense map a generous one: a 284k-note vault whose notes reach 7,244 units reported
+    /// 12,720. Every camera fit then framed a circle nearly twice the size of the thing in it, and
+    /// the map sat small in the middle of the pane with no padding constant to blame.
     pub fn extent(self: World) f32 {
+        if (self.note_extent > 0) return self.note_extent;
         var e: f32 = 1;
         for (self.lad.roots) |r| {
             const p = self.field.pos[r];
@@ -1168,12 +1284,17 @@ pub const World = struct {
                     const r: f32 = if (is_note) p.note_r_px else blk: {
                         const full = @max(1.0, p.mass_cap_px *
                             (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
-                        // A splitting mass shrinks to a single note's size as it fades, rather
-                        // than hanging at full radius while children appear inside it. The ring
-                        // reads as collapsing into the point its children emerge from, which is
-                        // what makes a split look like one object becoming several instead of two
+                        // A splitting mass shrinks away entirely as it fades, rather than
+                        // hanging at full radius while children appear inside it. The ring reads
+                        // as collapsing into the point its children emerge from, which is what
+                        // makes a split look like one object becoming several instead of two
                         // unrelated things crossfading. Runs in reverse on merge, for free.
-                        break :blk full + (p.note_r_px - full) * self.anim[id];
+                        //
+                        // To *note* size rather than to nothing was the first cut, and it left the
+                        // parent standing at the centroid as a note-sized disc with a full-strength
+                        // outline — indistinguishable from one of the children it had just let go,
+                        // and popping out a moment later. The end of a split has to be nothing.
+                        break :blk full * (1 - self.anim[id]);
                     };
                     try self.marks.append(self.gpa, .{
                         .cell = id,
@@ -1423,6 +1544,46 @@ pub const World = struct {
         for (dead.items) |k| _ = self.focus_grow.remove(k);
     }
 
+    /// Put `lifted` in `linkKey` order, in place.
+    ///
+    /// Radix rather than a comparison sort: the key is two cell ids packed into 64 bits, and a
+    /// vault of 353k cells leaves the top three bytes of each half zero, so five of the eight
+    /// passes are skipped outright.
+    fn sortLiftedByKey(self: *World) void {
+        if (self.lifted.items.len < 2) return;
+        self.sc_lift_scratch.resize(self.gpa, self.lifted.items.len) catch return;
+        const sorted = radix.sortByKey(LiftedLink, linkKey, self.lifted.items, self.sc_lift_scratch.items);
+        // `sortByKey` returns whichever buffer the last pass wrote into.
+        if (sorted.ptr != self.lifted.items.ptr) @memcpy(self.lifted.items, sorted);
+    }
+
+    /// Tell each candidate what it was drawn at last frame, so selection can prefer lines the
+    /// reader is already looking at.
+    ///
+    /// Sorts a `{key, index}` view rather than `lifted` itself. This runs on the *untruncated*
+    /// candidate set — tens of thousands of links, against a budget of ten — and a `LiftedLink` is
+    /// twenty-four bytes against twelve, so sorting the links here cost more than the hash map this
+    /// whole change was replacing. `lifted` is put in key order after truncation instead, where the
+    /// array is the budget's size.
+    fn stampIncumbency(self: *World) !void {
+        for (self.lifted.items) |*l| l.alpha = 0;
+        if (self.fades.items.len == 0 or self.lifted.items.len == 0) return;
+
+        try self.sc_keys.resize(self.gpa, self.lifted.items.len);
+        try self.sc_keys_scratch.resize(self.gpa, self.lifted.items.len);
+        for (self.sc_keys.items, self.lifted.items, 0..) |*k, l, i| {
+            k.* = .{ .key = linkKey(l), .idx = @intCast(i) };
+        }
+        const keys = radix.sortByKey(KeyIdx, keyIdxKey, self.sc_keys.items, self.sc_keys_scratch.items);
+
+        var j: usize = 0;
+        for (keys) |k| {
+            while (j < self.fades.items.len and self.fades.items[j].key < k.key) j += 1;
+            if (j >= self.fades.items.len) break;
+            if (self.fades.items[j].key == k.key) self.lifted.items[k.idx].alpha = self.fades.items[j].v;
+        }
+    }
+
     fn fadeLinks(self: *World, p: Params, dt: f32) !void {
         try self.stepFocusGrow(p, dt);
 
@@ -1450,73 +1611,76 @@ pub const World = struct {
         // times the work the budget exists to bound. Six frames is still a dissolve rather than a
         // blink, and holds the overshoot to well under half the budget.
         const rate = @min(1.0, dt * link_fade_rate);
-        self.fade_epoch +%= 1;
-        if (self.fade_epoch == 0) {
-            var reset = self.link_fade.valueIterator();
-            while (reset.next()) |v| v.stamp = 0;
-            self.fade_epoch = 1;
-        }
-        const epoch = self.fade_epoch;
-
-        self.links.clearRetainingCapacity();
-        try self.links.ensureUnusedCapacity(self.gpa, self.lifted.items.len);
-        for (self.lifted.items) |l| {
-            const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
-            const gop = try self.link_fade.getOrPut(self.gpa, key);
-            const prev: f32 = if (gop.found_existing) gop.value_ptr.v else 0;
-            var v = prev + (1 - prev) * rate;
-            if (v > 0.996) v = 1 else self.settled = false;
-            gop.value_ptr.* = .{ .v = v, .stamp = epoch };
-            var out = l;
-            out.alpha = v;
-            self.links.appendAssumeCapacity(out);
-        }
 
         // Retire early when the tail is running long.
         //
-        // The drawn set is the budget plus whatever is fading out of it, so a pan that churns hard
-        // enough can carry more ghosts than live links. Raising the retire threshold when that
-        // happens sheds the faintest of them — the ones nearest invisible anyway — and keeps the
-        // overshoot bounded without a sort or a second pass. Uses last frame's count, because this
-        // frame's is not known until the walk below has finished, and a frame of lag on a cull
-        // threshold is not observable.
-        // Hard ceiling, not just a raised threshold.
-        //
-        // A soft threshold only sheds the faintest, and it is applied a frame late — which is fine
-        // for the drift of an ordinary pan and useless for the case that actually hurts. Clicking a
-        // link flies the camera, `lift_hold` holds the web for the flight, and when the hold
-        // releases a whole new cut lands at once: every line of the old web departs on a single
-        // frame. Fading all of them triples the drawn set exactly when the camera is moving
-        // fastest, which is the hitch.
-        //
-        // Past the cap a departing link is retired outright. Nothing is lost by it: a fade says
-        // "this is the same web, changing", and when the entire web has been replaced that is not
-        // true — there is no continuity to draw, and snapping is both honest and free.
+        // The drawn set is the budget plus whatever is fading out of it, so a cut that turns over
+        // hard enough can carry more ghosts than live links. Past the cap a departing link is
+        // retired outright: a fade says "this is the same web, changing", and when the whole web
+        // has been replaced that is not true — there is no continuity to draw, and snapping is both
+        // honest and free. Uses last frame's count, and a frame of lag on a cull threshold is not
+        // observable.
         const ghost_cap = @max(p.link_budget / 8, 1);
         const retire_at: f32 = if (self.ghosts_prev > ghost_cap) 0.25 else 0.02;
-        var ghosts: usize = 0;
 
-        const dead = &self.sc_dead;
-        dead.clearRetainingCapacity();
-        var it = self.link_fade.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.stamp == epoch) continue;
-            const v = kv.value_ptr.v * (1 - rate);
-            if (v <= retire_at or ghosts >= ghost_cap) {
-                try dead.append(self.gpa, kv.key_ptr.*);
-                continue;
+        const next = &self.sc_fades_next;
+        next.clearRetainingCapacity();
+        try next.ensureTotalCapacity(self.gpa, self.lifted.items.len + self.fades.items.len);
+        self.links.clearRetainingCapacity();
+        // The exact upper bound of the merge: every lifted link, plus at most one ghost per
+        // surviving fade. Deliberately not `ghost_cap`, which is derived from `link_budget` and is
+        // a *counter* limit — a caller that leaves the budget unbounded would ask for a
+        // `maxInt(usize)` allocation here.
+        try self.links.ensureTotalCapacity(self.gpa, self.lifted.items.len + self.fades.items.len);
+
+        // One linear merge of two sorted arrays. `lifted` is key-sorted by the lift, `fades` came
+        // out of this same merge last frame and so is sorted too, and the output is written in key
+        // order — which is what keeps it sorted for next time without a sort of its own.
+        var ghosts: usize = 0;
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < self.lifted.items.len or j < self.fades.items.len) {
+            const kl: u64 = if (i < self.lifted.items.len) linkKey(self.lifted.items[i]) else std.math.maxInt(u64);
+            const kf: u64 = if (j < self.fades.items.len) self.fades.items[j].key else std.math.maxInt(u64);
+
+            if (kl < kf) {
+                // Arriving: nothing was drawn here last frame, so it starts at nothing.
+                var v: f32 = rate;
+                if (v > 0.996) v = 1 else self.settled = false;
+                var out = self.lifted.items[i];
+                out.alpha = v;
+                self.links.appendAssumeCapacity(out);
+                next.appendAssumeCapacity(.{ .key = kl, .v = v });
+                i += 1;
+            } else if (kl == kf) {
+                // Still drawn: rise toward full.
+                const prev = self.fades.items[j].v;
+                var v = prev + (1 - prev) * rate;
+                if (v > 0.996) v = 1 else self.settled = false;
+                var out = self.lifted.items[i];
+                out.alpha = v;
+                self.links.appendAssumeCapacity(out);
+                next.appendAssumeCapacity(.{ .key = kl, .v = v });
+                i += 1;
+                j += 1;
+            } else {
+                // Departed — no longer lifted, whether the cut dropped its cells or the budget
+                // dropped the link. Drawn while it fades, then forgotten.
+                const v = self.fades.items[j].v * (1 - rate);
+                j += 1;
+                if (v <= retire_at or ghosts >= ghost_cap) continue;
+                ghosts += 1;
+                self.settled = false;
+                self.links.appendAssumeCapacity(.{
+                    .a = @intCast(kf >> 32),
+                    .b = @truncate(kf),
+                    .w = 0,
+                    .alpha = v,
+                });
+                next.appendAssumeCapacity(.{ .key = kf, .v = v });
             }
-            kv.value_ptr.* = .{ .v = v, .stamp = epoch };
-            self.settled = false;
-            ghosts += 1;
-            try self.links.append(self.gpa, .{
-                .a = @intCast(kv.key_ptr.* >> 32),
-                .b = @truncate(kv.key_ptr.*),
-                .w = 0,
-                .alpha = v,
-            });
         }
-        for (dead.items) |k| _ = self.link_fade.remove(k);
+        std.mem.swap(std.ArrayListUnmanaged(Fade), &self.fades, next);
         self.ghosts_prev = ghosts;
     }
 
@@ -1747,9 +1911,47 @@ pub const World = struct {
                 // A note drawn as itself owns its whole link set.
                 .essential = self.lad.cells[la].child_count == 0 or
                     self.lad.cells[lb].child_count == 0,
+                .highway = self.lad.cells[la].parent != self.lad.cells[lb].parent,
+                // Filled by `stampIncumbency` from what this link was drawn at last frame. Zero
+                // until then, which is what "the reader has never seen this line" means.
+                .alpha = 0,
             });
         }
         prof.build_ns += plap(&pt);
+
+        try self.stampIncumbency();
+
+        // Every drawn cell keeps its own heaviest line — see `LiftedLink.anchor`.
+        //
+        // Two passes over the lifted set and one over the cut, all of them sequential, and the
+        // per-cell state is stamped so a new frame costs nothing to clear.
+        self.anchor_epoch +%= 1;
+        if (self.anchor_epoch == 0) {
+            @memset(self.anchor_of, .{});
+            self.anchor_epoch = 1;
+        }
+        for (self.lifted.items, 0..) |l, i| {
+            for ([_]u32{ l.a, l.b }) |c| {
+                if (c >= self.anchor_of.len) continue;
+                const m = &self.anchor_of[c];
+                if (m.stamp != self.anchor_epoch or l.w > m.w) {
+                    m.* = .{ .stamp = self.anchor_epoch, .link = @intCast(i), .w = l.w };
+                }
+            }
+        }
+        for (self.cut.items) |c| {
+            if (c >= self.anchor_of.len) continue;
+            const m = self.anchor_of[c];
+            if (m.stamp == self.anchor_epoch and m.link < self.lifted.items.len) {
+                self.lifted.items[m.link].anchor = true;
+            }
+        }
+
+        self.last_candidates = self.lifted.items.len;
+        self.last_cand_highway = 0;
+        for (self.lifted.items) |l| {
+            if (l.highway) self.last_cand_highway += 1;
+        }
         // Count what may not be dropped before deciding whether to drop anything.
         var essential_n: usize = 0;
         for (self.lifted.items) |l| {
@@ -1759,7 +1961,7 @@ pub const World = struct {
         // where a hairball genuinely says nothing. It must not cap a link belonging to a note the
         // reader can see individually: a node drawn as itself showing three of its seven links is
         // worse than showing none, because there is no way to tell which are missing.
-        const keep = @max(p.link_budget, essential_n);
+        const keep = @max(@min(p.link_budget, self.cut.items.len *| p.links_per_cell), essential_n);
         if (self.lifted.items.len > keep) {
             // Focus-incident pairs sort first, ahead of weight.
             //
@@ -1778,6 +1980,10 @@ pub const World = struct {
             selectTopK(self.lifted.items, keep);
             self.lifted.shrinkRetainingCapacity(keep);
         }
+        // `fadeLinks` merges against `fades`, and the merge is the whole reason the fade is no
+        // longer a hash map. This is the only place `lifted` is put in key order, and it runs on
+        // the kept set rather than every candidate.
+        self.sortLiftedByKey();
         prof.sort_ns += plap(&pt);
 
         try self.fadeLinks(p, dt);
@@ -2415,6 +2621,11 @@ test "leaf_pitch is the spacing the layout actually produces" {
     // spacing was whatever that settle happened to produce. The layout picks its spacing and
     // normalises to it now, so the assertion is that the two agree — and that the pitch clears
     // `2.0`, below which discs of radius `note_r` overlap by construction.
+    //
+    // `leaf_pitch` is the *nearest-neighbour* spacing, which is what `note_r` has to be derived
+    // from: overlap is decided by whoever is closest. `Result.spacing` is the Hilbert-gap proxy and
+    // reads above it, so the check below is a floor and a ceiling rather than an equality — see
+    // `layout.Result.spacing`.
     try testing.expectEqual(layout.default_spacing, leaf_pitch);
     try testing.expect(leaf_pitch > 2.0);
 
@@ -2429,7 +2640,8 @@ test "leaf_pitch is the spacing the layout actually produces" {
 
     var res = try layout.solve(gpa, n, edges, paths, .{ .note_r = 4 });
     defer res.deinit(gpa);
-    try testing.expectApproxEqAbs(leaf_pitch, res.spacing, 0.25);
+    try testing.expect(res.spacing >= leaf_pitch - 0.25);
+    try testing.expect(res.spacing <= leaf_pitch * 1.6);
 }
 
 test "a small island vault resolves every note at overview zoom" {

@@ -52,6 +52,7 @@ const Visible = struct {
 const fold = @import("fold.zig");
 const spatial = @import("spatial.zig");
 const layout = @import("layout.zig");
+const radix = @import("radix.zig");
 const proximity = @import("proximity.zig");
 const resolve = @import("../index/resolve.zig");
 
@@ -146,15 +147,8 @@ const sun_grow_factor: f32 = 1.45;
 const proximity_falloff_px: f32 = 100;
 /// Extra falloff multiplier once fully zoom-revealed (more sensitive close-up hover).
 const proximity_falloff_zoom_boost: f32 = 1.75;
-/// Extra screen-px gap neighbors try to keep from a swollen node.
-const neighbor_gap_px: f32 = 6;
 /// How hard grown nodes shove neighbors aside (0–1). The hovered node itself stays put.
 const neighbor_push: f32 = 0.85;
-/// Furthest a swollen node may shove anything, in lattice cells. Node radii are screen sizes
-/// divided by zoom, so without this the reach grows without bound as the camera pulls out — see
-/// the shove pass in `applyProximity`. Two cells is comfortably more than a bubble ever needs
-/// and keeps the effect reading as "nudge the neighbours", never "part the vault".
-const max_shove_slots: f32 = 2.0;
 /// Chase rate for hover_t (1/s). Higher = snappier.
 const hover_chase_k: f32 = 14;
 /// Dwell before the mass-influence ring appears. A glance should not paint a second disc
@@ -224,7 +218,7 @@ const max_labels: usize = 96;
 /// guards distinguishes "startup discovery pass", "open set never changed" and "note not matched
 /// to a graph node", which are indistinguishable from the outside.
 const framing_debug = false;
-/// Paired with `debug_hud` — see the log line in `updateLabels`. It separates the three causes of
+/// Paired with the `ATLAS_HUD` overlay — see the log line in `updateLabels`. It separates the three causes of
 /// a missing label that look identical on screen: no candidates, empty titles, or a placer that
 /// found room for nobody.
 const label_debug = false;
@@ -266,7 +260,12 @@ const fit_edge_px: f32 = open_screen_r + 7;
 const fit_label_px: f32 = open_screen_r + label_gap + 15;
 /// Target edge margin as a fraction of the short pane side. Higher → zoom-to-extents sits a
 /// little further out so outermost nodes aren't tight against the window.
-const fit_pad_frac: f32 = 0.16;
+///
+/// Applied to *each* side, so 0.16 spent nearly a third of the pane on margin and the vault was
+/// drawn in the middle two thirds. The lower clamp in `fitPadPx` already guarantees an outermost
+/// note clears its own bubble and label, which is the thing the margin exists for; the rest of it
+/// was just distance.
+const fit_pad_frac: f32 = 0.05;
 /// Resting size boost from zoom alone (additive scale), before proximity stacks on top.
 const zoom_rest_swell: f32 = 0.35;
 /// Largest a *resting* node may be relative to the on-screen gap between lattice cells. Under a
@@ -342,6 +341,13 @@ var label_epoch: u32 = 0;
 
 /// `a` is the link *source* — edges grow outward from it, so direction is not incidental.
 const GraphEdge = struct { a: usize, b: usize };
+
+/// Unordered pair identity, for the canonical sort in the rebuild prep.
+fn graphEdgeKey(e: GraphEdge) u64 {
+    const lo: u64 = @intCast(@min(e.a, e.b));
+    const hi: u64 = @intCast(@max(e.a, e.b));
+    return (lo << 32) | hi;
+}
 
 /// Per-node hash of "who am I linked to", used to decide which nodes the layout may hold still.
 ///
@@ -540,6 +546,14 @@ const Interior = struct {
 /// "laying out" step the solve uses makes a long but healthy build indistinguishable from a hang.
 const JobPhase = enum(u8) { solving, building_map };
 
+/// The interiors handed between solves. Not in the job arena — they outlive the job.
+fn freeReuse(gpa: std.mem.Allocator, r: layout.Reuse) void {
+    gpa.free(@constCast(r.inner));
+    gpa.free(@constCast(r.home));
+    gpa.free(@constCast(r.ids));
+    gpa.free(@constCast(r.frames));
+}
+
 const LayoutJob = struct {
     arena: std.heap.ArenaAllocator,
     phase: std.atomic.Value(u8) = .init(@intFromEnum(JobPhase.solving)),
@@ -552,6 +566,12 @@ const LayoutJob = struct {
     done: std.atomic.Value(bool) = .init(false),
     /// Set by the worker when the solve fails; re-raised on the UI thread at apply time.
     fail: ?anyerror = null,
+
+    /// The previous solve's interiors, and this one's, for the next. Owned by the panel across
+    /// rebuilds rather than by `arena`, because the whole point is that they outlive the solve
+    /// that produced them — see `layout.Reuse`.
+    reuse: ?layout.Reuse = null,
+    next_reuse: ?layout.Reuse = null,
 
     /// What this rebuild was for — checked at apply time, since the vault can move underneath.
     gen: u64,
@@ -581,6 +601,15 @@ const LayoutJob = struct {
     /// indices (id-sorted notes), and the only way a node gets a start position — everything else
     /// takes its place from the world on the first `syncNodesFromWorld`. Lives in `arena`.
     precomputed: ?[]const dvui.Point = null,
+    /// The previous solve's answer, when this rebuild's link graph is identical to the one that
+    /// produced it. Positions are a pure function of the graph, so re-deriving them would spend a
+    /// second arriving at the same numbers — see where this is set in the rebuild prep.
+    settled: ?struct { pos: []const layout.Vec2, comp: []const u32 } = null,
+    /// Identity of this rebuild's note order, for the check above.
+    order_hash: u64 = 0,
+    /// This solve's positions, adopted by `finishRebuild` for the next rebuild to compare against.
+    next_pos: []layout.Vec2 = &.{},
+    next_comp: []u32 = &.{},
 
 
     /// Placement inputs, copied from the panel at spawn so the worker never reads live state.
@@ -668,26 +697,61 @@ const LayoutJob = struct {
         place.rotation_per_level = job.place_rotation;
 
         const bodies = try a.alloc(f32, job.n);
+        const note_ids = try a.alloc(u64, job.n);
         for (job.order, 0..) |si, gi| {
             bodies[gi] = @floatFromInt(job.snap.nodes[si].size);
+            // Stable across rebuilds, unlike `gi` — the order is by id, so one inserted note
+            // shifts every index after it. See `layout.Reuse`.
+            note_ids[gi] = @bitCast(job.snap.nodes[si].id);
         }
 
         const t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
         const fold_opts: fold.Options = .{ .cancel = &job.cancel, .bodies = bodies };
 
-        // Solve the whole vault, every time.
+        // Cluster and place the whole vault every time; *memoise* the interiors.
         //
-        // This used to reuse the previous build's positions and settle only what the edit
-        // touched, because a rebuild runs on every save and a solve cost six to twenty-two
-        // seconds. It now costs under one, which removes the reason — and reuse had a cost of its
-        // own that no amount of tuning fixes: an incrementally settled vault is not the vault a
-        // fresh open produces, so the map you closed was not the map you reopened. Solving from
-        // the graph every time makes the arrangement a pure function of the vault again.
+        // This used to reuse the previous build's positions and settle only what the edit touched,
+        // and that was abandoned for a reason no amount of tuning fixes: an incrementally settled
+        // vault is not the vault a fresh open produces, so the map you closed was not the map you
+        // reopened. `Options.reuse` is not that. A territory's interior is a deterministic function
+        // of its own subgraph, matched by membership, so a reused one is bit-identical to what
+        // solving it again would produce — the arrangement stays a pure function of the vault.
+        // Nothing about the link graph moved, so neither did the answer.
+        //
+        // A save that edits prose republishes the whole snapshot exactly as a save that adds a link
+        // does, and the layout used to re-derive 284k positions either way. `changed[]` — already
+        // computed for re-framing — says whether any note's own link set moved; when none did, and
+        // the note set is the same, the solve is a pure function of inputs that have not changed.
+        if (job.settled) |prev| {
+            job.world = try world_mod.World.initFrom(
+                gpa,
+                job.n,
+                links,
+                .{ .pos = prev.pos, .comp = prev.comp },
+                fold_opts,
+                place,
+            );
+            dvui.log.info("atlas world: reused {d} positions — no link changed", .{job.n});
+            return;
+        }
+
         var lay = try layout.solve(gpa, job.n, links, path_arg, .{
             .note_r = place.note_r,
             .cancel = &job.cancel,
+            .ids = note_ids,
+            .reuse = job.reuse,
         });
-        defer lay.deinit(gpa);
+        // Handed to the next solve, not freed with the rest of the result — see `layout.Reuse`.
+        job.next_reuse = .{ .ids = lay.ids, .inner = lay.inner, .home = lay.home, .frames = lay.frames };
+        job.next_pos = try gpa.dupe(layout.Vec2, lay.pos);
+        job.next_comp = try gpa.dupe(u32, lay.comp);
+        defer {
+            lay.inner = &.{};
+            lay.home = &.{};
+            lay.ids = &.{};
+            lay.frames = &.{};
+            lay.deinit(gpa);
+        }
         job.world = try world_mod.World.initFrom(
             gpa,
             job.n,
@@ -699,6 +763,18 @@ const LayoutJob = struct {
         // Kept (not a temporary diagnostic): this is how long "Building map…" is on screen, it is
         // the largest remaining cost in opening a vault, and it is the number to watch if that
         // wait ever grows. Logged from the worker, same as the indexer's own scan summary.
+        // What the *next* stage needs, reported now so the plumbing is verifiable before anything
+        // depends on it: how much of this rebuild the indexer could actually account for. A scoped
+        // re-solve is only sound when `dirty_known` holds — a structural edit moves where other
+        // notes' links resolve, so "these notes were written" stops describing the change.
+        dvui.log.info("atlas dirty: {d} note(s), scoped={}  interiors {d}/{d}  frames {d}/{d}", .{
+            job.snap.dirty.len,
+            job.snap.dirty_known,
+            layout.reused_interiors,
+            layout.solved_interiors,
+            layout.reused_frames,
+            layout.placed_frames,
+        });
         dvui.log.info("atlas world: {d} notes / {d} edges coarsened and placed in {d}ms", .{
             job.n,
             links.len,
@@ -714,6 +790,14 @@ const LayoutJob = struct {
         // and is not in the arena, so it must be freed explicitly.
         if (job.world) |*w| w.deinit();
         job.world = null;
+        // Same contract: `finishRebuild` clears this when it adopts it, so a non-null one here
+        // belongs to a solve nobody collected.
+        if (job.next_reuse) |r| freeReuse(gpa, r);
+        job.next_reuse = null;
+        gpa.free(job.next_pos);
+        gpa.free(job.next_comp);
+        job.next_pos = &.{};
+        job.next_comp = &.{};
         job.arena.deinit();
         gpa.destroy(job);
     }
@@ -835,6 +919,16 @@ pub const Panel = struct {
     since_rebuild_s: f32 = 1e9,
     /// Where notes sat *before* the current rebuild, so they can slide to their new homes rather
     /// than teleport. Note id → old world position; see `morph_s` and `applyMorph`.
+    /// The last completed solve's interiors, handed to the next one so a territory that comes
+    /// back with the same members is copied rather than re-solved — see `layout.Reuse`.
+    reuse: ?layout.Reuse = null,
+    /// The last completed solve's finished positions, and a hash of the note order they belong to.
+    ///
+    /// Kept so a republish that did not touch a single link can skip the solve outright: positions
+    /// are a pure function of the link graph, so an unchanged graph has an answer already in hand.
+    last_pos: []layout.Vec2 = &.{},
+    last_comp: []u32 = &.{},
+    last_order: u64 = 0,
     morph_from: std.AutoHashMapUnmanaged(i64, dvui.Point) = .empty,
     /// 0 → 1 across `morph_s` after a rebuild. 1 means settled and `morph_from` is empty.
     morph_t: f32 = 1,
@@ -843,6 +937,13 @@ pub const Panel = struct {
     rebuild_waiting: bool = false,
     /// The one node directly under the cursor, if any. Drives the hand cursor and highlight.
     hover_node: ?usize = null,
+    /// `revealPosition` for an interior click, retried for a few frames. Opening a file
+    /// scrolls the raw editor immediately; the markdown preview pane does not exist until a
+    /// later frame, so the first call's `previewReveal` is dropped. See `tickPendingReveal`.
+    reveal_path_buf: [1024]u8 = undefined,
+    reveal_path_len: u16 = 0,
+    reveal_line: u32 = 0,
+    reveal_frames: u8 = 0,
     /// Eased hover weight for `hover_cluster`, and which region it belongs to. Kept on the panel
     /// rather than per cluster: only one region is ever under the cursor, and the hierarchy is
     /// rebuilt often enough that per-cluster state would not survive to be worth keeping.
@@ -961,6 +1062,12 @@ pub const Panel = struct {
     }
 
     pub fn deinit(self: *Panel) void {
+        if (self.reuse) |r| freeReuse(sdk.allocator(), r);
+        self.reuse = null;
+        sdk.allocator().free(self.last_pos);
+        sdk.allocator().free(self.last_comp);
+        self.last_pos = &.{};
+        self.last_comp = &.{};
         if (self.density) |*d| d.deinit();
         self.visible.deinit(sdk.allocator());
         self.open_notes.deinit(sdk.allocator());
@@ -1047,6 +1154,8 @@ pub const Panel = struct {
         self.hover_cluster = null;
         self.hover_cluster_prev = null;
         self.hover_cluster_t = 0;
+        self.reveal_path_len = 0;
+        self.reveal_frames = 0;
         self.press_node = null;
         self.world_epoch = self.layout_epoch -% 1;
         self.world_radius = 0;
@@ -1224,7 +1333,7 @@ pub fn shutdown() void {
 /// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
 /// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
 /// text HUD and scanning every node for span every frame is pure overhead on the hot path.
-const debug_hud = false;
+
 /// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
 ///
 /// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
@@ -1243,6 +1352,11 @@ const FrameProfile = struct {
     misc_ns: u64 = 0,
     bubbles_ns: u64 = 0,
     hover_ns: u64 = 0,
+    /// `labels_ns` split: gathering the web's segments for the placer, versus placing names.
+    /// The two have completely different scaling — one is the drawn link count, the other the
+    /// candidate count — and one line reporting their sum cannot say which is being paid.
+    labels_seg_ns: u64 = 0,
+    labels_place_ns: u64 = 0,
     labels_ns: u64 = 0,
     edge_anim_ns: u64 = 0,
     draw_edges_ns: u64 = 0,
@@ -1349,6 +1463,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // placer all work over that selection rather than over the whole vault, which is what keeps
     // their cost a property of the mark budget instead of the note count.
     stepWorld(p, &prof);
+    trackFocusTarget(p);
     stepInteriorWorld(p);
     applyInteriorFramingIfNeeded(p);
     frame_profile.misc_ns += profLap(&prof);
@@ -1356,6 +1471,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     frame_profile.bubbles_ns = profLap(&prof);
     followParent(p);
     updateHover(p);
+    tickPendingReveal(p);
     frame_profile.hover_ns = profLap(&prof);
     // After `updateHover` — placement priority is led by which node is under the cursor.
     // Whichever level the reader is mostly looking at owns the names; see `updateLabels`.
@@ -1458,7 +1574,10 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
         // after it, and the placer already guaranteed they don't collide with each other.
         drawLabels(p);
         frame_profile.draw_labels_ns = profLap(&prof);
-        if (debug_hud) drawDebugHud(p);
+        if (hudEnabled()) {
+            drawDebugHud(p);
+            logFrameProfile(p);
+        }
     }
     // Before `handleInput` so the button consumes its own press rather than the graph
     // treating it as the start of a pan.
@@ -1467,7 +1586,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
 }
 
 /// Layout ease + pixi-bubble proximity: chase `home` toward the hex `target`, then chase
-/// `hover_t` from screen-stable mouse distance, grow in place under the cursor, and shove
+/// `hover_t` from screen-stable mouse distance and grow in place under the cursor.
 /// *neighbors* aside so labels stay readable. Nodes never flee the mouse — that made
 /// hover/click impossible. Zoom reveal is applied at draw/hit time.
 ///
@@ -1598,9 +1717,12 @@ fn decayProximity(nodes: []GraphNode, t_hover: f32) bool {
     return unsettled;
 }
 
-/// Soft proximity swell + neighbour shove for one cloud. `slot`/`cloud_radius` are that
+/// Soft proximity swell for one cloud. `slot`/`cloud_radius` are that
 /// level's lattice spacing and extent so interior hover scales like the overview at the same
 /// on-screen gap.
+/// How far the hover field reaches, in the cloud's own note spacing.
+const proximity_falloff_slots: f32 = 3.5;
+
 fn applyProximity(
     p: *Panel,
     nodes: []GraphNode,
@@ -1624,16 +1746,29 @@ fn applyProximity(
     const strength = proximity.strength(cloud_radius * 2 * zoom, falloff_px);
 
     var hover_unsettled = false;
-    var any_shove = false;
     // Only what is on screen as itself. Hover is a screen-space effect on a drawn disc, so a note
     // that is off view or merged into a marker has nothing to swell and nothing to be pushed by.
-    // The indices are kept because the shove pass below needs the same set twice.
     const arena = dvui.currentWindow().arena();
     var active: std.ArrayList(u32) = .empty;
     active.ensureTotalCapacity(arena, if (selection) |s| s.len else nodes.len) catch {};
     var walk = NodeIter.init(nodes, selection);
     while (walk.next()) |step| active.append(arena, @intCast(step.index)) catch {};
 
+    // The field reaches the same *number of neighbours* in either cloud, not the same number of
+    // world units.
+    //
+    // An interior used to be a special case: only the hit-test winner swelled, because the vault's
+    // falloff is sized for sparse notes and an interior packs hundreds of items into one ring — so
+    // the same reach lit a whole quadrant and the cloud looked like it was sliding even with the
+    // sun pinned. That reasoning was about the falloff being too *wide*, and collapsing to a single
+    // node is a much bigger change than the problem called for: it made an interior the one place
+    // where moving the mouse lights one disc instead of a neighbourhood.
+    //
+    // Capping the reach at a few of the cloud's own slots keeps the soft field and keeps it local.
+    // Inert for the overview, whose falloff is already inside this bound at the zooms where
+    // proximity is visible at all.
+    const interior_cloud = nodes.ptr == p.interior.nodes.ptr;
+    const reach_w = @min(falloff_w, proximity_falloff_slots * slot);
     for (active.items) |ni| {
         const n = &nodes[ni];
         const want: f32 = if (!inside or strength <= 0.001) 0 else blk: {
@@ -1642,7 +1777,10 @@ fn applyProximity(
             const dx = n.home.x - mouse_w.x;
             const dy = n.home.y - mouse_w.y;
             const d = @sqrt(dx * dx + dy * dy);
-            break :blk std.math.clamp(1.0 - d / falloff_w, 0, 1) * strength;
+            const soft = std.math.clamp(1.0 - d / reach_w, 0, 1) * strength;
+            // The one under the cursor still reaches full swell, so the disc that takes the click
+            // is unambiguous however soft its neighbours are.
+            break :blk if (p.hover_node == ni and interior_cloud) @max(soft, 1) else soft;
         };
         // Open docs keep a gentle resting swell so they stay findable in the cloud.
         const want_final = if (n.open) @max(want, open_rest_hover) else want;
@@ -1651,186 +1789,32 @@ fn applyProximity(
         n.hover_t = prev + (want_final - prev) * t_hover;
         if (@abs(n.hover_t - want_final) > 0.004) hover_unsettled = true;
 
-        // Grow in place from the layout home — spacing is applied as neighbor shove below.
+        // Grown in place: a swollen disc overlaps its neighbours rather than parting them.
         n.pos = n.home;
-        // Resting open-doc swell must not count as a shove source. It used to: every open
-        // note sat at hover_t ≥ 0.22, so the O(n²) neighbour pass ran *every frame* even with
-        // the mouse nowhere near the cloud — the main reason an idle graph ate tens of fps.
-        if (shoveHover(n.*) >= 0.08) any_shove = true;
     }
 
-    // Grown nodes push neighbors away from *themselves* (not away from the cursor).
-    // Only mouse-swollen nodes act as sources — zoom-rest and open-doc resting size are
-    // draw-only so a close-up / open tab doesn't shove the whole vault apart.
+    // No neighbour shove, in either cloud.
     //
-    // Two things bound this, and both matter at vault scale:
+    // The overview never had one. Its marks are drawn from the world's own positions, so a shove
+    // moved `n.pos` — which hit-testing and the label placer read — without moving anything drawn:
+    // near the cursor the ring you could see and the target you could click drifted apart, the node
+    // lit up, and the click landed on nothing. Drawing the shove instead is the other repair and it
+    // is the wrong one, because link endpoints come from those same world positions, so a shoved
+    // node would pull away from its own lines. So the pass was gated off for the overview and left
+    // running for the interior.
     //
-    //   • Reach is capped at `max_shove_slots` lattice cells. The radii here are *screen* sizes
-    //     divided by zoom, so as you zoom out they grow without bound in world units — at far
-    //     zoom on a big vault a single swollen node was reaching thousands of world units and
-    //     flinging the cloud apart. `proximity.strength` only catches this once the whole web
-    //     is smaller than the falloff, which never happens for a large vault at its fitted view.
-    //
-    //   • Only nodes inside that reach are visited, via a bucket grid. The old pass was every
-    //     source against every node, and the number of sources peaks at *mid* zoom — far out,
-    //     `strength` is 0; far in, the world-space falloff is tiny so almost nothing swells;
-    //     in between, a large share of the cloud is swollen and the whole thing is quadratic.
-    //     That band is exactly where the frame rate fell off a cliff.
-    // The overview draws its marks from the world's own positions (`Mark.wx/wy`), not from
-    // `n.pos` — so a shove applied here is never drawn there. It still moved `n.pos`, which is what
-    // hit-testing and the label placer read, so near the cursor the ring you can see and the target
-    // you can click drifted apart: the node lights up, the cursor does not become a hand, and the
-    // click lands on nothing. Worse at some zooms than others, because the reach is a world-space
-    // distance derived from a screen-space radius.
-    //
-    // Drawing the shove instead would be the other repair, and it is the wrong one: link endpoints
-    // come from the same world positions the marks do, so shoved nodes would pull away from their
-    // own lines.
-    const drawn_from_world = nodes.ptr == p.nodes.ptr;
-    if (any_shove and strength > 0.001 and !drawn_from_world) {
-        const gap_w = neighbor_gap_px * dpiScale() / zoom;
-        const reach_cap = slot * max_shove_slots;
-
-        var grid = ShoveGrid.init(arena, nodes, active.items, reach_cap) catch null;
-        defer if (grid) |*g| g.deinit();
-
-        for (active.items) |si| {
-            const src = nodes[si];
-            const src_shove = shoveHover(src);
-            if (src_shove < 0.08) continue;
-            const src_r = @min(bubbleScreenRadius(src, zoom_t, slot * zoom) / zoom, reach_cap);
-
-            if (grid) |g| {
-                var it = g.near(src.home);
-                while (it.next()) |di| {
-                    if (di == si) continue;
-                    shovePair(&nodes[di], src, src_r, gap_w, src_shove, zoom_t, zoom, reach_cap, slot * zoom);
-                }
-            } else {
-                for (active.items) |di| {
-                    if (di == si) continue;
-                    shovePair(&nodes[di], src, src_r, gap_w, src_shove, zoom_t, zoom, reach_cap, slot * zoom);
-                }
-            }
-        }
+    // Which left the two clouds behaving differently for a reason that was really about only one of
+    // them, and the interior as the odd one out: hovering an item there parted its neighbours while
+    // hovering a note out in the vault did not. Swelling in place is the whole affordance in both.
+    if (interior_cloud and nodes.len > 0 and nodes[0].is_sun) {
+        nodes[0].pos = nodes[0].home;
     }
     return hover_unsettled;
 }
 
-/// Push one node clear of a swollen neighbour. `reach_cap` bounds both radii so the shove stays
-/// a local nudge in world units no matter how far out the camera is.
-fn shovePair(
-    dst: *GraphNode,
-    src: GraphNode,
-    src_r: f32,
-    gap_w: f32,
-    src_shove: f32,
-    zoom_t: f32,
-    zoom: f32,
-    reach_cap: f32,
-    gap_px: f32,
-) void {
-    const dx = dst.home.x - src.home.x;
-    const dy = dst.home.y - src.home.y;
-    const d = @sqrt(dx * dx + dy * dy);
-    if (d < 1e-3) return;
-    const dst_r = @min(bubbleScreenRadius(dst.*, zoom_t, gap_px) / zoom, reach_cap);
-    const need = @min(src_r + dst_r + gap_w, reach_cap);
-    if (d >= need) return;
-    // `falloff_w` (the hover reach, a fixed *screen* distance) covers a shrinking share of the
-    // field as zoom increases, so fewer sources are simultaneously swollen at once at high zoom —
-    // but at low zoom_t, a dense field (hundreds of interior content items, all close together in
-    // vault-world terms) can have many swollen sources shoving the same neighbour at once, and
-    // each pair's shove stacks additively with no normalization between them. Tapering the push
-    // itself by zoom_t keeps that far-zoom compounding gentle without touching the near-zoom feel
-    // it was tuned for, floored so it never fully disables the effect.
-    const push_scale = std.math.clamp(zoom_t, 0.2, 1.0);
-    const amt = (need - d) * neighbor_push * src_shove * push_scale;
-    dst.pos.x += (dx / d) * amt;
-    dst.pos.y += (dy / d) * amt;
-}
-
-/// Bucket grid over node homes for the proximity shove. Cell size is the shove reach, so every
-/// node a source can possibly reach lies in the 3×3 block around it.
-const ShoveGrid = struct {
-    allocator: std.mem.Allocator,
-    cell: f32,
-    map: std.AutoHashMap([2]i32, std.ArrayList(usize)),
-
-    /// `which` is the set of node indices to bin — the ones on screen, not the whole vault.
-    fn init(
-        allocator: std.mem.Allocator,
-        nodes: []const GraphNode,
-        which: []const u32,
-        cell: f32,
-    ) !ShoveGrid {
-        var g: ShoveGrid = .{
-            .allocator = allocator,
-            .cell = @max(cell, 1e-3),
-            .map = std.AutoHashMap([2]i32, std.ArrayList(usize)).init(allocator),
-        };
-        errdefer g.deinit();
-        for (which) |i| {
-            const gop = try g.map.getOrPut(g.keyOf(nodes[i].home));
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(allocator, i);
-        }
-        return g;
-    }
-
-    fn deinit(g: *ShoveGrid) void {
-        var it = g.map.valueIterator();
-        while (it.next()) |list| list.deinit(g.allocator);
-        g.map.deinit();
-    }
-
-    fn keyOf(g: ShoveGrid, p: dvui.Point) [2]i32 {
-        return .{
-            @intFromFloat(@floor(p.x / g.cell)),
-            @intFromFloat(@floor(p.y / g.cell)),
-        };
-    }
-
-    fn near(g: *const ShoveGrid, at: dvui.Point) NearIter {
-        return .{ .g = g, .key = g.keyOf(at) };
-    }
-
-    const NearIter = struct {
-        g: *const ShoveGrid,
-        key: [2]i32,
-        dx: i32 = -1,
-        dy: i32 = -1,
-        bucket: []const usize = &.{},
-        at: usize = 0,
-
-        fn next(it: *NearIter) ?usize {
-            while (true) {
-                if (it.at < it.bucket.len) {
-                    defer it.at += 1;
-                    return it.bucket[it.at];
-                }
-                if (it.dy > 1) return null;
-                const k: [2]i32 = .{ it.key[0] + it.dx, it.key[1] + it.dy };
-                it.dx += 1;
-                if (it.dx > 1) {
-                    it.dx = -1;
-                    it.dy += 1;
-                }
-                it.bucket = if (it.g.map.get(k)) |b| b.items else &.{};
-                it.at = 0;
-            }
-        }
-    };
-};
-
 /// Open notes rest at `open_rest_hover` so they stay visible; shove only cares about the
 /// mouse-driven portion above that floor.
 const open_rest_hover: f32 = 0.22;
-
-fn shoveHover(n: GraphNode) f32 {
-    if (n.open) return @max(0, n.hover_t - open_rest_hover);
-    return n.hover_t;
-}
 
 /// 0 at sparse overview → 1 when layout neighbours are far enough apart on screen that
 /// labels and proximity detail should read clearly.
@@ -2193,9 +2177,13 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         .paths = &.{},
         .sigs = &.{},
         .changed = &.{},
+        // Borrowed for the length of the solve. The panel keeps owning it until this job's own
+        // result replaces it in `finishRebuild`, so an abandoned solve leaves it intact.
+        .reuse = p.reuse,
     };
     errdefer job.arena.deinit();
     const arena = job.arena.allocator();
+    const prep_t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
 
     // Owned copy: the rebuild below walks these strings for as long as the layout solve takes,
     // which on a large vault is many indexer commits — far longer than a borrowed slice lives.
@@ -2275,6 +2263,30 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         // Keep source→dest order for the connect animation; layout treats edges as undirected.
         try edge_list.append(arena, .{ .a = ai, .b = bi });
     }
+
+    // Canonical order, because the snapshot's is not one.
+    //
+    // `loadSnapEdges` runs `SELECT src_id, dst_id FROM links` with no `ORDER BY` — deliberately,
+    // since sorting 3.3M rows in SQLite is expensive and the consumer dedups anyway. But rewriting
+    // a note deletes and reinserts its links, so the rows come back in a *different order* after an
+    // edit, and that order reaches the solve.
+    //
+    // It matters because the weights are summed. `cellweb.dedupe` and `louvain.contract` both fold
+    // parallel edges by adding floats, and float addition is not associative: a different encounter
+    // order gives weights that differ in the last bits, Louvain's `gain > best_gain` flips wherever
+    // that crosses a tie, and territories churn for reasons that have nothing to do with the edit.
+    // Measured against this: the harness, which builds its edges in file order, reuses 100% of
+    // territories after adding a link between the vault's two biggest hubs; the app, reading the
+    // same vault through SQLite, reused 66% after a one-word edit.
+    //
+    // Sorting here rather than in SQL puts the cost where it is cheap — one radix pass over an
+    // array already in hand — and it makes "the map is a pure function of the vault" true of the
+    // whole pipeline rather than of `layout.solve` in isolation.
+    {
+        const scratch = try arena.alloc(GraphEdge, edge_list.items.len);
+        const sorted = radix.sortByKey(GraphEdge, graphEdgeKey, edge_list.items, scratch);
+        if (sorted.ptr != edge_list.items.ptr) @memcpy(edge_list.items, sorted);
+    }
     const layout_edges = try arena.alloc(layout_full.Edge, edge_list.items.len);
     for (edge_list.items, 0..) |e, i| layout_edges[i] = .{ .a = e.a, .b = e.b };
 
@@ -2329,6 +2341,35 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     job.paths = paths[0];
     job.sigs = sigs;
     job.changed = changed;
+
+    // Can this rebuild skip the solve entirely?
+    //
+    // Only when the link graph is *identical*: same notes, in the same order, and not one of them
+    // with a different neighbour set. The order hash is not redundant — a note flipping between
+    // real and phantom renumbers every index after it without changing anyone's links, and the
+    // stored positions are indexed by that order.
+    {
+        var order_hash: u64 = 0xcbf29ce484222325;
+        for (order.items) |si| {
+            order_hash ^= @as(u64, @bitCast(snap.nodes[si].id));
+            order_hash *%= 0x100000001b3;
+        }
+        var any_link_moved = false;
+        for (changed) |c| {
+            if (c) {
+                any_link_moved = true;
+                break;
+            }
+        }
+        if (!any_link_moved and
+            order_hash == p.last_order and
+            p.last_pos.len == n and
+            p.last_comp.len == n)
+        {
+            job.settled = .{ .pos = p.last_pos, .comp = p.last_comp };
+        }
+        job.order_hash = order_hash;
+    }
     job.place_opts = p.place_opts;
     job.place_rotation = p.place_rotation;
 
@@ -2365,6 +2406,14 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         return;
     }
 
+    // What the reader waits through that the solve timing does not cover: this whole prep runs on
+    // the *UI thread* before the worker is even started — `snapshotCopy` alone duplicates every
+    // note (with its path and title strings) and every edge.
+    dvui.log.info("atlas prep: {d}ms on the UI thread ({d} notes, {d} edges)", .{
+        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - prep_t0, 1_000_000),
+        n,
+        job.edges.len,
+    });
     job.thread = std.Thread.spawn(.{}, LayoutJob.run, .{job}) catch {
         // No thread available — better a hitch than no graph.
         defer job.deinit(gpa);
@@ -2378,6 +2427,27 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
 /// Turn a solved job into the panel's live arrangement. UI thread only, and only once `done`.
 fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     const gpa = sdk.allocator();
+    const finish_t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    defer dvui.log.info("atlas adopt: {d}ms on the UI thread", .{
+        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - finish_t0, 1_000_000),
+    });
+    // Adopt this solve's interiors as the next one's memo, and let the old set go.
+    if (job.next_reuse) |r| {
+        if (p.reuse) |old| freeReuse(gpa, old);
+        p.reuse = r;
+        job.next_reuse = null;
+    }
+    // Same for the finished positions. A rebuild that *reused* them produced none of its own and
+    // leaves what is already stored in place, which is exactly the arrangement still on screen.
+    if (job.next_pos.len > 0) {
+        gpa.free(p.last_pos);
+        gpa.free(p.last_comp);
+        p.last_pos = job.next_pos;
+        p.last_comp = job.next_comp;
+        job.next_pos = &.{};
+        job.next_comp = &.{};
+    }
+    p.last_order = job.order_hash;
     const snap = job.snap;
     const n = job.n;
     const first_build = job.first_build;
@@ -2600,7 +2670,15 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     //
     // `fitted_vp_*` is still deliberately left alone: that governs resize detection, and
     // clearing it here would make the next frame look like a first fit and *snap*.
-    if (!first_build) applyFraming(p);
+    //
+    // Skipped outright when the solve reused the previous positions. A save that edits prose
+    // republishes exactly as a save that adds a link does, and re-framing then is not merely
+    // wasted — it is *visible*: the world adopted here starts fully coalesced (`anim` is zero), so
+    // `focusNode` reads the note's position through the mass it is currently inside, retargets the
+    // camera at that blob, and the pursuit then walks it back as the LOD opens. The reader typed a
+    // word and watched the map recentre itself. If nothing moved, nothing needs re-framing.
+    const positions_held = job.settled != null;
+    if (!first_build and !positions_held) applyFraming(p);
 
     // Follow the note the reader is with, when nothing else is going to.
     //
@@ -2615,7 +2693,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     // with everything else rearranged around it. Through `retarget`, not a snap, so it reads as
     // following rather than as the view jumping — and `retarget`'s own epsilon check means a
     // rebuild that did not move the note costs nothing at all.
-    if (!first_build and p.framing == .free) {
+    if (!first_build and !positions_held and p.framing == .free) {
         if (anchor_before) |before| anchor: {
             const id = anchor_id orelse break :anchor;
             const w = if (p.world_state) |*ws| ws else break :anchor;
@@ -3275,6 +3353,10 @@ fn stepInteriorWorld(p: *Panel) void {
 /// travels with its note instead of being left behind by a relayout.
 fn followParent(p: *Panel) void {
     if (p.interior.nodes.len == 0) return;
+    // `stepInteriorWorld` already wrote this frame's positions from the parent mark.
+    // Translating again by `nodes[idx].home - mark` (they disagree under LOD) slid the
+    // sun after the camera had pinned to it.
+    if (interiorHasPointer(p)) return;
     const id = p.interior.note_id orelse return;
     const idx = p.id_index.get(id) orelse return;
     const parent = p.nodes[idx].home;
@@ -3291,6 +3373,38 @@ fn followParent(p: *Panel) void {
         n.pos.y += dy;
     }
     p.interior.parent = parent;
+}
+
+/// Keep a focus flight aimed at where the note *is*, not where it was when the flight began.
+///
+/// `focusNode` reads the note's position through `World.noteWorldPos`, which answers with the mass
+/// the note is currently inside when it is still coalesced. Flying to a note from overview
+/// therefore aims at a blob — and the blob is exactly what the zoom is about to split, so by the
+/// time the camera arrives the note has emerged somewhere else inside it and the flight lands
+/// beside its target rather than on it. On a dense vault that is a whole screen out; the reader
+/// sees the note they asked for sitting against the edge of the pane.
+///
+/// Re-aiming each frame turns the flight into a pursuit, which is what it always should have been:
+/// the destination is a note, and where the note is drawn is a moving fact until the descent
+/// finishes.
+///
+/// Only past a threshold, because `chase` re-plans its path whenever the destination moves and a
+/// per-frame re-plan would flatten the arc into a plain exponential ease. Half a lattice slot is
+/// well under "the reader would notice" and well over the jitter of a settling animation.
+fn trackFocusTarget(p: *Panel) void {
+    if (p.camera.user_driving) return;
+    const id = switch (p.framing) {
+        .note => |v| v,
+        else => return,
+    };
+    const idx = p.id_index.get(id) orelse return;
+    const w = ensureWorld(p) orelse return;
+    const wp = w.noteWorldPos(@intCast(idx)) orelse return;
+    const slot = if (p.layout_slot > 1) p.layout_slot else 1;
+    const dx = wp.x - p.camera.center_target.x;
+    const dy = wp.y - p.camera.center_target.y;
+    if (dx * dx + dy * dy < (slot * 0.5) * (slot * 0.5)) return;
+    p.camera.center_target = .{ .x = wp.x, .y = wp.y };
 }
 
 fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
@@ -3662,9 +3776,11 @@ fn applyInteriorFramingIfNeeded(p: *Panel) void {
     // Recomputing a pin from a mid-chase camera walks the sun around the pane: each frame's
     // `poseZoomAround` uses the drifted screen position as the new pin.
     if (p.camera.chasing()) return;
-    if (!p.layout_settled or p.interior.t < 0.98) {
-        applyFraming(p);
-    }
+    // Only while the dive is still arriving. Overview `layout_settled` going false (open-doc
+    // swell, a morph) used to retrigger this every frame *after* the camera had landed, and
+    // `poseZoomAround` then walked the sun with the mouse via any leftover hover offset.
+    if (p.interior.t >= 0.98) return;
+    applyFraming(p);
 }
 
 /// Re-derive the camera pose for the current `framing`. Called whenever the thing the pose was
@@ -3733,7 +3849,7 @@ fn fitMaxGapPx(vp: dvui.Rect.Physical) f32 {
 /// dinner-plate stop and forbade small interiors from filling the panel.
 fn interiorFitZoom(p: *const Panel) f32 {
     const max_r = @max(p.interior.radius, 1e-3);
-    const sun = p.interior.nodes[0].pos;
+    const sun = p.interior.nodes[0].home;
     const bounds: dvui.Rect = .{
         .x = sun.x - max_r,
         .y = sun.y - max_r,
@@ -3750,7 +3866,9 @@ fn interiorFitZoom(p: *const Panel) f32 {
 /// `fitInteriorSun` if the reader wants the cloud centred.
 fn zoomInteriorPinned(p: *Panel, mode: FitMode) void {
     if (p.interior.nodes.len == 0) return;
-    const pose = p.camera.poseZoomAround(p.interior.nodes[0].pos, interiorFitZoom(p));
+    // `home`, not `pos`: proximity shove is a screen-space hover offset and must not retarget
+    // the pin. Using the shoved sun walked the cloud around the pane whenever framing re-ran.
+    const pose = p.camera.poseZoomAround(p.interior.nodes[0].home, interiorFitZoom(p));
     if (mode.animate) {
         p.camera.retarget(pose);
     } else {
@@ -3763,7 +3881,7 @@ fn zoomInteriorPinned(p: *Panel, mode: FitMode) void {
 /// Put the interior in the middle of the pane and zoom to fit. The extents button, not enter.
 fn fitInteriorSun(p: *Panel, mode: FitMode) void {
     if (p.interior.nodes.len == 0) return;
-    const sun = p.interior.nodes[0].pos;
+    const sun = p.interior.nodes[0].home;
     p.camera.center_target = sun;
     p.camera.zoom_target = interiorFitZoom(p);
     if (!mode.animate) {
@@ -3786,7 +3904,10 @@ fn vaultExtentsPose(p: *const Panel) ?Camera.Pose {
         if (p.world_state) |*w| {
             if (w.lad.roots.len > 0) {
                 const e = w.extent();
-                const pad_px: f32 = 24;
+                // Now that `extent` reports where the notes actually are rather than a count-based
+                // estimate of the root cell, the margin is the only thing standing between the map
+                // and the pane edge — so it is a real margin rather than a token one.
+                const pad_px: f32 = fitPadPx(vp);
                 const usable_w = @max(1, vp.w - pad_px * 2);
                 const usable_h = @max(1, vp.h - pad_px * 2);
                 const z = @min(usable_w, usable_h) / (2 * @max(e, 1e-3));
@@ -4065,6 +4186,14 @@ const detail_anchor: f32 = 360;
 /// past the comfortable point, because that is what a quality control is for. On a small vault it
 /// costs nothing either way: there are only ~800 adjacent cut-cell pairs to draw, so 900 and 20000
 /// produce 761 and 802 lines respectively.
+/// Ambient lines per drawn cell — see `world_mod.Params.links_per_cell`.
+///
+/// Two, because a drawn thing with more than a couple of visible connections apiece stops reading
+/// as connected to anything in particular. At overview this is what takes simplewiki's web from
+/// ten thousand lines over 1,450 masses to about three thousand; zoomed in, where the cut holds
+/// thousands of cells, `link_budget` is the binding cap again and nothing changes.
+const ambient_links_per_cell: usize = 2;
+
 fn ambientLinkBudget(mark_budget: usize) usize {
     return world_mod.Params.ambientLinkBudget(mark_budget);
 }
@@ -4253,11 +4382,19 @@ fn updateActiveDoc(p: *Panel, st: anytype) void {
     const rel = query.vaultRelative(vault, path, &rel_buf) orelse return;
     const gi = p.path_index.get(rel) orelse return;
 
-    // Already framing this note — a graph click focuses before the tab list catches up, and
+    // Already *flying to* this note — a graph click focuses before the tab list catches up, and
     // re-flying here would restart the ease mid-flight.
-    switch (p.framing) {
-        .note, .interior => |id| if (id == p.nodes[gi].note_id) return,
-        else => {},
+    //
+    // While the camera is still chasing, deliberately. The test used to be "is this note what we
+    // last framed", which is a different question and stays true long after the flight has landed:
+    // a reader who framed a note, panned away, and then selected it again got nothing, because the
+    // panel still considered it framed. Selecting a note should put it on screen, and the only case
+    // that needs protecting is the handover from the click to the workbench.
+    if (p.camera.chasing()) {
+        switch (p.framing) {
+            .note, .interior => |id| if (id == p.nodes[gi].note_id) return,
+            else => {},
+        }
     }
     // Nor when the reader is inside it: opening a section from within a hand-driven descent makes
     // that document active, and flying to its node would eject them. See `insideInterior`.
@@ -4402,6 +4539,7 @@ fn worldParams(p: *Panel) world_mod.Params {
     return .{
         .budget = p.mark_budget,
         .link_budget = ambientLinkBudget(p.mark_budget),
+        .links_per_cell = ambient_links_per_cell,
         // Highlighted lines get the same allowance as the ambient web, spent focused-note-first.
         .focus_link_budget = ambientLinkBudget(p.mark_budget),
         .focus_leaf = focus_leaf,
@@ -4544,16 +4682,12 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
 
     const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
     for (p.interior.nodes, 0..) |node, i| {
-        const kind_mul = if (i > 0 and i < p.interior.item_kind.len)
-            contentKindRadiusMul(p.interior.item_kind[i])
-        else
-            1.0;
         buf[i] = .{
             .screen = p.camera.worldToScreen(node.pos),
             .r_px = if (node.is_sun and sun_r0 > 0)
                 std.math.lerp(sun_r0, bubbleScreenRadius(node, zoom_t, gap_px), yield_t)
             else
-                bubbleScreenRadius(node, zoom_t, gap_px) * kind_mul,
+                interiorNodeRadiusPx(p, i, node, zoom_t, gap_px),
             .fill = nodeFill(theme, node),
             // The sun is the note you are inside — dashed, so leaving reads differently from
             // stepping between content items.
@@ -4624,7 +4758,18 @@ fn overviewMarkStyle(ctx: *anyopaque, w: *const world_mod.World, m: world_mod.Ma
     const is_open = m.is_note and m.note < p.nodes.len and p.nodes[m.note].open;
     const is_dashed = is_open;
     // A dashed mark is always highlight-rimmed, which is what makes dashed mean "this one".
-    const border = if (is_dashed or holds_open) hot else border_rest;
+    const border_own = if (is_dashed or holds_open) hot else border_rest;
+    // A mass on its way out walks its outline to the background as it collapses.
+    //
+    // The pose carries the split — the ring shrinks into the point its children emerge from — but
+    // pose alone is not enough: a full-strength outline shrinking to nothing reads as a node of
+    // its own, right up to the frame it vanishes. Notes are exempt: an absorbed note walks to the
+    // *mass's* fill through `joinFill` below, because mixing it to the background would paint an
+    // opaque hole over the very thing it is joining. A mass has nothing behind it but the map.
+    const border = if (m.is_note)
+        border_own
+    else
+        galaxy.intoBg(border_own, galaxy.panelFill(theme), m.alpha);
 
     // Same face as a resting note. Masses used to fill with window text mixed toward the
     // background, so a merge was notes fading to "nothing" against a disc of a different colour.
@@ -4954,6 +5099,16 @@ fn cloudKeepIn(centres: dvui.Rect.Physical, bubble_r: f32, label_h: f32) dvui.Re
     };
 }
 
+/// Overlap of two screen rects, empty when they miss.
+fn rectIntersect(a: dvui.Rect.Physical, b: dvui.Rect.Physical) dvui.Rect.Physical {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    if (x1 <= x0 or y1 <= y0) return .{};
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
 fn updateLabels(
     p: *Panel,
     nodes: []GraphNode,
@@ -5003,6 +5158,53 @@ fn updateLabels(
     // The overview reads the same gathered web the draw pass does, so the placer avoids exactly
     // the lines that exist — and, as with the draw pass, does not walk the vault's whole link set
     // to find them. An interior cloud has no gathered set and is small enough to scan.
+    var cand: std.ArrayList(usize) = .empty;
+    var reserved: usize = 0;
+    var cloud_r: f32 = 0;
+    // How far from its own mark a name can land: the disc, the gap, and the widest label. Slots
+    // outside this of any candidate cannot be chosen, so nothing out there can collide.
+    const label_reach = (label_max_w + label_gap + font.textSize("Ag").h) * scale;
+    var reach_lo: dvui.Point.Physical = .{ .x = std.math.floatMax(f32), .y = std.math.floatMax(f32) };
+    var reach_hi: dvui.Point.Physical = .{ .x = -std.math.floatMax(f32), .y = -std.math.floatMax(f32) };
+    // The same box in world units, so a link can be rejected from its cell poses without being
+    // transformed first.
+    var wreach_lo: dvui.Point = .{ .x = std.math.floatMax(f32), .y = std.math.floatMax(f32) };
+    var wreach_hi: dvui.Point = .{ .x = -std.math.floatMax(f32), .y = -std.math.floatMax(f32) };
+    // Only what is on screen as itself. This loop used to walk the whole vault every frame the
+    // pointer or the camera moved, which on a large vault was the single most expensive thing
+    // the panel did — and all but a few hundred of those nodes were off screen or merged, so it
+    // was computing placement inputs for labels that could not be drawn.
+    var it = NodeIter.init(nodes, selection);
+    while (it.next()) |step| {
+        const n = &nodes[step.index];
+        const s = p.camera.worldToScreen(n.pos);
+        const r_px = bubbleScreenRadius(n.*, zoom_t, slot * p.camera.zoom);
+        cloud_r = @max(cloud_r, r_px);
+        if (!vp.outsetAll(r_px).contains(s)) {
+            // Off-screen: nothing is drawn, so there is no fade to preserve.
+            n.label_vis = 0;
+            continue;
+        }
+        if (reserved < max_reserved_bubbles) {
+            const rr = r_px * bubble_reserve_scale;
+            placer.reserve(.{ .x = s.x - rr, .y = s.y - rr, .w = rr * 2, .h = rr * 2 });
+            reserved += 1;
+        }
+        if (labelReveal(n.*, zoom_t) > label_reveal_min) {
+            cand.append(arena, step.index) catch {};
+            const reach = r_px + label_reach;
+            reach_lo.x = @min(reach_lo.x, s.x - reach);
+            reach_lo.y = @min(reach_lo.y, s.y - reach);
+            reach_hi.x = @max(reach_hi.x, s.x + reach);
+            reach_hi.y = @max(reach_hi.y, s.y + reach);
+            const wreach = reach / @max(p.camera.zoom, 1e-6);
+            wreach_lo.x = @min(wreach_lo.x, n.pos.x - wreach);
+            wreach_lo.y = @min(wreach_lo.y, n.pos.y - wreach);
+            wreach_hi.x = @max(wreach_hi.x, n.pos.x + wreach);
+            wreach_hi.y = @max(wreach_hi.y, n.pos.y + wreach);
+        }
+    }
+
     // Containment's web is `world.links`, already lifted onto living cells. Feeding the classic
     // path's `vis_edges` here instead described lines that are not on screen, so the placer
     // refused slot after slot for collisions with a web that was not being drawn.
@@ -5016,7 +5218,14 @@ fn updateLabels(
         if (w.lad.leaf_cell.len != nodes.len) break :blk null;
         break :blk w.links.items;
     };
-    const seg_cap = if (containment_links) |cl| cl.len else edges.len;
+    // Interiors draw no links — headings orbit rather than being wired to the sun. Feeding
+    // the outline starburst to the placer walls off every label slot on a giant document.
+    const seg_cap = if (nodes.ptr == p.interior.nodes.ptr)
+        0
+    else if (containment_links) |cl|
+        cl.len
+    else
+        edges.len;
     const seg_buf = arena.alloc(labels.Segment, seg_cap) catch return;
     // Cell -> world position for this frame's marks, so resolving a link's two endpoints is two
     // lookups rather than two scans of the mark list. `markWorldPos` is linear, and at the
@@ -5024,18 +5233,37 @@ fn updateLabels(
     // that grows with the *budget*, so raising it to see more punished you quadratically.
     // The lookup is `World.markIndex`, the same dense stamped array `world_draw.zig` reads; this
     // used to be a second `AutoHashMapUnmanaged` built from the same mark list every frame.
+    var seg_prof = profNow();
     var seg_n: usize = 0;
+    // Empty when nothing is a candidate, which rejects every segment without transforming it.
+    if (cand.items.len == 0) {
+        wreach_lo = .{ .x = 1, .y = 1 };
+        wreach_hi = .{ .x = -1, .y = -1 };
+    }
+    const seg_clip: dvui.Rect.Physical = if (cand.items.len == 0) .{} else rectIntersect(
+        .{ .x = reach_lo.x, .y = reach_lo.y, .w = reach_hi.x - reach_lo.x, .h = reach_hi.y - reach_lo.y },
+        vp.outsetAll(40),
+    );
     for (0..seg_cap) |i| {
         var wa: dvui.Point = undefined;
         var wb: dvui.Point = undefined;
         if (containment_links) |cl| {
             const w = &p.world_state.?;
-            const ia = w.markIndex(cl[i].a) orelse continue;
-            const ib = w.markIndex(cl[i].b) orelse continue;
-            const ma = w.marks.items[ia];
-            const mb = w.marks.items[ib];
-            wa = .{ .x = ma.wx, .y = ma.wy };
-            wb = .{ .x = mb.wx, .y = mb.wy };
+            // `w.px`/`w.py` are the animated cell poses the marks are *built* from, indexed by cell
+            // — two float reads, against a `markIndex` memo lookup plus a 24-byte mark read. And
+            // because they are available before any transform, the link can be rejected in world
+            // space, which is the whole point: `seg` was 1.06 ms of a 1.08 ms label phase, and
+            // almost all of it was transforming ten thousand links to find out that a handful of
+            // candidates were nowhere near any of them.
+            const la = cl[i].a;
+            const lb = cl[i].b;
+            if (la >= w.px.len or lb >= w.px.len) continue;
+            wa = .{ .x = w.px[la], .y = w.py[la] };
+            wb = .{ .x = w.px[lb], .y = w.py[lb] };
+            // Segment bounding box against the candidates' reach. Conservative, and it costs four
+            // comparisons where the alternative costs two matrix transforms.
+            if (@max(wa.x, wb.x) < wreach_lo.x or @min(wa.x, wb.x) > wreach_hi.x or
+                @max(wa.y, wb.y) < wreach_lo.y or @min(wa.y, wb.y) > wreach_hi.y) continue;
         } else {
             const e = edges[i];
             if (e.a >= nodes.len or e.b >= nodes.len) continue;
@@ -5044,8 +5272,15 @@ fn updateLabels(
         }
         const a = p.camera.worldToScreen(wa);
         const b = p.camera.worldToScreen(wb);
-        // Skip links that don't nick the panel — same cheap reject the draw pass uses.
-        if (!segmentMaybeInView(a, b, vp.outsetAll(40))) continue;
+        // Skip links that cannot reach any name. The placer only refuses a slot that collides
+        // with a drawn line, and a slot never sits further from its own mark than `label_reach`,
+        // so a segment outside every candidate's reach cannot change a single decision.
+        //
+        // This used to reject against the whole viewport, which is the same test the draw pass
+        // uses — right for drawing, far too generous for placing. On a coalesced frame the web is
+        // 10,636 links and the candidates are six notes: gathering and indexing the entire web to
+        // place six names cost 1.6 ms, the largest bucket left in the frame after `hover`.
+        if (!segmentMaybeInView(a, b, seg_clip)) continue;
         seg_buf[seg_n] = .{ .a = a, .b = b };
         seg_n += 1;
     }
@@ -5056,6 +5291,7 @@ fn updateLabels(
     // slots — the placer's own collision test was the largest single cost of a panning frame.
     // Below a few hundred segments the linear walk is the cheaper answer and the index is skipped.
     if (seg_n > 256) placer.seg_grid = labels.SegGrid.build(arena, vp, placer.segs);
+    frame_profile.labels_seg_ns += profLap(&seg_prof);
 
     // Diagnostic for "notes resolve but carry no names". Throttled to once a second: the three
     // things that can each independently produce no label are an empty candidate list, titles that
@@ -5080,32 +5316,6 @@ fn updateLabels(
                 .{ if (selection) |sel| sel.len else nodes.len, titled, first_title, zoom_t, seg_n },
             );
         }
-    }
-
-    var cand: std.ArrayList(usize) = .empty;
-    var reserved: usize = 0;
-    var cloud_r: f32 = 0;
-    // Only what is on screen as itself. This loop used to walk the whole vault every frame the
-    // pointer or the camera moved, which on a large vault was the single most expensive thing
-    // the panel did — and all but a few hundred of those nodes were off screen or merged, so it
-    // was computing placement inputs for labels that could not be drawn.
-    var it = NodeIter.init(nodes, selection);
-    while (it.next()) |step| {
-        const n = &nodes[step.index];
-        const s = p.camera.worldToScreen(n.pos);
-        const r_px = bubbleScreenRadius(n.*, zoom_t, slot * p.camera.zoom);
-        cloud_r = @max(cloud_r, r_px);
-        if (!vp.outsetAll(r_px).contains(s)) {
-            // Off-screen: nothing is drawn, so there is no fade to preserve.
-            n.label_vis = 0;
-            continue;
-        }
-        if (reserved < max_reserved_bubbles) {
-            const rr = r_px * bubble_reserve_scale;
-            placer.reserve(.{ .x = s.x - rr, .y = s.y - rr, .w = rr * 2, .h = rr * 2 });
-            reserved += 1;
-        }
-        if (labelReveal(n.*, zoom_t) > label_reveal_min) cand.append(arena, step.index) catch {};
     }
 
     // Screen-space silhouette of the cloud, from the arrangement's own world bounds rather than
@@ -5133,6 +5343,7 @@ fn updateLabels(
         }
     };
     std.mem.sort(usize, cand.items, Order{ .nodes = nodes, .zoom_t = zoom_t }, Order.less);
+    var place_prof = profNow();
 
     const ellipsis_w = font.textSize("…").w;
     var placed: usize = 0;
@@ -5214,6 +5425,7 @@ fn updateLabels(
             n.label_vis = 0;
         }
     }
+    frame_profile.labels_place_ns += profLap(&place_prof);
     live.clearRetainingCapacity();
     live.appendSlice(sdk.allocator(), next.items) catch {};
     p.labels_settled = !unsettled;
@@ -5228,12 +5440,10 @@ fn drawLabels(p: *Panel) void {
         const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), @as(f32, 1));
         const fade = p.interior.t;
         for (p.interior.nodes, 0..) |n, i| {
-            if (p.hover_node == i) continue;
+            if (p.hover_node == i) continue; // `drawHoverLabel` owns this one
             drawLabel(n, zoom_t, fade);
         }
-        if (p.hover_node) |i| {
-            if (i < p.interior.nodes.len) drawLabel(p.interior.nodes[i], zoom_t, fade);
-        }
+        drawHoverLabel(p, fade);
         return;
     }
     // Containment defers to the LOD, exactly as placement does — a mark that resolved to an
@@ -5363,6 +5573,33 @@ fn renderTextPlated(
 fn drawHoverLabel(p: *Panel, fade: f32) void {
     if (fade <= 0.02) return;
     const i = p.hover_node orelse return;
+
+    if (interiorHasPointer(p)) {
+        if (i >= p.interior.nodes.len) return;
+        const n = p.interior.nodes[i];
+        if (n.is_sun) return;
+        if (n.title.len == 0) return;
+        const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), @as(f32, 1));
+        const gap_px = p.interior.slot * p.camera.zoom;
+        const r = interiorNodeRadiusPx(p, i, n, zoom_t, gap_px);
+        const cw = dvui.currentWindow();
+        const font = dvui.Font.theme(.body).larger(label_font_delta).withWeight(.bold);
+        const centre = p.camera.worldToScreen(n.pos);
+        const theme = dvui.themeGet();
+        renderTextPlated(
+            font,
+            n.title,
+            .{ .x = centre.x, .y = centre.y },
+            r,
+            p.camera.viewport,
+            cw.natural_scale,
+            theme.color(.highlight, .fill).opacity(fade),
+            theme.color(.window, .fill).opacity(label_plate_opacity * fade),
+            n.pointer_t,
+        );
+        return;
+    }
+
     if (i >= p.nodes.len) return;
     if (p.at_level0.len != p.nodes.len or !p.at_level0[i]) return;
     // The focused note already has its own unconditional name; two would sit on each other.
@@ -5562,20 +5799,58 @@ fn hoverSizeCap(gap_cap: f32, screen_cap: f32, hover: f32) f32 {
     return std.math.lerp(gap_cap, @max(gap_cap, screen_cap), t);
 }
 
+/// How much larger a hub is drawn than an ordinary note.
+///
+/// A map where every note is the same disc says nothing about which of them the vault is built
+/// around. Size is the cheapest channel for that — it survives being one of four thousand marks,
+/// it needs no legend, and a bigger dot is what a reader already reads as "more".
+///
+/// The curve is anchored at *both* ends, which the first cut was not. Normalising `log2(degree)`
+/// straight from zero spends most of the range where there is no information: a note with four
+/// links came out at 1.19x and one with a hundred at 1.50x, so the two were 26% apart — a
+/// difference of about a pixel on a five-pixel disc, and invisible exactly where the reader is
+/// looking for hierarchy. Holding everything up to `degree_swell_from` at rest size and spending
+/// the whole range between there and `degree_swell_at` puts the contrast among the notes that
+/// actually differ.
+const degree_swell: f32 = 1.0;
+/// Degree below which a note is drawn at its plain resting size. Around the median of a real
+/// vault, so "ordinary" means ordinary.
+const degree_swell_from: f32 = 4;
+/// Degree at which the full `degree_swell` is reached. Flat above it, so the one hub with tens of
+/// thousands of links is drawn like a well-connected note rather than swallowing its neighbourhood.
+const degree_swell_at: f32 = 256;
+
+fn degreeSwell(n: GraphNode) f32 {
+    // The sun is the note you are inside; its size means "you are here", not "this is popular".
+    if (n.is_sun or n.degree == 0) return 1;
+    const d = @log2(1 + @as(f32, @floatFromInt(n.degree)));
+    const lo = @log2(1 + degree_swell_from);
+    const hi = @log2(1 + degree_swell_at);
+    return 1 + degree_swell * std.math.clamp((d - lo) / (hi - lo), 0, 1);
+}
+
 fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
-    const base: f32 = if (n.is_sun)
+    const swell = degreeSwell(n);
+    const base: f32 = (if (n.is_sun)
         sun_screen_r
     else if (n.open)
         open_screen_r
     else
-        base_screen_r;
+        base_screen_r) * swell;
     const zoom_boost = zoom_rest_swell * std.math.clamp(zoom_t, 0, 1);
     // outBack only on the hover channel — pop on the way in, ends at grow when t=1.
     const hover = std.math.clamp(n.hover_t, 0, 1);
     // `gap_px` comes from the camera and is already physical, so the tuned sizes join it there.
     const s = dpiScale();
     const cap = (if (n.is_sun) max_sun_screen_r else max_node_screen_r) * s;
-    const gap_cap = gap_px * gap_radius_frac;
+    // The slot cap scales with degree too, or the swell never survives to be drawn.
+    //
+    // At rest `hoverSizeCap` returns exactly `gap_cap`, so every note is pinned to the same
+    // fraction of its lattice slot however large its own base is — which is precisely the
+    // "every note is the same disc" this swell exists to fix. Scaling the cap keeps what it is
+    // for (neighbours keep air between them) while letting a well-connected note use more of
+    // the room it sits in.
+    const gap_cap = gap_px * gap_radius_frac * swell;
     const rest_px = base * s * (1.0 + zoom_boost);
     const grow = if (n.is_sun) sun_grow_factor else grow_factor + coalesce_grow * coalesceCrush(gap_cap, rest_px);
     const hover_boost = grow * dvui.easing.outBack(hover);
@@ -5584,6 +5859,15 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     // and losing them into the crowd is worse than a little overlap.
     const floor: f32 = @as(f32, if (n.is_sun or n.open or n.hover_t > 0.5) 3.0 else 0.6) * s;
     return @max(@min(want, hoverSizeCap(gap_cap, cap, hover)), floor);
+}
+
+/// Drawn / hit radius for an interior item. Headings and body blocks scale by kind, same as
+/// `drawInteriorMarks` — hit-testing against the unscaled rest size missed the disc the
+/// reader was pointing at.
+fn interiorNodeRadiusPx(p: *const Panel, i: usize, n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
+    var r = bubbleScreenRadius(n, zoom_t, gap_px);
+    if (i > 0 and i < p.interior.item_kind.len) r *= contentKindRadiusMul(p.interior.item_kind[i]);
+    return r;
 }
 
 /// The disc colour notes and coalesced masses share at rest.
@@ -5710,7 +5994,7 @@ fn profNow() i96 {
 
 /// Nanoseconds since `mark`, and advance it.
 ///
-/// These used to compile out unless `debug_hud` was set, which is why the single most expensive
+/// These used to compile out unless the HUD was enabled, which is why the single most expensive
 /// thing the panel does per frame — `stepWorld`, and the whole-vault walks around it — went
 /// unmeasured for so long: the region between `rebuild_ns` and `bubbles_ns` was discarded with a
 /// bare `_ = profLap(&prof)`, so the HUD's "us total" could report a healthy frame while most of
@@ -5720,6 +6004,48 @@ fn profLap(mark: *i96) u64 {
     const now = std.Io.Clock.boot.now(dvui.io).nanoseconds;
     defer mark.* = now;
     return @intCast(now - mark.*);
+}
+
+/// Nanoseconds as microseconds, for the two frame-cost readouts.
+fn us(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1000.0;
+}
+
+/// One line of the frame breakdown to the log, once a second, while `ATLAS_HUD` is set.
+///
+/// The on-screen HUD is the same numbers, but it is one long line clipped at the pane edge — the
+/// phase timings, which are the only part that says *what* is slow, fall off the right-hand side
+/// on a wide vault where the header is longest. The log is copyable and survives the frame.
+///
+/// Every 120 frames rather than every frame: at 120 fps that is one line a second, which is a
+/// readable trace of a session rather than a flood that is itself a cost.
+fn logFrameProfile(p: *Panel) void {
+    const S = struct {
+        var n: u32 = 0;
+    };
+    S.n += 1;
+    if (S.n % 120 != 0) return;
+    const fp = frame_profile;
+    dvui.log.info(
+        "atlas frame: total {d}us | rebuild {d} misc {d} bubbles {d} hover {d} labels {d} " ++
+            "(seg {d} place {d}) | world step {d} sync {d} lift {d} " ++
+            "| edges {d} nodes {d} clusters {d} names {d} " ++
+            "|| marks {d} links {d} notes {d} clusters {d} pathed {d} zoom {d:.4}",
+        .{
+            us(fp.total()),          us(fp.rebuild_ns),
+            us(fp.misc_ns),          us(fp.bubbles_ns),
+            us(fp.hover_ns),         us(fp.labels_ns),
+            us(fp.labels_seg_ns),    us(fp.labels_place_ns),
+            us(fp.world_step_ns),    us(fp.world_sync_ns),
+            us(fp.world_lift_ns),    us(fp.draw_edges_ns),
+            us(fp.draw_nodes_ns),    us(fp.draw_clusters_ns),
+            us(fp.draw_labels_ns),
+            if (p.world_state) |*w| w.marks.items.len else 0,
+            if (p.world_state) |*w| w.links.items.len else 0,
+            fp.nodes_drawn,          fp.clusters_drawn,
+            fp.nodes_pathed,         p.camera.zoom,
+        },
+    );
 }
 
 fn drawDebugHud(p: *Panel) void {
@@ -5763,12 +6089,6 @@ fn drawDebugHud(p: *Panel) void {
 
     const fp = frame_profile;
     const rs = cw.renderStats();
-    const us = struct {
-        fn f(ns: u64) f64 {
-            return @as(f64, @floatFromInt(ns)) / 1000.0;
-        }
-    }.f;
-
     // What the note you are looking at is actually doing.
     //
     // "It flies away as I zoom toward it" has had several different causes, and they are
@@ -6332,30 +6652,60 @@ fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Poi
     var best: ?usize = null;
     var best_d: f32 = std.math.floatMax(f32);
     const zoom_t = @max(detailRevealT(slot, p.camera.zoom), @as(f32, 1));
-    // Only what is actually on screen as itself. A note merged into a marker is not clickable —
-    // and walking the selection instead of the whole vault is also what keeps this off the
-    // per-frame O(n) list, since the selection is bounded by the viewport. The interior has no
-    // such gating: every content item is always drawn as itself (see `buildInteriorWorld`), so
-    // `nodes.ptr == p.interior.nodes.ptr` never needs an equivalent to `p.at_level0`.
-    const drawn = if (nodes.ptr == p.nodes.ptr and p.at_level0.len == nodes.len)
-        p.at_level0
-    else
-        null;
-    for (nodes, 0..) |n, i| {
-        if (drawn) |d| {
-            if (!d[i]) continue;
-        }
-        const s = p.camera.worldToScreen(n.pos);
-        const dx = s.x - screen.x;
-        const dy = s.y - screen.y;
-        const d = @sqrt(dx * dx + dy * dy);
-        const hit_r = bubbleScreenRadius(n, zoom_t, slot * p.camera.zoom) + 6 * dpiScale();
-        if (d <= hit_r and d < best_d) {
-            best_d = d;
-            best = i;
-        }
+    const in_interior = nodes.ptr == p.interior.nodes.ptr;
+
+    // The interior has no gating: every content item is always drawn as itself (see
+    // `buildInteriorWorld`), and it is one section's worth of notes, so it is walked outright.
+    if (in_interior) {
+        for (0..nodes.len) |i| hitTestNode(p, nodes, i, slot, zoom_t, screen, true, &best, &best_d);
+        return best;
+    }
+
+    // The overview walks the *selection*, not the vault.
+    //
+    // This ran over every node and `continue`d on the ones not drawn as themselves. Skipping is
+    // not free: `GraphNode` is 160 bytes, so at 286k notes the test read 45 MB and cost ~650 us a
+    // frame — the largest bucket in the frame profile at coalesced zoom, paid every frame whether
+    // or not the cursor was near a note, and paid identically whether the map had drawn 150 marks
+    // or 3,400. `p.visible` is the exact set the skip was selecting for, published by
+    // `syncNodesFromWorld` earlier in the same frame and bounded by the mark budget.
+    //
+    // An empty selection means nothing is drawn as itself, so nothing is hoverable — which is the
+    // right answer, and the one the `at_level0` skip was computing the expensive way.
+    for (p.visible.items) |v| {
+        if (v.level != 0 or v.index >= nodes.len) continue;
+        hitTestNode(p, nodes, v.index, slot, zoom_t, screen, false, &best, &best_d);
     }
     return best;
+}
+
+/// One node's hit test, against the same radius it is drawn at, keeping the nearest hit.
+fn hitTestNode(
+    p: *Panel,
+    nodes: []const GraphNode,
+    i: usize,
+    slot: f32,
+    zoom_t: f32,
+    screen: dvui.Point.Physical,
+    in_interior: bool,
+    best: *?usize,
+    best_d: *f32,
+) void {
+    const n = nodes[i];
+    const s = p.camera.worldToScreen(n.pos);
+    const dx = s.x - screen.x;
+    const dy = s.y - screen.y;
+    const d = @sqrt(dx * dx + dy * dy);
+    const pad = 6 * dpiScale();
+    const gap_px = slot * p.camera.zoom;
+    const hit_r = if (in_interior)
+        interiorNodeRadiusPx(p, i, n, zoom_t, gap_px) + pad
+    else
+        bubbleScreenRadius(n, zoom_t, gap_px) + pad;
+    if (d <= hit_r and d < best_d.*) {
+        best_d.* = d;
+        best.* = i;
+    }
 }
 
 /// Leave a note's interior and frame that note back in the vault neighbourhood.
@@ -6413,6 +6763,31 @@ fn revealInteriorSection(p: *Panel, st: anytype, idx: usize) void {
     _ = wb.revealPosition(abs, n.line, 0, false) catch |err| {
         dvui.log.err("atlas: revealPosition {s}:{d}: {any}", .{ abs, n.line, err });
     };
+    // The markdown preview pane is created on a later frame than the raw editor. Host
+    // `previewReveal` is a one-shot on the reveal frame, so a first open drops it. Keep
+    // asking until the preview has had a chance to exist.
+    queuePreviewReveal(p, abs, n.line);
+}
+
+fn queuePreviewReveal(p: *Panel, abs: []const u8, line: u32) void {
+    const n = @min(abs.len, p.reveal_path_buf.len);
+    @memcpy(p.reveal_path_buf[0..n], abs[0..n]);
+    p.reveal_path_len = @intCast(n);
+    p.reveal_line = line;
+    p.reveal_frames = 12;
+    dvui.refresh(null, @src(), null);
+}
+
+fn tickPendingReveal(p: *Panel) void {
+    if (p.reveal_frames == 0 or p.reveal_path_len == 0) return;
+    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse {
+        p.reveal_frames = 0;
+        return;
+    };
+    const abs = p.reveal_path_buf[0..p.reveal_path_len];
+    _ = wb.revealPosition(abs, p.reveal_line, 0, false) catch {};
+    p.reveal_frames -= 1;
+    if (p.reveal_frames > 0) dvui.refresh(null, @src(), null);
 }
 
 fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
@@ -6523,7 +6898,8 @@ pub fn wantsRepaintFor(p: *Panel) bool {
         // again. Progress is the honest test: once the camera has arrived, `t` stops moving,
         // whatever value it arrived at.
         (p.framing == .interior and p.interior.nodes.len > 0 and p.interior.t < 0.98 and
-            @abs(p.interior.t - p.interior.t_prev) > 0.0005);
+            @abs(p.interior.t - p.interior.t_prev) > 0.0005) or
+        p.reveal_frames > 0;
 }
 
 test "dropping a vault forgets hover, interior, camera, and the previous generation" {
@@ -6619,6 +6995,18 @@ test "hover is allowed to fill past the lattice gap toward the screen cap" {
     try std.testing.expectEqual(@as(f32, 60), hoverSizeCap(60, 48, 1));
 }
 
+test "a dense interior quadrant shoving the sun would translate the whole cloud" {
+    // giant-0.md: 401 headings on a ring, falloff lighting ~a quadrant (~80 sources).
+    // Each source that still overlaps the sun after radii+gap pushes it by
+    // `(need - d) * neighbor_push`. Stacked, that is larger than the nested berth —
+    // the sun (the visual centre) flies, which reads as the view jumping.
+    const n_src: f32 = 80;
+    const overlap: f32 = 0.4;
+    const flung = n_src * overlap * neighbor_push;
+    const berth = hex.levelSpacing(3) * interior.default_footprint;
+    try std.testing.expect(flung > berth);
+}
+
 test "an interior fit uses the cloud radius, not the overview dinner-plate cap" {
     // A two-item note has a tiny local extent, so `interior.slot` is large relative to the
     // cloud. Capping zoom at `fitMaxGapPx / slot` then forbade the camera from going close
@@ -6634,4 +7022,39 @@ test "an interior fit uses the cloud radius, not the overview dinner-plate cap" 
     // The un-capped fit covers most of the pane; the dinner-plate zoom does not.
     try std.testing.expect(fit_zoom * radius * 2 > vp_short * 0.5);
     try std.testing.expect(dinner_plate * radius * 2 < vp_short * 0.5);
+}
+
+/// A once-read boolean from the process environment.
+///
+/// Read once and cached: these choose how a frame is drawn or how the map is solved, and neither
+/// may change shape between two frames — or between two solves — in one session. The plugin is a
+/// dylib inside the host, so there is no argv of its own to read; the environment is what a
+/// developer can set before launching without a rebuild.
+fn envFlag(comptime name: []const u8, cache: *?bool) bool {
+    if (cache.*) |v| return v;
+    const v = blk: {
+        if (@import("builtin").is_test or @import("builtin").os.tag == .windows) break :blk false;
+        var i: usize = 0;
+        while (std.c.environ[i]) |entry| : (i += 1) {
+            const kv = std.mem.span(entry);
+            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+            if (!std.mem.eql(u8, kv[0..eq], name)) continue;
+            const val = kv[eq + 1 ..];
+            break :blk val.len > 0 and val[0] != '0';
+        }
+        break :blk false;
+    };
+    cache.* = v;
+    return v;
+}
+
+
+/// `ATLAS_HUD=1` shows the per-phase frame breakdown. It is the only way to tell a slow *draw*
+/// from a slow *decision* while the app is running, and the harness cannot see the draw path at
+/// all — `bench --world --zoom` drives `World` directly, with no panel and no dvui.
+fn hudEnabled() bool {
+    const S = struct {
+        var cached: ?bool = null;
+    };
+    return envFlag("ATLAS_HUD", &S.cached);
 }

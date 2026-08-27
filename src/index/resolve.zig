@@ -131,11 +131,47 @@ pub fn resolveIndexed(
     index: ?*const Index,
     buf: []u8,
 ) ?Match {
-    const norm = normalize(target);
+    // Percent-decode first, because a markdown link to a note whose name has a space is written
+    // `[R. N. Ravi](R.%20N.%20Ravi.md)` — that is what editors emit, and it is what the preview
+    // renders as a working link. Undecoded, `R.%20N.%20Ravi` matches no candidate and the edge
+    // simply does not exist: the note is linked on screen and unlinked in the graph, with nothing
+    // to say which. Wikilinks are unaffected (they carry the name verbatim), so this only ever
+    // shows up on the markdown-link form.
+    var decoded: [max_path_len]u8 = undefined;
+    const norm = normalize(percentDecode(target, &decoded));
     if (norm.text.len == 0) return null;
 
     if (norm.is_path) return resolveAsPath(norm, source_path, candidates, index, buf);
     return resolveAsName(norm.text, source_path, candidates, index);
+}
+
+/// Decode `%XX` escapes. Returns `target` untouched when there is nothing to decode, and a slice
+/// of `buf` otherwise. Decoding only ever shortens, so `max_path_len` is always enough.
+///
+/// A lone `%` or a malformed escape is passed through as written: it is far more likely to be a
+/// literal per-cent in a note's name than a truncated escape, and inventing a byte there would
+/// break a link that currently works.
+pub fn percentDecode(target: []const u8, buf: []u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, target, '%') == null) return target;
+    if (target.len > buf.len) return target;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < target.len) {
+        if (target[i] == '%' and i + 2 < target.len) {
+            const hi = std.fmt.charToDigit(target[i + 1], 16) catch null;
+            const lo = std.fmt.charToDigit(target[i + 2], 16) catch null;
+            if (hi != null and lo != null) {
+                buf[n] = hi.? * 16 + lo.?;
+                n += 1;
+                i += 3;
+                continue;
+            }
+        }
+        buf[n] = target[i];
+        n += 1;
+        i += 1;
+    }
+    return buf[0..n];
 }
 
 /// Case-folded lookup tables over a candidate slice.
@@ -740,4 +776,23 @@ test "joinAndClean resolves dot segments" {
 test "joinAndClean refuses to overrun its buffer" {
     var small: [4]u8 = undefined;
     try testing.expectEqual(@as(?[]const u8, null), joinAndClean("", "aaa/bbb", &small));
+}
+
+test "a markdown link to a spaced note name resolves through its percent escapes" {
+    // `[R. N. Ravi](R.%20N.%20Ravi.md)` is what an editor writes for a note whose name has spaces,
+    // and the preview renders it as a working link. The graph resolved it against the candidate
+    // list verbatim, matched nothing, and silently dropped the edge — a note visibly linked in the
+    // document and absent from the map.
+    const candidates = [_]Candidate{
+        .{ .path = "R. N. Ravi.md", .stem = "R. N. Ravi" },
+        .{ .path = "Ashwani Kumar (politician).md", .stem = "Ashwani Kumar (politician)" },
+    };
+    var buf: [max_path_len]u8 = undefined;
+    const m = resolve("R.%20N.%20Ravi.md", "Ashwani Kumar (politician).md", &candidates, &buf);
+    try std.testing.expect(m != null);
+    try std.testing.expectEqual(@as(usize, 0), m.?.index);
+
+    // A literal per-cent that is not an escape stays literal.
+    var buf2: [max_path_len]u8 = undefined;
+    try std.testing.expectEqualStrings("100% done", percentDecode("100% done", &buf2));
 }

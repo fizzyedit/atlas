@@ -639,6 +639,10 @@ pub fn convertWikilinks(
     bytes: []const u8,
     src_rel: []const u8,
     candidates: []const resolve.Candidate,
+    /// Lookup tables over `candidates`; null falls back to scanning them. A document being
+    /// converted has as many links as it has, and each one would otherwise be a pass over the
+    /// whole vault — on a save, on the UI thread.
+    index: ?*const resolve.Index,
     media: []const resolve.Candidate,
 ) !?[]const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -667,7 +671,7 @@ pub fn convertWikilinks(
             fence_char = f.char;
             fence_len = f.len;
             try out.appendSlice(arena, line);
-        } else if (try convertLine(arena, &out, content, src_rel, candidates, media)) {
+        } else if (try convertLine(arena, &out, content, src_rel, candidates, index, media)) {
             changed = true;
             // `content` dropped a trailing `\r`; put it back so line endings survive.
             if (content.len != line.len) try out.appendSlice(arena, line[content.len..]);
@@ -695,6 +699,7 @@ fn convertLine(
     line: []const u8,
     src_rel: []const u8,
     candidates: []const resolve.Candidate,
+    index: ?*const resolve.Index,
     media: []const resolve.Candidate,
 ) !bool {
     var scratch: std.ArrayList(u8) = .empty;
@@ -720,6 +725,8 @@ fn convertLine(
                 if (embed) {
                     // The `!` sits before the slice we tokenized, so it is already in `scratch`
                     // (or is `tok.embed`'s own leading byte). Emit only the `[...](...)` part.
+                    // Media stays a linear scan: `index` covers notes, and there are few
+                    // enough attachments that building a second one would not pay for itself.
                     if (resolve.resolve(tok.target, src_rel, media, &buf)) |m| {
                         const label = if (tok.alias.len > 0) tok.alias else tok.target;
                         try writeMarkdownLink(arena, &scratch, label, media[m.index].path, src_rel, "");
@@ -728,7 +735,7 @@ fn convertLine(
                         continue;
                     }
                 } else if (resolve.isNoteLikeTarget(tok.target)) {
-                    if (resolve.resolve(tok.target, src_rel, candidates, &buf)) |m| {
+                    if (resolve.resolveIndexed(tok.target, src_rel, candidates, index, &buf)) |m| {
                         const label = if (tok.alias.len > 0) tok.alias else tok.target;
                         try writeMarkdownLink(arena, &scratch, label, candidates[m.index].path, src_rel, tok.heading);
                         i += tok.end;
@@ -1249,7 +1256,7 @@ const conv_media = [_]resolve.Candidate{
 };
 
 fn convert(src: []const u8, src_rel: []const u8) !?[]const u8 {
-    return convertWikilinks(testing.allocator, src, src_rel, &conv_candidates, &conv_media);
+    return convertWikilinks(testing.allocator, src, src_rel, &conv_candidates, null, &conv_media);
 }
 
 fn expectConverted(src: []const u8, src_rel: []const u8, want: []const u8) !void {

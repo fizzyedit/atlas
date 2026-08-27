@@ -200,6 +200,19 @@ pub const Options = struct {
 /// calibrated against "a real link" — `folder_w` above, the link budgets downstream — keeps its
 /// meaning. At `p = 1` on the reference corpus this runs from about 0.06 for a link to the largest
 /// hub up to about 4 for a link between two rarely-cited notes.
+/// Round `x` to `digits` significant figures.
+///
+/// For constants that scale a whole vault's weights: the exact value carries no meaning the layout
+/// depends on, while its *stability* under an edit decides whether the map holds still. See the use
+/// in `degreeNormalised`.
+fn quantiseSignificant(x: f32, digits: i32) f32 {
+    if (!(x > 0) or !std.math.isFinite(x)) return x;
+    const mag = @floor(@log10(x));
+    const step = std.math.pow(f32, 10, mag - @as(f32, @floatFromInt(digits - 1)));
+    if (!(step > 0) or !std.math.isFinite(step)) return x;
+    return @round(x / step) * step;
+}
+
 pub fn degreeNormalised(
     gpa: std.mem.Allocator,
     n_notes: usize,
@@ -227,7 +240,22 @@ pub fn degreeNormalised(
         @memcpy(out, links);
         return out;
     }
-    const mean_deg: f32 = 2.0 * @as(f32, @floatFromInt(counted)) / @as(f32, @floatFromInt(n_notes));
+    // Quantised, because this one number scales *every* edge weight in the vault.
+    //
+    // `mean_deg` is global: it is derived from the total link count, so adding a single link moves
+    // it, and moving it re-weights all 3.35M edges at once. Each weight changes by about three
+    // parts in ten million — invisible on its own, and decisive in aggregate. The region-graph
+    // force solve reads those weights, so it settles somewhere fractionally different *everywhere*,
+    // and one added link moves the median note 14 radii with the whole map reshuffling behind it.
+    // That is the "a single link changes the entire graph" symptom the territories design exists to
+    // remove, and it survived every structural fix because it was never structural.
+    //
+    // Rounding to four significant figures makes the constant a step function of vault size: an
+    // ordinary edit cannot cross a step, so the weights come back bit-identical and everything
+    // downstream — the memo, the placement, the reader's view — holds still. It stays a pure
+    // function of the vault, so a cold open still reproduces the same map.
+    const mean_raw: f32 = 2.0 * @as(f32, @floatFromInt(counted)) / @as(f32, @floatFromInt(n_notes));
+    const mean_deg: f32 = quantiseSignificant(mean_raw, 4);
 
     const k2 = mean_deg * mean_deg;
     if (p == 1) {

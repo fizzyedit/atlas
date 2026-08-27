@@ -64,6 +64,16 @@ pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, li
 /// shimmering. The colour was never the problem: `intoBg` returns an opaque mix, so a line is a
 /// solid colour and its *coverage* is what was flickering.
 const web_px: f32 = 1.0;
+/// The heaviest routes, against `web_px` for the lightest.
+///
+/// A coalesced view is *all* routes between places — coalescing already removed the links inside
+/// one place — so "street versus highway" has nothing left to separate. What is left to separate is
+/// how much traffic a route carries, which is what a road map grades: a few thick trunk roads read
+/// as structure, and a field of eight hundred identical strokes reads as noise, even when it is the
+/// same eight hundred lines. Graded by weight against the frame's own median, so the scale follows
+/// the vault instead of a constant that only suits one.
+const web_px_heavy: f32 = 2.2;
+const web_ink_heavy: f32 = 1.5;
 const focus_web_px: f32 = 1.8;
 
 /// Ambient-web mix. Constant, not a function of how many lines are on screen.
@@ -72,7 +82,7 @@ const focus_web_px: f32 = 1.8;
 /// added or culled lines recoloured *every* surviving edge. That was the flash. Overlaps
 /// already stay one shade (`intoBg` is opaque), so a dense web is a texture of this colour
 /// rather than a glow — there is nothing left for a count-based mix to do except pulse.
-const ambient_mix: f32 = 0.28;
+const ambient_mix: f32 = 0.14;
 /// Focused-note links, also constant, and kept well above the ambient web so the answer to
 /// "what does this note connect to" stays the brightest lines on screen.
 const focus_mix: f32 = 0.55;
@@ -200,6 +210,17 @@ pub fn draw(
         defer lit_segs.deinit(arena);
         const lit_base = theme.color(.highlight, .fill);
         const ambient_t = ambient_mix * fade;
+        // Median weight of the ambient web this frame, for the stroke grading below. Nth-element
+        // over a scratch copy — the frame arena already holds the link list, and a full sort of ten
+        // thousand weights to read one of them is the kind of thing that ends up in a trace.
+        const w_median: f32 = blk: {
+            const count = w.links.items.len;
+            if (count == 0) break :blk 0;
+            const ws = arena.alloc(f32, count) catch break :blk 0;
+            for (ws, w.links.items) |*x, l| x.* = l.w;
+            std.mem.sort(f32, ws, {}, std.sort.asc(f32));
+            break :blk ws[count / 2];
+        };
         const focus_t = focus_mix * fade;
 
         // Where a link's endpoint is, even when that endpoint has no mark this frame.
@@ -292,9 +313,36 @@ pub fn draw(
             // worse than blinking them: the mix targeted `.window.fill`, which is not the graph's
             // backdrop, so a fade ended on a *different colour* instead of on nothing. That was a
             // true observation about a broken target, not about crossfading.
-            const t = ambient_t * std.math.clamp(l.alpha, 0, 1);
+            // 0 at the median, 1 at four times it. Heavy-tailed weights, so the median is the
+            // honest middle and the cap stops one hub-to-hub aggregate owning the whole scale.
+            const grade = if (w_median > 0)
+                std.math.clamp((l.w / w_median - 1) / 3, 0, 1)
+            else
+                0;
+            // Arrive on the *split's* clock, not a clock of the web's own.
+            //
+            // `mul` is a cell's accumulated parent openness: 1 at rest, and ramping 0 -> 1 exactly
+            // while the parent that contains it is opening. `present` already slides the cell's
+            // pose out from that parent's centre over the same ramp, so both ends of a line born
+            // from a split begin *at the parent point* and travel outward. Keying the line's
+            // strength to the same number is what makes it extend to meet the notes instead of
+            // fading in beside them on an unrelated six-frame timer — and it costs two array reads,
+            // because the world computed it for the marks already.
+            //
+            // Runs in reverse on a merge, for free: as children retract into their parent, `mul`
+            // falls and their lines retract with them.
+            //
+            // Live links only. A ghost's cells may not have been walked for many frames, so its
+            // `mul` is whatever it was when the cut last touched it; departures stay on the
+            // crossfade, which is the thing that knows they are leaving.
+            var t = @min(ambient_t * std.math.clamp(l.alpha, 0, 1) *
+                std.math.lerp(@as(f32, 1), web_ink_heavy, grade), 1);
+            if (l.w > 0 and l.a < w.mul.len and l.b < w.mul.len) {
+                t *= @min(w.mul[l.a], w.mul[l.b]);
+            }
             if (t <= 0.004) continue;
-            batch.add(seg.a, seg.b, web_px * galaxy.dpiScale(), galaxy.intoBg(border_rest, bg, t));
+            const px = std.math.lerp(web_px, web_px_heavy, grade);
+            batch.add(seg.a, seg.b, px * galaxy.dpiScale(), galaxy.intoBg(border_rest, bg, t));
             stats.links_drawn += 1;
         }
 

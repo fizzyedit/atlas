@@ -94,6 +94,13 @@ pub const Opts = struct {
     /// `error.Canceled`. A full-vault solve runs for seconds on a worker thread, and shutdown
     /// must not have to wait it out — this code lives in a dylib that is about to be unloaded.
     cancel: ?*std.atomic.Value(bool) = null,
+    /// Per-node mass, one entry per note. Null means every node is 1. A region-graph solve
+    /// passes community sizes so a large territory clears more room than a small one.
+    mass: ?[]const f32 = null,
+    /// Pull toward the origin. The live vault solve keeps the default; a region graph that
+    /// will be packed as discs afterwards wants 0, or gravity squashes the adjacency the
+    /// springs just found into a cookie-cutter disc.
+    gravity: f32 = gravity_k,
 };
 
 /// The coarsening hierarchy the solve built on its way down.
@@ -213,7 +220,12 @@ pub fn solve(
     // clears proportionally more room than a lone note.
     var mass = try allocator.alloc(f32, n);
     defer allocator.free(mass);
-    @memset(mass, 1);
+    if (opts.mass) |m| {
+        std.debug.assert(m.len >= n);
+        @memcpy(mass, m[0..n]);
+    } else {
+        @memset(mass, 1);
+    }
 
     // -- coarsen -----------------------------------------------------------------------
     // Each entry maps that level's nodes up to the next coarser level's.
@@ -288,8 +300,8 @@ pub fn solve(
     // -- solve the coarsest ------------------------------------------------------------
     var pos = try allocator.alloc(dvui.Point, cur_n);
     defer allocator.free(pos);
-    seedSpiral(pos[0..cur_n]);
-    try relax(allocator, n, cur_n, level_edges.items, mass, pos, opts.max_iters, opts.cancel);
+    seedCloud(pos[0..cur_n]);
+    try relax(allocator, n, cur_n, level_edges.items, mass, pos, opts.max_iters, opts.cancel, opts.gravity);
 
     // -- project back down -------------------------------------------------------------
     var level = ladder.items.len;
@@ -328,7 +340,7 @@ pub fn solve(
         const t = @as(f32, @floatFromInt(level)) / @as(f32, @floatFromInt(@max(ladder.items.len, 1)));
         const iters_f = @as(f32, @floatFromInt(opts.min_iters)) +
             (@as(f32, @floatFromInt(opts.max_iters)) - @as(f32, @floatFromInt(opts.min_iters))) * t;
-        try relax(allocator, n, fine_n, fine_edges, fine_mass, pos, @intFromFloat(iters_f), opts.cancel);
+        try relax(allocator, n, fine_n, fine_edges, fine_mass, pos, @intFromFloat(iters_f), opts.cancel, opts.gravity);
 
         // Done with this level; the finer ones below still have to be held.
         allocator.free(level_sets.items[level]);
@@ -509,6 +521,7 @@ fn relax(
     pos: []dvui.Point,
     iters: usize,
     cancel: ?*std.atomic.Value(bool),
+    gravity: f32,
 ) !void {
     if (n < 2 or iters == 0) return;
     const force = try allocator.alloc(dvui.Point, n);
@@ -556,8 +569,8 @@ fn relax(
         prof.attract_ns += plap(&pt);
 
         for (0..n) |i| {
-            var fx = force[i].x - pos[i].x * gravity_k;
-            var fy = force[i].y - pos[i].y * gravity_k;
+            var fx = force[i].x - pos[i].x * gravity;
+            var fy = force[i].y - pos[i].y * gravity;
             const fl = @sqrt(fx * fx + fy * fy);
             if (fl > step and fl > 1e-6) {
                 fx *= step / fl;
@@ -1114,12 +1127,16 @@ fn pairForceOn(pos: []const dvui.Point, force: []dvui.Point, mass: []const f32, 
 }
 
 
-fn seedSpiral(pos: []dvui.Point) void {
-    const golden = 2.39996322972865332;
+fn seedCloud(pos: []dvui.Point) void {
+    // A disc of jitter, not a golden-angle spiral. The spiral was a compact seed that the force
+    // solve never fully forgot on trees and chains — those graphs have too few cycles to pull
+    // a spiral into a cloud, so the seed *was* the shape. Density matches `spacing` so the
+    // first relax step is not a gas explosion.
+    const n = pos.len;
+    const R = spacing * @sqrt(@as(f32, @floatFromInt(@max(n, 1))));
     for (pos, 0..) |*p, i| {
-        const r = spacing * 0.9 * @sqrt(@as(f32, @floatFromInt(i)) + 0.5);
-        const a = @as(f32, @floatFromInt(i)) * golden;
-        p.* = .{ .x = @cos(a) * r, .y = @sin(a) * r };
+        const jt = jitter(i);
+        p.* = .{ .x = jt[0] * R * 0.75, .y = jt[1] * R * 0.75 };
     }
 }
 

@@ -603,3 +603,76 @@ test "blocks, tags, and embeds attach to the nearest enclosing heading" {
     try testing.expectEqual(@as(u32, 3), cg.items[paragraph_idx.?].weight);
     try testing.expectEqual(@as(u32, 4), cg.items[list_idx.?].weight);
 }
+
+test "completion seeks the stem index instead of scanning the table" {
+    // The regression this guards is a UI freeze, not a wrong answer: `stem_fold LIKE 'ab%'`
+    // returns exactly the right rows, but sqlite's case-insensitive LIKE refuses the
+    // BINARY-collated index, so every keystroke scanned all 286k rows of a Wikipedia-sized
+    // vault and sorted the survivors — ~270 ms of stalled typing. Only the plan can tell the
+    // two apart, so the plan is what's asserted.
+    const gpa = testing.allocator;
+    var tmp = try TempDir.create(gpa, "complete-plan");
+    defer tmp.destroy(gpa);
+
+    var db = try tmp.open(gpa, "/some/vault");
+    defer db.close(gpa);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const Step = struct { id: i64, parent: i64, notused: i64, detail: []const u8 };
+    var stmt = try db.conn.prepare(
+        \\EXPLAIN QUERY PLAN
+        \\SELECT stem, path, title FROM notes
+        \\WHERE phantom = 0 AND stem_fold >= 'ab' AND stem_fold < 'ac'
+        \\ORDER BY stem_fold LIMIT 64
+    );
+    defer stmt.deinit();
+    var iter = try stmt.iterator(Step, .{});
+
+    var seeks: usize = 0;
+    while (try iter.nextAlloc(arena.allocator(), .{})) |step| {
+        // A full scan, or a temp b-tree that has to see every matching row before the LIMIT
+        // can take 64 of them — either one is the freeze coming back.
+        try testing.expect(std.mem.indexOf(u8, step.detail, "SCAN notes") == null);
+        try testing.expect(std.mem.indexOf(u8, step.detail, "TEMP B-TREE") == null);
+        if (std.mem.indexOf(u8, step.detail, "SEARCH") != null and
+            std.mem.indexOf(u8, step.detail, "notes_stem_fold") != null) seeks += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), seeks);
+}
+
+test "completion matches case-insensitively and treats LIKE wildcards as text" {
+    const gpa = testing.allocator;
+    var tmp = try TempDir.create(gpa, "complete-rows");
+    defer tmp.destroy(gpa);
+
+    var db = try tmp.open(gpa, "/some/vault");
+    defer db.close(gpa);
+
+    try db.conn.exec("INSERT INTO notes(id,path,stem,stem_fold,title) VALUES(1,'AB Aurigae.md','AB Aurigae','ab aurigae','')", .{}, .{});
+    try db.conn.exec("INSERT INTO notes(id,path,stem,stem_fold,title) VALUES(2,'Ab Anar.md','Ab Anar','ab anar','')", .{}, .{});
+    try db.conn.exec("INSERT INTO notes(id,path,stem,stem_fold,title) VALUES(3,'Zebra.md','Zebra','zebra','Zebra')", .{}, .{});
+    try db.conn.exec("INSERT INTO notes(id,path,stem,stem_fold,title) VALUES(4,'Ghost.md','Ghost','ghost','')", .{}, .{});
+    try db.conn.exec("UPDATE notes SET phantom = 1 WHERE id = 4", .{}, .{});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Folded order, so the two spellings of `ab` sort together rather than splitting on case.
+    const ab = try query.complete(&db, a, "AB", 64);
+    try testing.expectEqual(@as(usize, 2), ab.len);
+    try testing.expectEqualStrings("Ab Anar", ab[0].target);
+    try testing.expectEqualStrings("AB Aurigae", ab[1].target);
+    // Title falls back to the stem when the note has none.
+    try testing.expectEqualStrings("Ab Anar", ab[0].title);
+
+    // An empty prefix is every real note, still capped by the limit; phantoms stay out.
+    const all = try query.complete(&db, a, "", 64);
+    try testing.expectEqual(@as(usize, 3), all.len);
+    try testing.expectEqual(@as(usize, 1), (try query.complete(&db, a, "", 1)).len);
+
+    // `%` used to be a wildcard the user could type by accident and match the whole vault.
+    try testing.expectEqual(@as(usize, 0), (try query.complete(&db, a, "%", 64)).len);
+    try testing.expectEqual(@as(usize, 0), (try query.complete(&db, a, "_ebra", 64)).len);
+}

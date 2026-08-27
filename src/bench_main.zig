@@ -18,6 +18,8 @@
 //! | `--world` | the level-of-detail sweep across a zoom range |
 //! | `--interior` | the same sweep for a single note's content cloud |
 //! | `--stats` | graph structure (degree, components, hub fragility) — no layout |
+//! | `--shapes` | one row per vault: layout grade (spread, overlap, bimodality, displacement) |
+//! | `--stability` | Gate 1: cold cluster, add one edge, cold cluster, how many notes flip |
 //!
 //! Tuning flags: `--place pack|layout`, `--budget=N`, `--link-budget=N`, `--scan-cap=N`,
 //! `--reps=N`, `--svg <dir>`.
@@ -40,6 +42,7 @@ const spatial = @import("ui/spatial.zig");
 const louvain = @import("ui/louvain.zig");
 const layout = @import("ui/layout.zig");
 const cellweb = @import("ui/cellweb.zig");
+const shape_metrics = @import("ui/shape_metrics.zig");
 
 /// When set (via `--svg <dir>`), every solved layout is also written there as an SVG.
 var svg_dir: ?[]const u8 = null;
@@ -51,10 +54,16 @@ var synth_place_explicit: bool = false;
 /// correlation) instead of running layout. Fast even on a huge vault — no force solve, no Galaxy.
 var stats_mode: bool = false;
 var world_mode: bool = false;
-/// `--budget=N`: the mark budget the `--world` sweep runs at. The panel's own slider goes to
+/// `--budget=N`: the mark budget the `--world` sweep runs at.
+///
+/// Defaults to the top of the "Graph quality" slider, because that is where the map is actually
+/// being run and judged — not to `plugin_mark_budget`. A bench tuned to a setting nobody uses
+/// reports comfort the reader never sees: at 4,000 the panel draws 10,000 links, eleven times the
+/// 900 the old default measured.
+/// The panel's own slider goes to
 /// 4000, and several per-frame costs scale with it rather than with note count, so a sweep pinned
 /// at the 280 default cannot see them.
-var world_budget: usize = 280;
+var world_budget: usize = 4000;
 /// `--pan`: after settling each zoom, keep stepping with the camera *moving*, and report what a
 /// frame costs then. The settled numbers below it are the parked-camera steady state; a pan is the
 /// case the reader actually complains about, because it invalidates the lift cache every frame.
@@ -93,6 +102,9 @@ const sweep_centre_note: u32 = 0;
 /// pan at 60 fps (~800 px/s); a flick is several times that, and the interesting failures are all
 /// at the fast end.
 var world_pan_px: f32 = 13;
+/// `--zoom`: travel in and out repeatedly on one `World`, to catch cost that *accumulates*.
+var world_zoom_travel: bool = false;
+var world_zoom_cycles: u32 = 8;
 /// `--scan-cap=N`: `Params.link_scan_cap`, so a sweep can show what the cap is costing.
 var world_scan_cap: usize = 256;
 /// `--split-px=N`: `Params.split_px`, the on-screen radius at which a cell opens. The panel scales
@@ -120,6 +132,25 @@ var index_edit: bool = false;
 /// window to sample. Looping gives a stable number and a profile long enough to read.
 var refold_mode: bool = false;
 var refold_reps: usize = 5;
+/// `--shapes`: one compact row per vault (or per child vault of a gauntlet parent).
+var shapes_mode: bool = false;
+/// Skip the second solve that grades single-edge displacement. Fast iteration only.
+var shapes_no_displace: bool = false;
+/// `--no-territories`: solve as one global force layout instead of the default territories, so a
+/// change can still be graded against what it replaced.
+var shapes_territories: bool = true;
+/// `--frame-max=N` / `--region-max=N`: the two sizes that decide how the vault is cut up for
+/// placement, exposed so the trade between link locality and stability can be swept.
+var shapes_frame_max: usize = 0;
+var shapes_region_max: u32 = 0;
+var shapes_header_printed: bool = false;
+/// `--churn`: how many *territories* come back different after one added link, with the
+/// post-clustering stages switched on and off, so the churn can be attributed to a stage.
+var churn_mode: bool = false;
+/// `--stability`: Gate 1 — cold Louvain, one extra edge, cold Louvain, how many notes flip.
+var stability_mode: bool = false;
+var stability_trials: u32 = 21;
+var stability_header_printed: bool = false;
 
 const Note = struct {
     path: []const u8,
@@ -141,8 +172,10 @@ pub fn main(init: std.process.Init) !void {
             \\  target = <vault-dir> | synth:N[:shape[:avg_deg]]
             \\  shapes = scale-free | islands | hub | bipartite | chain | orphans | lfr
             \\  modes  = --index | --index-warm | --index-edit | --refold
-            \\           --world | --interior | --stats   (default: scan/resolve/place table)
+            \\           --world | --interior | --stats | --shapes | --stability
+            \\           (default: scan/resolve/place table)
             \\  flags  = --place pack|layout  --budget=N  --scan-cap=N  --reps=N  --svg <dir>
+            \\           --no-displace  --no-territories  --trials=N  --resolution=F
             \\
         , .{});
         return error.MissingArgument;
@@ -152,9 +185,32 @@ pub fn main(init: std.process.Init) !void {
     // regardless of where it appears among the targets.
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--stats")) stats_mode = true;
+        if (std.mem.eql(u8, a, "--shapes")) shapes_mode = true;
+        if (std.mem.eql(u8, a, "--stability")) stability_mode = true;
+        if (std.mem.eql(u8, a, "--churn")) churn_mode = true;
+        if (std.mem.startsWith(u8, a, "--trials=")) {
+            stability_trials = std.fmt.parseInt(u32, a["--trials=".len..], 10) catch stability_trials;
+        }
+        if (std.mem.eql(u8, a, "--no-displace")) shapes_no_displace = true;
+        if (std.mem.eql(u8, a, "--no-territories")) shapes_territories = false;
+        if (std.mem.startsWith(u8, a, "--frame-max=")) {
+            shapes_frame_max = std.fmt.parseInt(usize, a["--frame-max=".len..], 10) catch shapes_frame_max;
+        }
+        if (std.mem.startsWith(u8, a, "--region-max=")) {
+            shapes_region_max = std.fmt.parseInt(u32, a["--region-max=".len..], 10) catch shapes_region_max;
+        }
         if (std.mem.eql(u8, a, "--world")) world_mode = true;
         if (std.mem.eql(u8, a, "--pan")) {
             world_pan = true;
+            world_mode = true;
+        }
+        if (std.mem.eql(u8, a, "--zoom")) {
+            world_zoom_travel = true;
+            world_mode = true;
+        }
+        if (std.mem.startsWith(u8, a, "--cycles=")) {
+            world_zoom_cycles = std.fmt.parseInt(u32, a["--cycles=".len..], 10) catch world_zoom_cycles;
+            world_zoom_travel = true;
             world_mode = true;
         }
         if (std.mem.startsWith(u8, a, "--zoom-mul=")) {
@@ -236,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (!stats_mode and !world_mode and !index_mode and !refold_mode) {
+    if (!stats_mode and !world_mode and !index_mode and !refold_mode and !shapes_mode and !stability_mode) {
         std.debug.print(
             "{s:<22}{s:>7}{s:>8}{s:>9}{s:>8}{s:>10}{s:>8}{s:>9}{s:>8}{s:>8}{s:>9}{s:>11}\n",
             .{ "vault", "notes", "edges", "read", "scan", "resolve", "hop2", "force", "pack", "relax", "snap+ref", "LAYOUT" },
@@ -271,6 +327,16 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--stats")) {
             continue; // handled in the pre-pass above
         }
+        if (std.mem.eql(u8, a, "--shapes")) continue;
+        if (std.mem.eql(u8, a, "--stability")) continue;
+        if (std.mem.eql(u8, a, "--churn")) continue;
+        if (std.mem.startsWith(u8, a, "--trials=")) continue;
+        if (std.mem.eql(u8, a, "--no-displace")) continue;
+        if (std.mem.eql(u8, a, "--no-territories")) continue;
+        if (std.mem.startsWith(u8, a, "--frame-max=")) continue;
+        if (std.mem.startsWith(u8, a, "--region-max=")) continue;
+        if (std.mem.eql(u8, a, "--zoom")) continue;
+        if (std.mem.startsWith(u8, a, "--cycles=")) continue;
         if (std.mem.eql(u8, a, "--place")) {
             i += 1;
             if (i >= args.len) return error.MissingArgument;
@@ -305,11 +371,19 @@ pub fn main(init: std.process.Init) !void {
             }
             if (world_mode) {
                 try worldSynth(gpa, io, spec);
+            } else if (stability_mode) {
+                try stabilitySynth(gpa, io, spec);
             } else if (stats_mode) {
                 try statsSynth(gpa, io, spec);
             } else {
                 try benchSynth(gpa, io, spec);
             }
+        } else if (churn_mode) {
+            try churnTarget(gpa, io, a);
+        } else if (stability_mode) {
+            try stabilityTarget(gpa, io, a);
+        } else if (shapes_mode) {
+            try shapesTarget(gpa, io, a);
         } else if (refold_mode) {
             try refoldVault(gpa, io, a);
         } else if (index_mode) {
@@ -486,7 +560,8 @@ fn clusterReport(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fo
     for (ledges, edges) |*d, e| d.* = .{ .a = e.a, .b = e.b, .w = e.w };
 
     const t0 = now(io);
-    var res = try louvain.cluster(gpa, n, ledges, .{ .resolution = cluster_resolution });
+    // The one caller that actually reads `q` — see `louvain.Options.measure_q`.
+    var res = try louvain.cluster(gpa, n, ledges, .{ .resolution = cluster_resolution, .measure_q = true });
     defer res.deinit(gpa);
     const cluster_ns = elapsed(io, t0);
 
@@ -557,7 +632,10 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     // The same two stages the panel runs: solve for positions, then group them. Building through
     // `World.init` instead would measure a path the app no longer takes — which is how this sweep
     // once came to report parameters nothing shipped with.
-    var lay = try layout.solve(gpa, n, edges, paths, .{ .note_r = place_opts.note_r });
+    var lay = try layout.solve(gpa, n, edges, paths, .{
+        .note_r = place_opts.note_r,
+        .territories = shapes_territories,
+    });
     const solve_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
     {
         const mp = multilevel.prof;
@@ -652,6 +730,11 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
         }
         std.debug.print("\n", .{});
     }
+    // Kept past `lay.deinit` for the stage split below, which rebuilds `spatial` from them.
+    const lay_pos = try gpa.dupe(spatial.Vec2, lay.pos);
+    defer gpa.free(lay_pos);
+    const lay_comp = try gpa.dupe(u32, lay.comp);
+    defer gpa.free(lay_comp);
     lay.deinit(gpa);
     defer w.deinit();
     const build_ns: u64 = @intCast(std.Io.Clock.boot.now(io).nanoseconds - build_t0);
@@ -676,46 +759,91 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             world_link_budget
         else
             world_mod.Params.ambientLinkBudget(budget),
+        .links_per_cell = 2,
         .link_scan_cap = world_scan_cap,
         .split_px = world_split_px,
     };
-    const vw: f32 = 1200;
-    const vh: f32 = 700;
+    // The pane the graph actually gets, not a token viewport. Marks and links are selected by
+    // what falls inside it, so a half-size window measures half the load.
+    const vw: f32 = 2400;
+    const vh: f32 = 980;
     const ext = w.extent();
     const z_fit = @min(vw, vh) * 0.44 / ext;
 
     std.debug.print("\n==== world: {s} ====\n", .{label});
-    std.debug.print("  notes={d}  links={d}  ladder depth={d}  cells={d}  root r={d:.1}\n", .{
-        n, edges.len, w.lad.depth, w.lad.cells.len, ext,
+    // `roots` is the floor on the drawn set: nothing above it can coalesce, so a vault with
+    // thousands of roots cannot honour a mark budget at any zoom, however far out the reader goes.
+    std.debug.print("  notes={d}  links={d}  ladder depth={d}  cells={d}  roots={d}  root r={d:.1}\n", .{
+        n, edges.len, w.lad.depth, w.lad.cells.len, w.lad.roots.len, ext,
     });
-    // Split the two halves by building them once more on their own. Costs one extra build in the
-    // bench and tells us which stage a rebuild is actually spending its seconds in.
-    var fold_ns: u64 = 0;
+    // Split the stages by building them once more on their own. Costs one extra build in the bench
+    // and tells us which one a rebuild is actually spending its seconds in.
+    //
+    // These are the stages `World.buildFrom` runs, which are **not** the ones this used to report.
+    // It timed `fold.build`, and the positions-first rewrite stopped calling it here: the drawing
+    // hierarchy comes from `spatial.build` over the solved positions now. So the line blamed 589 ms
+    // on a function this path does not execute, which is the same failure the `link_budget` comment
+    // in `Params.ambientLinkBudget` warns about — a bench that measures something other than the
+    // thing it stands in for is worse than no bench.
+    var norm_ns: u64 = 0;
+    var spat_ns: u64 = 0;
     var web_ns: u64 = 0;
     {
         const f0 = std.Io.Clock.boot.now(io).nanoseconds;
-        var lad2 = try fold.build(gpa, n, edges, paths, fold_opts);
-        defer lad2.deinit(gpa);
+        const scored = try fold.degreeNormalised(gpa, n, edges, fold_opts.degree_norm);
+        defer gpa.free(scored);
         const f1 = std.Io.Clock.boot.now(io).nanoseconds;
-        var web2 = try cellweb.build(gpa, &lad2, edges);
-        defer web2.deinit(gpa);
+        const wnote = try gpa.alloc(f32, n);
+        defer gpa.free(wnote);
+        @memset(wnote, 0);
+        for (edges) |e| {
+            if (e.a >= n or e.b >= n or e.a == e.b) continue;
+            wnote[e.a] += 1;
+            wnote[e.b] += 1;
+        }
+        const body = try gpa.alloc(f32, n);
+        defer gpa.free(body);
+        @memset(body, 0);
+        var spat2 = try spatial.build(gpa, n, lay_pos, lay_comp, wnote, body, .{});
+        defer spat2.deinit(gpa);
         const f2 = std.Io.Clock.boot.now(io).nanoseconds;
-        fold_ns = @intCast(f1 - f0);
-        web_ns = @intCast(f2 - f1);
+        var web2 = try cellweb.build(gpa, &spat2.lad, scored);
+        defer web2.deinit(gpa);
+        const f3 = std.Io.Clock.boot.now(io).nanoseconds;
+        norm_ns = @intCast(f1 - f0);
+        spat_ns = @intCast(f2 - f1);
+        web_ns = @intCast(f3 - f2);
     }
     std.debug.print(
-        "  World.init (per republish) = {d:.0} ms   [fold.build {d:.0} ms  cellweb {d:.0} ms]\n",
+        "  World.init (per republish) = {d:.0} ms   [degreeNorm {d:.0} ms  spatial {d:.0} ms  cellweb {d:.0} ms]\n",
         .{
             @as(f64, @floatFromInt(build_ns)) / 1e6,
-            @as(f64, @floatFromInt(fold_ns)) / 1e6,
+            @as(f64, @floatFromInt(norm_ns)) / 1e6,
+            @as(f64, @floatFromInt(spat_ns)) / 1e6,
             @as(f64, @floatFromInt(web_ns)) / 1e6,
         },
     );
+    // Before `layoutReport`, deliberately. That diagnostic walks the whole ladder and leaves
+    // every cell's children placed, and the app never does — travelling a cold field is part of
+    // what the probe is measuring.
+    if (world_zoom_travel) {
+        // Centred on a real note for the same reason the static sweep is: at leaf zoom the world
+        // origin is empty space between notes, and a probe that draws nothing measures nothing.
+        var cx: f32 = 0;
+        var cy: f32 = 0;
+        if (w.noteWorldPos(if (world_focus >= 0) @intCast(world_focus) else sweep_centre_note)) |fp| {
+            cx = fp.x;
+            cy = fp.y;
+        }
+        try zoomProbe(io, &w, .{ .w = vw, .h = vh, .zoom = z_fit, .cx = cx, .cy = cy }, params, z_fit);
+        return;
+    }
     try layoutReport(gpa, io, &w, edges, paths, label);
-    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6}   {s:>7} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{
+    std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6} {s:>8} {s:>6} {s:>6} {s:>6}  {s:>7} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{
         "zoom",  "marks",  "notes",   "masses",  "links",   "drawn",
-        "bound", "clr ms", "topo ms", "pres ms", "lift ms", "frame ms",
+        "bound", "cand", "chwy%", "hwy%", "mute%", "clr ms", "topo ms", "pres ms", "lift ms", "frame ms",
     });
+
 
     var zoom = z_fit;
     var stepn: usize = 0;
@@ -779,7 +907,30 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
                     "",
             });
         }
-        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6}   {d:>7.2} {d:>7.2} {d:>7.2} {d:>7.2} {d:>8.2}\n", .{
+        var hwy_n: usize = 0;
+        for (w.links.items) |l| {
+            if (l.highway) hwy_n += 1;
+        }
+        // Drawn marks with no line touching them, as a share of those that *have* a link in the
+        // graph. This is the "floating island" the reader sees: a cluster the budget left mute,
+        // which reads as unconnected and then sprouts a dozen connections one zoom step later.
+        var mute_n: usize = 0;
+        var linked_n: usize = 0;
+        {
+            var touched = std.AutoHashMapUnmanaged(u32, void){};
+            defer touched.deinit(gpa);
+            for (w.links.items) |l| {
+                try touched.put(gpa, l.a, {});
+                try touched.put(gpa, l.b, {});
+            }
+            for (w.marks.items) |m| {
+                const lo, const hi = w.web.range(m.cell);
+                if (hi <= lo) continue;
+                linked_n += 1;
+                if (!touched.contains(m.cell)) mute_n += 1;
+            }
+        }
+        std.debug.print("  {d:>9.3}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {d:>7}  {s:>6} {d:>8} {d:>5}% {d:>5}% {d:>5}%  {d:>7.2} {d:>7.2} {d:>7.2} {d:>7.2} {d:>8.2}\n", .{
             zoom,
             w.marks.items.len,
             notes,
@@ -787,6 +938,10 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             w.links.items.len,
             drawn,
             if (w.bound) "Y" else "",
+            w.last_candidates,
+            if (w.last_candidates > 0) w.last_cand_highway * 100 / w.last_candidates else 0,
+            if (w.links.items.len > 0) hwy_n * 100 / w.links.items.len else 0,
+            if (linked_n > 0) mute_n * 100 / linked_n else 0,
             ms(clr_ns),
             ms(topo_ns),
             ms(pres_ns),
@@ -1580,6 +1735,134 @@ fn writeWorldSvg(
     std.debug.print("  svg -> {s}/{s}.svg  ({d} notes, {d} links)\n", .{ dir, name, pts.items.len, kept.items.len });
 }
 
+/// `--zoom`: travel in and out repeatedly on **one** `World`, and report each lap separately.
+///
+/// The zoom sweep and `--pan` both measure a world that has just been built, at a zoom it has
+/// settled at. Neither can see cost that *accumulates*: state that survives a frame and grows
+/// every time the cut turns over — `link_fade`, lazy `containment` placement, the scratch tables —
+/// is free on lap one and expensive on lap eight. "Smooth for the first few zooms, then very bad"
+/// is exactly that shape, and nothing in the harness could show it.
+///
+/// So: ramp the camera from fit to leaf zoom and back, several times, on the same `World`, and
+/// print per-lap frame cost beside the sizes of everything that persists. A lap that costs more
+/// than the one before it names its own cause in the columns to its right.
+fn zoomProbe(
+    io: std.Io,
+    w: *world_mod.World,
+    view: world_mod.View,
+    params: world_mod.Params,
+    z_fit: f32,
+) !void {
+    // One lap covers the same decades the static sweep steps through, at a rate a hand can
+    // actually produce: a scroll wheel run is roughly a factor of two per six frames.
+    // Below fit as well as above it. The first cut of this started at fit and only travelled
+    // inward, which is exactly the half that was already fine — the state the reader gets stuck
+    // in is *further out* than fit, where the ladder has run out of things to coalesce and the
+    // mark budget is being asked to bound a set that cannot shrink.
+    const z_lo = z_fit / 16;
+    const z_hi = z_fit * 4096;
+    const half = 120;
+    const per_lap = half * 2;
+    // 120 fps is the target the map is judged against, so the whole frame — decide, present,
+    // lift, and every pixel the panel then draws — has 8.33 ms. What this probe times is only the
+    // first three; the draw is the rest of that budget, not headroom on top of it.
+    const target_fps = 120;
+    const frame_budget_ms: f64 = 1000.0 / @as(f64, target_fps);
+
+    std.debug.print(
+        "  frame budget {d:.2} ms ({d} fps)\n" ++
+            "  {s:>4}  {s:>8} {s:>8} {s:>8} {s:>6}   {s:>7} {s:>7} {s:>9}   " ++
+            "{s:>8} {s:>8} {s:>9} {s:>8} {s:>8}\n",
+        .{ frame_budget_ms, target_fps, "lap",   "mean ms", "p95 ms", "max ms", "over", "marks", "links", "line Mpx",
+            "rebuilt", "scan ms",  "build ms", "sort ms", "fade ms" },
+    );
+
+    world_mod.prof = .{};
+    world_mod.prof_io = io;
+    defer world_mod.prof_io = null;
+
+    var samples: [per_lap]f64 = undefined;
+    var prev: @TypeOf(world_mod.prof) = .{};
+    var lap: u32 = 0;
+    while (lap < world_zoom_cycles) : (lap += 1) {
+        var v = view;
+        var marks_max: usize = 0;
+        var links_max: usize = 0;
+        var fades_max: u32 = 0;
+        var line_px_max: f64 = 0;
+        for (0..per_lap) |i| {
+            // Geometric in, geometric out: constant *ratio* per frame is what a wheel does, and a
+            // linear ramp would crawl at overview and jump decades at leaf zoom.
+            const k: f32 = if (i < half)
+                @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half))
+            else
+                @as(f32, @floatFromInt(per_lap - i)) / @as(f32, @floatFromInt(half));
+            v.zoom = z_lo * std.math.pow(f32, z_hi / z_lo, k);
+
+            const t0 = now(io);
+            w.clearFrame();
+            try w.decideTopology(v, params);
+            try w.present(v, params, 1.0 / 60.0);
+            try w.liftLinks(params, 1.0 / 60.0);
+            samples[i] = ms(elapsed(io, t0));
+            // Peak, not the value at the end of the lap. A lap ends back at fit zoom where almost
+            // nothing is drawn, so end-of-lap sizes describe the cheapest frame in it.
+            marks_max = @max(marks_max, w.marks.items.len);
+            links_max = @max(links_max, w.links.items.len);
+            fades_max = @max(fades_max, @as(u32, @intCast(w.fades.items.len)));
+
+            // Total drawn line length, in screen pixels.
+            //
+            // Link *count* is budgeted and identical between two layouts; link *length* is not,
+            // and it is what the rasteriser actually pays. A layout whose links cross a quarter of
+            // the vault draws the same 11,250 lines over several times the pixels, and none of the
+            // columns beside this one can tell the two apart — which is how a layout change that
+            // tripled mean link length read as "no worse" in every existing harness.
+            var px: f64 = 0;
+            for (w.links.items) |l| {
+                if (l.a >= w.px.len or l.b >= w.px.len) continue;
+                const dx = w.px[l.a] - w.px[l.b];
+                const dy = w.py[l.a] - w.py[l.b];
+                px += @sqrt(@as(f64, dx * dx + dy * dy)) * v.zoom;
+            }
+            line_px_max = @max(line_px_max, px);
+        }
+
+        var sorted = samples;
+        std.mem.sort(f64, &sorted, {}, std.sort.asc(f64));
+        var sum: f64 = 0;
+        for (samples) |x| sum += x;
+
+        const pr = world_mod.prof;
+        var over: usize = 0;
+        for (samples) |x| {
+            if (x > frame_budget_ms) over += 1;
+        }
+        std.debug.print(
+            "  {d:>4}  {d:>8.2} {d:>8.2} {d:>8.2} {d:>5}%   {d:>7} {d:>7} {d:>9.1}   " ++
+                "{d:>8} {d:>8.2} {d:>9.2} {d:>8.2} {d:>8.2}\n",
+            .{
+                lap + 1,
+                sum / @as(f64, per_lap),
+                sorted[per_lap * 95 / 100],
+                sorted[per_lap - 1],
+                over * 100 / per_lap,
+                marks_max,
+                links_max,
+                line_px_max / 1_000_000.0,
+                // The lift's own breakdown: how often the fingerprint cache missed, and where the
+                // rebuild went when it did.
+                pr.recomputes - prev.recomputes,
+                ms(pr.scan_ns - prev.scan_ns),
+                ms(pr.build_ns - prev.build_ns),
+                ms(pr.sort_ns - prev.sort_ns),
+                ms(pr.fade_ns - prev.fade_ns),
+            },
+        );
+        prev = pr;
+    }
+}
+
 fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world_mod.Params, px_per_frame: f32) !void {
     const frames = 120;
     // A hand pan runs about 800 screen px/s, so ~13 px a frame at 60. Converting through the zoom
@@ -1957,6 +2240,419 @@ fn statsVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
     for (notes.items, paths) |note, *p| p.* = note.path;
 
     try bench_stats.report(gpa, n, edges.items, paths, std.fs.path.basename(dir_path));
+}
+
+fn printStabilityHeader() void {
+    std.debug.print(
+        "{s:<22}{s:>8}{s:>9}{s:>8}{s:>8}{s:>7}{s:>22}{s:>22}{s:>8}{s:>8}\n",
+        .{
+            "shape", "n", "e", "comm-f", "comm-r", "trials",
+            "fine p50/p90/max", "region p50/p90/max", "fine%", "region%",
+        },
+    );
+    std.debug.print("{s}\n", .{"-" ** 120});
+}
+
+fn printStabilityRow(label: []const u8, n: usize, e: usize, s: louvain.Stability) void {
+    const nf: f64 = @floatFromInt(@max(n, 1));
+    std.debug.print(
+        "{s:<22}{d:>8}{d:>9}{d:>8}{d:>8}{d:>7}  {d:>6}/{d}/{d}  {d:>6}/{d}/{d}  {d:>6.2}% {d:>6.2}%\n",
+        .{
+            label,
+            n,
+            e,
+            s.comm_fine,
+            s.comm_region,
+            s.trials,
+            s.fine_p50,
+            s.fine_p90,
+            s.fine_max,
+            s.region_p50,
+            s.region_p90,
+            s.region_max,
+            @as(f64, @floatFromInt(s.fine_p50)) * 100.0 / nf,
+            @as(f64, @floatFromInt(s.region_p50)) * 100.0 / nf,
+        },
+    );
+}
+
+fn stabilityTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    if (!stability_header_printed) {
+        printStabilityHeader();
+        stability_header_printed = true;
+    }
+    if (try shouldExpandShapes(gpa, io, dir_path)) {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true, .access_sub_paths = true });
+        defer dir.close(io);
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (names.items) |nm| gpa.free(nm);
+            names.deinit(gpa);
+        }
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (entry.name.len > 0 and entry.name[0] == '.') continue;
+            try names.append(gpa, try gpa.dupe(u8, entry.name));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        for (names.items) |name| {
+            const child = try std.fs.path.join(gpa, &.{ dir_path, name });
+            defer gpa.free(child);
+            try stabilityVault(gpa, io, child);
+        }
+        return;
+    }
+    try stabilityVault(gpa, io, dir_path);
+}
+
+fn stabilityVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var notes: std.ArrayList(Note) = .empty;
+    var read_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    try collect(gpa, arena, io, dir_path, dir_path, &notes, &read_ns, &scan_ns);
+    if (notes.items.len == 0) return;
+    const n = notes.items.len;
+
+    const candidates = try arena.alloc(resolve.Candidate, n);
+    for (notes.items, candidates) |note, *c| c.* = .{ .path = note.path, .stem = note.stem };
+
+    var edges: std.ArrayList(louvain.Edge) = .empty;
+    var buf: [resolve.max_path_len]u8 = undefined;
+    var cand_index = try resolve.Index.init(gpa, candidates);
+    defer cand_index.deinit();
+    for (notes.items, 0..) |note, i| {
+        for (note.links) |raw| {
+            if (!resolve.isNoteLikeTarget(raw)) continue;
+            const m = resolve.resolveIndexed(raw, note.path, candidates, &cand_index, &buf) orelse continue;
+            if (m.index == i) continue;
+            try edges.append(arena, .{ .a = @intCast(i), .b = @intCast(m.index) });
+        }
+    }
+
+    const s = try louvain.stability(gpa, n, edges.items, stability_trials, .{ .resolution = cluster_resolution });
+    printStabilityRow(std.fs.path.basename(dir_path), n, edges.items.len, s);
+}
+
+fn stabilitySynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !void {
+    _ = io;
+    if (!stability_header_printed) {
+        printStabilityHeader();
+        stability_header_printed = true;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var graph = try vault_synth.generate(gpa, arena, spec);
+    defer graph.deinit(gpa);
+    const ledges = try arena.alloc(louvain.Edge, graph.edges.len);
+    for (graph.edges, ledges) |e, *d| d.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
+    var name_buf: [48]u8 = undefined;
+    const label = spec.nameBuf(&name_buf);
+    const s = try louvain.stability(gpa, spec.n, ledges, stability_trials, .{ .resolution = cluster_resolution });
+    printStabilityRow(label, spec.n, ledges.len, s);
+}
+
+/// `--churn DIR`: how much of the *territory* set survives one added link, stage by stage.
+///
+/// The memo in `layout.solve` reuses a territory whose membership came back identical, so its hit
+/// rate *is* the stability of the partition — no separate matching needed. Running the same pair of
+/// solves with the post-clustering stages switched off attributes the churn: `region_max` at
+/// infinity disables `splitOversized`, `region_min` at one disables `mergeSpecks`.
+///
+/// This exists because the memo landed at 66% of interiors and 0% of frames on a live edit, and
+/// those two numbers are the same fact: groups hold ~13 territories, so a third of territories
+/// churning leaves almost no group untouched. Whatever moves this number moves everything built on
+/// top of it.
+fn churnTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var notes: std.ArrayList(Note) = .empty;
+    var read_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    try collect(gpa, arena, io, dir_path, dir_path, &notes, &read_ns, &scan_ns);
+    if (notes.items.len == 0) return;
+    const n = notes.items.len;
+
+    const candidates = try arena.alloc(resolve.Candidate, n);
+    for (notes.items, candidates) |note, *c| c.* = .{ .path = note.path, .stem = note.stem };
+    var edges: std.ArrayList(fold.Edge) = .empty;
+    var buf: [resolve.max_path_len]u8 = undefined;
+    var cand_index = try resolve.Index.init(gpa, candidates);
+    defer cand_index.deinit();
+    for (notes.items, 0..) |note, i| {
+        for (note.links) |raw| {
+            if (!resolve.isNoteLikeTarget(raw)) continue;
+            const m = resolve.resolveIndexed(raw, note.path, candidates, &cand_index, &buf) orelse continue;
+            if (m.index == i) continue;
+            try edges.append(arena, .{ .a = @intCast(i), .b = @intCast(m.index) });
+        }
+    }
+    const paths = try arena.alloc([]const u8, n);
+    for (notes.items, paths) |note, *p| p.* = note.path;
+    const ids = try arena.alloc(u64, n);
+    for (ids, 0..) |*d, i| d.* = i + 1;
+
+    const extra = (try shape_metrics.pickNewEdge(gpa, n, edges.items)) orelse {
+        std.debug.print("{s}: no edge to add\n", .{std.fs.path.basename(dir_path)});
+        return;
+    };
+    const edges2 = try arena.alloc(fold.Edge, edges.items.len + 1);
+    @memcpy(edges2[0..edges.items.len], edges.items);
+    edges2[edges.items.len] = extra;
+
+    // The same experiment against a *busy* pair.
+    //
+    // `pickNewEdge` takes a random non-adjacent pair, and in a heavy-tailed vault a random note is
+    // an obscure one — so the random probe measures the easiest edit there is. Degree normalisation
+    // weights a link `w·K/√(dₐ·d_b)`, so adding one link to a note of degree d changes the weight
+    // of all d of its existing links: an edit between two well-connected notes perturbs thousands
+    // of weights at once, and that is the edit a reader actually makes.
+    const deg = try arena.alloc(u32, n);
+    @memset(deg, 0);
+    for (edges.items) |e| {
+        deg[e.a] += 1;
+        deg[e.b] += 1;
+    }
+    var hub_a: u32 = 0;
+    for (deg, 0..) |d, i| {
+        if (d > deg[hub_a]) hub_a = @intCast(i);
+    }
+    var hub_b: u32 = if (hub_a == 0) 1 else 0;
+    for (deg, 0..) |d, i| {
+        if (i == hub_a) continue;
+        if (d > deg[hub_b]) hub_b = @intCast(i);
+    }
+    const edges3 = try arena.alloc(fold.Edge, edges.items.len + 1);
+    @memcpy(edges3[0..edges.items.len], edges.items);
+    edges3[edges.items.len] = .{ .a = hub_a, .b = hub_b };
+    std.debug.print("  random pair deg {d}/{d}   busy pair deg {d}/{d}\n", .{
+        deg[extra.a], deg[extra.b], deg[hub_a], deg[hub_b],
+    });
+
+    std.debug.print("  {s}  ({d} notes, {d} links)\n", .{ std.fs.path.basename(dir_path), n, edges.items.len });
+    std.debug.print("  {s:<30} {s:>6} {s:>9} {s:>9} {s:>10}\n", .{ "stages", "reuse", "d-p50", "d-p99", "raw p50" });
+
+    const Cfg = struct { label: []const u8, min: u32, max: u32, norm: f32, busy: bool = false };
+    const cfgs = [_]Cfg{
+        .{ .label = "louvain only, random pair", .min = 1, .max = std.math.maxInt(u32), .norm = 0.5 },
+        .{ .label = "+ splitOversized", .min = 1, .max = 128, .norm = 0.5 },
+        .{ .label = "+ mergeSpecks (shipping)", .min = 8, .max = 128, .norm = 0.5 },
+        .{ .label = "shipping, busy pair", .min = 8, .max = 128, .norm = 0.5, .busy = true },
+        .{ .label = "busy pair, no degree norm", .min = 8, .max = 128, .norm = 0, .busy = true },
+    };
+    for (cfgs) |cfg| {
+        var first = try layout.solve(gpa, n, edges.items, paths, .{
+            .note_r = 1,
+            .ids = ids,
+            .region_min = cfg.min,
+            .region_max = cfg.max,
+            .degree_norm = cfg.norm,
+        });
+        defer first.deinit(gpa);
+        var second = try layout.solve(gpa, n, if (cfg.busy) edges3 else edges2, paths, .{
+            .note_r = 1,
+            .ids = ids,
+            .region_min = cfg.min,
+            .region_max = cfg.max,
+            .degree_norm = cfg.norm,
+            .reuse = .{ .ids = first.ids, .inner = first.inner, .home = first.home, .frames = first.frames },
+        });
+        defer second.deinit(gpa);
+        const kept = layout.reused_interiors;
+        const of = layout.solved_interiors;
+        const frames_kept = layout.reused_frames;
+        const frames_of = layout.placed_frames;
+
+        // Reuse says the *inputs* held still. This says whether the reader sees that: a memo that
+        // hits everywhere is worth nothing if the frames above it still re-place and carry every
+        // territory with them.
+        var report: shape_metrics.Report = .{};
+        try shape_metrics.setDisplacement(gpa, &report, first.pos, second.pos, 1);
+
+        // Raw distance, with no alignment at all.
+        //
+        // `setDisplacement` is Procrustes: it rotates and translates the new positions onto the old
+        // before measuring, which is right for asking "did the *arrangement* change" and exactly
+        // wrong for asking "did the reader see anything move". A whole island sliding across the
+        // map is a pure translation, so Procrustes reports zero for the one motion most visible
+        // from the outside.
+        const raw = try gpa.alloc(f32, first.pos.len);
+        defer gpa.free(raw);
+        for (raw, first.pos, second.pos) |*d, a, b| {
+            d.* = @sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+        }
+        std.mem.sort(f32, raw, {}, std.sort.asc(f32));
+        const raw_p50 = if (raw.len > 0) raw[raw.len / 2] else 0;
+        std.debug.print("  {s:<30} {d:>5}% {d:>8.1}r {d:>8.1}r {d:>9.1}r   frames {d}/{d}\n", .{
+            cfg.label,
+            if (of > 0) kept * 100 / of else 0,
+            report.disp_p50,
+            report.disp_p99,
+            raw_p50,
+            frames_kept,
+            frames_of,
+        });
+    }
+}
+
+/// `--shapes DIR`: grade `layout.solve` on each child vault, or on DIR itself when it is one vault.
+///
+/// A gauntlet parent (many child corpora, almost no markdown of its own) expands. A single vault
+/// — `tree/`, simplewiki — is one row, even if it has subfolders of notes.
+fn shapesTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    if (!shapes_header_printed) {
+        shape_metrics.printHeader();
+        shapes_header_printed = true;
+    }
+    if (try shouldExpandShapes(gpa, io, dir_path)) {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true, .access_sub_paths = true });
+        defer dir.close(io);
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (names.items) |n| gpa.free(n);
+            names.deinit(gpa);
+        }
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (entry.name.len > 0 and entry.name[0] == '.') continue;
+            try names.append(gpa, try gpa.dupe(u8, entry.name));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        for (names.items) |name| {
+            const child = try std.fs.path.join(gpa, &.{ dir_path, name });
+            defer gpa.free(child);
+            try shapesVault(gpa, io, child);
+        }
+        return;
+    }
+    try shapesVault(gpa, io, dir_path);
+}
+
+fn shouldExpandShapes(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !bool {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true, .access_sub_paths = true }) catch return false;
+    defer dir.close(io);
+    var md_here: usize = 0;
+    var vault_kids: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.name.len > 0 and entry.name[0] == '.') continue;
+        switch (entry.kind) {
+            .file => {
+                if (std.ascii.endsWithIgnoreCase(entry.name, ".md")) md_here += 1;
+            },
+            .directory => {
+                const child = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
+                defer gpa.free(child);
+                if (try dirHasMarkdown(gpa, io, child)) vault_kids += 1;
+            },
+            else => {},
+        }
+    }
+    return vault_kids >= 2 and md_here < vault_kids;
+}
+
+fn dirHasMarkdown(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !bool {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true, .access_sub_paths = true }) catch return false;
+    defer dir.close(io);
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.name.len > 0 and entry.name[0] == '.') continue;
+        switch (entry.kind) {
+            .file => {
+                if (std.ascii.endsWithIgnoreCase(entry.name, ".md")) return true;
+            },
+            .directory => {
+                const child = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
+                defer gpa.free(child);
+                if (try dirHasMarkdown(gpa, io, child)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn shapesVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var notes: std.ArrayList(Note) = .empty;
+    var read_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    try collect(gpa, arena, io, dir_path, dir_path, &notes, &read_ns, &scan_ns);
+    if (notes.items.len == 0) return;
+    const n = notes.items.len;
+
+    const candidates = try arena.alloc(resolve.Candidate, n);
+    for (notes.items, candidates) |note, *c| c.* = .{ .path = note.path, .stem = note.stem };
+
+    var edges: std.ArrayList(fold.Edge) = .empty;
+    var buf: [resolve.max_path_len]u8 = undefined;
+    var cand_index = try resolve.Index.init(gpa, candidates);
+    defer cand_index.deinit();
+    for (notes.items, 0..) |note, i| {
+        for (note.links) |raw| {
+            if (!resolve.isNoteLikeTarget(raw)) continue;
+            const m = resolve.resolveIndexed(raw, note.path, candidates, &cand_index, &buf) orelse continue;
+            if (m.index == i) continue;
+            try edges.append(arena, .{ .a = @intCast(i), .b = @intCast(m.index) });
+        }
+    }
+
+    const paths = try arena.alloc([]const u8, n);
+    for (notes.items, paths) |note, *p| p.* = note.path;
+
+    const note_r: f32 = 1.0;
+    const defaults: layout.Options = .{};
+    const t0 = now(io);
+    var laid = try layout.solve(gpa, n, edges.items, paths, .{
+        .note_r = note_r,
+        .iters = .{ .max_iters = ml_iters },
+        .territories = shapes_territories,
+        .frame_max = if (shapes_frame_max > 0) shapes_frame_max else defaults.frame_max,
+        .region_max = if (shapes_region_max > 0) shapes_region_max else defaults.region_max,
+        .resolution = cluster_resolution,
+    });
+    defer laid.deinit(gpa);
+    const solve_ms = ms(elapsed(io, t0));
+
+    var report = try shape_metrics.grade(gpa, n, edges.items, laid.pos, laid.comp, note_r, solve_ms);
+
+    if (!shapes_no_displace) {
+        if (try shape_metrics.pickNewEdge(gpa, n, edges.items)) |extra| {
+            const edges2 = try arena.alloc(fold.Edge, edges.items.len + 1);
+            @memcpy(edges2[0..edges.items.len], edges.items);
+            edges2[edges.items.len] = extra;
+            var laid2 = try layout.solve(gpa, n, edges2, paths, .{
+                .note_r = note_r,
+                .iters = .{ .max_iters = ml_iters },
+                .territories = shapes_territories,
+                .frame_max = if (shapes_frame_max > 0) shapes_frame_max else defaults.frame_max,
+                .region_max = if (shapes_region_max > 0) shapes_region_max else defaults.region_max,
+            });
+            defer laid2.deinit(gpa);
+            try shape_metrics.setDisplacement(gpa, &report, laid.pos, laid2.pos, note_r);
+        }
+    }
+
+    shape_metrics.printRow(std.fs.path.basename(dir_path), report);
 }
 
 /// In-memory scale simulator: generate a shaped graph, pack or force-layout, optional Galaxy smoke.

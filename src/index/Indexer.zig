@@ -75,6 +75,22 @@ pub const Snapshot = struct {
     /// its own multi-minute phase on a large vault, and reporting it as "building notes" leaves
     /// the count frozen on the last file for the whole of it — which reads as a hang.
     phase: Phase = .idle,
+    /// Notes rewritten since the previous published snapshot.
+    ///
+    /// The indexer already knows this — `indexPending` returns `unchanged` / `rewrote` / `structural`
+    /// per file and the incremental path uses it to scope the *relink*. It then threw it away, and
+    /// every consumer downstream re-derived it: the graph re-solves the whole vault on every
+    /// commit because a whole snapshot is all it is given, so a one-note edit costs the same
+    /// seconds a first open does.
+    ///
+    /// Only meaningful when `dirty_known` is true.
+    dirty: []const i64 = &.{},
+    /// Is `dirty` an exhaustive account of what changed?
+    ///
+    /// False after a full scan, and false after a *structural* change — a note appearing or
+    /// vanishing moves where other notes' links resolve, so the edit is not confined to the notes
+    /// that were written. A consumer must treat false as "assume everything moved".
+    dirty_known: bool = false,
 };
 
 pub const Phase = enum(u8) {
@@ -105,8 +121,19 @@ pub const CandidateSet = struct {
     /// Backs both slices. The owner deinits it; `undefined` is never a valid state here, so this
     /// type is only ever constructed by `buildCandidates`.
     arena: std.heap.ArenaAllocator,
+    /// Lookup tables over `notes`, built here on the worker so the UI thread never resolves a
+    /// link by scanning the vault. Without it every `[[…]]` the markdown renderer draws costs
+    /// four passes over every candidate. Measured at Simple English Wikipedia's 284k notes:
+    /// **5.7 ms per link** scanning versus **1.2 µs** through the index, so a 100-link article
+    /// costs 570 ms of stalled UI on the frame after each generation bump — and the generation
+    /// moves on every commit, so a background scan re-froze the document repeatedly.
+    ///
+    /// Notes only. Attachments are a few hundred entries even in a vault full of images, so an
+    /// index over them would cost more to build than the scan it replaces.
+    index: resolve.Index,
 
     pub fn deinit(self: *CandidateSet) void {
+        self.index.deinit();
         self.arena.deinit();
     }
 };
@@ -185,6 +212,16 @@ snapshots: [2]Snapshot = .{ .{}, .{} },
 snap_arenas: [2]?std.heap.ArenaAllocator = .{ null, null },
 snap_pub: std.atomic.Value(u8) = .init(0),
 snap_mutex: std.Io.Mutex = .init,
+/// Notes rewritten since the last publish, accumulated by whichever path did the writing and
+/// drained by `commitAndPublish` into the snapshot it builds. Worker-thread only.
+pending_dirty: std.ArrayListUnmanaged(i64) = .empty,
+/// Notes a *full scan* rewrote, and whether it saw anything a scoped relink cannot describe.
+/// Same distinction the incremental path keeps; see the relink decision in `runFullScan`.
+scan_rewrote: std.ArrayListUnmanaged(i64) = .empty,
+scan_structural: bool = false,
+/// Set when the change cannot be described by `pending_dirty` alone — a full scan, a structural
+/// edit, or a failure to record an id. Cleared on publish along with the list.
+pending_broad: bool = true,
 
 /// The candidate lists for the generation `commitAndPublish` is about to announce, waiting for the
 /// UI thread to claim them. Written by the worker under `cand_mutex` *before* the generation bump,
@@ -356,6 +393,8 @@ pub fn deinit(self: *Indexer) void {
     self.stop();
     self.dropResolveCache();
     self.pending.deinit(self.gpa);
+    self.pending_dirty.deinit(self.gpa);
+    self.scan_rewrote.deinit(self.gpa);
     for (&self.snap_arenas) |*slot| {
         if (slot.*) |*a| a.deinit();
         slot.* = null;
@@ -513,11 +552,26 @@ pub fn snapshotCopy(self: *Indexer, arena: std.mem.Allocator) !Snapshot {
     defer self.snap_mutex.unlock(dvui.io);
     const src = self.snapshots[self.snap_pub.load(.acquire)];
 
+    // One allocation for every string, not two per note.
+    //
+    // `dupe` per path and per title is 568,000 allocations on a 284k-note vault, every rebuild, on
+    // the UI thread — and the strings are read-only for the life of the copy, so there is nothing
+    // the separate allocations buy. Sizing one block and slicing it is the same bytes with the
+    // allocator called once.
+    var text_len: usize = 0;
+    for (src.nodes) |s| text_len += s.path.len + s.title.len;
+    const text = try arena.alloc(u8, text_len);
+    var at: usize = 0;
+
     const nodes = try arena.alloc(SnapNode, src.nodes.len);
     for (src.nodes, nodes) |s, *d| {
         d.* = s;
-        d.path = try arena.dupe(u8, s.path);
-        d.title = try arena.dupe(u8, s.title);
+        @memcpy(text[at..][0..s.path.len], s.path);
+        d.path = text[at..][0..s.path.len];
+        at += s.path.len;
+        @memcpy(text[at..][0..s.title.len], s.title);
+        d.title = text[at..][0..s.title.len];
+        at += s.title.len;
     }
     const edges = try arena.dupe(SnapEdge, src.edges);
 
@@ -530,6 +584,8 @@ pub fn snapshotCopy(self: *Indexer, arena: std.mem.Allocator) !Snapshot {
         .complete = src.complete,
         .scan_total = src.scan_total,
         .phase = src.phase,
+        .dirty = try arena.dupe(i64, src.dirty),
+        .dirty_known = src.dirty_known,
     };
 }
 
@@ -616,10 +672,20 @@ fn worker(self: *Indexer) void {
                             // than leave its edges parked on the `dst_id = src_id` stand-in.
                             structural = true;
                         };
+                        // The same fact, kept for the *consumers* rather than for the relink.
+                        // Failing to record it is not fatal here either — it only means the next
+                        // snapshot says "assume everything moved", which is what every snapshot
+                        // used to say.
+                        self.pending_dirty.append(self.gpa, id) catch {
+                            self.pending_broad = true;
+                        };
                     },
                     .structural => {
                         changed = true;
                         structural = true;
+                        // A note appeared or vanished, so where *other* notes' links resolve can
+                        // have moved. No list of written notes describes that.
+                        self.pending_broad = true;
                         // The note set (or the names resolution reads) moved.
                         self.dropResolveCache();
                     },
@@ -659,6 +725,10 @@ pub const ScanMode = enum {
 /// Public only so the headless harness (`bench --index`) can drive one scan on the calling
 /// thread and read `timings` afterwards. The app always reaches this through `worker`.
 pub fn runFullScan(self: *Indexer, io: std.Io, mode: ScanMode) !void {
+    // A full walk rewrites whatever it finds and relinks everything; no list of notes describes
+    // it. Set before the walk, not after, so a publish from *inside* the scan is broad too.
+    self.pending_broad = true;
+
     // Hand the UI whatever the *previous* session already indexed, before walking anything.
     //
     // A scan of a Wikipedia-scale vault runs for minutes, and until it publishes there is no
@@ -751,7 +821,12 @@ pub fn runFullScan(self: *Indexer, io: std.Io, mode: ScanMode) !void {
     // Anything real that we didn't see is gone from disk. A note deleted outside the editor is
     // its own kind of stale edge, so these count as changes too.
     const drop_start = self.markNs();
-    if (try self.dropMissing(&seen)) changed = true;
+    // A note that vanished is structural by definition: every `[[Name]]` that resolved to it now
+    // resolves somewhere else or nowhere, and no list of *edited* notes describes that.
+    if (try self.dropMissing(&seen)) {
+        changed = true;
+        self.scan_structural = true;
+    }
     if (try self.dropMissingMedia(&media_seen)) changed = true;
     self.timings.drop_ns = self.sinceNs(drop_start);
 
@@ -792,7 +867,29 @@ pub fn runFullScan(self: *Indexer, io: std.Io, mode: ScanMode) !void {
     // open of a large vault fast instead of a repeat of the first.
     if (self.quit.load(.acquire)) return;
     const relink_start = self.markNs();
-    if (changed) try self.relinkAll();
+    // Scoped when the walk only found edited notes.
+    //
+    // Re-opening a large vault re-resolved every link in it because *anything* changing set one
+    // boolean. On simplewiki that is 4.2 s of an 8.1 s warm open to answer a question about three
+    // files. `structural` is still the escape hatch and still means the full pass: a note appearing,
+    // vanishing or being renamed moves where *other* notes' links resolve, and nothing narrower is
+    // correct for that. A note whose own body changed moves only its own links.
+    //
+    // The drop pass above deletes notes that vanished, and it sets `changed` without going through
+    // `indexOne` — so a deletion has to count as structural, which `dropMissing` marks.
+    if (changed) {
+        if (self.scan_structural or self.scan_rewrote.items.len == 0) {
+            try self.relinkAll();
+        } else {
+            for (self.scan_rewrote.items) |id| {
+                _ = self.relinkNote(id) catch |err| {
+                    log.warn("relink note {d}: {s}", .{ id, @errorName(err) });
+                };
+            }
+        }
+    }
+    self.scan_rewrote.clearRetainingCapacity();
+    self.scan_structural = false;
     self.timings.relink_ns = self.sinceNs(relink_start);
 
     self.publishProgress(.publishing, 0, 0);
@@ -859,6 +956,12 @@ fn walk(
     };
     defer dir.close(io);
 
+    // Files this directory has decided to read, held until there are enough to read together.
+    var batch: std.ArrayListUnmanaged(ReadAhead) = .empty;
+    defer batch.deinit(self.gpa);
+    var batch_bytes: usize = 0;
+    defer self.flushReads(io, &batch, &batch_bytes, changed) catch {};
+
     var rel_buf: [query.max_rel_path]u8 = undefined;
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
@@ -874,7 +977,12 @@ fn walk(
         if (sdk.host().isPathIgnored(self.vault_root, abs, entry.name, entry.kind)) continue;
 
         switch (entry.kind) {
-            .directory => try self.walk(io, abs, seen, media_seen, files_since_commit, last_commit, changed, report_progress),
+            .directory => {
+                // Flush before descending: the batch holds `abs` buffers this frame owns, and a
+                // subdirectory's own batch would otherwise interleave with them.
+                try self.flushReads(io, &batch, &batch_bytes, changed);
+                try self.walk(io, abs, seen, media_seen, files_since_commit, last_commit, changed, report_progress);
+            },
             .file => {
                 if (query.isMediaPath(entry.name)) {
                     // Attachments are recorded by path only — never opened, never parsed, and
@@ -895,11 +1003,30 @@ fn walk(
                 errdefer self.gpa.free(rel_owned);
                 try seen.put(self.gpa, rel_owned, {});
 
-                const outcome = self.indexOne(io, rel_owned) catch |err| blk: {
+                // Decide now, read later. `probeFile` is the cheap half — one `stat` and one
+                // index lookup — and it is what says whether the file needs reading at all, so a
+                // warm open still touches no file contents.
+                const probe = self.probeFile(io, rel_owned, abs) catch |err| blk: {
                     log.warn("index {s}: {s}", .{ rel_owned, @errorName(err) });
-                    break :blk .unchanged;
+                    break :blk Probe.unchanged;
                 };
-                if (outcome != .unchanged) changed.* = true;
+                switch (probe) {
+                    .unchanged => {},
+                    .deleted => {
+                        changed.* = true;
+                        self.scan_structural = true;
+                    },
+                    .read => |r| {
+                        var pend = r;
+                        // The batch outlives this iteration, so it needs its own copy of the path.
+                        pend.abs = try self.gpa.dupe(u8, abs);
+                        try batch.append(self.gpa, pend);
+                        batch_bytes += @intCast(r.size);
+                        if (batch.items.len >= read_batch_files or batch_bytes >= read_batch_bytes) {
+                            try self.flushReads(io, &batch, &batch_bytes, changed);
+                        }
+                    },
+                }
 
                 files_since_commit.* += 1;
                 const now = std.Io.Clock.boot.now(io).nanoseconds;
@@ -985,21 +1112,154 @@ pub fn indexBuffer(self: *Indexer, rel: []const u8, bytes: []const u8) !IndexOut
     return .{ .rewrote = (try lookupNoteMeta(db, rel) orelse return .structural).id };
 }
 
-fn indexOne(self: *Indexer, io: std.Io, rel: []const u8) !IndexOutcome {
-    const db = self.db orelse return .unchanged;
+/// Most files read ahead in one batch, and the most bytes those may hold.
+///
+/// A cold index of a large vault spends most of its time waiting on the disk one file at a time:
+/// 37.7 s of an 82 s first open, at ~120 us a file, which is what a small read costs when nothing
+/// overlaps it. Reads are independent, so a batch of them can be in flight at once and the latency
+/// stacks instead of queueing. The byte cap is the real bound — notes are usually a couple of KB
+/// but `max_file_bytes` allows 4 MB, and a batch of those would be gigabytes.
+const read_batch_files: usize = 512;
+const read_batch_bytes: usize = 32 * 1024 * 1024;
+/// Workers the read-ahead may use. More than the core count on purpose: these threads are waiting
+/// on the disk, not computing, so the useful number is set by how many reads the device will
+/// overlap rather than by how many cores there are.
+const read_threads: usize = 12;
 
-    const abs = try std.fs.path.join(self.gpa, &.{ self.vault_root, rel });
-    defer self.gpa.free(abs);
+/// One file the walk has decided it must read, from the `stat` and index lookup it already did.
+const ReadAhead = struct {
+    /// Borrowed from `seen`, which owns it for the length of the scan.
+    rel: []const u8,
+    /// Owned by the batch.
+    abs: []u8,
+    mtime_ns: i64,
+    size: i64,
+    known_id: i64,
+    known_hash: i64,
+    had_known: bool,
+    /// Filled by `ReadCtx`; null when the read failed and the file is skipped.
+    bytes: ?[]u8 = null,
+};
+
+/// Read every pending file, several at a time.
+///
+/// Workers touch only their own `ReadAhead` — no database, no shared counters — so there is nothing
+/// to synchronise. Failures leave `bytes` null and are skipped by the caller, exactly as a failed
+/// read was before.
+const ReadCtx = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    items: []ReadAhead,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn run(self: *ReadCtx) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.items.len) return;
+            const it = &self.items[i];
+            var file = std.Io.Dir.cwd().openFile(self.io, it.abs, .{}) catch continue;
+            defer file.close(self.io);
+            const buf = self.gpa.alloc(u8, @intCast(it.size)) catch continue;
+            const n = file.readPositionalAll(self.io, buf, 0) catch {
+                self.gpa.free(buf);
+                continue;
+            };
+            // A file that shrank between the stat and the read is not an error; take what is there.
+            it.bytes = buf[0..n];
+        }
+    }
+};
+
+/// Read every file in `batch` at once, then apply them in walk order.
+///
+/// The reads run on their own threads and touch nothing but their own entry. Applying — hashing,
+/// parsing, writing the row — stays here, in the order the walk found the files, because SQLite is
+/// not shared and because the outcome accounting must not depend on which read finished first.
+fn flushReads(
+    self: *Indexer,
+    io: std.Io,
+    batch: *std.ArrayListUnmanaged(ReadAhead),
+    batch_bytes: *usize,
+    changed: *bool,
+) !void {
+    defer {
+        for (batch.items) |it| {
+            if (it.bytes) |b| self.gpa.free(b.ptr[0..@as(usize, @intCast(it.size))]);
+            self.gpa.free(it.abs);
+        }
+        batch.clearRetainingCapacity();
+        batch_bytes.* = 0;
+    }
+    if (batch.items.len == 0) return;
+
+    const read_start = self.markNs();
+    var ctx: ReadCtx = .{ .io = io, .gpa = self.gpa, .items = batch.items };
+    if (batch.items.len < 4) {
+        ctx.run();
+    } else {
+        var handles: [read_threads]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < @min(read_threads, batch.items.len)) : (spawned += 1) {
+            handles[spawned] = std.Thread.spawn(.{}, ReadCtx.run, .{&ctx}) catch break;
+        }
+        // Whatever could not be spawned, this thread does — and it takes work from the same queue,
+        // so a failure to spawn costs parallelism and never correctness.
+        ctx.run();
+        for (handles[0..spawned]) |h| h.join();
+    }
+    self.timings.read_ns += self.sinceNs(read_start);
+
+    for (batch.items) |it| {
+        const bytes = it.bytes orelse continue; // read failed; already warned about, skip it
+        const outcome = self.applyFile(it, bytes) catch |err| blk: {
+            log.warn("index {s}: {s}", .{ it.rel, @errorName(err) });
+            break :blk IndexOutcome.unchanged;
+        };
+        switch (outcome) {
+            .unchanged => {},
+            .rewrote => |id| {
+                changed.* = true;
+                // The same accounting the incremental path keeps, so a walk that found a handful
+                // of edited notes can relink those instead of all 3.35M links.
+                self.scan_rewrote.append(self.gpa, id) catch {
+                    self.scan_structural = true;
+                };
+            },
+            .structural => {
+                changed.* = true;
+                self.scan_structural = true;
+            },
+        }
+    }
+}
+
+/// What the walk should do with one file, decided from its `stat` and the row we already have.
+const Probe = union(enum) {
+    /// Same mtime and size as the indexed row: nothing to read.
+    unchanged,
+    /// The file is gone. Structural — every link that resolved to it now resolves elsewhere.
+    deleted,
+    /// Must be read; the fields the apply step needs afterwards.
+    read: ReadAhead,
+};
+
+/// The cheap half of indexing one file: `stat`, and the index row if we have one.
+///
+/// Split out from `indexOne` so the *expensive* half — the read — can be batched and run several
+/// files at a time. Everything here touches the database, so it stays on the walk's own thread.
+fn probeFile(self: *Indexer, io: std.Io, rel: []const u8, abs: []u8) !Probe {
+    const db = self.db orelse return .unchanged;
 
     const stat_start = self.markNs();
     const st = std.Io.Dir.cwd().statFile(io, abs, .{}) catch {
         self.timings.stat_ns += self.sinceNs(stat_start);
-        // Gone — delete the real note row if we had one. The graph loses a node, and every link
-        // that pointed at it has to fall back to a phantom, so this is structural.
         try deleteNote(db, rel);
-        return .structural;
+        return .deleted;
     };
-    if (st.size > max_file_bytes) return .unchanged;
+    if (st.size > max_file_bytes) {
+        self.timings.stat_ns += self.sinceNs(stat_start);
+        return .unchanged;
+    }
     const mtime_ns: i64 = @truncate(st.mtime.nanoseconds);
     const size: i64 = @intCast(st.size);
 
@@ -1013,32 +1273,63 @@ fn indexOne(self: *Indexer, io: std.Io, rel: []const u8) !IndexOutcome {
     }
     self.timings.stat_ns += self.sinceNs(stat_start);
     self.timings.files_read += 1;
+    return .{ .read = .{
+        .rel = rel,
+        .abs = abs,
+        .mtime_ns = mtime_ns,
+        .size = size,
+        .known_id = if (known) |m| m.id else 0,
+        .known_hash = if (known) |m| m.hash else 0,
+        .had_known = known != null,
+    } };
+}
 
-    const read_start = self.markNs();
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, abs, self.gpa, .limited(max_file_bytes)) catch |err| {
-        log.warn("read {s}: {s}", .{ rel, @errorName(err) });
-        return .unchanged;
-    };
-    defer self.gpa.free(bytes);
-    self.timings.read_ns += self.sinceNs(read_start);
-
+/// The half that writes: hash the bytes, and store the note if they differ from what we had.
+fn applyFile(self: *Indexer, it: ReadAhead, bytes: []const u8) !IndexOutcome {
+    const db = self.db orelse return .unchanged;
     const hash: i64 = @bitCast(std.hash.XxHash3.hash(0, bytes));
-    if (known) |meta| {
-        if (meta.hash == hash) {
-            // Metadata catch-up only — this is the save landing on a buffer we already
-            // indexed (which stamped `mtime_ns = 0`). Nothing the graph draws moved.
-            try touchNote(db, meta.id, mtime_ns, size);
-            return .unchanged;
-        }
+    if (it.had_known and it.known_hash == hash) {
+        // Metadata catch-up only — this is the save landing on a buffer we already indexed
+        // (which stamped `mtime_ns = 0`). Nothing the graph draws moved.
+        try touchNote(db, it.known_id, it.mtime_ns, it.size);
+        return .unchanged;
     }
-    const has_aliases = try self.writeNote(db, rel, bytes, mtime_ns, size, hash);
+    const has_aliases = try self.writeNote(db, it.rel, bytes, it.mtime_ns, it.size, hash);
     // A file we already had: only its own links moved. A file we had not seen is a new node, and
     // links elsewhere may have been parked on a phantom waiting for it. Aliases are structural for
     // the reason spelled out in `indexBuffer`.
-    if (!has_aliases) {
-        if (known) |meta| return .{ .rewrote = meta.id };
-    }
+    if (!has_aliases and it.had_known) return .{ .rewrote = it.known_id };
     return .structural;
+}
+
+/// One file, read and applied on this thread. The path `indexPending` and the tests take; the walk
+/// goes through `probeFile` and a batched read instead.
+fn indexOne(self: *Indexer, io: std.Io, rel: []const u8) !IndexOutcome {
+    const abs = try std.fs.path.join(self.gpa, &.{ self.vault_root, rel });
+    defer self.gpa.free(abs);
+
+    const probe = try self.probeFile(io, rel, abs);
+    const it = switch (probe) {
+        .unchanged => return .unchanged,
+        .deleted => return .structural,
+        .read => |r| r,
+    };
+
+    const read_start = self.markNs();
+    var file = std.Io.Dir.cwd().openFile(io, abs, .{}) catch |err| {
+        log.warn("open {s}: {s}", .{ rel, @errorName(err) });
+        return .unchanged;
+    };
+    defer file.close(io);
+    const buf = self.gpa.alloc(u8, @intCast(it.size)) catch return .unchanged;
+    defer self.gpa.free(buf);
+    const n_read = file.readPositionalAll(io, buf, 0) catch |err| {
+        log.warn("read {s}: {s}", .{ rel, @errorName(err) });
+        return .unchanged;
+    };
+    self.timings.read_ns += self.sinceNs(read_start);
+
+    return self.applyFile(it, buf[0..n_read]);
 }
 
 /// Scan `bytes` and replace every derived row for `rel`. Shared by the disk and live-buffer
@@ -1561,6 +1852,12 @@ pub fn commitAndPublish(self: *Indexer) !void {
 
     const nodes = try loadSnapNodes(db, arena);
     const edges = try loadSnapEdges(db, arena);
+    // Drained here rather than by the caller, so every path that publishes — incremental, full
+    // scan, or a future one — gets the same accounting without having to remember to.
+    const dirty = try arena.dupe(i64, self.pending_dirty.items);
+    const dirty_known = !self.pending_broad;
+    self.pending_dirty.clearRetainingCapacity();
+    self.pending_broad = false;
     const snap = Snapshot{
         .note_count = try countOf(db, "SELECT count(*) FROM notes WHERE phantom = 0"),
         // From the rows just read, not a second full scan of `links` for a number we hold.
@@ -1570,6 +1867,8 @@ pub fn commitAndPublish(self: *Indexer) !void {
         .edges = edges,
         .complete = true,
         .scan_total = self.scan_total.load(.acquire),
+        .dirty = dirty,
+        .dirty_known = dirty_known,
     };
 
     // Same trip through the notes table, one thread earlier.
@@ -1634,7 +1933,11 @@ fn buildCandidates(self: *Indexer, db: *Db, gpa: std.mem.Allocator) !CandidateSe
         try query.loadCandidatesOn(&db.conn, a);
 
     const media = try query.loadMediaCandidatesOn(&db.conn, a);
-    return .{ .notes = notes, .media = media, .arena = arena };
+    // `gpa`, not the set's arena: `Index` owns hash maps and an arena of its own and frees them
+    // in `deinit`, which the arena's free-all would not reach.
+    var index = try resolve.Index.init(gpa, notes);
+    errdefer index.deinit();
+    return .{ .notes = notes, .media = media, .arena = arena, .index = index };
 }
 
 /// Deep-copy a candidate list into `a`. The strings are owned by the source arena, so a shallow
@@ -2270,4 +2573,53 @@ test "relinkNote resolves the edited note's links and leaves the rest alone" {
     };
     _ = try v.indexer.relinkNote(id);
     try testing.expectEqual(@as(usize, 2), try v.realEdgeCount());
+}
+
+test "a published snapshot says which notes were rewritten, and when it cannot" {
+    // The layout re-solves the whole vault on every commit because a whole snapshot is all it is
+    // handed — a one-note edit costs the seconds a first open does. The indexer has always known
+    // better: `indexPending` classifies every file and the incremental path already uses that to
+    // scope the *relink*. This is the same fact, carried as far as the consumers.
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+
+    // A body edit to an existing note: exactly the notes that were written, and nothing else.
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]] twice\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    var scoped_arena = std.heap.ArenaAllocator.init(gpa);
+    defer scoped_arena.deinit();
+    const scoped = try v.indexer.snapshotCopy(scoped_arena.allocator());
+    try testing.expect(scoped.dirty_known);
+    try testing.expectEqual(@as(usize, 1), scoped.dirty.len);
+    try testing.expectEqual(id, scoped.dirty[0]);
+
+    // Draining is what makes the account per-publish rather than cumulative — a second commit with
+    // nothing new must not re-report the first commit's note as dirty.
+    try v.indexer.commitAndPublish();
+    var empty_arena = std.heap.ArenaAllocator.init(gpa);
+    defer empty_arena.deinit();
+    const empty = try v.indexer.snapshotCopy(empty_arena.allocator());
+    try testing.expect(empty.dirty_known);
+    try testing.expectEqual(@as(usize, 0), empty.dirty.len);
+
+    // A structural change cannot be described by a list of written notes: a note appearing moves
+    // where *other* notes' links resolve. The snapshot has to say so rather than under-report.
+    v.indexer.pending_broad = true;
+    try v.indexer.commitAndPublish();
+    var broad_arena = std.heap.ArenaAllocator.init(gpa);
+    defer broad_arena.deinit();
+    const broad = try v.indexer.snapshotCopy(broad_arena.allocator());
+    try testing.expect(!broad.dirty_known);
 }
