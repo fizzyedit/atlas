@@ -83,9 +83,10 @@ size on disk. The rest below are separate build steps, not part of the plugin.
 
 - `zig build bench -Doptimize=ReleaseFast -- <flags> <vault>` is a headless timing harness:
   `--index` builds the SQLite index and reports where the time went, `--index-edit` times one
-  edit against a built index, `--refold` times the layout rebuild, `--world` sweeps the level of
-  detail across a zoom range, and `--stats` reports graph structure. Run it against a real folder
-  of markdown or a `synth:N:shape` spec.
+  edit against a built index, `--layout-edit` mirrors a save (cold solve vs reuse), `--refold`
+  times a full spatial rebuild, `--world` sweeps the level of detail across a zoom range, and
+  `--stats` reports graph structure. Run it against a real folder of markdown or a `synth:N:shape`
+  spec.
 - `zig build wiki-import -- <dump.xml> <out-dir>` turns a MediaWiki XML dump into a vault, which
   is where the reference corpus in `docs/design/scale-architecture.md` comes from.
 

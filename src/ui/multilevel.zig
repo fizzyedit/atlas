@@ -144,55 +144,6 @@ pub const Ladder = struct {
     }
 };
 
-/// Build the coarsening hierarchy alone, without laying anything out.
-///
-/// The layout only produces a ladder when it takes the multilevel path — a full repack of a
-/// large vault. But the *view* wants the hierarchy on every rebuild, including the incremental
-/// ones that dominate while a vault is being indexed, and tying level-of-detail to which layout
-/// path happened to run means it blinks out the moment anything is edited.
-///
-/// This is O(n + e) per level over about log(n) levels, and touches no positions, so it is cheap
-/// enough to redo on every rebuild.
-pub fn coarsen(allocator: std.mem.Allocator, n: usize, edges: []const Edge) !Ladder {
-    var level_edges: std.ArrayList(WEdge) = .empty;
-    defer level_edges.deinit(allocator);
-    try level_edges.ensureTotalCapacity(allocator, edges.len);
-    for (edges) |e| {
-        if (e.a >= n or e.b >= n or e.a == e.b) continue;
-        level_edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = e.w });
-    }
-
-    var maps: std.ArrayList([]u32) = .empty;
-    var counts: std.ArrayList(usize) = .empty;
-    errdefer {
-        for (maps.items) |m| allocator.free(m);
-        maps.deinit(allocator);
-        counts.deinit(allocator);
-    }
-    try counts.append(allocator, n);
-
-    var cur_n = n;
-    while (cur_n > coarsest_n and maps.items.len < max_levels) {
-        const parent = try allocator.alloc(u32, cur_n);
-        const coarse_n = try match(allocator, cur_n, level_edges.items, parent);
-        // No structure left to merge — a star, or a graph with no edges at all. Stopping here
-        // is right: further levels would be arbitrary groupings, not communities.
-        if (@as(f32, @floatFromInt(coarse_n)) > @as(f32, @floatFromInt(cur_n)) * min_shrink) {
-            allocator.free(parent);
-            break;
-        }
-        try contract(allocator, &level_edges, parent);
-        try maps.append(allocator, parent);
-        try counts.append(allocator, coarse_n);
-        cur_n = coarse_n;
-    }
-
-    return .{
-        .maps = try maps.toOwnedSlice(allocator),
-        .counts = try counts.toOwnedSlice(allocator),
-    };
-}
-
 /// Lay out `n` nodes into `out` (unit space, centred on the origin).
 pub fn solve(
     allocator: std.mem.Allocator,

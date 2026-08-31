@@ -91,6 +91,23 @@ pub const Snapshot = struct {
     /// vanishing moves where other notes' links resolve, so the edit is not confined to the notes
     /// that were written. A consumer must treat false as "assume everything moved".
     dirty_known: bool = false,
+    /// True when this publish left the edge array identical to the previous one.
+    ///
+    /// A prose save rewrites a note's body and republishes, but its outbound links are the same
+    /// rows. The graph already knows that case as `job.settled`; this flag lets it skip the copy
+    /// of every edge *and* the world rebuild, rather than discovering the no-op after walking
+    /// 3.3M of them. Only meaningful when `dirty_known` is true — a structural publish reloads
+    /// everything and leaves this false.
+    edges_same: bool = false,
+};
+
+/// Pointer-free layout inputs, so the graph can decide "identity skip" without copying 73 MB.
+pub const LayoutPeek = struct {
+    dirty_known: bool = false,
+    edges_same: bool = false,
+    complete: bool = false,
+    node_n: usize = 0,
+    dirty_n: usize = 0,
 };
 
 pub const Phase = enum(u8) {
@@ -586,7 +603,45 @@ pub fn snapshotCopy(self: *Indexer, arena: std.mem.Allocator) !Snapshot {
         .phase = src.phase,
         .dirty = try arena.dupe(i64, src.dirty),
         .dirty_known = src.dirty_known,
+        .edges_same = src.edges_same,
     };
+}
+
+/// The facts a layout rebuild needs to choose a path, without copying the snapshot.
+pub fn peekLayout(self: *Indexer) LayoutPeek {
+    self.snap_mutex.lockUncancelable(dvui.io);
+    defer self.snap_mutex.unlock(dvui.io);
+    const src = self.snapshots[self.snap_pub.load(.acquire)];
+    return .{
+        .dirty_known = src.dirty_known,
+        .edges_same = src.edges_same,
+        .complete = src.complete,
+        .node_n = src.nodes.len,
+        .dirty_n = src.dirty.len,
+    };
+}
+
+/// Deep-copy the dirty notes (and only those) into `arena`.
+pub fn copyDirtyNotes(self: *Indexer, arena: std.mem.Allocator) ![]SnapNode {
+    self.snap_mutex.lockUncancelable(dvui.io);
+    defer self.snap_mutex.unlock(dvui.io);
+    const src = self.snapshots[self.snap_pub.load(.acquire)];
+    if (src.dirty.len == 0 or src.nodes.len == 0) return &.{};
+
+    var want = std.AutoHashMap(i64, void).init(arena);
+    try want.ensureTotalCapacity(@intCast(src.dirty.len));
+    for (src.dirty) |id| try want.put(id, {});
+
+    var out: std.ArrayList(SnapNode) = .empty;
+    try out.ensureTotalCapacity(arena, src.dirty.len);
+    for (src.nodes) |s| {
+        if (!want.contains(s.id)) continue;
+        var d = s;
+        d.path = try arena.dupe(u8, s.path);
+        d.title = try arena.dupe(u8, s.title);
+        out.appendAssumeCapacity(d);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 // -- worker -----------------------------------------------------------------------
@@ -1833,6 +1888,21 @@ pub fn commitAndPublish(self: *Indexer) !void {
     // Building the snapshot is a full read of every note and every link — seconds on a large
     // vault, and pure waste if the vault is being closed. The UI thread is joining this worker.
     if (self.quit.load(.acquire)) return;
+
+    // A scoped edit already has a complete snapshot in the ring. Patch that slot in place
+    // rather than reloading every note and every link from SQLite — the common save is one
+    // note's title and body, and walking 284k rows to republish it is the hitch the graph
+    // then has to skip a second time.
+    const dirty_known = !self.pending_broad;
+    if (dirty_known) {
+        if (try self.tryPatchPublished(db, self.pending_dirty.items)) {
+            self.pending_dirty.clearRetainingCapacity();
+            self.pending_broad = false;
+            _ = self.generation.fetchAdd(1, .release);
+            return;
+        }
+    }
+
     const next: u8 = (self.snap_pub.load(.acquire) + 1) & 1;
 
     // Recycling this slot frees the strings a reader may be part-way through copying, so the
@@ -1855,7 +1925,7 @@ pub fn commitAndPublish(self: *Indexer) !void {
     // Drained here rather than by the caller, so every path that publishes — incremental, full
     // scan, or a future one — gets the same accounting without having to remember to.
     const dirty = try arena.dupe(i64, self.pending_dirty.items);
-    const dirty_known = !self.pending_broad;
+    const known = !self.pending_broad;
     self.pending_dirty.clearRetainingCapacity();
     self.pending_broad = false;
     const snap = Snapshot{
@@ -1868,7 +1938,8 @@ pub fn commitAndPublish(self: *Indexer) !void {
         .complete = true,
         .scan_total = self.scan_total.load(.acquire),
         .dirty = dirty,
-        .dirty_known = dirty_known,
+        .dirty_known = known,
+        .edges_same = false,
     };
 
     // Same trip through the notes table, one thread earlier.
@@ -1976,6 +2047,163 @@ pub fn takeCandidates(self: *Indexer) ?CandidateSet {
     return set;
 }
 
+/// Patch the published snapshot in place for a prose save. Returns false when the change cannot
+/// be described that way — no complete snapshot yet, a note appeared or vanished, a dirty id the
+/// snapshot does not know, or *any* link changed — and the caller then takes the full reload.
+///
+/// Deliberately limited to saves that leave the edge array alone. Splicing a note's rows into the
+/// published edge list was tried: the list lives in that slot's arena, which is only recycled by a
+/// full publish, so every link edit added another copy of all 3.3M rows — tens of megabytes a
+/// save, for the length of the session. A link save has to re-solve the whole layout anyway
+/// (seconds), so the ~180 ms reload it falls back to is not the cost worth that.
+///
+/// Nothing is written until every check has passed, so a `false` return leaves the published
+/// snapshot exactly as it was rather than half-patched.
+///
+/// Holds `snap_mutex` for the whole patch so a concurrent `snapshotCopy` either sees the previous
+/// generation or the patched one, never a half-written slot.
+fn tryPatchPublished(self: *Indexer, db: *Db, dirty_ids: []const i64) !bool {
+    const pub_i = self.snap_pub.load(.acquire);
+    self.snap_mutex.lockUncancelable(dvui.io);
+    defer self.snap_mutex.unlock(dvui.io);
+
+    const snap = &self.snapshots[pub_i];
+    if (!snap.complete or snap.nodes.len == 0) return false;
+    if (self.snap_arenas[pub_i] == null) return false;
+    const arena = self.snap_arenas[pub_i].?.allocator();
+
+    var scratch_state = std.heap.ArenaAllocator.init(self.gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const db_n = (try db.conn.one(usize, "SELECT count(*) FROM notes", .{}, .{})) orelse 0;
+    if (db_n != snap.nodes.len) return false;
+
+    // `loadSnapNodes` orders by id, so a dirty note is a binary search rather than a hash map
+    // built over the whole vault on every save. A snapshot that is not sorted (a synthetic
+    // publish) simply fails the lookup and takes the full reload.
+    const at = try scratch.alloc(usize, dirty_ids.len);
+    for (dirty_ids, at) |id, *slot| slot.* = indexOfId(snap.nodes, id) orelse return false;
+
+    if (dirty_ids.len == 0) {
+        snap.dirty = &.{};
+        snap.dirty_known = true;
+        snap.edges_same = true;
+        snap.phase = .idle;
+        return true;
+    }
+
+    if (!try outboundUnchanged(db, scratch, snap.edges, dirty_ids)) return false;
+
+    // Load every replacement row before installing any of them, so a note that vanished between
+    // the write and this read cannot leave half the dirty set patched.
+    const fresh = try scratch.alloc(SnapNode, dirty_ids.len);
+    for (dirty_ids, fresh) |id, *slot| {
+        slot.* = (try loadOneSnapNode(db, arena, id)) orelse return false;
+    }
+    const nodes = @constCast(snap.nodes);
+    for (at, fresh) |idx, row| nodes[idx] = row;
+
+    snap.dirty = try arena.dupe(i64, dirty_ids);
+    snap.dirty_known = true;
+    snap.edges_same = true;
+    snap.phase = .idle;
+    return true;
+}
+
+/// Index of `id` in an id-sorted node array, or null when it is absent or the array is not sorted.
+fn indexOfId(nodes: []const SnapNode, id: i64) ?usize {
+    var lo: usize = 0;
+    var hi: usize = nodes.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const at = nodes[mid].id;
+        if (at == id) return mid;
+        if (at < id) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+fn loadOneSnapNode(db: *Db, arena: std.mem.Allocator, id: i64) !?SnapNode {
+    var stmt = try db.conn.prepare(
+        \\SELECT n.id, n.path, n.title, n.stem, n.phantom, n.size
+        \\FROM notes n WHERE n.id = ?
+    );
+    defer stmt.deinit();
+
+    var iter = try stmt.iterator(struct {
+        id: i64,
+        path: []const u8,
+        title: []const u8,
+        stem: []const u8,
+        phantom: i64,
+        size: i64,
+    }, .{id});
+    const row = (try iter.nextAlloc(arena, .{})) orelse return null;
+    const title = if (row.title.len > 0) row.title else row.stem;
+    return .{
+        .id = row.id,
+        .path = row.path,
+        .title = title,
+        .phantom = row.phantom != 0,
+        .degree = 0,
+        .size = @intCast(@max(row.size, 0)),
+    };
+}
+
+fn outboundUnchanged(
+    db: *Db,
+    arena: std.mem.Allocator,
+    edges: []const SnapEdge,
+    dirty_ids: []const i64,
+) !bool {
+    var dirty = std.AutoHashMap(i64, void).init(arena);
+    try dirty.ensureTotalCapacity(@intCast(dirty_ids.len));
+    for (dirty_ids) |id| try dirty.put(id, {});
+
+    var old_n = std.AutoHashMap(i64, u32).init(arena);
+    var old_h = std.AutoHashMap(i64, u64).init(arena);
+    try old_n.ensureTotalCapacity(@intCast(dirty_ids.len));
+    try old_h.ensureTotalCapacity(@intCast(dirty_ids.len));
+    for (dirty_ids) |id| {
+        try old_n.put(id, 0);
+        try old_h.put(id, 0);
+    }
+    for (edges) |e| {
+        if (!dirty.contains(e.src_id)) continue;
+        const n = old_n.getPtr(e.src_id).?;
+        const h = old_h.getPtr(e.src_id).?;
+        n.* += 1;
+        h.* +%= mix64(@as(u64, @bitCast(e.dst_id)));
+    }
+
+    for (dirty_ids) |id| {
+        var n: u32 = 0;
+        var h: u64 = 0;
+        var stmt = try db.conn.prepare("SELECT dst_id FROM links WHERE src_id = ?");
+        defer stmt.deinit();
+        var iter = try stmt.iterator(struct { dst_id: i64 }, .{id});
+        while (true) {
+            const row = (try iter.next(.{})) orelse break;
+            n += 1;
+            h +%= mix64(@as(u64, @bitCast(row.dst_id)));
+        }
+        if (n != (old_n.get(id) orelse 0)) return false;
+        if (h != (old_h.get(id) orelse 0)) return false;
+    }
+    return true;
+}
+
+fn mix64(v: u64) u64 {
+    var x = v;
+    x ^= x >> 33;
+    x *%= 0xff51afd7ed558ccd;
+    x ^= x >> 33;
+    x *%= 0xc4ceb9fe1a85ec53;
+    x ^= x >> 33;
+    return x;
+}
+
 fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
     // Degree = distinct neighbours via a UNION so a mutual link isn't counted twice.
     // No degree here. It used to be computed in SQL — first as a correlated `UNION` subquery per
@@ -1985,9 +2213,12 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
     // edge onto its unordered `(min,max)` pair to build its own edge list, which is precisely
     // "distinct neighbours (in ∪ out)", so it counts degree there in one pass over an array it has
     // in hand. `SnapNode.degree` survives for `publishSynthetic`, which is handed real degrees.
+    // `ORDER BY n.id` is not cosmetic: `tryPatchPublished` locates a dirty note by binary search
+    // over this array, and without it every prose save had to build a 284k-entry hash map first.
+    // The rows come off the primary key, so SQLite pays nothing to hand them over sorted.
     var stmt = try db.conn.prepare(
         \\SELECT n.id, n.path, n.title, n.stem, n.phantom, 0 AS degree, n.size
-        \\FROM notes n
+        \\FROM notes n ORDER BY n.id
     );
     defer stmt.deinit();
 
@@ -2612,6 +2843,7 @@ test "a published snapshot says which notes were rewritten, and when it cannot" 
     defer empty_arena.deinit();
     const empty = try v.indexer.snapshotCopy(empty_arena.allocator());
     try testing.expect(empty.dirty_known);
+    try testing.expect(empty.edges_same);
     try testing.expectEqual(@as(usize, 0), empty.dirty.len);
 
     // A structural change cannot be described by a list of written notes: a note appearing moves
@@ -2622,4 +2854,145 @@ test "a published snapshot says which notes were rewritten, and when it cannot" 
     defer broad_arena.deinit();
     const broad = try v.indexer.snapshotCopy(broad_arena.allocator());
     try testing.expect(!broad.dirty_known);
+    try testing.expect(!broad.edges_same);
+}
+
+test "a prose save patches the snapshot and leaves edges in place" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+    try v.indexer.commitAndPublish();
+    var before_arena = std.heap.ArenaAllocator.init(gpa);
+    defer before_arena.deinit();
+    const before_snap = try v.indexer.snapshotCopy(before_arena.allocator());
+    const before = v.indexer.peekLayout();
+    try testing.expect(before.complete);
+    const edge_n = before_snap.edges.len;
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]] — more words\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    _ = try v.indexer.relinkNote(id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(peek.edges_same);
+    try testing.expectEqual(before.node_n, peek.node_n);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const dirty = try v.indexer.copyDirtyNotes(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), dirty.len);
+    try testing.expectEqual(id, dirty[0].id);
+    try testing.expect(std.mem.endsWith(u8, dirty[0].path, "README.md"));
+
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(edge_n, snap.edges.len);
+}
+
+test "adding a wikilink falls back to a full reload rather than a patch" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("Optics.md", "# Optics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+    try v.indexer.commitAndPublish();
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]] and [[Optics]]\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    _ = try v.indexer.relinkNote(id);
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(!peek.edges_same);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(@as(usize, 2), snap.edges.len);
+}
+
+test "removing a wikilink falls back to a full reload rather than counting as prose" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("Optics.md", "# Optics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]] and [[Optics]]\n");
+    try v.indexer.commitAndPublish();
+
+    var before_arena = std.heap.ArenaAllocator.init(gpa);
+    defer before_arena.deinit();
+    const before = try v.indexer.snapshotCopy(before_arena.allocator());
+    try testing.expectEqual(@as(usize, 2), before.edges.len);
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]]\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    _ = try v.indexer.relinkNote(id);
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(!peek.edges_same);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), snap.edges.len);
+    try testing.expectEqual(id, snap.edges[0].src_id);
+}
+
+test "removing every wikilink falls back to a full reload rather than counting as prose" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+    try v.indexer.commitAndPublish();
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    _ = try v.indexer.relinkNote(id);
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(!peek.edges_same);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(@as(usize, 0), snap.edges.len);
 }

@@ -153,30 +153,63 @@ The wikilink candidate lists are built here too and handed to the UI thread by o
 rather than being queried on demand during a frame.
 
 **The camera follows the note you are reading.** A re-fold re-derives the hierarchy from the link
-graph, so an edit can move every note in the vault — including the one on screen. `applyFraming`
-re-derives the pose for `.extents`, `.note` and `.interior`, but `.free` (the reader panned by hand)
-deliberately re-derives nothing, on the grounds that a hand pan is a place someone chose to be. That
-reasoning assumes the world stayed still. So `finishRebuild` records where the anchor note sat
-before the rebuild and shifts the camera by exactly how far it moved: the pan is preserved
-*relative to the note* rather than to the world, and the note ends up back under the same pixel with
-everything else rearranged around it. Through `Camera.retarget`, so it eases rather than jumps, and
-so a rebuild that did not move the note costs nothing.
+graph, so an edit can move every note in the vault — including the one on screen. Click-to-open
+and recenter `focusNode` to the note's *layout home* (`last_pos`), never the coalesced mass it
+happens to be drawn inside. A save does not re-focus: it shifts the camera by how far that home
+moved and keeps zoom, so a link edit cannot fly the view. `.interior` still re-derives its pin.
 
 ### 3. Snapshot → world (layout worker)
 
-The "Building map…" wait, and the largest single piece of work in a rebuild.
+The "Building map…" wait, and the largest single piece of work in a rebuild — but only when the
+link graph actually moved.
 
-- **`fold.zig`** coarsens the link graph into a ladder of cells. This is a *hierarchy*, not a layout:
-  which notes belong together, nested.
-- **`containment.zig`** places each cell's children inside its parent's disc. Position is *derived*
-  from the hierarchy — there is no force simulation and nothing to converge.
-- **`cellweb.zig`** folds every link onto cell pairs once, so the web can be drawn at any level of
-  the hierarchy without re-walking 3M edges.
+- **`layout.zig`** decides every note's position: Louvain territories, multilevel interiors,
+  nested frames, island pack. Clustering is always a fresh Louvain of the current graph — the
+  same one a cold open would run — so an edit cannot leave the map differing from a reopen.
+  A territory whose subgraph is byte-identical (membership *and* induced edges) is copied from
+  the previous solve (`Options.reuse`); that is memoisation of a pure function, not history.
+- **`spatial.zig`** builds the drawing hierarchy from those positions (Hilbert curve, CDC chunks).
+  The Hilbert box is persisted so one outlier does not rekey the vault.
+- **`cellweb.zig`** folds every link onto cell pairs once, so the web can be drawn at any level
+  without re-walking 3M edges.
+- **`world.zig`** owns the living set. Positions come from layout, hierarchy from spatial, never
+  the reverse.
 
-Deriving position from structure buys a property that used to be bought with a lot of machinery: a
-note whose links did not change lands in the same cell, so an edit somewhere else in the vault does
-not shuffle your view. The old force layout needed an incremental-anchoring pass to fake that;
-containment gets it for free.
+A prose save whose links did not change skips this stage entirely: the live World is kept and
+only dirty note metadata is patched. `fold.zig` still supplies `degreeNormalised`, connected
+components, and the `Ladder` type the spatial hierarchy occupies; it is not the drawing tree.
+
+A link edit pays both stages in full, and there is deliberately no "re-settle the live ladder
+instead of rebuilding it" path. One was written and measured: keeping the ladder requires the
+Hilbert order to survive the re-solve, and because clustering *and* frame placement are global,
+some note always crosses a neighbour on the curve — the check was false on every real edit. The
+step it guards is 355 ms of a ~2.3 s save. Re-settling in place only becomes reachable once
+re-clustering is local, and making it local means giving up "the map you reopen is the map a cold
+open produces" unless the layout is persisted alongside the index.
+
+### Why one link moves the map
+
+Adding a single link moves ~66% of the notes more than a lattice slot, and it is worth being
+precise about why, because two plausible explanations are both wrong.
+
+It is not the map sliding or breathing: removing the best-fit translation takes the median from 38
+to 28 world units, and removing the best-fit scale makes the residual *worse*. And it is not stale
+or churning content — 99.9% of notes keep both their territory and their exact offset inside it.
+They are carried. One `FrameMemo` miss at nesting depth 1, on a frame of 112 group-discs, re-places
+112 rigid bodies that between them hold the whole giant component.
+
+The re-placement is correct — it is what a cold open produces — but it lands nowhere near where it
+was, because `placeFrame` is *chaotic*: `multilevel.solve` coarsens to ~40 super-nodes and seeds
+them from a jitter cloud, so a small change in one disc's radius or one edge weight settles into a
+different, equally valid arrangement. Two fixes were tried against this and both failed, measured:
+quantising the float radii in `frameKey` (the invalidation travels through u64 signature hashes,
+not float bits) and seeding the coarsest level from stable identities rather than array indices
+(worse — 188k moved became 283k).
+
+Making this still without giving up "the map is always the truth" means making the placement
+*continuous* in its inputs rather than caching it — the map may not be seeded from a previous
+solve. That is a redesign of `placeFrame`, not a patch. `--layout-edit` reports every number above,
+so it can be attacked with a measurement in hand.
 
 Vaults of 4,000 notes or fewer skip the worker and solve inline — a thread would cost a frame of
 latency for work too fast to see.
@@ -343,10 +376,11 @@ on screen to place — and otherwise only when something feeding it moved.
 |---|---|---|---|
 | Full scan | ~70 s | worker | Bounded by disk. Reports progress; never blocks a frame. |
 | `relinkAll` | one pass over 3M links | worker | Once per scan, skipped when nothing changed. An *edit* uses `relinkNote` instead. |
-| `commitAndPublish` | ~180 ms, ~73 MB copy | worker | Once per settled generation, not per batch. The last whole-vault step on the edit path. |
-| fold + containment + cellweb | ~610 ms | layout worker | Once per rebuild, coalesced by the quiet timer. |
-| `snapshotCopy` | ~73 MB copy | **UI thread** | Once per rebuild. The alternative is a use-after-free. |
-| `p.nodes` | ~46 MB | **UI thread** | Once per rebuild. The next scale step is deleting this array. |
+| `commitAndPublish` | ~180 ms full; a prose save patches one note | worker | A save whose links did not move patches the published snapshot in place. Anything else — a link edit included — reloads. |
+| `layout.solve` | ~1.9 s | layout worker | Cold open, Rebuild index, and every link edit. A prose save skips it entirely. Reuse of byte-identical interiors takes it to ~1.2 s. **This is the whole remaining save cost.** |
+| spatial + cellweb (`World.initFrom`) | ~355 ms | layout worker | Same three cases. Measured, not assumed — it is a sixth of the solve, not its equal. |
+| `snapshotCopy` | ~73 MB copy | **UI thread** | Cold open, structural change, link edit. The identity skip does not copy the vault. |
+| `p.nodes` | ~46 MB | **UI thread** | Cold open. Identity skip patches dirty titles in place. |
 
 Two of these are on the UI thread, which is the honest weak spot: a rebuild has a visible cost
 proportional to the vault, and the quiet-coalesce timer exists to make sure you pay it once rather
@@ -356,10 +390,12 @@ than continuously. The **per-frame** row is the one that has to stay empty, and 
 
 ## Verifying it
 
-- `zig build bench -- --world <vault>` sweeps the containment path at a fixed budget and reports
+- `zig build bench -- --world <vault>` sweeps the live World at a fixed budget and reports
   marks and links per frame. **Diff the marks and links columns** — that is the draw budget holding
   or not holding. Do not try to verify this from a live window: `tour-gpu.csv` timings are
   vsync-locked and prove nothing about cost.
+- `--layout-edit` mirrors a save: cold `layout.solve` and `World.initFrom`, then a second solve
+  with reuse — identical edges (what the identity skip avoids) versus one added link.
 - `--budget=N` / `--scan-cap=N` show what the budget and the link-scan cap are actually buying.
 - `--stats` reports graph structure — degree distribution, components, the coarsening ladder, folder
   correlation — without running layout, so it is fast at any vault size.

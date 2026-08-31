@@ -13,11 +13,14 @@
 //! so the graph shows fewer names rather than a legible-looking smear of overlapping ones.
 //!
 //! Everything sits on the hex lattice in `hex.zig`: `dotgrid` paints it as a zoom-aware dot
-//! background and `layout_full` force-places linked notes near each other then snaps them
+//! background and `layout.solve` places linked notes near each other then snaps them
 //! onto the lattice, so a node always lands dead centre on a dot. When the index changes,
 //! nodes ease from their old home to the new one. Links animate out from their source note
 //! on connect and retract on disconnect; the node under the cursor takes the hand cursor
 //! and a button-style highlight.
+//!
+//! Positions come from `layout.solve`; the drawing hierarchy from `spatial` via `World.initFrom`.
+//! A prose save that does not change links keeps the live World and patches note metadata.
 const std = @import("std");
 const dvui = @import("dvui");
 const core = @import("core");
@@ -50,7 +53,6 @@ const Visible = struct {
     alpha: f32,
 };
 const fold = @import("fold.zig");
-const spatial = @import("spatial.zig");
 const layout = @import("layout.zig");
 const radix = @import("radix.zig");
 const proximity = @import("proximity.zig");
@@ -417,12 +419,18 @@ const EdgeAnim = struct {
     lit_from_a: bool = true,
 };
 
-/// The note the camera should stay with across a rebuild: whatever is framed, else the open one.
+/// The note the camera should stay with across a rebuild: whatever is framed, else the
+/// active document, else an open tab. Tab order is last because two open notes in a Wikipedia
+/// vault are routinely on opposite sides of the map — following `open_notes[0]` while the
+/// reader saves the *other* tab is how a save lost the node they were looking at.
 fn anchorNoteId(p: *Panel) ?i64 {
     switch (p.framing) {
         .note => |id| return id,
         .interior => |id| return id,
         else => {},
+    }
+    if (activeNodeIndex(p)) |gi| {
+        if (gi < p.nodes.len) return p.nodes[gi].note_id;
     }
     if (p.open_notes.items.len > 0) {
         const idx = p.open_notes.items[0];
@@ -528,19 +536,9 @@ const Interior = struct {
 
 /// A graph rebuild in flight on a worker thread.
 ///
-/// The solve (`layout_full.targets`) is the one part of a rebuild that scales badly with vault
-/// size — seconds on a large vault even after the near-field grid work — and it used to run
-/// inside `draw`, which is why opening a big folder froze the whole editor rather than the
-/// panel. Everything a rebuild needs is prepared into `arena` up front, the worker solves into
-/// `targets`, and the UI thread finishes the job on a later frame.
-///
-/// The panel's own arena is deliberately *not* reset when a job starts. The previous
-/// arrangement stays live and keeps drawing until the new one is ready, so a reindex on an
-/// already-open graph never blanks the view.
-///
-/// Ownership: prep runs on the UI thread and finishes before the thread is spawned; nothing
-/// touches `arena` while `done` is false. That is what makes a plain (non-threadsafe) arena
-/// safe here.
+/// `layout.solve` places the vault; `World.initFrom` (or a local geometry nudge) builds the
+/// drawing hierarchy. Prep runs on the UI thread into `arena`; the worker never reads live panel
+/// state. The previous arrangement stays on screen until `finishRebuild` adopts the result.
 /// What a running solve is currently doing, for the spinner. Written by the worker, read by the
 /// UI thread — the world build is tens of seconds on a large vault, and reporting it as the same
 /// "laying out" step the solve uses makes a long but healthy build indistinguishable from a hang.
@@ -586,16 +584,12 @@ const LayoutJob = struct {
 
     n: usize,
     edges: []GraphEdge,
-    layout_edges: []layout_full.Edge,
     degrees: []u32,
     paths: [][]const u8,
-    /// Per-note hash of "which notes am I linked to", carried onto `GraphNode.link_sig` so the
-    /// *next* rebuild can tell whose links moved.
+    note_ids: []u64 = &.{},
+    bodies: []f32 = &.{},
+    /// Per-note hash of "which notes am I linked to", carried onto `GraphNode.link_sig`.
     sigs: []u64,
-    /// Whose own links changed since the last rebuild. The one consumer is the re-frame in
-    /// `finishRebuild`: a note whose neighbourhood just changed shape is a note the camera should
-    /// look at again.
-    changed: []bool,
 
     /// Positions for a data source that packs its own (the vault simulator). Parallel to graph
     /// indices (id-sorted notes), and the only way a node gets a start position — everything else
@@ -618,7 +612,7 @@ const LayoutJob = struct {
 
     /// The living world, built here rather than on the UI thread.
     ///
-    /// This is the largest single piece of work in a rebuild — `fold.build` coarsens every note
+    /// This is the largest single piece of work in a rebuild — `spatial.build` groups every note
     /// and `cellweb` folds every link, both proportional to notes *and* edges — and it used to run
     /// inside `ensureWorld` at the top of `drawPanel`, freezing the editor for tens of seconds on
     /// a 286k-note vault.
@@ -634,6 +628,9 @@ const LayoutJob = struct {
     /// frame (`liftLinks` hashmaps, list growth), so an arena would grow without bound for as long
     /// as the graph is on screen.
     world: ?world_mod.World = null,
+    /// The Hilbert box the previous world keyed against, so a rebuild does not renumber every
+    /// key in the vault because one note landed outside the old extent. See `world_mod.Quant`.
+    quant: world_mod.Quant = .{},
 
     fn run(job: *LayoutJob) void {
         job.solve() catch |e| {
@@ -643,29 +640,33 @@ const LayoutJob = struct {
     }
 
     fn solve(job: *LayoutJob) !void {
-        // No force layout, and no multilevel coarsen.
+        // Positions from `layout.solve`, drawing hierarchy from `World.initFrom`.
         //
-        // Both are superseded by containment. `fold` + `containment` decide every position from
-        // the link hierarchy, and `syncNodesFromWorld` overwrites `target`/`home`/`pos` on every
-        // note the world draws — so `layout_full.targets` was solving an arrangement that is
-        // immediately thrown away.
+        // A prose save whose link graph did not change (`job.settled`) skips both: the live World
+        // is the right one, and rebuilding it is what made a one-word edit look like a zoom
+        // hitch (`anim` reset to 0). A link edit re-solves the current graph — the same Louvain a
+        // cold open would run — and rebuilds the world from the result.
         //
-        // This was not a small tax. A CPU sample of a 283,881-note vault stuck for minutes on
-        // "Preparing graph…" put 1,537 of 3,141 worker samples inside `layout_full.targets`, and
-        // 1,361 of those inside `PlacedIndex.overlaps` — the whole multi-minute wait, spent
-        // producing positions nothing would read.
-        //
-        // Building the world is therefore the whole of a solve. `finishRebuild` takes the vault's
-        // extent from it too, which is where the drawn positions actually come from.
+        // There is deliberately no "nudge the live ladder instead" path here. One was written and
+        // measured: `spatial.curveOrderHolds` is false on every real edit, because clustering and
+        // frame placement are global, so some note always moves far enough to cross a neighbour on
+        // the Hilbert curve. Re-settling the ladder in place only becomes possible once
+        // re-clustering is *local*; until then it is unreachable code guarding a 355 ms step.
         if (job.precomputed) |pos| {
             if (pos.len != job.n) return error.SynthPosLen;
         }
         try job.buildWorld();
     }
 
-    /// `World.init` for this job's note set. Mirrors what `ensureWorld` used to do inline.
+    /// `layout.solve` then `World.initFrom` for this job's note set.
     fn buildWorld(job: *LayoutJob) !void {
         if (job.n == 0) return;
+        if (job.settled != null) {
+            // Identity skip: the panel keeps `p.world_state`. Building a new World here is what
+            // the log line "reused N positions — no link changed" used to mean, and it was the
+            // remaining hitch on a prose save.
+            return;
+        }
         job.phase.store(@intFromEnum(JobPhase.building_map), .release);
         const gpa = sdk.allocator();
         const a = job.arena.allocator();
@@ -673,10 +674,6 @@ const LayoutJob = struct {
         const links = try a.alloc(fold.Edge, job.edges.len);
         for (job.edges, 0..) |e, i| links[i] = .{ .a = @intCast(e.a), .b = @intCast(e.b), .w = 1 };
 
-        // `fold.build` only runs its folder chain when `paths.len == n_notes`, so a full-length
-        // array of *empty* paths is worse than no array at all: every path compares equal, the
-        // sort leaves arbitrary index order, and the chain wires unrelated notes together at
-        // `folder_w`. Hand it an empty slice instead so it coarsens on real links alone.
         var any_path = false;
         for (job.paths) |path| {
             if (path.len > 0) {
@@ -686,54 +683,19 @@ const LayoutJob = struct {
         }
         const path_arg: []const []const u8 = if (any_path) job.paths else &.{};
 
-        // World scale has to match the classic layout's, because everything downstream — camera
-        // fit, zoom thresholds, `interiorWant`, label placement — is calibrated in those units.
-        // `slotSpacingFor` is the world distance between adjacent notes; containment puts two
-        // ring-adjacent leaves `leaf_pitch × note_r` apart, so solve for `note_r`. This is the
-        // same value `finishRebuild` assigns to `p.layout_slot`, deliberately computed from `n`
-        // in both places rather than read across the thread boundary.
         var place = job.place_opts;
         place.note_r = layout_full.slotSpacingFor(job.n) / world_mod.leaf_pitch;
         place.rotation_per_level = job.place_rotation;
 
-        const bodies = try a.alloc(f32, job.n);
-        const note_ids = try a.alloc(u64, job.n);
-        for (job.order, 0..) |si, gi| {
-            bodies[gi] = @floatFromInt(job.snap.nodes[si].size);
-            // Stable across rebuilds, unlike `gi` — the order is by id, so one inserted note
-            // shifts every index after it. See `layout.Reuse`.
-            note_ids[gi] = @bitCast(job.snap.nodes[si].id);
+        const bodies = if (job.bodies.len == job.n) job.bodies else try a.alloc(f32, job.n);
+        if (job.bodies.len != job.n) @memset(bodies, 0);
+        const note_ids = if (job.note_ids.len == job.n) job.note_ids else try a.alloc(u64, job.n);
+        if (job.note_ids.len != job.n) {
+            for (note_ids, 0..) |*d, i| d.* = i;
         }
 
         const t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
         const fold_opts: fold.Options = .{ .cancel = &job.cancel, .bodies = bodies };
-
-        // Cluster and place the whole vault every time; *memoise* the interiors.
-        //
-        // This used to reuse the previous build's positions and settle only what the edit touched,
-        // and that was abandoned for a reason no amount of tuning fixes: an incrementally settled
-        // vault is not the vault a fresh open produces, so the map you closed was not the map you
-        // reopened. `Options.reuse` is not that. A territory's interior is a deterministic function
-        // of its own subgraph, matched by membership, so a reused one is bit-identical to what
-        // solving it again would produce — the arrangement stays a pure function of the vault.
-        // Nothing about the link graph moved, so neither did the answer.
-        //
-        // A save that edits prose republishes the whole snapshot exactly as a save that adds a link
-        // does, and the layout used to re-derive 284k positions either way. `changed[]` — already
-        // computed for re-framing — says whether any note's own link set moved; when none did, and
-        // the note set is the same, the solve is a pure function of inputs that have not changed.
-        if (job.settled) |prev| {
-            job.world = try world_mod.World.initFrom(
-                gpa,
-                job.n,
-                links,
-                .{ .pos = prev.pos, .comp = prev.comp },
-                fold_opts,
-                place,
-            );
-            dvui.log.info("atlas world: reused {d} positions — no link changed", .{job.n});
-            return;
-        }
 
         var lay = try layout.solve(gpa, job.n, links, path_arg, .{
             .note_r = place.note_r,
@@ -741,7 +703,6 @@ const LayoutJob = struct {
             .ids = note_ids,
             .reuse = job.reuse,
         });
-        // Handed to the next solve, not freed with the rest of the result — see `layout.Reuse`.
         job.next_reuse = .{ .ids = lay.ids, .inner = lay.inner, .home = lay.home, .frames = lay.frames };
         job.next_pos = try gpa.dupe(layout.Vec2, lay.pos);
         job.next_comp = try gpa.dupe(u32, lay.comp);
@@ -752,6 +713,7 @@ const LayoutJob = struct {
             lay.frames = &.{};
             lay.deinit(gpa);
         }
+
         job.world = try world_mod.World.initFrom(
             gpa,
             job.n,
@@ -759,14 +721,8 @@ const LayoutJob = struct {
             .{ .pos = lay.pos, .comp = lay.comp },
             fold_opts,
             place,
+            job.quant,
         );
-        // Kept (not a temporary diagnostic): this is how long "Building map…" is on screen, it is
-        // the largest remaining cost in opening a vault, and it is the number to watch if that
-        // wait ever grows. Logged from the worker, same as the indexer's own scan summary.
-        // What the *next* stage needs, reported now so the plumbing is verifiable before anything
-        // depends on it: how much of this rebuild the indexer could actually account for. A scoped
-        // re-solve is only sound when `dirty_known` holds — a structural edit moves where other
-        // notes' links resolve, so "these notes were written" stops describing the change.
         dvui.log.info("atlas dirty: {d} note(s), scoped={}  interiors {d}/{d}  frames {d}/{d}", .{
             job.snap.dirty.len,
             job.snap.dirty_known,
@@ -784,14 +740,8 @@ const LayoutJob = struct {
 
     fn deinit(job: *LayoutJob, gpa: std.mem.Allocator) void {
         if (job.thread) |t| t.join();
-        // Only reached if nobody took it — an abandoned solve, or one that failed after this
-        // point. `finishRebuild` clears the field when it adopts it, so reaching a non-null world
-        // here means the job died before adoption; it holds the largest allocation in the plugin
-        // and is not in the arena, so it must be freed explicitly.
         if (job.world) |*w| w.deinit();
         job.world = null;
-        // Same contract: `finishRebuild` clears this when it adopts it, so a non-null one here
-        // belongs to a solve nobody collected.
         if (job.next_reuse) |r| freeReuse(gpa, r);
         job.next_reuse = null;
         gpa.free(job.next_pos);
@@ -929,6 +879,8 @@ pub const Panel = struct {
     last_pos: []layout.Vec2 = &.{},
     last_comp: []u32 = &.{},
     last_order: u64 = 0,
+    /// Hilbert box persisted across rebuilds so one outlier does not rekey the vault.
+    quant: world_mod.Quant = .{},
     morph_from: std.AutoHashMapUnmanaged(i64, dvui.Point) = .empty,
     /// 0 → 1 across `morph_s` after a rebuild. 1 means settled and `morph_from` is empty.
     morph_t: f32 = 1,
@@ -1068,6 +1020,8 @@ pub const Panel = struct {
         sdk.allocator().free(self.last_comp);
         self.last_pos = &.{};
         self.last_comp = &.{};
+        self.last_order = 0;
+        self.quant = .{};
         if (self.density) |*d| d.deinit();
         self.visible.deinit(sdk.allocator());
         self.open_notes.deinit(sdk.allocator());
@@ -1104,6 +1058,7 @@ pub const Panel = struct {
             w.deinit();
             self.world_state = null;
         }
+        self.quant = .{};
         self.interior.clear();
         self.interior.fail_id = null;
         self.interior.fail_gen = std.math.maxInt(u64);
@@ -2128,6 +2083,23 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         return;
     }
 
+    // Identity skip: a prose save already patched the snapshot and left the edge array alone.
+    // The map on screen is the right one — do not copy it, do not rebuild the World, do not
+    // realloc GraphNode. Patch titles/size/phantom on the dirty ids and keep drawing.
+    if (!p.force_rebuild and st.indexer_ready and p.world_state != null and p.nodes.len > 0) {
+        const peek = st.indexer.peekLayout();
+        if (peek.complete and peek.dirty_known and peek.edges_same and peek.node_n == p.nodes.len) {
+            var scratch = std.heap.ArenaAllocator.init(sdk.allocator());
+            defer scratch.deinit();
+            const dirty_notes = try st.indexer.copyDirtyNotes(scratch.allocator());
+            try finishSettledRebuild(p, st, gen, open_hash, dirty_notes);
+            p.force_rebuild = false;
+            p.note_count = st.indexer.counts().note_count;
+            dvui.log.info("atlas adopt: settled, patched {d} note(s)", .{dirty_notes.len});
+            return;
+        }
+    }
+
     // Whatever prompted this rebuild, record the pane we have now.
     const aspect = desired;
     p.layout_aspect = aspect;
@@ -2172,26 +2144,105 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         .order = &.{},
         .n = 0,
         .edges = &.{},
-        .layout_edges = &.{},
         .degrees = &.{},
         .paths = &.{},
         .sigs = &.{},
-        .changed = &.{},
-        // Borrowed for the length of the solve. The panel keeps owning it until this job's own
-        // result replaces it in `finishRebuild`, so an abandoned solve leaves it intact.
         .reuse = p.reuse,
+        .quant = if (p.world_state) |*w| w.hilbertBox() else p.quant,
     };
     errdefer job.arena.deinit();
     const arena = job.arena.allocator();
     const prep_t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
 
-    // Owned copy: the rebuild below walks these strings for as long as the layout solve takes,
-    // which on a large vault is many indexer commits — far longer than a borrowed slice lives.
+    try prepFullJob(p, st, job, arena, &carry);
+    p.note_count = if (st.indexer_ready) st.indexer.counts().note_count else job.snap.note_count;
+
+    if (job.n == 0) {
+        // Empty vault — no solve to run, so the job is finished with here and the panel's own
+        // arena can be recycled immediately.
+        job.arena.deinit();
+        gpa.destroy(job);
+        if (p.world_state) |*w| {
+            w.deinit();
+            p.world_state = null;
+        }
+        p.label_live = .empty;
+        p.interior_label_live = .empty;
+        _ = p.arena.reset(.free_all);
+        p.id_index.clearRetainingCapacity();
+        p.gen = gen;
+        p.nodes = &.{};
+        p.edges = &.{};
+        var it = p.edge_anim.valueIterator();
+        while (it.next()) |v| v.alive = false;
+        p.world_radius = 0;
+        p.world_bounds = .{};
+        p.live_pos = &.{};
+        p.pointer_warm.clearRetainingCapacity();
+        p.visible.clearRetainingCapacity();
+        p.open_notes.clearRetainingCapacity();
+        p.open_hash = open_hash;
+        p.fitted_vp_w = 0;
+        p.fitted_vp_h = 0;
+        p.layout_settled = true;
+        return;
+    }
+
+    const n = job.n;
+    job.place_opts = p.place_opts;
+    job.place_rotation = p.place_rotation;
+
+    const StateT = @typeInfo(@TypeOf(st)).pointer.child;
+    if (@hasDecl(StateT, "packedPositions")) {
+        if (st.packedPositions()) |pos| {
+            if (pos.len == n) job.precomputed = try arena.dupe(dvui.Point, pos);
+        }
+    }
+
+    p.force_rebuild = false;
+
+    // Settled after a full copy: still skip the worker and World rebuild.
+    if (job.settled != null and p.world_state != null and p.nodes.len == n) {
+        dvui.log.info("atlas prep: settled skip {d}ms ({d} notes)", .{
+            @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - prep_t0, 1_000_000),
+            n,
+        });
+        try finishSettledJob(p, st, job);
+        job.deinit(gpa);
+        return;
+    }
+
+    if (n <= layout_inline_max and job.precomputed == null) {
+        defer job.deinit(gpa);
+        try job.solve();
+        try finishRebuild(p, st, job);
+        return;
+    }
+
+    dvui.log.info("atlas prep: {d}ms on the UI thread ({d} notes, {d} edges)", .{
+        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - prep_t0, 1_000_000),
+        n,
+        job.edges.len,
+    });
+    job.thread = std.Thread.spawn(.{}, LayoutJob.run, .{job}) catch {
+        defer job.deinit(gpa);
+        try job.solve();
+        try finishRebuild(p, st, job);
+        return;
+    };
+    p.job = job;
+}
+
+fn prepFullJob(
+    p: *Panel,
+    st: anytype,
+    job: *LayoutJob,
+    arena: std.mem.Allocator,
+    carry: *std.AutoHashMap(i64, GraphNode),
+) !void {
     const snap: Indexer.Snapshot = if (st.indexer_ready) try st.indexer.snapshotCopy(arena) else .{};
     job.snap = snap;
-    p.note_count = snap.note_count;
 
-    // Real notes first (id-sorted for a stable force-layout seed order), phantoms after.
     var order: std.ArrayList(usize) = .empty;
     try order.ensureTotalCapacity(arena, snap.nodes.len);
     for (snap.nodes, 0..) |n, i| {
@@ -2208,41 +2259,11 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
             return na.id < nb.id;
         }
     }.less);
-
     if (order.items.len == 0) {
-        // Empty vault — no solve to run, so the job is finished with here and the panel's own
-        // arena can be recycled immediately.
-        job.arena.deinit();
-        gpa.destroy(job);
-        if (p.world_state) |*w| {
-            w.deinit();
-            p.world_state = null;
-        }
-        p.label_live = .empty;
-        p.interior_label_live = .empty;
-        _ = p.arena.reset(.free_all);
-        p.id_index.clearRetainingCapacity();
-        p.gen = gen;
-        p.nodes = &.{};
-        p.edges = &.{};
-        // Nothing left to key against, so every link is dead — but let them retract rather
-        // than blink out.
-        var it = p.edge_anim.valueIterator();
-        while (it.next()) |v| v.alive = false;
-        p.world_radius = 0;
-        p.world_bounds = .{};
-        p.live_pos = &.{};
-        p.pointer_warm.clearRetainingCapacity();
-        p.visible.clearRetainingCapacity();
-        p.open_notes.clearRetainingCapacity();
-        p.open_hash = open_hash;
-        p.fitted_vp_w = 0;
-        p.fitted_vp_h = 0;
-        p.layout_settled = true;
+        job.n = 0;
         return;
     }
 
-    // Map snap note id → graph index before laying out — the force layout needs the edges.
     var snap_to_graph = std.AutoHashMap(i64, usize).init(arena);
     try snap_to_graph.ensureTotalCapacity(@intCast(order.items.len));
     for (order.items, 0..) |si, gi| {
@@ -2260,45 +2281,15 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
         const key = (lo << 32) | hi;
         const gop = try seen.getOrPut(key);
         if (gop.found_existing) continue;
-        // Keep source→dest order for the connect animation; layout treats edges as undirected.
         try edge_list.append(arena, .{ .a = ai, .b = bi });
     }
-
-    // Canonical order, because the snapshot's is not one.
-    //
-    // `loadSnapEdges` runs `SELECT src_id, dst_id FROM links` with no `ORDER BY` — deliberately,
-    // since sorting 3.3M rows in SQLite is expensive and the consumer dedups anyway. But rewriting
-    // a note deletes and reinserts its links, so the rows come back in a *different order* after an
-    // edit, and that order reaches the solve.
-    //
-    // It matters because the weights are summed. `cellweb.dedupe` and `louvain.contract` both fold
-    // parallel edges by adding floats, and float addition is not associative: a different encounter
-    // order gives weights that differ in the last bits, Louvain's `gain > best_gain` flips wherever
-    // that crosses a tie, and territories churn for reasons that have nothing to do with the edit.
-    // Measured against this: the harness, which builds its edges in file order, reuses 100% of
-    // territories after adding a link between the vault's two biggest hubs; the app, reading the
-    // same vault through SQLite, reused 66% after a one-word edit.
-    //
-    // Sorting here rather than in SQL puts the cost where it is cheap — one radix pass over an
-    // array already in hand — and it makes "the map is a pure function of the vault" true of the
-    // whole pipeline rather than of `layout.solve` in isolation.
     {
         const scratch = try arena.alloc(GraphEdge, edge_list.items.len);
         const sorted = radix.sortByKey(GraphEdge, graphEdgeKey, edge_list.items, scratch);
         if (sorted.ptr != edge_list.items.ptr) @memcpy(edge_list.items, sorted);
     }
-    const layout_edges = try arena.alloc(layout_full.Edge, edge_list.items.len);
-    for (edge_list.items, 0..) |e, i| layout_edges[i] = .{ .a = e.a, .b = e.b };
 
     const n = order.items.len;
-
-    // Degree from the edge list that was just deduped, not from the database.
-    //
-    // `loadSnapNodes` used to compute it in SQL, per note, which on a 283,878-note vault with 3.3M
-    // links was the single most expensive part of publishing a snapshot. Every form of that query
-    // is redundant: `edge_list` above has already collapsed each pair on its unordered `(min,max)`
-    // key, so counting entries here *is* "distinct neighbours (in ∪ out)" — the exact definition
-    // the SQL was reaching for — for the cost of one pass over an array already in cache.
     var degrees = try arena.alloc(u32, n);
     @memset(degrees, 0);
     for (edge_list.items) |e| {
@@ -2307,121 +2298,117 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     }
     const sigs = try linkSignatures(arena, n, order.items, snap.nodes, edge_list.items);
 
-    // Whose own links moved since the last rebuild.
-    //
-    // This used to be one output of a much larger pass that also produced `seeds`, `anchored` and
-    // a one-step position history per node — the incremental-anchoring inputs to the force solve:
-    // hold a node whose links didn't move, free the one-hop neighbours of one that did, and put a
-    // node back in its old cell when an edit undid the previous one. All of it computed a starting
-    // arrangement for `layout_full.targets`, which no longer runs (see `LayoutJob.solve`), so all
-    // of it was being computed and discarded — including three n-sized arrays per rebuild.
-    //
-    // Containment derives every position from the link hierarchy instead, which is stable across
-    // an edit by construction: a note whose links didn't change lands in the same cell without
-    // being told to. So the only question left is the one thing that outlived the solver — which
-    // notes the reader should be re-framed onto, in `finishRebuild`.
-    const changed = try arena.alloc(bool, n);
+    const paths = try arena.alloc([]const u8, n);
+    const note_ids = try arena.alloc(u64, n);
+    const bodies = try arena.alloc(f32, n);
     for (order.items, 0..) |si, gi| {
-        const prev = carry.get(snap.nodes[si].id) orelse {
-            changed[gi] = true;
-            continue;
-        };
-        changed[gi] = prev.link_sig != sigs[gi];
+        paths[gi] = snap.nodes[si].path;
+        note_ids[gi] = @bitCast(snap.nodes[si].id);
+        bodies[gi] = @floatFromInt(snap.nodes[si].size);
     }
-
-    const paths = try arena.alloc([][]const u8, 1);
-    paths[0] = try arena.alloc([]const u8, n);
-    for (order.items, 0..) |si, gi| paths[0][gi] = snap.nodes[si].path;
 
     job.n = n;
     job.order = try order.toOwnedSlice(arena);
     job.edges = try edge_list.toOwnedSlice(arena);
-    job.layout_edges = layout_edges;
     job.degrees = degrees;
-    job.paths = paths[0];
+    job.paths = paths;
+    job.note_ids = note_ids;
+    job.bodies = bodies;
     job.sigs = sigs;
-    job.changed = changed;
 
-    // Can this rebuild skip the solve entirely?
-    //
-    // Only when the link graph is *identical*: same notes, in the same order, and not one of them
-    // with a different neighbour set. The order hash is not redundant — a note flipping between
-    // real and phantom renumbers every index after it without changing anyone's links, and the
-    // stored positions are indexed by that order.
-    {
-        var order_hash: u64 = 0xcbf29ce484222325;
-        for (order.items) |si| {
-            order_hash ^= @as(u64, @bitCast(snap.nodes[si].id));
-            order_hash *%= 0x100000001b3;
+    var order_hash: u64 = 0xcbf29ce484222325;
+    for (job.order) |si| {
+        order_hash ^= @as(u64, @bitCast(snap.nodes[si].id));
+        order_hash *%= 0x100000001b3;
+    }
+    var any_link_moved = false;
+    for (job.order, 0..) |si, gi| {
+        const prev = carry.get(snap.nodes[si].id) orelse {
+            any_link_moved = true;
+            break;
+        };
+        if (gi >= sigs.len or prev.link_sig != sigs[gi]) {
+            any_link_moved = true;
+            break;
         }
-        var any_link_moved = false;
-        for (changed) |c| {
-            if (c) {
-                any_link_moved = true;
-                break;
+    }
+    if (!any_link_moved and
+        job.snap.edges_same and
+        order_hash == p.last_order and
+        p.last_pos.len == n and
+        p.last_comp.len == n)
+    {
+        job.settled = .{ .pos = p.last_pos, .comp = p.last_comp };
+    }
+    job.order_hash = order_hash;
+}
+
+fn finishSettledRebuild(
+    p: *Panel,
+    st: anytype,
+    gen: u64,
+    open_hash: u64,
+    dirty_notes: []const Indexer.SnapNode,
+) !void {
+    p.gen = gen;
+    p.since_rebuild_s = 0;
+    p.force_rebuild = false;
+    p.labels_stale = dirty_notes.len > 0;
+    const arena = p.arena.allocator();
+    for (dirty_notes) |info| {
+        const gi = p.id_index.get(info.id) orelse continue;
+        var n = &p.nodes[gi];
+        if (!std.mem.eql(u8, n.title, info.title)) {
+            n.title = try arena.dupe(u8, info.title);
+        }
+        if (!std.mem.eql(u8, n.path, info.path)) {
+            n.path = try arena.dupe(u8, info.path);
+            p.path_index.put(sdk.allocator(), n.path, @intCast(gi)) catch {};
+        }
+        n.phantom = info.phantom;
+        n.target_radius = radiusFor(n.degree, n.open, info.phantom);
+        if (p.world_state) |*w| {
+            if (gi < w.lad.leaf_cell.len) {
+                const leaf = w.lad.leaf_cell[gi];
+                if (leaf < w.lad.cells.len) w.lad.cells[leaf].body = @floatFromInt(info.size);
             }
         }
-        if (!any_link_moved and
-            order_hash == p.last_order and
-            p.last_pos.len == n and
-            p.last_comp.len == n)
-        {
-            job.settled = .{ .pos = p.last_pos, .comp = p.last_comp };
-        }
-        job.order_hash = order_hash;
     }
-    job.place_opts = p.place_opts;
-    job.place_rotation = p.place_rotation;
+    if (st.vault_root) |root| applyOpenSet(p, root, open_hash);
+}
 
-    // A data source that already knows where every note goes (the vault simulator, whose
-    // generator packs positions itself) hands them over here and the force layout is skipped
-    // entirely. Duck-typed on the method rather than a field, so the live `State` — which has no
-    // such method — compiles this branch out and is completely unaffected.
-    //
-    // This is load-bearing at scale, not an optimization: `layout_full` on a few hundred thousand
-    // notes takes minutes, and while it runs `p.job` never completes, `rebuildIfNeeded` returns
-    // early every frame, and the panel goes on redrawing whatever arrangement last *finished* —
-    // which reads exactly like "changing the note count does nothing."
-    const StateT = @typeInfo(@TypeOf(st)).pointer.child;
-    if (@hasDecl(StateT, "packedPositions")) {
-        if (st.packedPositions()) |pos| {
-            // Positions are keyed by note id `1..N`, which is graph index `0..N-1` after the
-            // id-sort above — so a length match is the whole validity check.
-            if (pos.len == n) job.precomputed = try arena.dupe(dvui.Point, pos);
-        }
+/// A settled rebuild: the link graph is unchanged, so the world and the node array on screen are
+/// already the right ones. Adopt the job's bookkeeping and patch the dirty notes' metadata.
+///
+/// Deliberately does *not* touch `p.edges`, `p.last_pos` or the world: a settled solve produced
+/// none of its own, and duping the vault's edge list into the panel arena — which only
+/// `finishRebuild` resets — grew it by tens of megabytes on every save.
+fn finishSettledJob(p: *Panel, st: anytype, job: *LayoutJob) !void {
+    p.last_order = job.order_hash;
+    p.note_count = job.snap.note_count;
+    p.layout_aspect = job.aspect;
+    p.layout_settled = true;
+
+    const dirty = try dirtyNodeInfo(p, job);
+    try finishSettledRebuild(p, st, job.gen, job.open_hash, dirty);
+}
+
+/// The `SnapNode` for each dirty id, resolved through `p.id_index` rather than by scanning
+/// `snap.nodes` per id — that scan was O(dirty x N) over the whole vault.
+fn dirtyNodeInfo(p: *Panel, job: *LayoutJob) ![]const Indexer.SnapNode {
+    const arena = job.arena.allocator();
+    var out: std.ArrayList(Indexer.SnapNode) = .empty;
+    try out.ensureTotalCapacity(arena, job.snap.dirty.len);
+    var want = std.AutoHashMap(i64, void).init(arena);
+    try want.ensureTotalCapacity(@intCast(job.snap.dirty.len));
+    for (job.snap.dirty) |id| {
+        if (p.id_index.contains(id)) try want.put(id, {});
     }
-
-    // Small vaults solve here and now: a worker would cost a frame of latency for work that is
-    // already too fast to see. Everything bigger goes to a thread, and the panel draws a spinner
-    // over whatever it had (see `draw`) instead of locking the editor for the duration.
-    // Synth precomputed jobs always use the worker above a few thousand — quadtree build is the cost.
-    // Consumed here, where a rebuild is actually committed to — not at the test, which runs on
-    // frames that then bail out on the quiet-coalesce timer or an incomplete index.
-    p.force_rebuild = false;
-
-    if (n <= layout_inline_max and job.precomputed == null) {
-        defer job.deinit(gpa);
-        try job.solve();
-        try finishRebuild(p, st, job);
-        return;
+    if (want.count() == 0) return &.{};
+    for (job.snap.nodes) |sn| {
+        if (want.contains(sn.id)) out.appendAssumeCapacity(sn);
     }
-
-    // What the reader waits through that the solve timing does not cover: this whole prep runs on
-    // the *UI thread* before the worker is even started — `snapshotCopy` alone duplicates every
-    // note (with its path and title strings) and every edge.
-    dvui.log.info("atlas prep: {d}ms on the UI thread ({d} notes, {d} edges)", .{
-        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - prep_t0, 1_000_000),
-        n,
-        job.edges.len,
-    });
-    job.thread = std.Thread.spawn(.{}, LayoutJob.run, .{job}) catch {
-        // No thread available — better a hitch than no graph.
-        defer job.deinit(gpa);
-        try job.solve();
-        try finishRebuild(p, st, job);
-        return;
-    };
-    p.job = job;
+    return out.items;
 }
 
 /// Turn a solved job into the panel's live arrangement. UI thread only, and only once `done`.
@@ -2439,6 +2426,11 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     }
     // Same for the finished positions. A rebuild that *reused* them produced none of its own and
     // leaves what is already stored in place, which is exactly the arrangement still on screen.
+    const follow_id: ?i64 = if (!job.first_build and job.settled == null) anchorNoteId(p) else null;
+    const follow_before: ?dvui.Point = if (follow_id) |id| blk: {
+        const idx = p.id_index.get(id) orelse break :blk null;
+        break :blk noteLayoutHome(p, idx);
+    } else null;
     if (job.next_pos.len > 0) {
         gpa.free(p.last_pos);
         gpa.free(p.last_comp);
@@ -2461,25 +2453,6 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     // Adopt the solved world in the same frame as the nodes it indexes. Deinit the old one
     // *first*: at Wikipedia scale two live worlds are a multi-hundred-megabyte spike, and there is
     // nothing to draw between these two statements.
-    // Where the note the reader is with sat *before* this rebuild, in world space.
-    //
-    // A re-fold re-derives the hierarchy from the link graph, so every note in the vault can land
-    // somewhere new — including the one being read. The camera is not re-derived when the reader
-    // panned by hand (`.free`), which is right for a resize and wrong for this: nothing moved under
-    // them then, and everything moves under them now. Captured here because the old world is freed
-    // two lines down, and it is the only thing that still knows where anything used to be.
-    const anchor_id = anchorNoteId(p);
-    const anchor_before: ?dvui.Point = blk: {
-        const id = anchor_id orelse break :blk null;
-        const w = if (p.world_state) |*ws| ws else break :blk null;
-        const idx = p.id_index.get(id) orelse break :blk null;
-        // `World.noteWorldPos` already walks the ancestor chain placing what it needs — a leaf in
-        // a branch the camera never opened has no position until asked, and the anchored note is
-        // very often exactly that.
-        const wp = w.noteWorldPos(@intCast(idx)) orelse break :blk null;
-        break :blk dvui.Point{ .x = wp.x, .y = wp.y };
-    };
-
     // Where every *drawn* note sits right now, so the new arrangement can be travelled to rather
     // than jumped to. Keyed on note id, because indices shift on every rebuild.
     //
@@ -2502,6 +2475,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
         if (p.world_state) |*old_world| old_world.deinit();
         p.world_state = w;
         job.world = null; // adopted — `LayoutJob.deinit` must not free it too
+        p.quant = w.hilbertBox();
     } else if (p.world_state) |*old_world| {
         // No new world (empty vault, or the worker bailed). Keeping the previous one would
         // pair Wikipedia-scale `links` with the 15-note array this apply is about to install.
@@ -2519,7 +2493,10 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     _ = p.arena.reset(.free_all);
     p.id_index.clearRetainingCapacity();
     p.path_index.clearRetainingCapacity();
-    p.active_doc_id = 0; // ids index the old node array; force a re-resolve against the new one
+    // Do not zero `active_doc_id`. It is the workbench document id, not a node index — wiping it
+    // made `updateActiveDoc` treat every re-solve as a tab switch and `focusNode` (zoom in) the
+    // open note. A link save would then undo the keep-zoom pan. Same document after a rebuild
+    // is a follow, not a focus.
     const arena = p.arena.allocator();
     p.gen = job.gen;
     p.since_rebuild_s = 0;
@@ -2558,7 +2535,6 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     p.note_count = snap.note_count;
 
     const sigs = job.sigs;
-    const changed = job.changed;
     const order = job.order;
     const open_hash = job.open_hash;
 
@@ -2566,7 +2542,7 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     p.at_level0 = arena.alloc(bool, n) catch &.{};
     p.notes_at_level0 = 0;
     // Union-find over all edges is a multi-second apply hitch at 400k — skip for synth / huge N.
-    p.island_count = if (job.precomputed != null or n > 50_000) 0 else countIslands(n, job.layout_edges);
+    p.island_count = if (job.precomputed != null or n > 50_000) 0 else countIslands(n, job.edges);
 
     // Extent of the web, from the world rather than from any solved position array: the world is
     // where the drawn positions come from, and its extent is what the camera frames and what the
@@ -2663,86 +2639,22 @@ fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     // still fine to apply, but there is no folder left to ask which notes are open.
     if (st.vault_root) |root| applyOpenSet(p, root, open_hash);
 
-    // The layout just re-solved, so whatever the camera was framing has moved under it. Track
-    // it. This is safe *because* of `.free`: a user who panned by hand is not retargeted, which
-    // is what made the old "refit on reindex" behaviour so hostile — the watcher reindexes
-    // every time you touch a file, and the view would jump out from under you on every click.
+    // The layout just re-solved, so whatever the camera was framing has moved under it.
+    // Keep zoom: a save that `focusNode`s would fly in, because a newly adopted world starts
+    // coalesced (`anim` is zero) and the focus pose floors against that blob. Shift the camera
+    // by how far the anchored note moved so it stays under the same pixel. `.interior` still
+    // re-derives its pin — the reader is inside the note, not looking at the overview.
     //
-    // `fitted_vp_*` is still deliberately left alone: that governs resize detection, and
-    // clearing it here would make the next frame look like a first fit and *snap*.
-    //
-    // Skipped outright when the solve reused the previous positions. A save that edits prose
-    // republishes exactly as a save that adds a link does, and re-framing then is not merely
-    // wasted — it is *visible*: the world adopted here starts fully coalesced (`anim` is zero), so
-    // `focusNode` reads the note's position through the mass it is currently inside, retargets the
-    // camera at that blob, and the pursuit then walks it back as the LOD opens. The reader typed a
-    // word and watched the map recentre itself. If nothing moved, nothing needs re-framing.
+    // Skipped when the solve reused the previous positions: nothing moved.
     const positions_held = job.settled != null;
-    if (!first_build and !positions_held) applyFraming(p);
-
-    // Follow the note the reader is with, when nothing else is going to.
-    //
-    // `applyFraming` re-derives the pose for `.extents`, `.note` and `.interior`, so those already
-    // track. `.free` deliberately re-derives nothing — a hand pan is a place someone chose to be,
-    // and yanking it back on every reindex is what made the old "refit on reindex" behaviour
-    // hostile. But that reasoning assumes the world stayed still, and a re-fold moves every note in
-    // it. Left alone, the note being read slides out of view and the reader has to find it again.
-    //
-    // So the pan is preserved *relative to the note* rather than to the world: shift the camera by
-    // exactly how far the note moved, and the note ends up back under the same pixel it occupied,
-    // with everything else rearranged around it. Through `retarget`, not a snap, so it reads as
-    // following rather than as the view jumping — and `retarget`'s own epsilon check means a
-    // rebuild that did not move the note costs nothing at all.
-    if (!first_build and !positions_held and p.framing == .free) {
-        if (anchor_before) |before| anchor: {
-            const id = anchor_id orelse break :anchor;
-            const w = if (p.world_state) |*ws| ws else break :anchor;
-            const idx = p.id_index.get(id) orelse break :anchor;
-            const after = w.noteWorldPos(@intCast(idx)) orelse break :anchor;
-            p.camera.retarget(.{
-                .center = .{
-                    .x = p.camera.center_target.x + (after.x - before.x),
-                    .y = p.camera.center_target.y + (after.y - before.y),
-                },
-                .zoom = p.camera.zoom_target,
-            });
-        }
-    }
-
-    // A note whose own links just changed is a note whose *neighbourhood* just changed shape —
-    // and the neighbourhood is exactly what a focus pose frames (see `focusNode`). So adding a
-    // link to the note you are looking at should re-frame it, the same way opening it did.
-    // Without this the new neighbour lands somewhere off the edge of the view, or the pose stays
-    // fitted to a neighbourhood that no longer exists.
-    //
-    // Overrides `.free` deliberately, which almost nothing else does: a hand pan is normally a
-    // choice to be left alone, but it was a choice made about an arrangement that this edit just
-    // changed. Only for the note being framed or read, never for an edit somewhere else in the
-    // vault — that would yank the view on every keystroke in any open document.
-    //
-    // Not while descended. `.interior` means the reader is inside the note; re-framing would
-    // eject them to the overview for what is, from in there, a change to the surroundings.
-    if (!first_build and p.framing != .interior) {
-        const framed: ?i64 = switch (p.framing) {
-            .note => |id| id,
-            else => null,
-        };
-        var refocus: ?usize = null;
-        if (framed) |id| {
-            if (p.id_index.get(id)) |idx| {
-                if (idx < n and changed[idx]) refocus = idx;
-            }
-        } else {
-            // No note framed (the camera is free, or on extents) — fall back to an open one,
-            // which is the closest thing to a selection there is.
-            for (p.nodes, 0..) |node, idx| {
-                if (node.open and idx < n and changed[idx]) {
-                    refocus = idx;
-                    break;
+    if (!first_build and !positions_held) {
+        if (follow_id) |id| {
+            if (follow_before) |before| {
+                if (p.id_index.get(id)) |idx| {
+                    followAnchorKeepZoom(p, before, noteLayoutHome(p, idx));
                 }
             }
         }
-        if (refocus) |idx| focusNode(p, idx);
     }
 }
 
@@ -3375,18 +3287,13 @@ fn followParent(p: *Panel) void {
     p.interior.parent = parent;
 }
 
-/// Keep a focus flight aimed at where the note *is*, not where it was when the flight began.
+/// Keep a focus flight aimed at the note's layout home, not where a coalesced mass was drawn
+/// when the flight began.
 ///
-/// `focusNode` reads the note's position through `World.noteWorldPos`, which answers with the mass
-/// the note is currently inside when it is still coalesced. Flying to a note from overview
-/// therefore aims at a blob — and the blob is exactly what the zoom is about to split, so by the
-/// time the camera arrives the note has emerged somewhere else inside it and the flight lands
-/// beside its target rather than on it. On a dense vault that is a whole screen out; the reader
-/// sees the note they asked for sitting against the edge of the pane.
-///
-/// Re-aiming each frame turns the flight into a pursuit, which is what it always should have been:
-/// the destination is a note, and where the note is drawn is a moving fact until the descent
-/// finishes.
+/// `GraphNode.pos` / a presentation `px` is the mass the note is currently inside when it is
+/// still coalesced. Flying to that blob — which the zoom is about to split — lands beside the
+/// note once the leaf emerges. Re-aiming each frame at `last_pos` turns the flight into a
+/// pursuit of the note's resting place, which does not move with the LOD.
 ///
 /// Only past a threshold, because `chase` re-plans its path whenever the destination moves and a
 /// per-frame re-plan would flatten the arc into a plain exponential ease. Half a lattice slot is
@@ -3398,13 +3305,12 @@ fn trackFocusTarget(p: *Panel) void {
         else => return,
     };
     const idx = p.id_index.get(id) orelse return;
-    const w = ensureWorld(p) orelse return;
-    const wp = w.noteWorldPos(@intCast(idx)) orelse return;
+    const home = noteLayoutHome(p, idx);
     const slot = if (p.layout_slot > 1) p.layout_slot else 1;
-    const dx = wp.x - p.camera.center_target.x;
-    const dy = wp.y - p.camera.center_target.y;
+    const dx = home.x - p.camera.center_target.x;
+    const dy = home.y - p.camera.center_target.y;
     if (dx * dx + dy * dy < (slot * 0.5) * (slot * 0.5)) return;
-    p.camera.center_target = .{ .x = wp.x, .y = wp.y };
+    p.camera.center_target = home;
 }
 
 fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
@@ -3582,9 +3488,10 @@ fn noteOpen(p: *const Panel, id: i64) bool {
 /// Two positions matter and only one of them used to be right:
 ///
 ///   * **Where.** `GraphNode.pos` is only written for notes that resolved as marks this frame, so
-///     a note inside a coalesced mass carries a stale one. `World.noteWorldPos` forces the lazy
-///     placement down the ancestor chain and returns the exact resting position instead, so the
-///     camera aims where the note will actually be when it arrives.
+///     a note inside a coalesced mass carries a stale one — the mass it was last drawn inside.
+///     `noteLayoutHome` reads `last_pos`, which is the layout solve's resting place for that
+///     note, the same place a cold open would put it. The camera aims there even when the leaf
+///     has no mark yet.
 ///   * **How close.** `World.noteResolveZoom` is the zoom at which the leaf's parent splits. Below
 ///     it the note cannot be drawn as itself, whatever else the framing wants — so it is a hard
 ///     floor, and "the selected note never coalesces" becomes a property of the camera.
@@ -3611,11 +3518,15 @@ fn focusNode(p: *Panel, idx: usize) void {
 
     const slot = if (p.layout_slot > 1) p.layout_slot else layout_full.slotSpacingFor(p.nodes.len);
 
-    var centre = focusPoseOf(p, idx, p.nodes[idx]);
+    // Layout home, never the coalesced mark. `GraphNode.pos` is only written for notes that
+    // resolved as marks this frame, so a coalesced note carries a stale parent-mass pose — and
+    // `ensureWorld` returning null (epoch mismatch) used to fall through to that, which is the
+    // "click 1901, land in a dense web, recenter does nothing" failure. `last_pos` is what
+    // `layout.solve` produced, the same place a cold open would put the note.
+    const centre = noteLayoutHome(p, idx);
     var z_floor: ?f32 = null;
-    if (ensureWorld(p)) |w| {
+    if (p.world_state) |*w| {
         const note: u32 = @intCast(idx);
-        if (w.noteWorldPos(note)) |wp| centre = .{ .x = wp.x, .y = wp.y };
         // Deliberately the *base* split, not the motion-biased one: this is where the camera will
         // come to rest, and at rest the bias is 1. Using the in-flight value would inflate the
         // floor by however fast the camera happened to be moving when the flight began, and land
@@ -3669,16 +3580,70 @@ fn focusNode(p: *Panel, idx: usize) void {
     dvui.refresh(null, @src(), null);
 }
 
-/// World pose used when framing a note.
+/// Resting world position of a note: `layout.solve`'s answer, not the LOD mark.
 ///
-/// Only use a living agent pose when that note is drawn as itself (leaf agent). Climbing to a
-/// coalesced mass centroid made focus/open-star framing jump to a random parent COM — the
-/// "click pops the node somewhere else" failure.
-fn focusPoseOf(p: *const Panel, note_i: usize, n: GraphNode) dvui.Point {
-    // `stepWorld` publishes the living pose straight onto the node, so there is nothing to climb.
-    _ = p;
-    _ = note_i;
-    return n.pos;
+/// A coalesced note has no mark of its own. Its `GraphNode.pos` is whatever mass last owned it
+/// (or the origin, if it has never been a mark). Framing from that is how a click on a far
+/// Wikipedia article landed in a dense web of somebody else's edges. `last_pos` is parallel to
+/// `p.nodes` and is written from the solve; the world's leaf `field.pos` is the same number
+/// after `initFrom`/`updateGeometry`.
+fn noteLayoutHome(p: *const Panel, idx: usize) dvui.Point {
+    if (idx < p.last_pos.len) {
+        return .{ .x = p.last_pos[idx].x, .y = p.last_pos[idx].y };
+    }
+    if (p.world_state) |*w| {
+        if (idx < w.lad.leaf_cell.len) {
+            const leaf = w.lad.leaf_cell[idx];
+            if (leaf != fold.invalid and leaf < w.field.pos.len) {
+                const q = w.field.pos[leaf];
+                return .{ .x = q.x, .y = q.y };
+            }
+        }
+    }
+    if (idx < p.nodes.len) return p.nodes[idx].home;
+    return .{};
+}
+
+fn captureSaveFollow(p: *Panel, next_pos: []const layout.Vec2) ?struct { before: dvui.Point, after: dvui.Point } {
+    const id = anchorNoteId(p) orelse return null;
+    const idx = p.id_index.get(id) orelse return null;
+    if (idx >= p.last_pos.len or idx >= next_pos.len) return null;
+    return .{
+        .before = .{ .x = p.last_pos[idx].x, .y = p.last_pos[idx].y },
+        .after = .{ .x = next_pos[idx].x, .y = next_pos[idx].y },
+    };
+}
+
+/// Pan with the anchored note after a re-solve, without changing zoom.
+///
+/// A save that `focusNode`s would fly in: a newly adopted world starts coalesced, and the focus
+/// pose floors against that blob. Click-to-open and recenter still `focusNode`; this is only
+/// the "the map moved under me" path. Must drop `user_driving` or `animateCamera` never chases
+/// — a hand pan earlier in the session would leave the retarget sitting on `center_target`
+/// while the live view stays put, which is how a link save lost the node.
+fn followAnchorKeepZoom(p: *Panel, before: dvui.Point, after: dvui.Point) void {
+    switch (p.framing) {
+        .interior => {
+            applyFraming(p);
+            return;
+        },
+        else => {},
+    }
+    const dx = after.x - before.x;
+    const dy = after.y - before.y;
+    if (@abs(dx) < 0.05 and @abs(dy) < 0.05) return;
+    p.camera.user_driving = false;
+    p.fling_x.cancel();
+    p.fling_y.cancel();
+    p.camera.fly_len = 0;
+    p.camera.retarget(.{
+        .center = .{
+            .x = p.camera.center_target.x + dx,
+            .y = p.camera.center_target.y + dy,
+        },
+        .zoom = p.camera.zoom_target,
+    });
+    dvui.refresh(null, @src(), null);
 }
 
 fn hashOpenNotes(vault: []const u8) u64 {
@@ -3710,7 +3675,7 @@ fn radiusFor(degree: u32, open: bool, phantom: bool) f32 {
 
 /// Connected-component count for the HUD. Loners / small islands are what carry pane proportions;
 /// a single island cannot take a wide or tall shape without stretching its internals.
-fn countIslands(n: usize, edges: []const layout_full.Edge) u32 {
+fn countIslands(n: usize, edges: []const GraphEdge) u32 {
     if (n == 0) return 0;
     var parent = sdk.allocator().alloc(usize, n) catch return 0;
     defer sdk.allocator().free(parent);
@@ -4027,6 +3992,7 @@ pub fn zoomExtentsFor(p: *Panel) void {
     // wherever that note moved to.
     if (focusTargetIndex(p)) |idx| {
         focusNode(p, idx);
+        p.camera.fly_len = 0;
         if (p.camera.viewport.w >= 32 and p.camera.viewport.h >= 32) {
             p.fitted_vp_w = p.camera.viewport.w;
             p.fitted_vp_h = p.camera.viewport.h;

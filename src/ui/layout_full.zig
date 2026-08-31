@@ -1,3 +1,5 @@
+//! Parked: tests and the historical harness. The panel solver is `layout.zig`.
+//!
 //! Full-vault graph layout — clustered, link-aware, hex-snapped.
 //!
 //! The goal is islands of related notes, not a uniform crystal:

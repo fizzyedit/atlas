@@ -1,31 +1,22 @@
-//! Positions derived from the hierarchy, instead of a hierarchy inferred from positions.
+//! Where each cell sits and how big it is: the store `world.zig` fills, plus the disc-packing
+//! rule that used to fill it.
 //!
-//! `layout_full.zig` places every note flat and then lets `quadlod` infer structure back out of
-//! the result. Laying a whole vault out flat is genuinely hard, which is why that file needs seven
-//! stacked mechanisms — force solve, folder cohesion, lattice snap, component packing, aspect
-//! envelope, crossing-minimising refine/swap, local relaxation — each with its own constants, all
-//! pulling against each other. It is not one layout to tune; it is seven.
+//! **This is no longer the position source.** `layout.zig` decides where every note goes and
+//! `spatial.zig` groups those positions into the drawing hierarchy; `World.initFrom` then writes
+//! the result straight into the `Field` here, so a cell's `pos` and `bound_r` are a lookup rather
+//! than something derived on the way down. What survives from that older design, and why:
 //!
-//! This file replaces them with a single rule:
-//!
-//! > **A cell's children are placed inside that cell's disc.**
-//!
-//! Applied recursively down a `fold.Ladder`. Three things fall out that were previously work:
-//!
-//! * **Aspect ratio is bounded by construction.** Everything lives inside the root disc at every
-//!   zoom, so there is no envelope to enforce and no wide-thin degenerate case. A tree laid out as
-//!   a tree has width 2^depth and height depth — a horizontal line is the inevitable result, not a
-//!   tuning failure. Here depth becomes *zoom*, not a spatial axis.
-//! * **The same rule works at 5 notes and at 1,000,000**, because it only ever places `arity`
-//!   items relative to one parent. Nothing is global, so nothing needs re-tuning with n.
-//! * **Radius is the area-conserving law** `r = note_r · √count`, which is what a merged bubble
-//!   does (2D area conservation: r = √(r₁² + r₂²)) and what the renderer already draws.
-//!
-//! What a force solve gave us and this does not, is expressing link structure *within* a group.
-//! That comes back as slot **assignment**: `fold` records the link weight between each pair of a
-//! cell's children, and `ensureChildren` searches arrangements to put strongly-linked siblings in
-//! adjacent slots. With at most `arity` children that search is exhaustive and exact — a global
-//! optimisation problem replaced by a bounded local one, evaluated lazily when a cell is opened.
+//! * **`Field` / `init`** — the per-cell `pos`, `bound_r` and `expanded` arrays the world reads
+//!   every frame. Still the right shape; only who writes them changed.
+//! * **`Options`** — `note_r`, arity, radius exponent, pack gap. Threaded through the panel and
+//!   the solve as the layout's tuning, so it outlived the placement it was written for.
+//! * **`placeAll` / `ensureChildren`** — the original rule, *a cell's children are placed inside
+//!   that cell's disc*, applied down a `fold.Ladder`. Reached now only through `World.init` and
+//!   `placementPositions`, which the tests and the historical harness use. The panel does not
+//!   call it: a cell's radius was an estimate rather than a bound (measured at up to 1.27x on
+//!   real ladders), and `decideTopology` culls branches on the claim that a disc contains its
+//!   subtree — so the gap silently threw away notes that were plainly on screen. A spatial cell's
+//!   bound *is* `max over children of (distance + child bound)`, computed bottom-up once.
 //!
 //! No dvui: positions are plain `Vec2`, so this stays in the headless test group alongside
 //! `fold.zig`.

@@ -112,17 +112,20 @@ pub const Options = struct {
     cancel: ?*std.atomic.Value(bool) = null,
     /// The previous solve's interiors, to be reused wherever a territory came back identical.
     ///
-    /// **Memoisation, not seeding.** The plan forbids seeding the *clustering* from last time, and
-    /// rightly: a partition that depends on history diverges from what a cold open produces, and
-    /// then the map you closed is not the map you reopen. This is a different thing. A territory's
-    /// interior is a deterministic function of its own subgraph, so when the subgraph comes back
-    /// byte-identical the answer is too — reusing it is skipping a computation whose result is
-    /// already known, and a cold open reproduces it exactly.
+    /// **Memoisation, not seeding.** Clustering is always a fresh Louvain of the current graph:
+    /// a partition that depends on history is not the partition a cold open would produce, and
+    /// then the map you closed is not the map you reopen. Interiors are a different thing. A
+    /// territory's interior is a deterministic function of its own subgraph (membership *and*
+    /// induced edges), so when that subgraph comes back byte-identical the answer is too —
+    /// reusing it is skipping a computation whose result is already known, and a cold open
+    /// reproduces it exactly.
     ///
-    /// Identity is by membership hash, checked per territory, so this needs no dirty set and
-    /// cannot be wrong about what changed: it is the *inputs* that are compared, not a claim about
-    /// them.
+    /// Identity is the subgraph, checked per territory, so this needs no dirty set and cannot
+    /// be wrong about what changed: it is the *inputs* that are compared, not a claim about them.
     reuse: ?Reuse = null,
+    /// Fill `stage_ns` with a per-stage breakdown of this solve. Off in the panel — it needs a
+    /// dvui window for the clock, and the numbers are only ever read by the bench.
+    profile: bool = false,
 };
 
 /// Per-note interior state from a previous `solve`, for `Options.reuse`.
@@ -136,7 +139,9 @@ pub const Reuse = struct {
     ids: []const u64 = &.{},
     /// Each note's offset from its territory's centre.
     inner: []const Vec2 = &.{},
-    /// Hash of the membership of the territory each note was in.
+    /// Hash of the territory each note was in: membership *and* the induced edge set.
+    /// Membership alone is not enough — an internal link leaves the members in place and
+    /// still changes the interior a cold open would solve.
     home: []const u64 = &.{},
     /// Where each disc sat inside its frame, keyed by (frame, disc) rather than by index — the
     /// same reasoning as `ids`, one level up. See `FrameSlot`.
@@ -163,8 +168,9 @@ pub const Result = struct {
     /// what lets `spatial.build` keep islands out of each other's cells.
     comp: []u32 = &.{},
     n_comp: u32 = 0,
-    /// Each note's offset from its territory's centre, and the membership hash of that territory.
-    /// Hand both back as `Options.reuse` on the next solve — see `Reuse`.
+    /// Each note's offset from its territory's centre, and the subgraph hash of that territory
+    /// (membership and induced edges). Hand both back as `Options.reuse` on the next solve —
+    /// see `Reuse`.
     inner: []Vec2 = &.{},
     home: []u64 = &.{},
     frames: []FrameSlot = &.{},
@@ -201,6 +207,7 @@ pub fn solve(
 ) !Result {
     reused_interiors = 0;
     solved_interiors = 0;
+    stage_ns = .initFill(0);
     var memo: FrameMemo = .{ .gpa = gpa };
     defer {
         memo.prev.deinit(gpa);
@@ -234,6 +241,7 @@ pub fn solve(
     // -- the edge set the solve sees ---------------------------------------------------
     // Degree normalisation applies to real links only. The orphan chain is appended afterwards at
     // its own flat weight, so normalising cannot dilute it and it cannot dilute the links.
+    const t_norm = stageNow(opts);
     const weighted = try fold.degreeNormalised(arena, n_notes, links, opts.degree_norm);
     var aug: std.ArrayListUnmanaged(Edge) = .empty;
     try aug.ensureTotalCapacity(arena, weighted.len + n_notes);
@@ -247,7 +255,9 @@ pub fn solve(
         try fold.addOrphanDrawer(arena, &aug, paths, links, n_notes, opts.folder_w);
     }
     const edges = aug.items;
+    stageAdd(opts, .normalise, t_norm);
 
+    const t_comp = stageNow(opts);
     out.n_comp = try fold.linkComponents(arena, out.comp, edges, n_notes);
 
     // -- group notes and edges by component --------------------------------------------
@@ -261,6 +271,7 @@ pub fn solve(
     for (0..out.n_comp) |c| {
         for (notes_csr.slice(@intCast(c)), 0..) |note, i| local[note] = @intCast(i);
     }
+    stageAdd(opts, .components, t_comp);
 
     // -- solve each component on its own ------------------------------------------------
     const centres = try arena.alloc(Vec2, out.n_comp);
@@ -353,6 +364,7 @@ pub fn solve(
     // A high percentile is the honest radius for packing: it tracks the mass rather than the tail.
     // The handful of notes outside it are in the sparsest part of the island, which is exactly
     // where a neighbouring island can sit without looking crowded.
+    const t_pack = stageNow(opts);
     for (0..out.n_comp) |c| {
         const members = notes_csr.slice(@intCast(c));
         if (members.len < 2) continue;
@@ -361,9 +373,13 @@ pub fn solve(
     try packComponents(arena, out, notes_csr, radii, centres, opts);
     try redistributeOrphans(arena, out, links, opts);
     recentre(out.pos);
+    stageAdd(opts, .pack, t_pack);
     out.frames = try memo.out.toOwnedSlice(gpa);
     reused_frames = memo.hits;
     placed_frames = memo.total;
+    missed_frame_discs = memo.miss_discs;
+    largest_missed_frame = memo.miss_max;
+    shallowest_missed_frame = memo.miss_min_depth;
     out.spacing = if (opts.note_r > 0)
         (try spatial.medianSpacing(gpa, out.pos, out.comp)) / opts.note_r
     else
@@ -840,7 +856,7 @@ fn placeComponentTerritories(
     edge_ids: []const u32,
     pos: []Vec2,
     /// Per note, written for the next solve to reuse: offset from the territory centre, and the
-    /// hash of that territory's membership.
+    /// hash of that territory's subgraph (membership and induced edges).
     inner: []Vec2,
     home: []u64,
     memo: *FrameMemo,
@@ -856,11 +872,9 @@ fn placeComponentTerritories(
         d.* = .{ .a = local[e.a], .b = local[e.b], .w = e.w };
     }
 
-    var clustered = try louvain.cluster(gpa, n, ledges, .{ .resolution = opts.resolution });
-    defer clustered.deinit(gpa);
-
     const comm = try arena.alloc(u32, n);
     var n_comm: u32 = 0;
+    const t_cluster = stageNow(opts);
     if (try isLattice(gpa, arena, n, edges, edge_ids, local)) {
         // A lattice is one place, and cutting it makes places that are not there.
         //
@@ -876,6 +890,10 @@ fn placeComponentTerritories(
         @memset(comm, 0);
         n_comm = 1;
     } else {
+        // Fresh Louvain of the current graph, same as a cold open. Seeding from last time's
+        // partition would make incremental(G+e) a different map from reopen(G+e).
+        var clustered = try louvain.cluster(gpa, n, ledges, .{ .resolution = opts.resolution });
+        defer clustered.deinit(gpa);
         if (clustered.levels.len == 0) {
             for (comm, 0..) |*c, i| c.* = @intCast(i);
         } else {
@@ -886,6 +904,7 @@ fn placeComponentTerritories(
         try splitOversized(gpa, arena, comm, &n_comm, ledges, opts.region_max, opts.resolution);
         try mergeSpecks(arena, comm, &n_comm, ledges, opts.region_min, opts.region_max);
     }
+    stageAdd(opts, .cluster, t_cluster);
     const count = try arena.alloc(u32, n_comm);
     @memset(count, 0);
     for (comm) |c| count[c] += 1;
@@ -898,13 +917,17 @@ fn placeComponentTerritories(
     const coh = try arena.alloc(f32, n_comm);
     const sig = try arena.alloc(u64, n_comm);
     @memset(sig, 0);
+    const t_interiors = stageNow(opts);
     try solveInteriors(arena, gpa, members, comm, n_comm, count, ledges, inner, home, sig, radius, coh, opts);
+    stageAdd(opts, .interiors, t_interiors);
 
     const centres = try arena.alloc(Vec2, n_comm);
     @memset(centres, .{});
     if (n_comm > 1) {
+        const t_frames = stageNow(opts);
         const region_edges = try aggregate(arena, comm, n_comm, ledges);
         try placeNested(gpa, arena, centres, radius, coh, sig, region_edges, pitch * territory_ocean, opts, memo, 0);
+        stageAdd(opts, .frames, t_frames);
     }
 
     for (members, comm) |note, c| pos[note] = .{ .x = centres[c].x + inner[note].x, .y = centres[c].y + inner[note].y };
@@ -961,7 +984,7 @@ fn placeNested(
         centres[0] = .{};
         return;
     }
-    if (n <= opts.frame_max or depth >= 16) return placeFrame(arena, centres, radius, coh, sigs, edges, ocean, opts, memo);
+    if (n <= opts.frame_max or depth >= 16) return placeFrame(arena, centres, radius, coh, sigs, edges, ocean, opts, memo, depth);
 
     // Group this level with the same clustering that made the territories, bounded to a frame.
     const group = try arena.alloc(u32, n);
@@ -988,7 +1011,7 @@ fn placeNested(
         // between frames for a reason that has nothing to do with the links.
         try splitOversized(gpa, arena, group, &n_group, ledges, @intCast(opts.frame_max), opts.resolution);
     }
-    if (n_group <= 1 or n_group >= n) return placeFrame(arena, centres, radius, coh, sigs, edges, ocean, opts, memo);
+    if (n_group <= 1 or n_group >= n) return placeFrame(arena, centres, radius, coh, sigs, edges, ocean, opts, memo, depth);
 
     // Members of each group, and each disc's index inside its group.
     const count = try arena.alloc(u32, n_group);
@@ -1092,6 +1115,9 @@ const FrameMemo = struct {
     gpa: std.mem.Allocator,
     hits: u32 = 0,
     total: u32 = 0,
+    miss_discs: usize = 0,
+    miss_max: usize = 0,
+    miss_min_depth: u32 = std.math.maxInt(u32),
 
     fn slotKey(frame: u64, sig: u64) u128 {
         return (@as(u128, frame) << 64) | sig;
@@ -1100,11 +1126,19 @@ const FrameMemo = struct {
     /// Fill `centres` from the previous solve, if every disc in this frame was there under the
     /// same key. All-or-nothing: a frame half-remembered is worse than one re-solved, because the
     /// discs that were found would sit against discs that were not.
-    fn reuse(self: *FrameMemo, key: u64, sigs: []const u64, centres: []Vec2) bool {
+    fn reuse(self: *FrameMemo, key: u64, sigs: []const u64, centres: []Vec2, depth: u32) bool {
         self.total += 1;
         if (self.prev.count() == 0) return false;
         for (sigs) |sig| {
-            if (!self.prev.contains(slotKey(key, sig))) return false;
+            if (!self.prev.contains(slotKey(key, sig))) {
+                // A miss re-places every disc in this frame, and a frame is a rigid body: the
+                // discs' own contents may be reused and still land somewhere new. So the count
+                // of misses says nothing on its own — the *size* of the missed frames does.
+                self.miss_discs += sigs.len;
+                self.miss_max = @max(self.miss_max, sigs.len);
+                self.miss_min_depth = @min(self.miss_min_depth, depth);
+                return false;
+            }
         }
         for (sigs, centres) |sig, *c| c.* = self.prev.get(slotKey(key, sig)).?;
         self.hits += 1;
@@ -1165,6 +1199,10 @@ fn placeFrame(
     ocean: f32,
     opts: Options,
     memo: *FrameMemo,
+    /// How deep in the nesting this frame sits. Only used to report *where* a memo miss landed:
+    /// a miss near the root re-places groups that each carry thousands of notes, so the count of
+    /// missed discs badly understates what moved.
+    depth: u32,
 ) !void {
     const n = centres.len;
     @memset(centres, .{});
@@ -1177,7 +1215,7 @@ fn placeFrame(
     // interiors: the placement is a deterministic function of its inputs, and the key hashes all
     // of them, so a hit is what re-solving would produce.
     const key = frameKey(sigs, radius, edges);
-    if (memo.reuse(key, sigs, centres)) return;
+    if (memo.reuse(key, sigs, centres, depth)) return;
     defer memo.record(key, sigs, centres);
 
     if (try placeLinkageIfTree(arena, centres, radius, edges, ocean)) return;
@@ -1575,6 +1613,49 @@ pub var reused_interiors: u32 = 0;
 pub var solved_interiors: u32 = 0;
 pub var reused_frames: u32 = 0;
 pub var placed_frames: u32 = 0;
+/// Discs re-placed because their frame missed the memo, and the biggest single such frame.
+/// A frame near the root of the nesting holds the whole vault, so one miss there moves
+/// everything under it however well the leaves were reused.
+pub var missed_frame_discs: usize = 0;
+pub var largest_missed_frame: usize = 0;
+/// Nesting depth of the miss closest to the root. 0 means the outermost frame was re-placed,
+/// which moves every note in the component however well everything below it was reused.
+pub var shallowest_missed_frame: u32 = 0;
+
+/// Where the last `solve` spent its time, in nanoseconds. Same contract as the counters above:
+/// reset by `solve`, accumulated across every component, read by the caller's log or by
+/// `bench --layout-edit`. Kept as globals rather than threaded through `Result` for the same
+/// reason — this describes the run, not the arrangement it produced.
+pub const Stage = enum {
+    /// `fold.degreeNormalised` plus the orphan drawer: one pass over every link in the vault.
+    normalise,
+    /// `linkComponents` and the note/edge bucketing that follows it.
+    components,
+    /// `isLattice`, `louvain.cluster`, `splitOversized`, `mergeSpecks`.
+    cluster,
+    /// `solveInteriors` — the memoised part.
+    interiors,
+    /// `aggregate` plus `placeNested`.
+    frames,
+    /// Island radii, `separateDiscs`, and the scale to world units.
+    pack,
+};
+pub var stage_ns: std.EnumArray(Stage, u64) = .initFill(0);
+
+/// Nanoseconds against the monotonic boot clock, or 0 when not profiling.
+///
+/// Gated the same way `layout_full.Profile` is, and for the same reason: `solve` runs in unit
+/// tests, which have no dvui window for `dvui.io` to read a clock out of. The bench turns it on;
+/// the panel leaves it off and pays nothing.
+fn stageNow(opts: Options) u64 {
+    if (!opts.profile) return 0;
+    return @intCast(std.Io.Clock.boot.now(dvui.io).nanoseconds);
+}
+
+fn stageAdd(opts: Options, s: Stage, since: u64) void {
+    if (!opts.profile) return;
+    stage_ns.getPtr(s).* += stageNow(opts) -| since;
+}
 
 /// One worker's slice of the interior solves. At file scope so its methods' locals do not
 /// shadow `solveInteriors`, which holds identically-named CSRs.
@@ -1598,6 +1679,35 @@ fn membershipHash(ctx: *const InteriorCtx, mem: []const u32) u64 {
     return if (acc == 0) 1 else acc;
 }
 
+/// Order-independent hash of a territory's induced subgraph: membership plus every interior
+/// edge, keyed by stable note ids so a different clustering order of the same set is the same
+/// hash. Weights are mixed in because degree-normalisation can change them without adding a
+/// link inside the territory, and a cold open would re-solve from those weights.
+fn subgraphHash(
+    ctx: *const InteriorCtx,
+    mem_sig: u64,
+    mem: []const u32,
+    edges: []const multilevel.Edge,
+) u64 {
+    var acc = mem_sig;
+    for (edges) |e| {
+        if (e.a >= mem.len or e.b >= mem.len) continue;
+        const id_a = ctx.keyOf(mem[e.a]);
+        const id_b = ctx.keyOf(mem[e.b]);
+        const lo = @min(id_a, id_b);
+        const hi = @max(id_a, id_b);
+        var h = lo;
+        h ^= hi *% 0x9e3779b97f4a7c15;
+        const wbits: u32 = @bitCast(e.w);
+        h ^= @as(u64, wbits);
+        h *%= 0xff51afd7ed558ccd;
+        h ^= h >> 33;
+        acc ^= h;
+    }
+    acc ^= @as(u64, edges.len) *% 0x9e3779b97f4a7c15;
+    return if (acc == 0) 1 else acc;
+}
+
 const InteriorCtx = struct {
     /// Stable id -> index in `Options.reuse`. Read-only for the workers.
     prev_at: *const std.AutoHashMapUnmanaged(u64, u32),
@@ -1618,19 +1728,19 @@ const InteriorCtx = struct {
     reused: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
 
-    /// Copy the previous solve's interior for this territory, if it had exactly these members.
+    /// Copy the previous solve's interior for this territory, if it had exactly this subgraph.
     ///
-    /// The check is `home[note] == sig` for every member. `sig` encodes the whole membership, so
-    /// agreement across every member means the previous territory held these notes and no others:
-    /// a larger set would have hashed to something else, and any member that has moved carries its
-    /// old territory's hash instead. So this is an equality test on the *inputs*, not a claim about
-    /// what changed — it cannot be fooled by a stale dirty set, and it needs none.
-    fn reuseInto(self: *const @This(), sig: u64, mem: []const u32, radius_out: *f32) bool {
+    /// `sub` is membership plus induced edges. Agreement across every member means the previous
+    /// territory held these notes, these links, and no others: a larger set would have hashed to
+    /// something else, an internal link would change the edge mix, and any member that has moved
+    /// carries its old territory's hash instead. So this is an equality test on the *inputs*,
+    /// not a claim about what changed — it cannot be fooled by a stale dirty set, and it needs none.
+    fn reuseInto(self: *const @This(), sub: u64, mem: []const u32, radius_out: *f32) bool {
         const prev = self.opts.reuse orelse return false;
         if (self.prev_at.count() == 0) return false;
         for (mem) |li| {
             const at = self.prev_at.get(self.keyOf(li)) orelse return false;
-            if (prev.home[at] != sig) return false;
+            if (prev.home[at] != sub) return false;
         }
         var rmax: f32 = 0;
         for (mem) |li| {
@@ -1676,15 +1786,19 @@ for (lo..hi) |c| {
     const k = count[c];
     const mem = member[start[c]..start[c + 1]];
 
-    // Identity of this territory: its membership, order-independent.
+    // Frame identity is membership; interior reuse is the induced subgraph. An internal
+    // link leaves the members in place (parent frame can still hit) and still changes
+    // the interior a cold open would solve.
     const sig = membershipHash(self, mem);
     self.sig[c] = sig;
-    for (mem) |li| home[notes[li]] = sig;
+    const edges = sub_edges[e_start[c]..e_start[c + 1]];
+    const sub = subgraphHash(self, sig, mem, edges);
+    for (mem) |li| home[notes[li]] = sub;
     if (k <= 1) continue;
 
-    // Already solved, in a previous solve, from exactly these notes. An interior is a pure
-    // function of its own subgraph, so the answer cannot have changed — see `Options.reuse`.
-    if (self.reuseInto(sig, mem, &radius[c])) {
+    // Already solved, in a previous solve, from exactly this subgraph. An interior is a pure
+    // function of that subgraph, so the answer cannot have changed — see `Options.reuse`.
+    if (self.reuseInto(sub, mem, &radius[c])) {
         _ = self.reused.fetchAdd(1, .monotonic);
         continue;
     }
@@ -2982,8 +3096,8 @@ test "a star of territories keeps every spoke near packed length" {
 
 test "reusing an unchanged territory gives the same map a cold solve would" {
     // The memo is only legitimate if it changes nothing. `Options.reuse` skips solving a territory
-    // whose membership came back identical, on the grounds that an interior is a deterministic
-    // function of its own subgraph — so the whole claim is that these two runs agree exactly. If
+    // whose subgraph came back identical, on the grounds that an interior is a deterministic
+    // function of that subgraph — so the whole claim is that these two runs agree exactly. If
     // they can differ, this is seeding by another name, and the map you close stops being the map
     // you reopen.
     const gpa = testing.allocator;
@@ -3024,6 +3138,56 @@ test "reusing an unchanged territory gives the same map a cold solve would" {
     try testing.expect(reused_interiors > 0); // otherwise this test proves nothing
     try testing.expect(reused_frames > 0);
     for (cold.pos, warm.pos) |a, b| {
+        try testing.expectEqual(a.x, b.x);
+        try testing.expectEqual(a.y, b.y);
+    }
+}
+
+test "a reused solve of an edited graph matches a cold open" {
+    // Cold(G+e) is the map you would see if you closed the vault and reopened it.
+    // Incremental with reuse must produce that map — not yesterday's partition with a new
+    // edge drawn on top. Territories whose subgraph is byte-identical may be copied; that
+    // is still a function of G+e, so the two runs agree.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const n_each: u32 = 14;
+    const n: u32 = n_each * 3;
+    var edges: std.ArrayListUnmanaged(Edge) = .empty;
+    for (0..3) |g| {
+        const base: u32 = @intCast(g * n_each);
+        for (0..n_each) |i| {
+            for (i + 1..n_each) |j| {
+                try edges.append(arena, .{ .a = base + @as(u32, @intCast(i)), .b = base + @as(u32, @intCast(j)) });
+            }
+        }
+    }
+    try edges.append(arena, .{ .a = 0, .b = n_each });
+    try edges.append(arena, .{ .a = n_each, .b = n_each * 2 });
+
+    const paths = try arena.alloc([]const u8, n);
+    for (paths, 0..) |*p, i| p.* = try std.fmt.allocPrint(arena, "n{d}.md", .{i});
+    const ids = try arena.alloc(u64, n);
+    for (ids, 0..) |*d, i| d.* = i + 1000;
+
+    var cold = try solve(gpa, n, edges.items, paths, .{ .note_r = 4, .ids = ids });
+    defer cold.deinit(gpa);
+
+    try edges.append(arena, .{ .a = 1, .b = n_each * 2 + 1 });
+
+    var cold_new = try solve(gpa, n, edges.items, paths, .{ .note_r = 4, .ids = ids });
+    defer cold_new.deinit(gpa);
+
+    var warm = try solve(gpa, n, edges.items, paths, .{
+        .note_r = 4,
+        .ids = ids,
+        .reuse = .{ .ids = cold.ids, .inner = cold.inner, .home = cold.home, .frames = cold.frames },
+    });
+    defer warm.deinit(gpa);
+
+    for (cold_new.pos, warm.pos) |a, b| {
         try testing.expectEqual(a.x, b.x);
         try testing.expectEqual(a.y, b.y);
     }

@@ -1,12 +1,10 @@
-//! One hierarchy for the whole vault.
+//! Components, degree-normalised weights, and the `Ladder` type the spatial hierarchy occupies.
 //!
-//! Today the graph carries four overlapping structures: `multilevel.Ladder` (link coarsening),
-//! `layout_full`'s flat positions, `lod.Pyramid` (the ladder, then continued *by position* once
-//! link structure runs out), and `quadlod.Tree` (a component forest rebuilt from those positions).
-//! They disagree, which is what a "half-fine/half-coarse" frame actually is.
-//!
-//! This file is the replacement for all four: a single arity-N coarsening ladder, and nothing
-//! else. Positions are derived from it (`containment.zig`) rather than being an input to it.
+//! This used to be the drawing tree: `fold.build` coarsened links and `containment` placed each
+//! note inside its parent's disc. Positions now come from `layout.zig`; the LOD tree from
+//! `spatial.zig`. What remains here is the shared graph plumbing those two still call —
+//! `degreeNormalised`, `linkComponents`, `addOrphanDrawer` — and `Ladder`/`Cell`, which spatial
+//! fills from Hilbert order rather than from link coarsening.
 //!
 //! Two design choices carry most of the weight:
 //!
@@ -205,7 +203,10 @@ pub const Options = struct {
 /// For constants that scale a whole vault's weights: the exact value carries no meaning the layout
 /// depends on, while its *stability* under an edit decides whether the map holds still. See the use
 /// in `degreeNormalised`.
-fn quantiseSignificant(x: f32, digits: i32) f32 {
+/// Round to `digits` significant figures. Used wherever a float has to be *hashed* rather than
+/// compared: a value carried through a float sum differs in its last bits for reasons that are
+/// not visible on screen, and a hash of the raw bits turns that into a cache miss.
+pub fn quantiseSignificant(x: f32, digits: i32) f32 {
     if (!(x > 0) or !std.math.isFinite(x)) return x;
     const mag = @floor(@log10(x));
     const step = std.math.pow(f32, 10, mag - @as(f32, @floatFromInt(digits - 1)));

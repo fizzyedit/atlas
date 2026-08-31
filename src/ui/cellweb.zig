@@ -158,22 +158,31 @@ pub fn build(
     lad: *const fold.Ladder,
     edges: []const fold.Edge,
 ) !CellWeb {
+    const n_cells = lad.cells.len;
+    if (n_cells == 0) return .{};
+    const all = try climbPairs(gpa, lad, edges);
+    defer gpa.free(all);
+    return csrFromPairs(gpa, n_cells, all);
+}
+
+/// Lift note-level edges onto cell pairs at every level they survive.
+fn climbPairs(
+    gpa: std.mem.Allocator,
+    lad: *const fold.Ladder,
+    edges: []const fold.Edge,
+) ![]Pair {
     var all: std.ArrayListUnmanaged(Pair) = .empty;
-    defer all.deinit(gpa);
+    errdefer all.deinit(gpa);
     var cur: std.ArrayListUnmanaged(Pair) = .empty;
     defer cur.deinit(gpa);
     var next: std.ArrayListUnmanaged(Pair) = .empty;
     defer next.deinit(gpa);
 
-    const n_cells = lad.cells.len;
-    if (n_cells == 0) return .{};
+    if (lad.cells.len == 0 or edges.len == 0) return all.toOwnedSlice(gpa);
 
-    // One scratch buffer for every `dedupe` on the way up: level 0 is the widest, and each level
-    // above it is strictly smaller.
     const scratch = try gpa.alloc(Pair, edges.len);
     defer gpa.free(scratch);
 
-    // Level 0: note ids -> the leaf cell holding them.
     try cur.ensureTotalCapacity(gpa, edges.len);
     for (edges) |e| {
         if (e.a >= lad.leaf_cell.len or e.b >= lad.leaf_cell.len) continue;
@@ -189,7 +198,6 @@ pub fn build(
     cur.shrinkRetainingCapacity(dedupe(cur.items, scratch));
     try all.appendSlice(gpa, cur.items);
 
-    // Climb. `depth + 2` is a safety stop; a correct ladder collapses in `depth` rounds.
     var round: u32 = 0;
     while (cur.items.len > 0 and round < @as(u32, lad.depth) + 2) : (round += 1) {
         next.clearRetainingCapacity();
@@ -197,7 +205,7 @@ pub fn build(
         for (cur.items) |p| {
             const pu = if (lad.cells[p.u].parent == fold.invalid) p.u else lad.cells[p.u].parent;
             const pv = if (lad.cells[p.v].parent == fold.invalid) p.v else lad.cells[p.v].parent;
-            if (pu == pv) continue; // met at their LCA; nothing coarser can separate them
+            if (pu == pv) continue;
             next.appendAssumeCapacity(.{
                 .u = @min(pu, pv),
                 .v = @max(pu, pv),
@@ -208,17 +216,19 @@ pub fn build(
         try all.appendSlice(gpa, next.items);
         std.mem.swap(std.ArrayListUnmanaged(Pair), &cur, &next);
     }
+    return all.toOwnedSlice(gpa);
+}
 
-    // CSR, both directions.
+fn csrFromPairs(gpa: std.mem.Allocator, n_cells: usize, all: []const Pair) !CellWeb {
     var web: CellWeb = .{
         .start = try gpa.alloc(u32, n_cells + 1),
-        .nbr = try gpa.alloc(u32, all.items.len * 2),
-        .w = try gpa.alloc(f32, all.items.len * 2),
+        .nbr = try gpa.alloc(u32, all.len * 2),
+        .w = try gpa.alloc(f32, all.len * 2),
     };
     errdefer web.deinit(gpa);
     @memset(web.start, 0);
 
-    for (all.items) |p| {
+    for (all) |p| {
         web.start[p.u] += 1;
         web.start[p.v] += 1;
     }
@@ -228,11 +238,10 @@ pub fn build(
         s.* = acc;
         acc += c;
     }
-    // `start` now holds each cell's begin offset; use a scratch cursor so it survives the fill.
     const cursor = try gpa.alloc(u32, n_cells);
     defer gpa.free(cursor);
     @memcpy(cursor, web.start[0..n_cells]);
-    for (all.items) |p| {
+    for (all) |p| {
         web.nbr[cursor[p.u]] = p.v;
         web.w[cursor[p.u]] = p.w;
         cursor[p.u] += 1;

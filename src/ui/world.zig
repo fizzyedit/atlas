@@ -1,9 +1,9 @@
 //! The living set: which cells are on screen this frame, where they are, and how big.
 //!
-//! This is the third and last piece of the containment path — `fold.zig` decides the hierarchy,
-//! `containment.zig` decides where a cell's children sit inside it, and this file decides which
-//! cells are *open* right now and turns them into screen-space marks. Together they replace
-//! `quadlod.zig` + `quad_agents.zig` + `lod.zig` + `multilevel.zig` + most of `layout_full.zig`.
+//! Positions come from `layout.zig`. The drawing hierarchy comes from `spatial.zig` (Hilbert/CDC
+//! over those positions). This file decides which cells are *open* right now and turns them into
+//! screen-space marks. Those two inputs never swap: a note's place is not a slot in a cell, and
+//! grouping notes for the LOD must not move them.
 //!
 //! The contract:
 //!
@@ -508,6 +508,13 @@ fn partitionLinks(items: []LiftedLink, lo: usize, hi: usize) usize {
     return i;
 }
 
+/// The Hilbert box a rebuild should reuse, or empty (`half == 0`) to derive one from the
+/// positions' extent. Widened in place when a point falls outside.
+pub const Quant = struct {
+    centre: spatial.Vec2 = .{},
+    half: f32 = 0,
+};
+
 pub const World = struct {
     gpa: std.mem.Allocator,
     lad: fold.Ladder,
@@ -671,6 +678,17 @@ pub const World = struct {
     /// otherwise freeze half-open until some unrelated event woke the app.
     settled: bool = true,
 
+    /// Drawn radius of a leaf, in world units, as `initFrom` was given it.
+    note_r: f32 = 1,
+    /// Hilbert quantisation box. Persisted so a rebuild does not rekey the vault when one
+    /// outlier appears; widened only when a point falls outside. See `spatial.Options`.
+    quant_centre: spatial.Vec2 = .{},
+    quant_half: f32 = 0,
+
+    pub fn hilbertBox(self: *const World) Quant {
+        return .{ .centre = self.quant_centre, .half = self.quant_half };
+    }
+
 
     /// `fold_opts.cancel`, when set, makes this abandonable — see `fold.Options.cancel`. The
     /// checks between phases below matter as much as the one inside the coarsening loop: the web
@@ -695,7 +713,7 @@ pub const World = struct {
 
         var placed = try placementPositions(gpa, n_notes, scored, paths, scored_opts, place_opts);
         defer placed.deinit(gpa);
-        return buildFrom(gpa, n_notes, scored, .{ .pos = placed.pos, .comp = placed.comp }, scored_opts, place_opts);
+        return buildFrom(gpa, n_notes, scored, .{ .pos = placed.pos, .comp = placed.comp }, scored_opts, place_opts, .{});
     }
 
     /// Where every note is, and which component it belongs to.
@@ -717,12 +735,13 @@ pub const World = struct {
         positions: Positions,
         fold_opts: fold.Options,
         place_opts: containment.Options,
+        quant: Quant,
     ) !World {
         const scored = try fold.degreeNormalised(gpa, n_notes, links, fold_opts.degree_norm);
         defer gpa.free(scored);
         var scored_opts = fold_opts;
         scored_opts.degree_norm = 0;
-        return buildFrom(gpa, n_notes, scored, positions, scored_opts, place_opts);
+        return buildFrom(gpa, n_notes, scored, positions, scored_opts, place_opts, quant);
     }
 
     fn buildFrom(
@@ -732,21 +751,15 @@ pub const World = struct {
         positions: Positions,
         fold_opts: fold.Options,
         place_opts: containment.Options,
+        quant: Quant,
     ) !World {
         // -- positions first, hierarchy second ---------------------------------------------
         //
-        // The drawing hierarchy is built from where the notes *are*, not from the link coarsening
-        // that decided where to put them. `fold` + `containment` still supply the positions here;
-        // what changes is that they no longer also decide which notes get drawn together.
-        //
-        // The reason is containment. A `fold` cell's radius is an estimate until it is expanded,
-        // and the estimate is not a bound — measured at up to 1.27x on real ladders, with
-        // essentially every cell holding a child that stuck out of it. `decideTopology` culls a
-        // branch on the claim that a cell's disc contains its subtree, so that gap silently threw
-        // away notes that were plainly on screen. A spatial cell's bound *is* `max over children
-        // of (distance + child bound)`, computed bottom-up once, so the claim is arithmetic rather
-        // than something `growAncestors` has to keep repairing.
-        var spat = try spatialFrom(gpa, n_notes, scored, positions, fold_opts, place_opts);
+        // The drawing hierarchy is built from where the notes *are*. `layout.solve` decided those
+        // positions; this only groups them. Caching, persisting, or skipping either side
+        // independently is what that split is for.
+        var used_quant = quant;
+        var spat = try spatialFrom(gpa, n_notes, scored, positions, fold_opts, place_opts, &used_quant);
         errdefer spat.deinit(gpa);
         var lad = spat.lad;
         spat.lad = .{}; // ownership moves to the `World` below
@@ -804,15 +817,15 @@ pub const World = struct {
         for (w.field.pos, spat.pos) |*dst, src| dst.* = .{ .x = src.x, .y = src.y };
         @memcpy(w.field.bound_r, spat.bound_r);
         @memset(w.field.expanded, true);
+        w.note_r = place_opts.note_r;
+        w.quant_centre = used_quant.centre;
+        w.quant_half = used_quant.half;
         spat.deinit(gpa);
         return w;
     }
 
-    /// Where `fold` + `containment` would put the notes.
-    ///
-    /// Transitional: this is the position source still to be replaced by a link-gravity solve.
-    /// Keeping it behind one function, returning nothing but positions, is what makes that a
-    /// local change — and what lets the caller substitute a cached or persisted set instead.
+    /// Where `fold` + `containment` would put the notes. Not the panel path: `layout.solve`
+    /// decides positions; this remains for tests and the historical `World.init` entry.
     pub const Placement = struct {
         pos: []spatial.Vec2 = &.{},
         comp: []u32 = &.{},
@@ -867,6 +880,7 @@ pub const World = struct {
         positions: Positions,
         fold_opts: fold.Options,
         place_opts: containment.Options,
+        quant: *Quant,
     ) !spatial.Result {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
@@ -884,15 +898,25 @@ pub const World = struct {
         const body = try arena.alloc(f32, n_notes);
         for (body, 0..) |*b, i| b.* = if (fold_opts.bodies.len == n_notes) fold_opts.bodies[i] else 0;
 
-        // The quantisation square, from the positions' own extent. Persisting it is what keeps a
-        // rebuild stable: keyed against a box that moves, one new outlier renumbers every Hilbert
-        // key in the vault and the whole hierarchy churns.
-        var half: f32 = 1e-3;
-        for (positions.pos) |q| half = @max(half, @max(@abs(q.x), @abs(q.y)));
+        // Persist the quantisation square; only widen when a point falls outside. Keyed against
+        // a box that moves, one new outlier renumbers every Hilbert key in the vault.
+        const centre = quant.centre;
+        var half = quant.half;
+        if (half <= 0) {
+            half = 1e-3;
+            for (positions.pos) |q| half = @max(half, @max(@abs(q.x - centre.x), @abs(q.y - centre.y)));
+        } else {
+            for (positions.pos) |q| {
+                half = @max(half, @max(@abs(q.x - centre.x), @abs(q.y - centre.y)));
+            }
+        }
+        quant.centre = centre;
+        quant.half = half;
 
         return spatial.build(gpa, n_notes, positions.pos, positions.comp, weight, body, .{
             .arity = fold_opts.arity,
             .note_r = place_opts.note_r,
+            .quant_centre = centre,
             .quant_half = half,
         });
     }
@@ -1377,36 +1401,17 @@ pub const World = struct {
     ///
     /// The panel's `GraphNode.pos` is only written for notes that resolved as marks, so a note
     /// sitting inside a coalesced mass carries a stale one — and aiming the camera at that is why
-    /// opening a document flew somewhere near the note rather than to it, then found the note
-    /// elsewhere on arrival.
-    ///
-    /// Containment places lazily, so the answer is not sitting in `field.pos` yet; but it is fully
-    /// *determined*, and forcing it costs a walk of the ancestor chain. Root-down, because
-    /// `ensureChildren` positions a cell's children relative to the cell's own already-known
-    /// centre: going leaf-up would read positions that have not been decided. Depth is
-    /// `log_arity(n)` — seven levels at 283,878 notes — so this is a few dozen placements, not a
-    /// traversal of the vault.
-    pub fn noteWorldPos(self: *World, note: u32) ?struct { x: f32, y: f32 } {
+    /// opening a document flew somewhere near the note rather than to it. After `initFrom` every
+    /// leaf is already at its layout home in `field.pos`; this is that lookup, not a walk that
+    /// packs the leaf into a parent disc.
+    pub fn noteWorldPos(self: *const World, note: u32) ?struct { x: f32, y: f32 } {
         if (note >= self.lad.leaf_cell.len) return null;
         const leaf = self.lad.leaf_cell[note];
-        if (leaf == fold.invalid or leaf >= self.lad.cells.len) return null;
-
-        var chain: [64]u32 = undefined;
-        var n: usize = 0;
-        var c = leaf;
-        while (n < chain.len) {
-            chain[n] = c;
-            n += 1;
-            const parent = self.lad.cells[c].parent;
-            if (parent == fold.invalid) break;
-            c = parent;
-        }
-
-        var i = n;
-        while (i > 0) {
-            i -= 1;
-            self.field.ensureChildren(&self.lad, chain[i]);
-        }
+        if (leaf == fold.invalid or leaf >= self.field.pos.len) return null;
+        // Resting layout position, not the presentation pose. `ensureChildren` would pack the
+        // leaf into its parent's disc when that parent has never been expanded — the mass the
+        // camera used to fly to. After `initFrom` every cell is already placed at the layout
+        // home, so this is a lookup.
         const p = self.field.pos[leaf];
         return .{ .x = p.x, .y = p.y };
     }
@@ -2690,6 +2695,7 @@ test "a small island vault resolves every note at overview zoom" {
         .{ .pos = lay.pos, .comp = lay.comp },
         .{},
         .{ .note_r = note_r },
+        .{},
     );
     defer w.deinit();
 
@@ -2704,6 +2710,11 @@ test "a small island vault resolves every note at overview zoom" {
     try settle(&w, view, .{ .budget = 360 }, 120);
     try testing.expectEqual(@as(usize, 6), w.noteMarks());
     for (w.marks.items) |m| try testing.expect(m.is_note);
+
+    // The Hilbert box is persisted on the world, so the next rebuild keys against the same
+    // square instead of renumbering every note because one outlier widened the extent.
+    const box = w.hilbertBox();
+    try testing.expect(box.half > 0);
 }
 
 test "holding topology keeps the open set while zoom changes" {

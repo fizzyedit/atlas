@@ -19,7 +19,8 @@
 //! | `--interior` | the same sweep for a single note's content cloud |
 //! | `--stats` | graph structure (degree, components, hub fragility) — no layout |
 //! | `--shapes` | one row per vault: layout grade (spread, overlap, bimodality, displacement) |
-//! | `--stability` | Gate 1: cold cluster, add one edge, cold cluster, how many notes flip |
+//! | `--churn` | how many territories come back different after one added link |
+//! | `--layout-edit` | save path: reuse memo + settled skip + World ms |
 //!
 //! Tuning flags: `--place pack|layout`, `--budget=N`, `--link-budget=N`, `--scan-cap=N`,
 //! `--reps=N`, `--svg <dir>`.
@@ -151,6 +152,9 @@ var churn_mode: bool = false;
 var stability_mode: bool = false;
 var stability_trials: u32 = 21;
 var stability_header_printed: bool = false;
+/// `--layout-edit`: cold `layout.solve`, then a second solve with reuse — identical edges
+/// (settled / World skip) versus one added link — and World init vs skip.
+var layout_edit_mode: bool = false;
 
 const Note = struct {
     path: []const u8,
@@ -171,9 +175,9 @@ pub fn main(init: std.process.Init) !void {
             \\usage: atlas-bench [mode] [flags] <target>...
             \\  target = <vault-dir> | synth:N[:shape[:avg_deg]]
             \\  shapes = scale-free | islands | hub | bipartite | chain | orphans | lfr
-            \\  modes  = --index | --index-warm | --index-edit | --refold
+            \\  modes  = --index | --index-warm | --index-edit | --refold | --layout-edit
             \\           --world | --interior | --stats | --shapes | --stability
-            \\           (default: scan/resolve/place table)
+            \\           (default: scan/resolve/`layout.solve` table)
             \\  flags  = --place pack|layout  --budget=N  --scan-cap=N  --reps=N  --svg <dir>
             \\           --no-displace  --no-territories  --trials=N  --resolution=F
             \\
@@ -188,6 +192,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--shapes")) shapes_mode = true;
         if (std.mem.eql(u8, a, "--stability")) stability_mode = true;
         if (std.mem.eql(u8, a, "--churn")) churn_mode = true;
+        if (std.mem.eql(u8, a, "--layout-edit")) layout_edit_mode = true;
         if (std.mem.startsWith(u8, a, "--trials=")) {
             stability_trials = std.fmt.parseInt(u32, a["--trials=".len..], 10) catch stability_trials;
         }
@@ -330,6 +335,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--shapes")) continue;
         if (std.mem.eql(u8, a, "--stability")) continue;
         if (std.mem.eql(u8, a, "--churn")) continue;
+        if (std.mem.eql(u8, a, "--layout-edit")) continue;
         if (std.mem.startsWith(u8, a, "--trials=")) continue;
         if (std.mem.eql(u8, a, "--no-displace")) continue;
         if (std.mem.eql(u8, a, "--no-territories")) continue;
@@ -380,6 +386,8 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (churn_mode) {
             try churnTarget(gpa, io, a);
+        } else if (layout_edit_mode) {
+            try layoutEditTarget(gpa, io, a);
         } else if (stability_mode) {
             try stabilityTarget(gpa, io, a);
         } else if (shapes_mode) {
@@ -649,7 +657,7 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
             .{ msf(mp.grid_ns), msf(mp.pyramid_ns), msf(mp.traverse_ns), msf(mp.attract_ns), msf(mp.integrate_ns), msf(mp.coarsen_ns), msf(mp.total()) },
         );
     }
-    var w = try world_mod.World.initFrom(gpa, n, edges, .{ .pos = lay.pos, .comp = lay.comp }, fold_opts, place_opts);
+    var w = try world_mod.World.initFrom(gpa, n, edges, .{ .pos = lay.pos, .comp = lay.comp }, fold_opts, place_opts, .{});
     {
         // Which islands the vault's extent is actually made of.
         const cnt = try gpa.alloc(u32, lay.n_comp);
@@ -2361,6 +2369,343 @@ fn stabilitySynth(gpa: std.mem.Allocator, io: std.Io, spec: vault_synth.Spec) !v
     printStabilityRow(label, spec.n, ledges.len, s);
 }
 
+/// How far every note moved between two solves, and how much of that was the whole map sliding.
+///
+/// `layout.recentre` keys the origin to the *bounding box* centre, so one note reaching a new
+/// extreme translates all 284k of them. Reporting raw and de-translated movement separates "the
+/// map moved under the reader" from "notes moved relative to each other" — only the second is a
+/// real rearrangement, and they need opposite fixes.
+const Displacement = struct {
+    raw_med: f64 = 0,
+    raw_p99: f64 = 0,
+    raw_max: f64 = 0,
+    aligned_med: f64 = 0,
+    aligned_p99: f64 = 0,
+    aligned_max: f64 = 0,
+    /// Notes that moved more than one lattice slot once the global slide is taken out.
+    moved: usize = 0,
+    shift_x: f64 = 0,
+    shift_y: f64 = 0,
+    /// Best-fit uniform scale between the two solves, and what is left after removing it.
+    /// A map that only breathed shows scale != 1 and a near-zero residual; a map that genuinely
+    /// rearranged shows scale ~= 1 and a residual as large as the raw movement.
+    scale: f64 = 1,
+    fit_med: f64 = 0,
+    fit_p99: f64 = 0,
+    fit_max: f64 = 0,
+    fit_moved: usize = 0,
+    /// Notes whose territory subgraph changed at all (`home` hash), whose interior offset within
+    /// that territory changed (`inner`), and whose territory kept both and was simply *placed*
+    /// somewhere else. The last one is frame-tree instability and nothing else.
+    home_changed: usize = 0,
+    inner_changed: usize = 0,
+    replaced: usize = 0,
+};
+
+/// Split the movement by which stage of the solve caused it. `home` is the territory's subgraph
+/// hash and `inner` the note's offset from its territory centre, so a note with both unchanged
+/// that still moved was carried there by the frame it sits in.
+fn attribute(d: *Displacement, before: layout.Result, after: layout.Result, slot: f64) void {
+    if (before.home.len != after.home.len or before.inner.len != after.inner.len) return;
+    for (before.home, after.home, before.inner, after.inner) |bh, ah, bi, ai| {
+        const dx = @as(f64, ai.x) - @as(f64, bi.x);
+        const dy = @as(f64, ai.y) - @as(f64, bi.y);
+        const inner_moved = @sqrt(dx * dx + dy * dy) > slot;
+        if (bh != ah) d.home_changed += 1;
+        if (inner_moved) d.inner_changed += 1;
+        if (bh == ah and !inner_moved) d.replaced += 1;
+    }
+}
+
+fn displacement(
+    gpa: std.mem.Allocator,
+    before: []const layout.Vec2,
+    after: []const layout.Vec2,
+    slot: f64,
+) !Displacement {
+    var d: Displacement = .{};
+    if (before.len == 0 or before.len != after.len) return d;
+
+    // Best-fit translation is the mean offset: the map's rigid slide between the two solves.
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    for (before, after) |b, a| {
+        sx += @as(f64, a.x) - @as(f64, b.x);
+        sy += @as(f64, a.y) - @as(f64, b.y);
+    }
+    d.shift_x = sx / @as(f64, @floatFromInt(before.len));
+    d.shift_y = sy / @as(f64, @floatFromInt(before.len));
+
+    const raw = try gpa.alloc(f64, before.len);
+    defer gpa.free(raw);
+    const aligned = try gpa.alloc(f64, before.len);
+    defer gpa.free(aligned);
+    for (before, after, raw, aligned) |b, a, *r, *al| {
+        const dx = @as(f64, a.x) - @as(f64, b.x);
+        const dy = @as(f64, a.y) - @as(f64, b.y);
+        r.* = @sqrt(dx * dx + dy * dy);
+        const ax = dx - d.shift_x;
+        const ay = dy - d.shift_y;
+        al.* = @sqrt(ax * ax + ay * ay);
+        if (al.* > slot) d.moved += 1;
+    }
+    // Best-fit uniform scale about each solve's own centroid. "Things near the edge move more"
+    // is what a scale change looks like — a note at radius R moves by (s-1)*R — so it has to be
+    // ruled in or out before blaming the clustering.
+    var bcx: f64 = 0;
+    var bcy: f64 = 0;
+    var acx: f64 = 0;
+    var acy: f64 = 0;
+    for (before, after) |b, a| {
+        bcx += b.x;
+        bcy += b.y;
+        acx += a.x;
+        acy += a.y;
+    }
+    const inv = 1.0 / @as(f64, @floatFromInt(before.len));
+    bcx *= inv;
+    bcy *= inv;
+    acx *= inv;
+    acy *= inv;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (before, after) |b, a| {
+        const bx = @as(f64, b.x) - bcx;
+        const by = @as(f64, b.y) - bcy;
+        num += bx * (@as(f64, a.x) - acx) + by * (@as(f64, a.y) - acy);
+        den += bx * bx + by * by;
+    }
+    d.scale = if (den > 0) num / den else 1;
+
+    const fit = try gpa.alloc(f64, before.len);
+    defer gpa.free(fit);
+    for (before, after, fit) |b, a, *f| {
+        const fx = (@as(f64, a.x) - acx) - d.scale * (@as(f64, b.x) - bcx);
+        const fy = (@as(f64, a.y) - acy) - d.scale * (@as(f64, b.y) - bcy);
+        f.* = @sqrt(fx * fx + fy * fy);
+        if (f.* > slot) d.fit_moved += 1;
+    }
+    std.mem.sort(f64, fit, {}, std.sort.asc(f64));
+
+    std.mem.sort(f64, raw, {}, std.sort.asc(f64));
+    std.mem.sort(f64, aligned, {}, std.sort.asc(f64));
+    const last = before.len - 1;
+    const p99 = @min(last, before.len * 99 / 100);
+    d.raw_med = raw[before.len / 2];
+    d.raw_p99 = raw[p99];
+    d.raw_max = raw[last];
+    d.aligned_med = aligned[before.len / 2];
+    d.aligned_p99 = aligned[p99];
+    d.aligned_max = aligned[last];
+    d.fit_med = fit[before.len / 2];
+    d.fit_p99 = fit[p99];
+    d.fit_max = fit[last];
+    return d;
+}
+
+fn stageMs(stages: @TypeOf(layout.stage_ns), s: layout.Stage) f64 {
+    return @as(f64, @floatFromInt(stages.get(s))) / 1_000_000.0;
+}
+
+/// `--layout-edit DIR`: the save path. Cold `layout.solve` + `World.initFrom`, then a second
+/// solve with reuse on identical edges (settled skip) and on one added link (scoped dirty ids),
+/// reporting solve ms, interior/frame reuse, and the world rebuild each one still pays.
+fn layoutEditTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var notes: std.ArrayList(Note) = .empty;
+    var read_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    try collect(gpa, arena, io, dir_path, dir_path, &notes, &read_ns, &scan_ns);
+    if (notes.items.len == 0) return;
+    const n = notes.items.len;
+
+    const candidates = try arena.alloc(resolve.Candidate, n);
+    for (notes.items, candidates) |note, *c| c.* = .{ .path = note.path, .stem = note.stem };
+    var edges: std.ArrayList(fold.Edge) = .empty;
+    var buf: [resolve.max_path_len]u8 = undefined;
+    var cand_index = try resolve.Index.init(gpa, candidates);
+    defer cand_index.deinit();
+    for (notes.items, 0..) |note, i| {
+        for (note.links) |raw| {
+            if (!resolve.isNoteLikeTarget(raw)) continue;
+            const m = resolve.resolveIndexed(raw, note.path, candidates, &cand_index, &buf) orelse continue;
+            if (m.index == i) continue;
+            try edges.append(arena, .{ .a = @intCast(i), .b = @intCast(m.index) });
+        }
+    }
+    const paths = try arena.alloc([]const u8, n);
+    for (notes.items, paths) |note, *p| p.* = note.path;
+    const ids = try arena.alloc(u64, n);
+    for (ids, 0..) |*d, i| d.* = i + 1;
+
+    const t0 = now(io);
+    var cold = try layout.solve(gpa, n, edges.items, paths, .{ .note_r = 4, .ids = ids, .profile = true });
+    defer cold.deinit(gpa);
+    const cold_ms = ms(elapsed(io, t0));
+    const cold_stages = layout.stage_ns;
+
+    const t_world = now(io);
+    var w = try world_mod.World.initFrom(
+        gpa,
+        n,
+        edges.items,
+        .{ .pos = cold.pos, .comp = cold.comp },
+        .{},
+        .{ .note_r = 4 },
+        .{},
+    );
+    const world_ms = ms(elapsed(io, t_world));
+    const quant = w.hilbertBox();
+    w.deinit();
+
+    const t_same = now(io);
+    var same = try layout.solve(gpa, n, edges.items, paths, .{
+        .note_r = 4,
+        .ids = ids,
+        .reuse = .{ .ids = cold.ids, .inner = cold.inner, .home = cold.home, .frames = cold.frames },
+        .profile = true,
+    });
+    defer same.deinit(gpa);
+    const same_ms = ms(elapsed(io, t_same));
+    const same_in = layout.reused_interiors;
+    const same_in_n = layout.solved_interiors;
+    const same_fr = layout.reused_frames;
+    const same_fr_n = layout.placed_frames;
+
+    const extra = (try shape_metrics.pickNewEdge(gpa, n, edges.items));
+    var edit_ms: f64 = 0;
+    var edit_in: u32 = 0;
+    var edit_in_n: u32 = 0;
+    var edit_fr: u32 = 0;
+    var edit_fr_n: u32 = 0;
+    var edit_world_ms: f64 = 0;
+    var edit_stages: @TypeOf(layout.stage_ns) = .initFill(0);
+    var edit_miss_discs: usize = 0;
+    var edit_miss_max: usize = 0;
+    var edit_miss_depth: u32 = 0;
+    var disp: Displacement = .{};
+    var comp_before: u32 = cold.n_comp;
+    var comp_after: u32 = cold.n_comp;
+    if (extra) |e| {
+        try edges.append(arena, e);
+        const t_edit = now(io);
+        var edited = try layout.solve(gpa, n, edges.items, paths, .{
+            .note_r = 4,
+            .ids = ids,
+            .reuse = .{ .ids = cold.ids, .inner = cold.inner, .home = cold.home, .frames = cold.frames },
+            .profile = true,
+        });
+        defer edited.deinit(gpa);
+        edit_ms = ms(elapsed(io, t_edit));
+        edit_stages = layout.stage_ns;
+        comp_before = cold.n_comp;
+        comp_after = edited.n_comp;
+        disp = try displacement(gpa, cold.pos, edited.pos, @as(f64, cold.spacing) * 4);
+        attribute(&disp, cold, edited, @as(f64, cold.spacing) * 4);
+        edit_in = layout.reused_interiors;
+        edit_in_n = layout.solved_interiors;
+        edit_fr = layout.reused_frames;
+        edit_fr_n = layout.placed_frames;
+        edit_miss_discs = layout.missed_frame_discs;
+        edit_miss_max = layout.largest_missed_frame;
+        edit_miss_depth = layout.shallowest_missed_frame;
+
+        // The world the edit has to be drawn through. Rebuilt, not nudged: keeping the live
+        // ladder needs the Hilbert order to survive the re-solve, and a global Louvain plus
+        // global frame placement always moves some note past a neighbour on the curve.
+        const t_world2 = now(io);
+        var w2 = try world_mod.World.initFrom(
+            gpa,
+            n,
+            edges.items,
+            .{ .pos = edited.pos, .comp = edited.comp },
+            .{},
+            .{ .note_r = 4 },
+            quant,
+        );
+        edit_world_ms = ms(elapsed(io, t_world2));
+        w2.deinit();
+    }
+
+    std.debug.print(
+        \\{s}  n={d}  edges={d}
+        \\  cold solve          {d:>8.1} ms
+        \\  World.initFrom      {d:>8.1} ms
+        \\  reuse (same edges)  {d:>8.1} ms  interiors {d}/{d}  frames {d}/{d}  (World skip)
+        \\  reuse (one link)    {d:>8.1} ms  interiors {d}/{d}  frames {d}/{d}
+        \\  World (one link)    {d:>8.1} ms
+        \\
+        \\  inside layout.solve      cold      one link
+        \\    normalise       {d:>10.1} {d:>13.1} ms   one pass over every link
+        \\    components      {d:>10.1} {d:>13.1} ms   union-find + bucketing
+        \\    cluster         {d:>10.1} {d:>13.1} ms   Louvain, split, merge
+        \\    interiors       {d:>10.1} {d:>13.1} ms   memoised by subgraph
+        \\    frames          {d:>10.1} {d:>13.1} ms   nested placement
+        \\    pack            {d:>10.1} {d:>13.1} ms   island radii + separate
+        \\
+    , .{
+        std.fs.path.basename(dir_path),
+        n,
+        edges.items.len,
+        cold_ms,
+        world_ms,
+        same_ms,
+        same_in,
+        same_in_n,
+        same_fr,
+        same_fr_n,
+        edit_ms,
+        edit_in,
+        edit_in_n,
+        edit_fr,
+        edit_fr_n,
+        edit_world_ms,
+        stageMs(cold_stages, .normalise),  stageMs(edit_stages, .normalise),
+        stageMs(cold_stages, .components), stageMs(edit_stages, .components),
+        stageMs(cold_stages, .cluster),    stageMs(edit_stages, .cluster),
+        stageMs(cold_stages, .interiors),  stageMs(edit_stages, .interiors),
+        stageMs(cold_stages, .frames),     stageMs(edit_stages, .frames),
+        stageMs(cold_stages, .pack),       stageMs(edit_stages, .pack),
+    });
+
+    std.debug.print(
+        \\
+        \\  how far one added link moved the map (world units, slot={d:.0})
+        \\    components      {d} -> {d}
+        \\    whole-map slide {d:.1}, {d:.1}   (recentre keys off the bounding box)
+        \\    raw             med {d:>8.1}   p99 {d:>9.1}   max {d:>9.1}
+        \\    slide removed   med {d:>8.1}   p99 {d:>9.1}   max {d:>9.1}
+        \\    moved > 1 slot  {d} of {d}
+        \\    best-fit scale  {d:.6}
+        \\    scale removed   med {d:>8.1}   p99 {d:>9.1}   max {d:>9.1}   moved {d}
+        \\
+        \\  why they moved
+        \\    territory changed        {d}   (subgraph hash differs)
+        \\    interior offset moved    {d}   (re-solved inside its territory)
+        \\    neither, but map moved   {d}   (carried by the frame it sits in)
+        \\
+        \\  frame memo misses
+        \\    discs re-placed          {d}
+        \\    biggest missed frame     {d} discs
+        \\    shallowest miss at depth {d}   (0 = the outermost frame)
+        \\
+    , .{
+        @as(f64, cold.spacing) * 4,
+        comp_before, comp_after,
+        disp.shift_x, disp.shift_y,
+        disp.raw_med, disp.raw_p99, disp.raw_max,
+        disp.aligned_med, disp.aligned_p99, disp.aligned_max,
+        disp.moved, n,
+        disp.scale,
+        disp.fit_med, disp.fit_p99, disp.fit_max, disp.fit_moved,
+        disp.home_changed, disp.inner_changed, disp.replaced,
+        edit_miss_discs, edit_miss_max, edit_miss_depth,
+    });
+}
+
 /// `--churn DIR`: how much of the *territory* set survives one added link, stage by stage.
 ///
 /// The memo in `layout.solve` reuses a territory whose membership came back identical, so its hit
@@ -2795,44 +3140,44 @@ fn benchVault(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
     }
 
     // -- layout --------------------------------------------------------------------
-    // First build: no seeds, nothing anchored — the exact path a freshly opened vault takes,
-    // and the one the user watches the app freeze through.
-    const seeds = try arena.alloc(?dvui.Point, n);
-    @memset(seeds, null);
+    // First build: the live panel path (`layout.solve`), not the parked `layout_full.targets`.
     const paths = try arena.alloc([]const u8, n);
     for (notes.items, paths) |note, *p| p.* = note.path;
-    const out = try arena.alloc(dvui.Point, n);
+    const links = try arena.alloc(fold.Edge, edges.items.len);
+    for (edges.items, links) |e, *le| le.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
 
-    var prof: layout_full.Profile = .{};
-    try layout_full.targets(gpa, n, edges.items, seeds, degrees, .{
-        .aspect = 1.6,
-        .paths = paths,
-        .profile = &prof,
-    }, out);
+    const t_lay = now(io);
+    var lay = try layout.solve(gpa, n, links, paths, .{ .note_r = 4 });
+    defer lay.deinit(gpa);
+    const layout_ns = elapsed(io, t_lay);
+
+    const out = try arena.alloc(dvui.Point, n);
+    for (lay.pos, out) |q, *p| p.* = .{ .x = q.x, .y = q.y };
 
     std.debug.print(
-        "{s:<16}{d:>7}{d:>8}{d:>8.0}m{d:>7.0}m{d:>9.0}m{d:>7.0}m{d:>8.0}m{d:>7.0}m{d:>7.0}m{d:>8.0}m{d:>10.0}m\n",
+        "{s:<16}{d:>7}{d:>8}{d:>8.0}m{d:>7.0}m{d:>9.0}m  layout {d:.0}ms  interiors {d}/{d}  frames {d}/{d}\n",
         .{
             std.fs.path.basename(dir_path),
             n,
             edges.items.len,
-            ms(read_ns),   ms(scan_ns),  ms(resolve_ns),
-            ms(prof.hop2_ns), ms(prof.force_ns), ms(prof.pack_ns),
-            ms(prof.relax_ns), ms(prof.snap_ns + prof.refine_ns), ms(prof.total_ns),
+            ms(read_ns),
+            ms(scan_ns),
+            ms(resolve_ns),
+            ms(layout_ns),
+            layout.reused_interiors,
+            layout.solved_interiors,
+            layout.reused_frames,
+            layout.placed_frames,
         },
     );
-    std.debug.print("    fill={d:.3}  cross-dir-edges={d}  max-degree={d}\n", .{ fillRatio(out, n), cross_dir, max_deg });
+    std.debug.print("    fill={d:.3}  cross-dir-edges={d}  max-degree={d}  spacing={d:.2}\n", .{
+        fillRatio(out, n),
+        cross_dir,
+        max_deg,
+        lay.spacing,
+    });
     if (svg_dir) |d| {
         try writeSvg(io, d, std.fs.path.basename(dir_path), out, edges.items, degrees, arena);
-        // Raw multilevel output, before packing/snap/refine — isolates whether the ladder is
-        // producing structure or whether a later stage is flattening it.
-        const ml_edges = try arena.alloc(multilevel.Edge, edges.items.len);
-        for (edges.items, ml_edges) |e, *me| me.* = .{ .a = @intCast(e.a), .b = @intCast(e.b) };
-        const raw = try arena.alloc(dvui.Point, n);
-        try multilevel.solve(gpa, n, ml_edges, raw, .{});
-        const label = try std.fmt.allocPrint(arena, "{s}-raw-ml", .{std.fs.path.basename(dir_path)});
-        try writeSvg(io, d, label, raw, edges.items, degrees, arena);
-
     }
 }
 fn fillRatio(pts: []const dvui.Point, n: usize) f64 {

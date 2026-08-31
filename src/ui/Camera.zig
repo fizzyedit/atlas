@@ -322,6 +322,16 @@ fn applyFlight(self: *Camera, f: f32) void {
         return;
     }
 
+    // Same zoom at both ends: slide. van Wijk's path still arcs *out* when the two centres
+    // are far apart, which is right for a click-to-focus flight and wrong for a save that
+    // asked to keep zoom — the reader would watch the map zoom out and lose the note.
+    if (@abs(self.fly_from_zoom - self.fly_to_zoom) < @max(self.fly_from_zoom, 0.01) * 1e-3) {
+        self.center.x = std.math.lerp(self.fly_from.x, self.fly_to.x, f);
+        self.center.y = std.math.lerp(self.fly_from.y, self.fly_to.y, f);
+        self.zoom = self.fly_to_zoom;
+        return;
+    }
+
     const ux = self.fly_to.x - self.fly_from.x;
     const uy = self.fly_to.y - self.fly_from.y;
     const dist = @sqrt(ux * ux + uy * uy);
@@ -549,6 +559,23 @@ test "zoom chase is geometric and never overshoots" {
     // A little slack for the arc's own overshoot in screen terms; the failure this guards is a
     // doubling, not a few percent.
     try testing.expect(far <= start_off * 1.1);
+}
+
+test "equal-zoom chase slides without arcing out" {
+    // A save follow keeps zoom_target. van Wijk would still zoom out on a long pan; that is
+    // how a link save lost the note even after the camera started chasing.
+    var c = camAt(.{ .x = 0, .y = 0 }, 2.0, .{ .x = 0, .y = 0, .w = 800, .h = 600 });
+    c.center_target = .{ .x = 4000, .y = -2500 };
+    c.zoom_target = 2.0;
+    var frames: usize = 0;
+    while (c.chasing() and frames < 600) : (frames += 1) {
+        _ = c.chase(1.0 / 60.0, 7);
+        try testing.expectApproxEqAbs(@as(f32, 2.0), c.zoom, 1e-4);
+    }
+    try testing.expect(!c.chasing());
+    try testing.expectApproxEqAbs(@as(f32, 4000), c.center.x, 0.02);
+    try testing.expectApproxEqAbs(@as(f32, -2500), c.center.y, 0.02);
+    try testing.expectEqual(@as(f32, 2.0), c.zoom);
 }
 
 test "chase is a no-op once targets are met" {
