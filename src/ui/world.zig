@@ -560,7 +560,7 @@ pub const World = struct {
     /// Per cell: stamped when it is an ancestor of one of the reader's open notes. See
     /// `markOpenChains`.
     open_chain: []u32,
-    open_chain_epoch: u32 = 0,
+    open_chain_epoch: u32 = 1,
     /// Scratch for the keys `fadeLinks` retires.
     sc_dead: std.ArrayListUnmanaged(u64) = .empty,
     /// Per-cell memo for `cutOf`, valid only while `cut[i].stamp == cut_epoch`. The stamp exists
@@ -573,8 +573,8 @@ pub const World = struct {
     /// Per cell: the heaviest lifted line touching it this frame. Stamped, so a new frame costs
     /// nothing to invalidate.
     anchor_of: []Anchor,
-    anchor_epoch: u32 = 0,
-    cut_epoch: u32 = 0,
+    anchor_epoch: u32 = 1,
+    cut_epoch: u32 = 1,
     /// Scratch for the lift and the crossfades, kept across frames rather than rebuilt inside it.
     ///
     /// Every one of these used to be `.empty` on entry and freed on exit, so a pan frame — which
@@ -601,7 +601,14 @@ pub const World = struct {
     /// built its own `AutoHashMapUnmanaged(u32, Point)` from the mark list to answer it. The answer
     /// is a property of the frame's marks, so the `World` publishes it once and both read it.
     mark_of: []Memo,
-    mark_epoch: u32 = 0,
+    /// Starts at 1, not 0: a never-written `Memo` is `.{ .stamp = 0, .of = fold.invalid }`, so an
+    /// epoch of 0 makes every unstamped entry read as a *hit* carrying `fold.invalid` as its mark
+    /// index. That is not hypothetical — `markIndex` is the one stamped memo with readers outside
+    /// the frame pipeline (`interiorAnchor`, hit testing, the label placer), and a `World` that has
+    /// been built but not yet `step`ped is exactly the state a vault has while its first notes are
+    /// being created. It handed out `marks.items[0xffffffff]` on an empty `marks` and took the
+    /// process with it. Every bump below skips back over 0 for the same reason.
+    mark_epoch: u32 = 1,
 
     /// One cut cell's per-neighbour-cell weight totals, dense and epoch-stamped instead of hashed.
     ///
@@ -611,7 +618,7 @@ pub const World = struct {
     /// a new accumulation costs an epoch bump, not a memset of one entry per cell in the vault.
     /// `side_hit` records which entries were touched so reading the totals back is O(touched).
     side: []SideAcc,
-    side_epoch: u32 = 0,
+    side_epoch: u32 = 1,
     side_hit: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Fingerprint of the cut the cached `lifted` set was built from, plus the inputs that change
@@ -771,8 +778,10 @@ pub const World = struct {
         // memory and read a stale memo as valid.
         @memset(w.cut_of, .{});
         @memset(w.anchor_of, .{});
-        // Same contract: `side_epoch` and `mark_epoch` are bumped *before* each use, so a stamp of
-        // 0 can never match the epoch of the first accumulation.
+        // Same contract, but note what it rests on: a stamp of 0 means "never written", so it is
+        // the *epoch* starting at 1 that keeps these zeroed entries from reading as hits. It is not
+        // enough that each epoch is bumped before its own accumulation — `markIndex` is read from
+        // outside the frame pipeline too, on a `World` that may never have been stepped.
         @memset(w.side, .{});
         @memset(w.mark_of, .{});
         @memset(w.open_chain, 0);
@@ -1002,9 +1011,23 @@ pub const World = struct {
         // fresh one; until it does, `markIndex` must answer "no mark" rather than hand out an index
         // into an array that no longer has it — which on a frame `step` returns early from (a world
         // with no roots) would be a read past the end.
-        self.mark_epoch +%= 1;
+        bumpEpoch(&self.mark_epoch, self.mark_of);
         // Invalidate the `cutOf` memo by moving the epoch, not by clearing 341k entries.
-        self.cut_epoch +%= 1;
+        bumpEpoch(&self.cut_epoch, self.cut_of);
+    }
+
+    /// Move a stamped memo array's epoch to a value nothing in it currently carries.
+    ///
+    /// Two things must not happen. The epoch must never land on 0, which is the stamp a
+    /// never-written entry has; and it must never wrap all the way onto a stamp still sitting in
+    /// the array, which is what the memset covers — that costs one clear per 2^32 bumps rather
+    /// than one per frame, which is the whole point of stamping.
+    fn bumpEpoch(epoch: *u32, memo: []Memo) void {
+        epoch.* +%= 1;
+        if (epoch.* == 0) {
+            @memset(memo, .{});
+            epoch.* = 1;
+        }
     }
 
     /// Pass 1 — which cells are open. Reads only the ladder, the view, and the budget.
@@ -1327,11 +1350,7 @@ pub const World = struct {
         // Publish cell -> mark index for the frame. One pass over the marks (a few thousand at the
         // top of the slider) so the draw and the label placer stop building a hash map each, and
         // their tens of thousands of endpoint lookups become array indexing.
-        self.mark_epoch +%= 1;
-        if (self.mark_epoch == 0) {
-            @memset(self.mark_of, .{});
-            self.mark_epoch = 1;
-        }
+        bumpEpoch(&self.mark_epoch, self.mark_of);
         for (self.marks.items, 0..) |m, i| {
             self.mark_of[m.cell] = .{ .stamp = self.mark_epoch, .of = @intCast(i) };
         }
@@ -1342,6 +1361,11 @@ pub const World = struct {
         if (cell >= self.mark_of.len) return null;
         const m = self.mark_of[cell];
         if (m.stamp != self.mark_epoch) return null;
+        // The stamp should already be enough. This is here because every caller uses the answer to
+        // index `marks` (or an array built parallel to it) directly, so the cost of the stamp ever
+        // being wrong is a wild read rather than a wrong position — and this is the one memo read
+        // from outside the frame pipeline, where "is the stamp current" is a harder thing to know.
+        if (m.of >= self.marks.items.len) return null;
         return m.of;
     }
 
@@ -2865,4 +2889,93 @@ test "clipSegment keeps what crosses the rect and drops what misses" {
     try testing.expect(clipSegment(-10, 200, 110, 200, 0, 0, 100, 100) == null);
     // Degenerate: a zero-length segment has no interior to keep.
     try testing.expect(clipSegment(50, 50, 50, 50, 0, 0, 100, 100) == null);
+}
+
+test "a world that has never been stepped reports no marks" {
+    // The crash this guards: a `World` is built the moment the note set changes, but `markIndex`
+    // has readers that run *before* the first `step` — `graph.interiorAnchor`, hit testing, the
+    // label placer. A never-written `Memo` is `.{ .stamp = 0, .of = fold.invalid }`, so while the
+    // epoch also started at 0 every cell in the vault reported a mark, and the index it reported
+    // was `fold.invalid`. `marks` is empty at that point, so the read landed 32 GB past a
+    // zero-length allocation and took the process with it (SIGBUS).
+    //
+    // It is reachable with three notes in a brand-new vault, which is why it went unnoticed: at
+    // any real size the panel had already stepped the world before anything asked.
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 3, 8, 64 }) |n| {
+        var w = try World.init(gpa, n, &.{}, &.{}, .{}, .{});
+        defer w.deinit();
+        try testing.expectEqual(@as(usize, 0), w.marks.items.len);
+        for (0..w.lad.cells.len) |c| {
+            try testing.expect(w.markIndex(@intCast(c)) == null);
+        }
+        // And out past the ladder, which is the branch that was already guarded.
+        try testing.expect(w.markIndex(@intCast(w.lad.cells.len)) == null);
+        try testing.expect(w.markIndex(fold.invalid) == null);
+    }
+}
+
+test "an index into marks is never handed out for a cell that has none" {
+    // The same invariant one level up, held across the frame boundary rather than only at init:
+    // after any step, every answer `markIndex` gives indexes a mark that is actually there, and
+    // it is that cell's own mark.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 300);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 300, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const p: Params = .{ .budget = 60 };
+    var zoom: f32 = 1;
+    while (zoom <= 200) : (zoom *= 2) {
+        try w.step(.{ .w = 900, .h = 600, .zoom = zoom, .cx = 0, .cy = 0 }, p, 1.0 / 60.0);
+        for (0..w.lad.cells.len) |c| {
+            const mi = w.markIndex(@intCast(c)) orelse continue;
+            try testing.expect(mi < w.marks.items.len);
+            try testing.expectEqual(@as(u32, @intCast(c)), w.marks.items[mi].cell);
+        }
+    }
+}
+
+test "a vault of one to a handful of notes resolves to one mark each" {
+    // A brand-new vault is the smallest input this pipeline ever sees, and the least exercised:
+    // the ladder is one root over a couple of leaves, there are no links to lift, and the budget
+    // is never anywhere near binding. Asserted here because it is where a new user starts, and
+    // because it is the case that produced a crash — see the never-stepped test above.
+    //
+    // The bar is the same as at any size: after the crossfade settles, every note is drawn as
+    // itself, nothing is left standing in as a coalesced mass, and the notes are actually apart
+    // on screen rather than stacked at the centre.
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 3, 4, 5, 12 }) |n| {
+        var w = try World.init(gpa, n, &.{}, &.{}, .{}, .{});
+        defer w.deinit();
+
+        // Fit-to-extents, the framing the panel opens on.
+        const view: View = .{
+            .w = 900,
+            .h = 600,
+            .zoom = 500.0 / (2 * @max(w.extent(), 1)),
+            .cx = 0,
+            .cy = 0,
+        };
+        try settle(&w, view, .{ .budget = 280 }, 400);
+
+        try testing.expectEqual(n, w.marks.items.len);
+        for (w.marks.items) |m| {
+            try testing.expect(m.is_note);
+            try testing.expect(m.note < n);
+            try testing.expectApproxEqAbs(@as(f32, 1), m.alpha, 1e-3);
+        }
+
+        // No two notes on top of each other. One disc is `note_r_px` across, so anything closer
+        // than a diameter is overlapping ink rather than two readable notes.
+        for (w.marks.items, 0..) |a, i| {
+            for (w.marks.items[i + 1 ..]) |b| {
+                const dx = (a.wx - b.wx) * view.zoom;
+                const dy = (a.wy - b.wy) * view.zoom;
+                try testing.expect(@sqrt(dx * dx + dy * dy) > a.r + b.r);
+            }
+        }
+    }
 }

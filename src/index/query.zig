@@ -22,8 +22,18 @@ pub const Backlink = struct {
     title: []const u8,
     line: u32,
     col: u32,
+    /// The link as it was written: the target text of `[[Target|alias]]`, or the label of a
+    /// markdown link. Carried so the backlinks filter has something on the *mention* to match —
+    /// without it the only searchable text is the source note's path and title, which is not
+    /// what someone typing in that box is looking for.
+    raw: []const u8 = "",
+    /// The `|alias` of a piped wikilink, empty otherwise. Searched alongside `raw`, since the
+    /// alias is the text actually visible in the source note.
+    alias: []const u8 = "",
     /// Filled by the *view* when a row is drawn, not by the query — see `backlinks.contextFor`.
-    /// Empty until then.
+    /// Empty until then, which is why it is deliberately **not** part of what the filter
+    /// searches: a row's context exists only once it has been on screen, so filtering on it
+    /// would match a different set depending on how far you had scrolled.
     context: []const u8 = "",
 };
 
@@ -118,7 +128,7 @@ pub fn headingLine(db: *Db, path: []const u8, heading: []const u8) !u32 {
 pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]Backlink {
     const id = (try noteIdForPath(db, dst_path)) orelse return &.{};
     var stmt = try db.reader().prepare(
-        \\SELECT n.path, n.title, n.stem, l.line, l.col
+        \\SELECT n.path, n.title, n.stem, l.line, l.col, l.raw, l.alias
         \\FROM links l
         \\JOIN notes n ON n.id = l.src_id
         \\WHERE l.dst_id = ? AND n.phantom = 0
@@ -133,6 +143,8 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
         stem: []const u8,
         line: i64,
         col: i64,
+        raw: []const u8,
+        alias: []const u8,
     }, .{id});
     while (true) {
         const row = (try iter.nextAlloc(arena, .{})) orelse break;
@@ -142,6 +154,8 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
             .title = title,
             .line = @intCast(row.line),
             .col = @intCast(row.col),
+            .raw = row.raw,
+            .alias = row.alias,
         });
     }
     return list.toOwnedSlice(arena);

@@ -458,6 +458,8 @@ pub fn dirtyBacklinks(
                 .title = try arena.dupe(u8, title),
                 .line = l.line,
                 .col = l.col,
+                .raw = try arena.dupe(u8, l.raw),
+                .alias = try arena.dupe(u8, l.alias),
                 .context = try arena.dupe(u8, l.context),
             });
         }

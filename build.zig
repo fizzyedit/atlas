@@ -87,6 +87,9 @@ pub fn build(b: *std.Build) void {
         .{ "atlas-louvain-tests", "src/ui/louvain.zig" },
         // Layout-shape grade: classifier, Procrustes displacement, bimodality. Headless.
         .{ "atlas-shape-metrics-tests", "src/ui/shape_metrics.zig" },
+        // Variable-height row windowing for virtualized lists: two float arrays and a binary
+        // search, no dvui and no vault types.
+        .{ "atlas-vrun-tests", "src/ui/vrun.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],
