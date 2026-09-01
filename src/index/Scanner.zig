@@ -500,8 +500,15 @@ fn scanLine(
             if (parseMarkdownLink(line, i)) |md| {
                 if (resolve.isNoteLikeTarget(md.url)) {
                     const context = try arena.dupe(u8, line);
+                    // `raw` stays exactly as written (the backlinks filter searches it), but the
+                    // `#fragment` is also split out into `heading`, the same column a wikilink's
+                    // `#anchor` fills. Without that, a link into a section is indistinguishable
+                    // from a link to the whole note once it's in the DB — which is what left the
+                    // interior view's section-to-section edges wikilink-only.
+                    const frag = if (std.mem.indexOfScalar(u8, md.url, '#')) |h| md.url[h + 1 ..] else "";
                     try links.append(arena, .{
                         .raw = try arena.dupe(u8, md.url),
+                        .heading = try arena.dupe(u8, frag),
                         .alias = try arena.dupe(u8, md.text),
                         .kind = .markdown,
                         .line = line_no,
@@ -1031,6 +1038,22 @@ test "local markdown links are recorded; http links are not" {
             try testing.expectEqualStrings("./Notes/A.md", note.links[0].raw);
             try testing.expectEqualStrings("local", note.links[0].alias);
             try testing.expectEqualStrings("B.md", note.links[1].raw);
+        }
+    }.body);
+}
+
+test "a markdown link's fragment is recorded as its heading" {
+    const src =
+        \\[Daphne > Habitat and Range](Daphne.md#habitat-and-range) and [plain](B.md)
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 2), note.links.len);
+            // `raw` is still the destination exactly as written — the fragment is *also* split out.
+            try testing.expectEqualStrings("Daphne.md#habitat-and-range", note.links[0].raw);
+            try testing.expectEqualStrings("habitat-and-range", note.links[0].heading);
+            try testing.expectEqualStrings("", note.links[1].heading);
         }
     }.body);
 }

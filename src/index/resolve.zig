@@ -138,11 +138,24 @@ pub fn resolveIndexed(
     // to say which. Wikilinks are unaffected (they carry the name verbatim), so this only ever
     // shows up on the markdown-link form.
     var decoded: [max_path_len]u8 = undefined;
-    const norm = normalize(percentDecode(target, &decoded));
+    const norm = normalize(stripFragment(percentDecode(target, &decoded)));
     if (norm.text.len == 0) return null;
 
     if (norm.is_path) return resolveAsPath(norm, source_path, candidates, index, buf);
     return resolveAsName(norm.text, source_path, candidates, index);
+}
+
+/// Everything before the `#`. A fragment says *where in* a note to land, never *which* note,
+/// so it has no business in resolution — and left on, it silently turns every sectioned link
+/// into its own phantom note (`Daphne.md#habitat` matches nothing named that, so the vault
+/// grows a ghost per section linked). Both link syntaxes carry one: `[[A#H]]` from the
+/// tokenizer, and `[A > H](a.md#h)` from the completer and `convertWikilinks`.
+///
+/// A target that is *only* a fragment (`#anchor`, a same-file jump) comes back empty, which
+/// `resolveIndexed` already treats as unresolvable.
+pub fn stripFragment(target: []const u8) []const u8 {
+    const hash = std.mem.indexOfScalar(u8, target, '#') orelse return target;
+    return target[0..hash];
 }
 
 /// Decode `%XX` escapes. Returns `target` untouched when there is nothing to decode, and a slice
@@ -795,4 +808,19 @@ test "a markdown link to a spaced note name resolves through its percent escapes
     // A literal per-cent that is not an escape stays literal.
     var buf2: [max_path_len]u8 = undefined;
     try std.testing.expectEqualStrings("100% done", percentDecode("100% done", &buf2));
+}
+
+test "a fragment says where in a note, not which note" {
+    const cands = [_]Candidate{
+        .{ .path = "Daphne.md", .stem = "Daphne" },
+        .{ .path = "Other.md", .stem = "Other" },
+    };
+    var buf: [max_path_len]u8 = undefined;
+    // Both spellings of a link into a section land on the note itself.
+    try testing.expectEqual(@as(usize, 0), resolve("Daphne.md#habitat-and-range", "A.md", &cands, &buf).?.index);
+    try testing.expectEqual(@as(usize, 0), resolve("Daphne#Habitat", "A.md", &cands, &buf).?.index);
+    // A percent-encoded path with a fragment still finds its note.
+    try testing.expectEqual(@as(usize, 0), resolve("Daphne.md#a%20b", "A.md", &cands, &buf).?.index);
+    // A same-file anchor names no note at all.
+    try testing.expect(resolve("#habitat", "A.md", &cands, &buf) == null);
 }

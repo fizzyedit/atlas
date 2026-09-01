@@ -2979,10 +2979,14 @@ fn interiorItemLabel(
     it: content_graph.Item,
     lines: ?[]const []const u8,
 ) []const u8 {
-    if (it.text.len > 0) return excerpt.clip(it.text, interior_content_label_max);
+    // `excerpt.plain` before `clip` in both arms: a heading carries its own inline markup out of
+    // the index (`### The **real** truth`) just as a body line does.
+    if (it.text.len > 0) return excerpt.clip(excerpt.plain(arena, it.text), interior_content_label_max);
 
     if (lines) |src| {
-        if (excerpt.blockExcerpt(src, it.line)) |text| return excerpt.clip(text, interior_content_label_max);
+        if (excerpt.blockExcerpt(src, it.line)) |text| {
+            return excerpt.clip(excerpt.plain(arena, text), interior_content_label_max);
+        }
     }
 
     // No source line to show. Say what the thing is and how big it is; `weight` is a word count for

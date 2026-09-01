@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const sqlite = @import("sqlite");
 const Db = @import("Db.zig");
 const resolve = @import("resolve.zig");
+const relpath = @import("relpath.zig");
 const schema = @import("schema.zig");
 // Named import, not a relative sibling path: `vault_synth.zig` (the synthetic producer of this
 // same type) needs the named form since its own standalone test module is rooted narrower than
@@ -115,13 +116,28 @@ pub fn headingLine(db: *Db, path: []const u8, heading: []const u8) !u32 {
     var fold_buf: [512]u8 = undefined;
     if (heading.len > fold_buf.len) return 0;
     const folded = foldInto(&fold_buf, heading);
-    const line = try db.reader().one(
+    if (try db.reader().one(
         i64,
         "SELECT line FROM headings WHERE note_id = ? AND text_fold = ? LIMIT 1",
         .{},
         .{ id, folded },
-    );
-    return @intCast(line orelse 0);
+    )) |line| return @intCast(@max(line, 0));
+
+    // Not the heading as written — try it as a slug (`#habitat-and-range`), the form a portable
+    // markdown link into a section carries. One pass over this note's headings, only on the miss.
+    var stmt = try db.reader().prepare("SELECT text, line FROM headings WHERE note_id = ? ORDER BY line");
+    defer stmt.deinit();
+    var iter = try stmt.iterator(struct { text: []const u8, line: i64 }, .{id});
+    var row_buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&row_buf);
+    while (true) {
+        fba.reset();
+        const row = (iter.nextAlloc(fba.allocator(), .{}) catch break) orelse break;
+        var text_fold: [512]u8 = undefined;
+        if (row.text.len > text_fold.len) continue;
+        if (headingMatches(row.text, folded, &text_fold)) return @intCast(@max(row.line, 0));
+    }
+    return 0;
 }
 
 /// Inbound edges for `dst_path`, ordered by source path then line — ready to group in the UI.
@@ -456,9 +472,22 @@ fn sectionByHeading(root_and_headings: []const content_graph.Item, heading: []co
     for (root_and_headings[1..], 1..) |n, i| {
         var nb: [512]u8 = undefined;
         if (n.text.len > nb.len) continue;
-        if (std.mem.eql(u8, foldInto(&nb, n.text), want)) return i;
+        if (headingMatches(n.text, want, &nb)) return i;
     }
     return null;
+}
+
+/// Does `heading_text` answer to the folded anchor `want`?
+///
+/// Two spellings of the same anchor have to match: a wikilink carries the heading *as written*
+/// (`#Habitat and Range`), a portable markdown link carries its GitHub slug
+/// (`#habitat-and-range`). Comparing folded text first and the slug second accepts both without
+/// the caller having to know which syntax the link came from — and without the slug form being
+/// able to match a *different* heading, since the slug is derived from this heading's own text.
+fn headingMatches(heading_text: []const u8, want: []const u8, fold_buf: []u8) bool {
+    if (std.mem.eql(u8, foldInto(fold_buf[0..heading_text.len], heading_text), want)) return true;
+    var slug_buf: [512]u8 = undefined;
+    return std.mem.eql(u8, relpath.headingAnchor(heading_text, &slug_buf), want);
 }
 
 pub const CompleteRow = struct {

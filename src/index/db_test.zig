@@ -712,3 +712,62 @@ test "heading completion is one note's outline, in document order" {
     try testing.expectEqual(@as(usize, 0), (try query.completeHeadings(&db, a, "a.md", "zzz", 64)).len);
     try testing.expectEqual(@as(usize, 0), (try query.completeHeadings(&db, a, "gone.md", "", 64)).len);
 }
+
+test "a portable markdown link into a section draws the same interior edge" {
+    // The completer writes `[A > Habitat and Range](a.md#habitat-and-range)`, so the anchor
+    // reaching the index is a slug, not the heading as written. The interior view has to see
+    // that as the same section-to-section edge a `[[A#Habitat and Range]]` would draw.
+    const gpa = testing.allocator;
+    var tmp = try TempDir.create(gpa, "selflink-md");
+    defer tmp.destroy(gpa);
+    var db = try tmp.open(gpa, "/some/vault");
+    defer db.close(gpa);
+    try seedOutline(&db);
+    try db.conn.exec(
+        "INSERT INTO headings(note_id, text, text_fold, level, line) VALUES(1,'Habitat and Range','habitat and range',2,6)",
+        .{},
+        .{},
+    );
+    try db.conn.exec(
+        \\INSERT INTO links(src_id, dst_id, raw, heading, kind, line, col)
+        \\VALUES(1, 1, 'a.md#habitat-and-range', 'habitat-and-range', 2, 22, 0)
+    ,
+        .{},
+        .{},
+    );
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const cg = try query.noteContentGraph(&db, arena.allocator(), 1, "A");
+
+    // Headings are ordered by line, so the new one sits between Alpha (4) and Beta (9): items
+    // are root, Alpha, Habitat and Range, Beta, Gamma, Delta.
+    try testing.expectEqualStrings("Habitat and Range", cg.items[2].text);
+    var found = false;
+    for (cg.edges) |e| {
+        if (e.kind != .link) continue;
+        found = true;
+        try testing.expectEqual(@as(u32, 5), e.a); // Delta, the section holding line 22
+        try testing.expectEqual(@as(u32, 2), e.b); // Habitat and Range
+    }
+    try testing.expect(found);
+}
+
+test "heading lookup accepts the slug spelling as well as the text" {
+    const gpa = testing.allocator;
+    var tmp = try TempDir.create(gpa, "heading-line");
+    defer tmp.destroy(gpa);
+    var db = try tmp.open(gpa, "/some/vault");
+    defer db.close(gpa);
+    try seedOutline(&db);
+    try db.conn.exec(
+        "INSERT INTO headings(note_id, text, text_fold, level, line) VALUES(1,'Habitat and Range','habitat and range',2,6)",
+        .{},
+        .{},
+    );
+
+    try testing.expectEqual(@as(u32, 9), try query.headingLine(&db, "a.md", "Beta"));
+    try testing.expectEqual(@as(u32, 6), try query.headingLine(&db, "a.md", "Habitat and Range"));
+    try testing.expectEqual(@as(u32, 6), try query.headingLine(&db, "a.md", "habitat-and-range"));
+    try testing.expectEqual(@as(u32, 0), try query.headingLine(&db, "a.md", "nope"));
+}
