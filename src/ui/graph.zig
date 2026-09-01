@@ -1158,11 +1158,20 @@ pub const Panel = struct {
 };
 
 var panel: ?Panel = null;
-/// Set by `draw`, consumed by `wantsRepaint`. The host asks for continuous frames *before*
-/// drawing, so this is "we painted on the previous pass" — enough to know the bottom panel
-/// is open and showing us. Without it, collapsing the panel froze settle flags mid-chase and
+/// Set by `draw`, aged by `wantsRepaint`. The host asks for continuous frames *before* drawing,
+/// so this is "we painted on the previous pass" — enough to know the bottom panel is open and
+/// showing us. Without it, collapsing the panel froze settle flags mid-chase and
 /// `needsContinuousRepaint` kept the whole editor at display refresh forever.
 var drawn_recently: bool = false;
+/// `frame_time_ns` of the frame `wantsRepaint` last answered in, and the answer it gave.
+///
+/// The visibility test above is a *consuming* read — that is what makes it "since the last poll"
+/// rather than "ever" — so a second poll in the same frame used to answer false and disagree with
+/// the first. Memoizing per frame makes the answer idempotent for any number of callers while
+/// keeping one aging step per frame, so nothing downstream has to know the read has a side
+/// effect. See `Editor.plugins_drawing` on the fizzy side, which polls once for the same reason.
+var poll_frame_ns: i128 = 0;
+var poll_answer: bool = false;
 
 fn ensurePanel(gpa: std.mem.Allocator) *Panel {
     if (panel == null) panel = Panel.init(gpa);
@@ -1450,9 +1459,25 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // viewport of a few dozen is cheap. Gating on pan speed / chase used to blank every name
     // the moment the camera moved, including at leaf zoom.
     const motion_busy = p.camera.user_driving and p.zoom_speed > zoom_hold_oct_ps * 0.45;
+    // The marks themselves are still moving, with nothing else to say so.
+    //
+    // Every other term below is about the *node* array, the camera, or the pointer. Neither of
+    // these two touches any of them: a rebuild's morph eases the world's marks from where they
+    // were to where they now belong (`applyMorph`, after `w.step`, so the world can already call
+    // itself settled), and the world's own open/close crossfades slide marks between a mass and
+    // its children. Both move what is drawn without moving anything the placer was watching, so
+    // the names stayed where they were placed on the first frame of the change and only caught up
+    // when something incidental — a hover, a pan — dirtied them. That is the "the graph
+    // rearranges, the labels don't" after a note is deleted out from under the panel.
+    //
+    // Bounded: the morph is `morph_s` long, the crossfades settle, and both are already asking
+    // for frames while they run, so this adds placer passes only across an animation that was
+    // going to be drawn anyway — the same deal `!proximity_settled` already makes for a hover.
+    const marks_moving = p.morph_t < 1 or (if (p.world_state) |*w| !w.settled else false);
     const labels_dirty = !at_cluster_zoom and !motion_busy and
         (p.labels_stale or !p.labels_settled or !p.proximity_settled or
-            !p.pointer_settled or !p.layout_settled or p.camera.chasing() or labelViewMoved(p));
+            !p.pointer_settled or !p.layout_settled or p.camera.chasing() or
+            marks_moving or labelViewMoved(p));
     if (at_cluster_zoom or motion_busy) {
         // Do not walk every note — at 100k+ that alone tanks the frame. Labels are not drawn…
         // except the open document's, which is named below regardless of what the LOD resolved.
@@ -1538,6 +1563,28 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // treating it as the start of a pan.
     drawFitButton(p, content);
     handleInput(p, st);
+
+    // Ask for the next frame while *anything* here is still in motion.
+    //
+    // Belt and braces with `needsContinuousRepaint`, deliberately. The host polls that hook once
+    // per frame *before* the panel draws, so it can only act on the previous frame's state; this
+    // is the same question asked of the state this frame just produced, which is what a solve or
+    // a coalesce window started during this draw needs. Both are idempotent — dvui coalesces
+    // refresh requests per frame — and either one alone is enough to keep the loop alive.
+    //
+    // The two states that make this load-bearing, and that no other animation here covers
+    // (`applyMorph`, `updateBubbles`, `animateCamera`, `stepFling` and the world's link reach all
+    // call `dvui.refresh` for themselves):
+    //
+    //   * `p.job` — a solve on a worker. The result is only collected by a *frame*, so with the
+    //     app asleep the rebuild lands whenever the reader next happens to move the mouse.
+    //   * `p.rebuild_waiting` — the coalesce window, which is worse than a delay: `pending_quiet_s`
+    //     only accumulates on frames that run, so with no frames the window never elapses and the
+    //     rebuild is not merely late, it never starts.
+    //
+    // Both are exactly the "the graph noticed, then froze until I moved the mouse" report after a
+    // note is deleted or renamed out from under the panel.
+    if (wantsRepaintFor(p)) dvui.refresh(null, @src(), null);
 }
 
 /// Layout ease + pixi-bubble proximity: chase `home` toward the hex `target`, then chase
@@ -6832,12 +6879,21 @@ fn pointerTargetsPanel(p: *const Panel, pt: dvui.Point.Physical) bool {
 /// label chases are settling, while links are extending/retracting, or while the camera is
 /// animating to a target.
 pub fn wantsRepaint() bool {
-    // Consume visibility from the last paint. If the panel is closed we never draw, so after
-    // one poll this goes false and the app can sleep even if settle flags are mid-chase.
+    // Outside a frame there is nothing to keep painting, and no frame stamp to memoize against.
+    const cw = dvui.current_window orelse return false;
+    if (cw.frame_time_ns == poll_frame_ns) return poll_answer;
+    poll_frame_ns = cw.frame_time_ns;
+
+    // Age visibility from the last paint. If the panel is closed we never draw, so after one
+    // frame this goes false and the app can sleep even if settle flags are mid-chase.
     const visible = drawn_recently;
     drawn_recently = false;
-    if (!visible) return false;
-    return wantsRepaintFor(&(panel orelse return false));
+    poll_answer = blk: {
+        if (!visible) break :blk false;
+        const p = if (panel) |*live| live else break :blk false;
+        break :blk wantsRepaintFor(p);
+    };
+    return poll_answer;
 }
 
 /// The actual "does this panel need another frame" check, parameterized — the real bottom

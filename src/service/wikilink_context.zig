@@ -13,6 +13,14 @@ pub const Context = struct {
     /// True for `![[…]]`. The completer offers media instead of notes, and the `!` is left
     /// outside `replace_start` so accepting an item keeps the embed an embed.
     embed: bool = false,
+    /// Bytes after the `#` and before `|` / caret, when the caret sits in the anchor half of
+    /// `[[Note#Section]]`. Null when there is no `#` before the caret — the difference between
+    /// "offer notes" and "offer the sections of `prefix`". Empty (non-null) right after the
+    /// `#`, which offers every section of the note.
+    ///
+    /// Null for a block ref (`#^id`) too: the index has no block anchors to offer, and half a
+    /// note's headings is a worse answer than none.
+    heading: ?[]const u8 = null,
 };
 
 /// Find an open `[[…]]` around `caret`. Null when the caret isn't inside one (so other
@@ -37,12 +45,28 @@ pub fn find(bytes: []const u8, caret: usize) ?Context {
     const o = open orelse return null;
 
     const body_start = o + 2;
-    var body_end = caret;
+    // First `|` and first `#` before the caret. The target stem ends at whichever comes first;
+    // the anchor half exists only when the `#` is the earlier of the two, since everything after
+    // a `|` is display text and a `#` in there anchors nothing.
+    var pipe_at: ?usize = null;
+    var hash_at: ?usize = null;
     var p = body_start;
     while (p < caret) : (p += 1) {
-        if (bytes[p] == '|' or bytes[p] == '#') {
-            body_end = p;
-            break;
+        if (bytes[p] == '|' and pipe_at == null) pipe_at = p;
+        if (bytes[p] == '#' and hash_at == null) hash_at = p;
+    }
+    var body_end = caret;
+    if (pipe_at) |pi| body_end = @min(body_end, pi);
+    if (hash_at) |hi| body_end = @min(body_end, hi);
+
+    var heading: ?[]const u8 = null;
+    if (hash_at) |hi| {
+        const before_pipe = if (pipe_at) |pi| hi < pi else true;
+        const block_ref = hi + 1 < bytes.len and bytes[hi + 1] == '^';
+        if (before_pipe and !block_ref) {
+            const h_start = hi + 1;
+            const h_end = if (pipe_at) |pi| @min(pi, caret) else caret;
+            heading = bytes[h_start..@max(h_start, h_end)];
         }
     }
 
@@ -60,6 +84,7 @@ pub fn find(bytes: []const u8, caret: usize) ?Context {
         .replace_start = o,
         .replace_end = replace_end,
         .embed = o > 0 and bytes[o - 1] == '!',
+        .heading = heading,
     };
 }
 
@@ -85,6 +110,48 @@ test "empty body" {
 test "ignores closed links" {
     const bytes = "[[done]] and more";
     try testing.expect(find(bytes, bytes.len) == null);
+}
+
+test "heading half is null without a hash" {
+    const bytes = "[[Daphne]]";
+    const ctx = find(bytes, "[[Daphne".len).?;
+    try testing.expect(ctx.heading == null);
+}
+
+test "empty heading right after the hash" {
+    const bytes = "[[Daphne#]]";
+    const ctx = find(bytes, "[[Daphne#".len).?;
+    try testing.expectEqualStrings("Daphne", ctx.prefix);
+    try testing.expectEqualStrings("", ctx.heading.?);
+    try testing.expectEqual(@as(usize, 0), ctx.replace_start);
+    try testing.expectEqual(bytes.len, ctx.replace_end);
+}
+
+test "heading prefix" {
+    const bytes = "[[Daphne#Hab]]";
+    const ctx = find(bytes, "[[Daphne#Hab".len).?;
+    try testing.expectEqualStrings("Daphne", ctx.prefix);
+    try testing.expectEqualStrings("Hab", ctx.heading.?);
+}
+
+test "heading stops at the pipe" {
+    const bytes = "[[Daphne#Habitat|al]]";
+    const ctx = find(bytes, "[[Daphne#Habitat|al".len).?;
+    try testing.expectEqualStrings("Daphne", ctx.prefix);
+    try testing.expectEqualStrings("Habitat", ctx.heading.?);
+}
+
+test "hash after a pipe is display text, not an anchor" {
+    const bytes = "[[Daphne|a#b]]";
+    const ctx = find(bytes, "[[Daphne|a#b".len).?;
+    try testing.expectEqualStrings("Daphne", ctx.prefix);
+    try testing.expect(ctx.heading == null);
+}
+
+test "block ref offers nothing" {
+    const bytes = "[[Daphne#^abc]]";
+    const ctx = find(bytes, "[[Daphne#^abc".len).?;
+    try testing.expect(ctx.heading == null);
 }
 
 test "stops prefix at pipe" {

@@ -32,6 +32,9 @@ const Cache = struct {
     /// was ~900 MB — over 90% of the database, and more than twice the markdown it came from — to
     /// avoid a file read that only happens when someone actually looks at a backlink.
     ctx: []?[]const u8 = &.{},
+    /// Bold ranges over each rendered line, parallel to `ctx` — the stretches that were links
+    /// before `renderContext` collapsed them to their names. Empty for a line with no link in it.
+    ctx_bold: [][]const Span = &.{},
     /// Height each row's context wraps to, in natural units; parallel to `ctx`. Zero means "not
     /// known" — the context has not been read yet, or the pane width moved and every entry is
     /// due a recount.
@@ -650,6 +653,106 @@ fn mentionContext(c: *const Cache, i: usize) []const u8 {
     return c.ctx[i] orelse "";
 }
 
+// ---- link rendering --------------------------------------------------------------------------
+//
+// A backlink row shows the line the link sits in, and that line is *markdown source*: half of it
+// is often brackets, a path, and an extension. `[Daphne](Daphne.md)` is nine characters of note
+// name inside twenty of syntax, and a row two of those wide reads as punctuation rather than as
+// prose. So the line is rewritten the way the note itself would render it — the link collapses to
+// the text a reader sees — and the stretches that came from a link are drawn bold, which is the
+// only cue left that they were links at all.
+
+/// A byte range of a rendered context line that came from a link, drawn bold.
+const Span = struct { start: usize, end: usize };
+
+/// One raw source line, rewritten for display, plus the bold ranges over the *rewritten* string.
+const Rendered = struct {
+    text: []const u8,
+    bold: []const Span = &.{},
+};
+
+/// What one link contributes to a rendered line, and where the syntax it came from ends.
+const Link = struct {
+    text: []const u8,
+    end: usize,
+};
+
+/// Strip a wikilink target down to the name a reader would recognise: drop any `#heading` or
+/// `^block` suffix, then take the basename and lose the extension, so `notes/Daphne.md#Family`
+/// shows as `Daphne`.
+fn wikiTargetName(target: []const u8) []const u8 {
+    var t = target;
+    if (std.mem.indexOfAny(u8, t, "#^")) |cut| t = t[0..cut];
+    t = std.mem.trim(u8, t, " \t");
+    if (t.len == 0) return t;
+    return displayTitle(t);
+}
+
+/// Parse the link opening at `raw[at]`, or null when what follows is not one — an unmatched `[`
+/// in prose is far more common than a broken link, and either way the bracket is then emitted
+/// literally and scanning resumes one byte along.
+fn parseLink(raw: []const u8, at: usize) ?Link {
+    if (at >= raw.len or raw[at] != '[') return null;
+
+    // `[[Target|alias]]` — the alias is what the source note displays, so it wins.
+    if (at + 1 < raw.len and raw[at + 1] == '[') {
+        const close = std.mem.indexOfPos(u8, raw, at + 2, "]]") orelse return null;
+        const inner = raw[at + 2 .. close];
+        const end = close + 2;
+        if (std.mem.indexOfScalar(u8, inner, '|')) |bar| {
+            const alias = std.mem.trim(u8, inner[bar + 1 ..], " \t");
+            if (alias.len > 0) return .{ .text = alias, .end = end };
+            return .{ .text = wikiTargetName(inner[0..bar]), .end = end };
+        }
+        return .{ .text = wikiTargetName(inner), .end = end };
+    }
+
+    // `[label](target)`. The label may not contain a nested `]`, which is the same restriction
+    // the scanner indexes under.
+    const rb = std.mem.indexOfScalarPos(u8, raw, at + 1, ']') orelse return null;
+    if (rb + 1 >= raw.len or raw[rb + 1] != '(') return null;
+    const rp = std.mem.indexOfScalarPos(u8, raw, rb + 2, ')') orelse return null;
+    const label = std.mem.trim(u8, raw[at + 1 .. rb], " \t");
+    // An empty label leaves nothing to show, so fall back to the target the way the wikilink
+    // branch does — `[](Daphne.md)` still reads as Daphne.
+    const text = if (label.len > 0) label else wikiTargetName(raw[rb + 2 .. rp]);
+    return .{ .text = text, .end = rp + 1 };
+}
+
+/// Rewrite one raw source line into what the row shows. The returned text is either `raw` itself
+/// (when there is no link in it, which is the common case and allocates nothing) or a fresh copy
+/// in `a`.
+fn renderContext(a: std.mem.Allocator, raw: []const u8) !Rendered {
+    if (std.mem.indexOfScalar(u8, raw, '[') == null) return .{ .text = raw };
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(a, raw.len);
+    var bold: std.ArrayList(Span) = .empty;
+
+    var i: usize = 0;
+    while (i < raw.len) {
+        // `![[embed]]` and `![alt](img)`: the bang belongs to the syntax, not to the text.
+        const bang = raw[i] == '!' and i + 1 < raw.len and raw[i + 1] == '[';
+        const open = if (bang) i + 1 else i;
+        if (raw[open] == '[') {
+            if (parseLink(raw, open)) |link| {
+                const start = out.items.len;
+                try out.appendSlice(a, link.text);
+                if (out.items.len > start) try bold.append(a, .{ .start = start, .end = out.items.len });
+                i = link.end;
+                continue;
+            }
+        }
+        try out.append(a, raw[i]);
+        i += 1;
+    }
+
+    return .{
+        .text = try out.toOwnedSlice(a),
+        .bold = try bold.toOwnedSlice(a),
+    };
+}
+
 /// The source line behind one backlink, read on demand and memoized.
 fn contextFor(c: *Cache, root: []const u8, i: usize) []const u8 {
     if (i >= c.ctx.len) return "";
@@ -676,8 +779,12 @@ fn contextFor(c: *Cache, root: []const u8, i: usize) []const u8 {
     while (it.next()) |line| : (line_no += 1) {
         if (line_no != bl.line) continue;
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        c.ctx[i] = trimmed;
-        return trimmed;
+        // Rendered once, here, rather than at draw time: `mentionLines` wraps against this string
+        // and the filter searches it, so the row's height and its text have to be the same text.
+        const r = renderContext(a, trimmed) catch Rendered{ .text = trimmed };
+        c.ctx[i] = r.text;
+        c.ctx_bold[i] = r.bold;
+        return r.text;
     }
     return "";
 }
@@ -790,6 +897,45 @@ fn revealBacklink(st: anytype, bl: query.Backlink, open_side: bool) void {
     };
 }
 
+/// One run of a context line: `core.dvui.addHighlightedText` with the font carried per run, so a
+/// link's name can be bold while the prose around it is not. The helper takes only a colour — the
+/// font there comes from the widget — and a run of a different weight is the whole point here.
+///
+/// Filter tinting is therefore scored per run rather than across the line: a query that straddles
+/// the boundary between prose and a link name highlights the halves it matches in each, which is
+/// what a reader sees anyway.
+fn addRun(
+    tl: *dvui.TextLayoutWidget,
+    s: []const u8,
+    q: *const fuzzy.Query,
+    plain_color: dvui.Color,
+    font: dvui.Font,
+) void {
+    if (s.len == 0) return;
+    const plain: dvui.Options = .{ .font = font, .color_text = plain_color };
+    if (q.isEmpty()) return tl.addText(s, plain);
+
+    var buf: [fuzzy.highlight_buf_len]usize = undefined;
+    const hits = fuzzy.highlight(s, q, &buf, .{ .plain = true });
+    if (hits.len == 0) return tl.addText(s, plain);
+
+    const matched: dvui.Options = .{ .font = font, .color_text = dvui.themeGet().color(.highlight, .fill) };
+    var i: usize = 0;
+    var h: usize = 0;
+    while (i < s.len) {
+        if (h < hits.len and hits[h] == i) {
+            // Consume the whole contiguous run of matched bytes in one addText.
+            const start = i;
+            while (h < hits.len and hits[h] == i) : (h += 1) i += 1;
+            tl.addText(s[start..i], matched);
+        } else {
+            const start = i;
+            i = if (h < hits.len) hits[h] else s.len;
+            tl.addText(s[start..i], plain);
+        }
+    }
+}
+
 fn drawMentionRow(bl: query.Backlink, index: usize, id_extra: usize, height: f32, q: *const fuzzy.Query) void {
     const st = runtime.state();
     const root = st.vault_root orelse return;
@@ -801,11 +947,18 @@ fn drawMentionRow(bl: query.Backlink, index: usize, id_extra: usize, height: f32
 
     // A dirty (unsaved-buffer) backlink arrives with its context already attached; a stored one
     // does not, and gets read from the file the first time this row is drawn.
-    const from_cache = if (bl.context.len > 0) bl.context else blk: {
-        if (cache == null) break :blk "";
-        break :blk contextFor(&cache.?, root, index);
-    };
-    const ctx = if (from_cache.len > 0) from_cache else "(empty line)";
+    //
+    // The stored one was rendered when it was read, and its bold ranges came back with it. The
+    // dirty one has never been through `renderContext`, so it goes through it here, into the
+    // frame arena — one line's work for the handful of rows an unsaved buffer contributes.
+    const rendered: Rendered = if (bl.context.len > 0)
+        renderContext(dvui.currentWindow().arena(), bl.context) catch .{ .text = bl.context }
+    else if (cache) |*c| .{
+        .text = contextFor(c, root, index),
+        .bold = if (index < c.ctx_bold.len) c.ctx_bold[index] else &.{},
+    } else .{ .text = "" };
+    const ctx = if (rendered.text.len > 0) rendered.text else "(empty line)";
+    const bold = if (rendered.text.len > 0) rendered.bold else &.{};
     // A text layout rather than a label, because a line of prose from the middle of a note is
     // however long it is and a single clipped line is not a useful glimpse of it. `break_lines`
     // wraps it; the shell's pinned height clips it at `row_max_lines`.
@@ -824,23 +977,27 @@ fn drawMentionRow(bl: query.Backlink, index: usize, id_extra: usize, height: f32
         // the shell that owns this row's padding and its hover surface.
         .padding = row_label_padding,
         .background = false,
-        // On the widget, not on each `addText`: `addHighlightedText` splits the line into runs and
-        // passes only a colour, so the font has to come from here — and it is the same `rowFont`
-        // that `mentionLines` wrapped against, or the measured height and the drawn height would
-        // be for two different fonts.
+        // The row's base font, which `addRun` overrides only for a link's name. It is the same
+        // `rowFont` that `mentionLines` wrapped against, or the measured height and the drawn
+        // height would be for two different fonts — the bold runs are a handful of words on a
+        // line and are deliberately not modelled in that estimate.
         .font = rowFont(),
         .max_size_content = rowTextMax(0),
         .id_extra = id_extra,
     });
     // Tinted even though the filter does not *search* the context (see `groupMatches`): when the
     // query does happen to appear in the line, showing where is the whole point of the row.
-    core.dvui.addHighlightedText(
-        &text,
-        ctx,
-        q,
-        true,
-        dvui.themeGet().color(.content, .text).opacity(0.75),
-    );
+    const plain_color = dvui.themeGet().color(.content, .text).opacity(0.75);
+    const bold_font = rowFont().withWeight(.bold);
+    var at: usize = 0;
+    for (bold) |span| {
+        if (span.start > at) addRun(&text, ctx[at..span.start], q, plain_color, rowFont());
+        // Full strength as well as bold: the name of a note is the part of the line worth
+        // finding, and it is the only thing left standing in for the link syntax that was here.
+        addRun(&text, ctx[span.start..span.end], q, dvui.themeGet().color(.content, .text), bold_font);
+        at = span.end;
+    }
+    if (at < ctx.len) addRun(&text, ctx[at..], q, plain_color, rowFont());
     text.deinit();
 
     for (dvui.events()) |*e| {
@@ -899,6 +1056,8 @@ fn refreshCache(c: *Cache, st: anytype, active_rel: []const u8) !void {
 fn resetContext(c: *Cache, arena: std.mem.Allocator) !void {
     c.ctx = try arena.alloc(?[]const u8, c.links.len);
     @memset(c.ctx, null);
+    c.ctx_bold = try arena.alloc([]const Span, c.links.len);
+    @memset(c.ctx_bold, &.{});
     c.ctx_h = try arena.alloc(f32, c.links.len);
     @memset(c.ctx_h, 0);
     c.ctx_w = 0;
@@ -943,4 +1102,45 @@ fn drawFooter(st: anytype) void {
         .color_text = dvui.themeGet().color(.content, .text).opacity(0.4),
         .margin = .{ .y = 10 },
     });
+}
+
+test "renderContext collapses links to their names" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No link: the line is handed back untouched, with nothing to embolden.
+    {
+        const r = try renderContext(a, "plain prose, no links");
+        try t.expectEqualStrings("plain prose, no links", r.text);
+        try t.expectEqual(@as(usize, 0), r.bold.len);
+    }
+    // Markdown link: the label survives, the target and the brackets do not.
+    {
+        const r = try renderContext(a, "met [Daphne](Daphne.md) at noon");
+        try t.expectEqualStrings("met Daphne at noon", r.text);
+        try t.expectEqual(@as(usize, 1), r.bold.len);
+        try t.expectEqualStrings("Daphne", r.text[r.bold[0].start..r.bold[0].end]);
+    }
+    // Wikilinks: the alias when there is one, otherwise the target's bare name.
+    {
+        const r = try renderContext(a, "[[notes/Daphne.md#Family|her]] and [[notes/Ivo.md]]");
+        try t.expectEqualStrings("her and Ivo", r.text);
+        try t.expectEqual(@as(usize, 2), r.bold.len);
+        try t.expectEqualStrings("her", r.text[r.bold[0].start..r.bold[0].end]);
+        try t.expectEqualStrings("Ivo", r.text[r.bold[1].start..r.bold[1].end]);
+    }
+    // Embeds drop their bang; an empty label falls back to the target.
+    {
+        const r = try renderContext(a, "![[Daphne]] ![alt](x.png) [](Ivo.md)");
+        try t.expectEqualStrings("Daphne alt Ivo", r.text);
+        try t.expectEqual(@as(usize, 3), r.bold.len);
+    }
+    // Brackets that open nothing are prose and stay put.
+    {
+        const r = try renderContext(a, "a [bracket] and [half](oops");
+        try t.expectEqualStrings("a [bracket] and [half](oops", r.text);
+        try t.expectEqual(@as(usize, 0), r.bold.len);
+    }
 }

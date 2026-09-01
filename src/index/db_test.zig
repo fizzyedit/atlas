@@ -676,3 +676,39 @@ test "completion matches case-insensitively and treats LIKE wildcards as text" {
     try testing.expectEqual(@as(usize, 0), (try query.complete(&db, a, "%", 64)).len);
     try testing.expectEqual(@as(usize, 0), (try query.complete(&db, a, "_ebra", 64)).len);
 }
+
+test "heading completion is one note's outline, in document order" {
+    const gpa = testing.allocator;
+    var tmp = try TempDir.create(gpa, "complete-headings");
+    defer tmp.destroy(gpa);
+    var db = try tmp.open(gpa, "/some/vault");
+    defer db.close(gpa);
+    try seedOutline(&db);
+    // A heading on the *other* note, to prove the query is scoped to the one asked for.
+    try db.conn.exec(
+        "INSERT INTO headings(note_id, text, text_fold, level, line) VALUES(2,'Alpha','alpha',1,0)",
+        .{},
+        .{},
+    );
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const all = try query.completeHeadings(&db, a, "a.md", "", 64);
+    try testing.expectEqual(@as(usize, 4), all.len);
+    try testing.expectEqualStrings("Alpha", all[0].text);
+    try testing.expectEqualStrings("Delta", all[3].text);
+    try testing.expectEqual(@as(u32, 1), all[0].level);
+    try testing.expectEqual(@as(u32, 2), all[1].level);
+    try testing.expectEqual(@as(u32, 20), all[3].line);
+
+    // Case-insensitive, and a substring rather than only a prefix.
+    const beta = try query.completeHeadings(&db, a, "a.md", "et", 64);
+    try testing.expectEqual(@as(usize, 1), beta.len);
+    try testing.expectEqualStrings("Beta", beta[0].text);
+
+    try testing.expectEqual(@as(usize, 2), (try query.completeHeadings(&db, a, "a.md", "", 2)).len);
+    try testing.expectEqual(@as(usize, 0), (try query.completeHeadings(&db, a, "a.md", "zzz", 64)).len);
+    try testing.expectEqual(@as(usize, 0), (try query.completeHeadings(&db, a, "gone.md", "", 64)).len);
+}

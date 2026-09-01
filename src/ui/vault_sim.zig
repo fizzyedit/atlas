@@ -323,6 +323,11 @@ pub const Sim = struct {
             }
         }
         self.pollJob();
+        // Belt and braces with this file's `needsContinuousRepaint`, for the reason spelled out at
+        // the tail of `graph.drawPanel`: the host polls that hook before the draw, so it answers
+        // for the previous frame, while the debounce and the regen poll above are advanced by
+        // *this* one. Without either, the window sits on "regenerating" until the mouse moves.
+        if (self.job != null or self.reload_frames != null) dvui.refresh(null, @src(), null);
     }
 
     /// `.detach` leaves an unfinished worker to claim and free itself — right for an interactive

@@ -892,8 +892,10 @@ fn placeComponentTerritories(
     } else {
         // Fresh Louvain of the current graph, same as a cold open. Seeding from last time's
         // partition would make incremental(G+e) a different map from reopen(G+e).
+        const t_louvain = stageNow(opts);
         var clustered = try louvain.cluster(gpa, n, ledges, .{ .resolution = opts.resolution });
         defer clustered.deinit(gpa);
+        stageAdd(opts, .cluster_louvain, t_louvain);
         if (clustered.levels.len == 0) {
             for (comm, 0..) |*c, i| c.* = @intCast(i);
         } else {
@@ -901,8 +903,12 @@ fn placeComponentTerritories(
             @memcpy(comm, src);
         }
         for (comm) |c| n_comm = @max(n_comm, c + 1);
+        const t_split = stageNow(opts);
         try splitOversized(gpa, arena, comm, &n_comm, ledges, opts.region_max, opts.resolution);
+        stageAdd(opts, .cluster_split, t_split);
+        const t_merge = stageNow(opts);
         try mergeSpecks(arena, comm, &n_comm, ledges, opts.region_min, opts.region_max);
+        stageAdd(opts, .cluster_merge, t_merge);
     }
     stageAdd(opts, .cluster, t_cluster);
     const count = try arena.alloc(u32, n_comm);
@@ -1633,6 +1639,14 @@ pub const Stage = enum {
     components,
     /// `isLattice`, `louvain.cluster`, `splitOversized`, `mergeSpecks`.
     cluster,
+    /// The top-level `louvain.cluster` alone, inside `cluster`. Single-threaded, global, and
+    /// order-dependent, so it is the floor of a re-solve: nothing can reuse it and nothing can
+    /// parallelise it without changing the map.
+    cluster_louvain,
+    /// `splitOversized` alone, inside `cluster`.
+    cluster_split,
+    /// `mergeSpecks` alone, inside `cluster`.
+    cluster_merge,
     /// `solveInteriors` — the memoised part.
     interiors,
     /// `aggregate` plus `placeNested`.

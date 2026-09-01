@@ -2570,6 +2570,15 @@ fn layoutEditTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !v
     });
     defer same.deinit(gpa);
     const same_ms = ms(elapsed(io, t_same));
+    // Correctness gate for the memos: identical edges must give an identical map. If a reused
+    // interior or frame ever differs from what a cold solve produces, this is where it shows up,
+    // and the number is not "small" — it is zero.
+    var same_max: f64 = 0;
+    for (cold.pos, same.pos) |a, b| {
+        const dx = @as(f64, a.x) - @as(f64, b.x);
+        const dy = @as(f64, a.y) - @as(f64, b.y);
+        same_max = @max(same_max, @sqrt(dx * dx + dy * dy));
+    }
     const same_in = layout.reused_interiors;
     const same_in_n = layout.solved_interiors;
     const same_fr = layout.reused_frames;
@@ -2669,6 +2678,19 @@ fn layoutEditTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !v
         stageMs(cold_stages, .interiors),  stageMs(edit_stages, .interiors),
         stageMs(cold_stages, .frames),     stageMs(edit_stages, .frames),
         stageMs(cold_stages, .pack),       stageMs(edit_stages, .pack),
+    });
+
+    std.debug.print(
+        \\      louvain       {d:>10.1} {d:>13.1} ms   the floor: global, serial, unreusable
+        \\      splitOversized{d:>10.1} {d:>13.1} ms
+        \\      mergeSpecks   {d:>10.1} {d:>13.1} ms
+        \\    same-edge map drift {d:.6}   (must be 0)
+        \\
+    , .{
+        stageMs(cold_stages, .cluster_louvain), stageMs(edit_stages, .cluster_louvain),
+        stageMs(cold_stages, .cluster_split),   stageMs(edit_stages, .cluster_split),
+        stageMs(cold_stages, .cluster_merge),   stageMs(edit_stages, .cluster_merge),
+        same_max,
     });
 
     std.debug.print(

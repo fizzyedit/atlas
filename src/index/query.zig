@@ -698,6 +698,59 @@ pub fn isMediaPath(name: []const u8) bool {
     return false;
 }
 
+pub const HeadingHit = struct {
+    text: []const u8,
+    /// `#` depth, 1-6. Carried so the completion list can show the outline's shape.
+    level: u32,
+    /// 0-based line, for a caller that wants to jump there.
+    line: u32,
+};
+
+/// The headings of one note whose text starts with — or contains — `prefix` (folded), for
+/// `[[Note#Section]]` completion.
+///
+/// Document order, not alphabetical: the list *is* the note's outline, and someone who has
+/// already picked the note is looking for a place in it. Filtered here rather than by a
+/// `text_fold` range the way `complete` does, because one note's headings are a handful of rows
+/// — the whole set costs one indexed seek on `headings_note` — and that buys a substring match,
+/// which is what finds "Habitat and range" from "range".
+pub fn completeHeadings(
+    db: *Db,
+    arena: std.mem.Allocator,
+    note_path: []const u8,
+    prefix: []const u8,
+    limit: usize,
+) ![]HeadingHit {
+    if (limit == 0) return &.{};
+    var fold_buf: [max_prefix]u8 = undefined;
+    if (prefix.len > fold_buf.len) return &.{};
+    const want = foldInto(&fold_buf, prefix);
+
+    const id = (try noteIdForPath(db, note_path)) orelse return &.{};
+    var stmt = try db.reader().prepare(
+        "SELECT text, text_fold, level, line FROM headings WHERE note_id = ? ORDER BY line",
+    );
+    defer stmt.deinit();
+
+    var list: std.ArrayList(HeadingHit) = .empty;
+    var iter = try stmt.iterator(struct {
+        text: []const u8,
+        text_fold: []const u8,
+        level: i64,
+        line: i64,
+    }, .{id});
+    while (try iter.nextAlloc(arena, .{})) |row| {
+        if (list.items.len >= limit) break;
+        if (want.len > 0 and std.mem.indexOf(u8, row.text_fold, want) == null) continue;
+        try list.append(arena, .{
+            .text = row.text,
+            .level = @intCast(@max(row.level, 1)),
+            .line = @intCast(@max(row.line, 0)),
+        });
+    }
+    return list.toOwnedSlice(arena);
+}
+
 /// Media rows whose name starts with `prefix` (folded), for `![[…]]` completion. Ordered by
 /// name so the list is stable between keystrokes.
 pub fn completeMedia(db: *Db, arena: std.mem.Allocator, prefix: []const u8, limit: usize) ![]CompleteRow {

@@ -1737,7 +1737,7 @@ fn upsertMedia(self: *Indexer, rel: []const u8) !void {
 fn dropMissingMedia(self: *Indexer, seen: *std.StringHashMapUnmanaged(void)) !bool {
     return self.dropMissingRows(
         "SELECT id, path FROM media",
-        "DELETE FROM media WHERE id = ?",
+        .media,
         seen,
     );
 }
@@ -1758,7 +1758,7 @@ fn dropMissingMedia(self: *Indexer, seen: *std.StringHashMapUnmanaged(void)) !bo
 fn dropMissingRows(
     self: *Indexer,
     comptime select_sql: []const u8,
-    comptime delete_sql: []const u8,
+    comptime kind: enum { note, media },
     seen: *std.StringHashMapUnmanaged(void),
 ) !bool {
     const db = self.db orelse return false;
@@ -1785,13 +1785,21 @@ fn dropMissingRows(
     if (to_delete.items.len == 0) return false;
     if (self.quit.load(.acquire)) return false;
 
-    var stmt = try db.conn.prepare(delete_sql);
-    defer stmt.deinit();
+    // Prepared once for media, where the drop really is one statement. A note is not: see
+    // `retireNote`, which runs a handful of already-cached statements per row.
+    var stmt = if (kind == .media) try db.conn.prepare("DELETE FROM media WHERE id = ?") else {};
+    defer if (kind == .media) stmt.deinit();
 
     self.beginBatch();
     for (to_delete.items, 0..) |id, i| {
-        stmt.reset();
-        stmt.exec(.{}, .{id}) catch |err| {
+        const dropped = switch (kind) {
+            .note => retireNote(db, id),
+            .media => blk: {
+                stmt.reset();
+                break :blk stmt.exec(.{}, .{id});
+            },
+        };
+        dropped catch |err| {
             self.endBatch();
             return err;
         };
@@ -1813,7 +1821,7 @@ const drop_chunk: usize = 20_000;
 fn dropMissing(self: *Indexer, seen: *std.StringHashMapUnmanaged(void)) !bool {
     return self.dropMissingRows(
         "SELECT id, path FROM notes WHERE phantom = 0",
-        "DELETE FROM notes WHERE id = ?",
+        .note,
         seen,
     );
 }
@@ -2365,7 +2373,68 @@ fn upsertNote(
 }
 
 fn deleteNote(db: *Db, path: []const u8) !void {
-    try db.conn.exec("DELETE FROM notes WHERE path = ? AND phantom = 0", .{}, .{path});
+    const id = (try db.conn.one(
+        i64,
+        "SELECT id FROM notes WHERE path = ? AND phantom = 0",
+        .{},
+        .{path},
+    )) orelse return;
+    try retireNote(db, id);
+}
+
+/// Take one note out of the vault: its file is gone, deleted or renamed away.
+///
+/// Deliberately not a plain `DELETE FROM notes`. `links.dst_id` is `ON DELETE CASCADE`, so
+/// deleting the row destroys the *inbound* link rows along with it — rows that belong to other
+/// notes, the ones still saying `[[Old Name]]`. Those are only rebuilt when their own file is
+/// re-parsed, so a rename silently dropped every backlink to the old name until something
+/// incidental re-read the notes holding them, and the graph's picture of the vault depended on
+/// which files had happened to be re-read since. The old name then reappeared as a phantom, one
+/// note at a time, long after the rename.
+///
+/// So the row only goes when nothing points at it. When something does, it *becomes* the phantom
+/// those links resolve to — exactly the row `ensurePhantom` would insert for them, minus the
+/// churn of moving every edge onto a new id — which is what `enqueueDelete` has always promised:
+/// "inbound edges keep their phantoms so the graph still shows N notes pointed here". Writing the
+/// file again promotes this same row back through `upsertNote`'s stem lookup.
+fn retireNote(db: *Db, id: i64) !void {
+    // Everything derived from bytes that no longer exist, this note's own outbound links
+    // included. Inbound links are `dst_id` rows on *other* notes and are not ours to drop.
+    const st = try db.cached();
+    inline for (.{ "del_aliases", "del_headings", "del_links", "del_tags", "del_blocks" }) |name| {
+        const stmt = &@field(st, name);
+        stmt.reset();
+        try stmt.exec(.{}, .{id});
+    }
+
+    const inbound = (try db.conn.one(i64, "SELECT 1 FROM links WHERE dst_id = ? LIMIT 1", .{}, .{id})) != null;
+    if (!inbound) {
+        try db.conn.exec("DELETE FROM notes WHERE id = ?", .{}, .{id});
+        return;
+    }
+
+    // A phantom for this name may already exist — a link somewhere spelled it differently, or
+    // pointed at it before this note was written. Two phantoms sharing a stem draw as two nodes
+    // with the same name, so move the edges over and let this row go instead.
+    if (try db.conn.one(
+        i64,
+        \\SELECT p.id FROM notes p
+        \\JOIN notes n ON n.id = ?
+        \\WHERE p.phantom = 1 AND p.stem_fold = n.stem_fold LIMIT 1
+    ,
+        .{},
+        .{id},
+    )) |existing| {
+        try db.conn.exec("UPDATE links SET dst_id = ? WHERE dst_id = ?", .{}, .{ existing, id });
+        try db.conn.exec("DELETE FROM notes WHERE id = ?", .{}, .{id});
+        return;
+    }
+
+    try db.conn.exec(
+        "UPDATE notes SET path = '', title = stem, mtime_ns = 0, size = 0, hash = 0, phantom = 1 WHERE id = ?",
+        .{},
+        .{id},
+    );
 }
 
 /// `created` is raised when this call *inserts* a phantom row, i.e. when the note set grew. The
@@ -2995,4 +3064,105 @@ test "removing every wikilink falls back to a full reload rather than counting a
     defer arena.deinit();
     const snap = try v.indexer.snapshotCopy(arena.allocator());
     try testing.expectEqual(@as(usize, 0), snap.edges.len);
+}
+
+// A rename in the file explorer is two facts on disk — the old path is gone, the new one is
+// there — and the watcher hands both to the indexer as ordinary paths to re-read. What must not
+// survive it is a node under the old name: the old row has to leave the notes table, and every
+// link that pointed at the old name has to move (or become a phantom) rather than keep the old
+// row alive. Reported as "renaming a note leaves both names in the graph".
+test "renaming a note on disk leaves only the new name" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+    const io = v.threaded.io();
+
+    try v.tmp.dir.createDirPath(io, "vault");
+    const vault = try v.tmp.dir.realPathFileAlloc(io, "vault", gpa);
+    defer gpa.free(vault);
+    v.indexer.vault_root = vault;
+
+    var vd = try std.Io.Dir.cwd().openDir(io, vault, .{});
+    defer vd.close(io);
+    try vd.writeFile(io, .{ .sub_path = "Alpha.md", .data = "# Alpha\n" });
+    try vd.writeFile(io, .{ .sub_path = "Beta.md", .data = "# Beta\n\nsee [[Alpha]]\n" });
+
+    // Seeded through `indexOne` rather than `runFullScan`: the walk reads the clock, and
+    // `dvui.io` is not valid headlessly (see `markNs`). Same write path either way.
+    _ = try v.indexer.indexOne(io, "Alpha.md");
+    _ = try v.indexer.indexOne(io, "Beta.md");
+    try v.indexer.relinkAll();
+    try testing.expectEqual(@as(usize, 2), try v.noteCount());
+    try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
+
+    try vd.rename("Alpha.md", vd, "Gamma.md", io);
+
+    // Exactly what `Watcher.onPathsChanged` enqueues for a rename on macOS, where the halves
+    // arrive unpaired: the old path (delivered as `.deleted`) and the new one (`.created`),
+    // both as "re-read this".
+    _ = try v.indexer.indexOne(io, "Alpha.md");
+    _ = try v.indexer.indexOne(io, "Gamma.md");
+    try v.indexer.relinkAll();
+
+    // One note under the new name, and no second row under the old one.
+    try testing.expectEqual(@as(usize, 2), try v.noteCount());
+    try testing.expectEqual(
+        @as(usize, 0),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE path = 'Alpha.md'", .{}, .{})).?,
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE path = 'Gamma.md'", .{}, .{})).?,
+    );
+
+    // Beta still says `[[Alpha]]`, and that is a broken link, not a link that never existed:
+    // its row must survive the note it pointed at (see `retireNote`) and land on a phantom.
+    try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE phantom = 1 AND stem = 'Alpha'", .{}, .{})).?,
+    );
+
+    // And re-reading a backlink source later changes nothing. Before `retireNote`, the cascade
+    // had already destroyed Beta's row, so the phantom appeared only here — the graph grew a
+    // node under the old name minutes after the rename, whenever something touched Beta.
+    _ = try v.indexer.indexBuffer("Beta.md", "# Beta\n\nsee [[Alpha]]\n\nmore\n");
+    try v.indexer.relinkAll();
+    try testing.expectEqual(@as(usize, 2), try v.noteCount());
+    try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE phantom = 1", .{}, .{})).?,
+    );
+}
+
+// The other half of `retireNote`: when nothing points at the note, the row goes entirely rather
+// than lingering as a phantom nobody links to — which would draw as a node for a file that does
+// not exist and that no note mentions.
+test "deleting an unlinked note removes its row" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+    const io = v.threaded.io();
+
+    try v.tmp.dir.createDirPath(io, "vault");
+    const vault = try v.tmp.dir.realPathFileAlloc(io, "vault", gpa);
+    defer gpa.free(vault);
+    v.indexer.vault_root = vault;
+
+    var vd = try std.Io.Dir.cwd().openDir(io, vault, .{});
+    defer vd.close(io);
+    try vd.writeFile(io, .{ .sub_path = "Lonely.md", .data = "# Lonely\n" });
+    _ = try v.indexer.indexOne(io, "Lonely.md");
+    try testing.expectEqual(@as(usize, 1), try v.noteCount());
+
+    try vd.deleteFile(io, "Lonely.md");
+    _ = try v.indexer.indexOne(io, "Lonely.md");
+    try v.indexer.relinkAll();
+
+    try testing.expectEqual(@as(usize, 0), try v.noteCount());
+    try testing.expectEqual(
+        @as(usize, 0),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes", .{}, .{})).?,
+    );
 }
