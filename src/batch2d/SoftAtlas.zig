@@ -13,7 +13,8 @@ const SoftAtlas = @This();
 /// A sprite's stroke scales with the quad, so drawn thickness is `width × radius` — one cell
 /// cannot hold a constant-looking stroke across the radius range a coalesced mass spans (roughly
 /// 14–46 px). One cell tuned for small marks reads as a fat band on a large one. Callers pick by
-/// radius; see `galaxy.drawStyledMarks`.
+/// radius (`dash_thin_from` in `galaxy.drawStyledMarks`). Masses always use these sprites in the
+/// field; the vector dashed stroke is reserved for the overlay (open notes, hovered masses).
 pub const Kind = enum { disc, glow, ring, dash_ring, dash_ring_thin };
 
 /// Normalized UV rectangle into the atlas texture.
@@ -24,9 +25,10 @@ pub const UvRect = struct {
     v1: f32,
 };
 
-/// Side of one cell in atlas pixels. 96 keeps large overview masses round under linear filter
-/// (64 read as soft rounded-rects once scaled past ~20px).
-pub const cell_px: u32 = 96;
+/// Side of one cell in atlas pixels. 128 keeps a ~1.5 px dash stroke several texels wide after
+/// linear filter, which is what lets the stroke read thin instead of a smeared band. 64 read as
+/// soft rounded-rects past ~20 px; 96 was round enough but too coarse to thin the dashes.
+pub const cell_px: u32 = 128;
 /// Padding inside each cell so linear filter does not bleed into neighbours.
 pub const pad_px: u32 = 3;
 const cells: u32 = 5;
@@ -93,11 +95,12 @@ fn paintCells(pixels: []dvui.Color.PMA) void {
     paintDisc(pixels, 0, 0.90, 0.07);
     paintGlow(pixels, 1);
     paintRing(pixels, 2, 0.82, 0.10, 0.07);
-    paintDashRing(pixels, 3, 0.82, 0.10, 0.07, 14, 0.55);
-    // Same outer radius, dash count and duty cycle, so the two read as one language — only the
-    // stroke narrows. 0.05 keeps a 46 px mass near two screen pixels, which is where the vector
-    // stroke this replaced clamped.
-    paintDashRing(pixels, 4, 0.82, 0.05, 0.05, 14, 0.55);
+    // Nine long dashes at ~70% duty — the same cadence as the vector overlay (`strokeCircleDashed`
+    // lands on ~9 dashes around the circle). Fourteen short ticks used to read as a dotted band,
+    // thicker than the nodes they sat next to. Stroke is `width × radius`: 0.055 keeps a 20 px
+    // mass near a pixel, 0.032 keeps a 46 px mass near 1.5 px.
+    paintDashRing(pixels, 3, 0.82, 0.055, 0.04, 9, 0.70);
+    paintDashRing(pixels, 4, 0.82, 0.032, 0.03, 9, 0.70);
 }
 
 fn cellOrigin(cell: u32) struct { x: u32, y: u32 } {

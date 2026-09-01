@@ -13,8 +13,7 @@
     .fingerprint = 0x720ad60ff03945c1,
     .dependencies = .{
         .fizzy = .{
-            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.49/fizzy-sdk-v0.1.49.tar.gz",
-            .hash = "fizzy-0.1.49-SGBwYyv8DABBKJCCuRB3fvmr8ikfv9kcrGA8mwzPO7su",
+            .path = "../../fizzy/sdk",
         },
         // SQLite, as a hash-pinned package rather than a vendored amalgamation. This one wraps
         // the official sqlite.org amalgamation zip in its own hash-pinned dependency and adds

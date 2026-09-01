@@ -186,7 +186,10 @@ fn onFolderOpen(state: *anyopaque, allocator: std.mem.Allocator) void {
 
 fn onFolderClose(state: *anyopaque) void {
     // A layout worker for the folder being closed has nothing left to deliver, and `draw`
-    // returns early once there is no vault, so it would never be collected there.
+    // returns early once there is no vault, so it would never be collected there. This has to
+    // forget the whole arrangement, not just join the worker: the host fires close then open
+    // even when the same recent is clicked again, and a half-torn-down panel crashes the
+    // subsequent rebuild.
     graph.shutdown();
     const st: *State = @ptrCast(@alignCast(state));
     st.closeVault(sdk.allocator());

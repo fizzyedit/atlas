@@ -1,9 +1,9 @@
 //! The living set: which cells are on screen this frame, where they are, and how big.
 //!
-//! This is the third and last piece of the containment path — `fold.zig` decides the hierarchy,
-//! `containment.zig` decides where a cell's children sit inside it, and this file decides which
-//! cells are *open* right now and turns them into screen-space marks. Together they replace
-//! `quadlod.zig` + `quad_agents.zig` + `lod.zig` + `multilevel.zig` + most of `layout_full.zig`.
+//! Positions come from `layout.zig`. The drawing hierarchy comes from `spatial.zig` (Hilbert/CDC
+//! over those positions). This file decides which cells are *open* right now and turns them into
+//! screen-space marks. Those two inputs never swap: a note's place is not a slot in a cell, and
+//! grouping notes for the LOD must not move them.
 //!
 //! The contract:
 //!
@@ -20,16 +20,18 @@
 //!    off-screen cell's whole subtree is off-screen and the test is exact. Without this the
 //!    candidate list fills with the entire vault, the budget check never passes, and the dive
 //!    stalls partway showing nothing but coalesced rings.
-//! 2. **Decide a level by a count threshold, never by visit order.** Opening biggest-first until
+//! 2. **Decide a level by a radius-class threshold, never by visit order.** Opening biggest-first until
 //!    the budget runs out leaves identical neighbours resolved differently depending on the walk —
 //!    a visible seam. But opening a whole level or none of it wastes most of the budget, since
 //!    level sizes go 1, arity, arity²…: the gauntlet drew 57 marks against a budget of 280.
-//!    Thresholding on *count* gets both — equal-count cells always agree, and the budget fills.
+//!    Thresholding on *span* gets both — equal-radius cells always agree, and the budget fills.
+//!    Gravity placement makes nearby groups of equal count differ in size; that is a feature.
 //! 3. **Never force an open cell closed at the budget wall.** Closing frees budget, which allows
 //!    reopening, which exceeds it again. The wall refuses only *new* opens.
 //! 4. **A note is a fixed screen size.** Only masses are count-and-zoom scaled, and soft-capped so
 //!    a cell the budget refused cannot inflate to fill the screen.
-//! 5. Radius is the area-conserving law `√count`, anchored on the note size.
+//! 5. Radius is the area-conserving law `√count` as a floor, grown for exclusive groups under
+//!    gravity, then replaced by the settled bound once a cell opens.
 //! 6. Split and merge crossfade through `anim`; topology itself stays discrete.
 //!
 //! Screen-space out, no dvui in: marks are plain numbers so this stays headless-testable.
@@ -38,16 +40,23 @@ const std = @import("std");
 pub const fold = @import("fold.zig");
 const containment = @import("containment.zig");
 const cellweb = @import("cellweb.zig");
+const spatial = @import("spatial.zig");
+const radix = @import("radix.zig");
+const layout = @import("layout.zig");
 
 pub const Mark = struct {
     cell: u32,
     /// Animated world position. The caller applies its own camera transform, so there is exactly
     /// one place that knows how world maps to screen.
+    ///
+    /// There used to be a screen position here too, computed from `View` alongside these. Nothing
+    /// ever read it — `world_draw` transforms `wx`/`wy` itself, because it is the only place that
+    /// knows the caller's `toWorld` nesting — while *two* places wrote it and had to keep it in
+    /// step: `present`, and `applyMorph` afterwards. A field that is written twice and read never
+    /// is a desync waiting for a third writer.
     wx: f32,
     wy: f32,
-    /// Screen position (viewport-relative, origin top-left) and radius in pixels.
-    x: f32,
-    y: f32,
+    /// Radius in screen pixels.
     r: f32,
     alpha: f32,
     /// A real note (draw filled) rather than a coalesced mass (draw dashed).
@@ -73,6 +82,32 @@ pub const LiftedLink = struct {
     /// At least one endpoint is a note drawn as *itself* rather than inside a mass, which makes
     /// this link exempt from the budget — see the `keep` calculation in `liftLinks`.
     essential: bool = false,
+    /// This is the heaviest line incident to one of its two cells, and so the one line that keeps
+    /// that cell from being drawn as though it had no connections at all.
+    ///
+    /// Truncation is by weight over the *whole* frame, and a peripheral group's links are light —
+    /// a handful of ordinary mentions — so a hub-to-hub aggregate in the middle of the map outbids
+    /// every one of them. The group is then drawn as a cluster of notes with no lines whatsoever,
+    /// which reads as "nothing links here", and zooming in one step makes a dozen connections
+    /// appear out of nothing. That is a lie about the graph, and a worse one than showing too few
+    /// lines: absence is a claim, and the budget was making it by accident.
+    ///
+    /// At most one per drawn cell, so this reserves no more than the cut's size out of a budget
+    /// that is already `links_per_cell` times it.
+    anchor: bool = false,
+    /// This pair leaves its neighbourhood: its two cells do not share a parent.
+    ///
+    /// Reported, not ranked on. The territories plan calls for a highway layer — "most of 3.5M
+    /// edges are streets inside a place, a few are routes between places" — and that is true of the
+    /// *note-level* edge set. It is not true of the lifted one: a link inside a mass is aggregated
+    /// into that mass and never becomes a line, so by the time the web is drawn, coalescing has
+    /// already thrown the streets away. Measured on simplewiki at overview, 88-96% of lifted
+    /// candidates are already cross-parent, and ranking them first moved the drawn set from 96% to
+    /// 99% — a no-op. The highway layer exists; `cellweb` aggregation is what builds it.
+    ///
+    /// Kept because the sweep's `chwy%` / `hwy%` columns are what said so, and the next person to
+    /// reach for this idea should be able to see the same numbers rather than build it again.
+    highway: bool = false,
     /// 0..1 crossfade. Links enter and leave the lifted set as the cut changes under a pan, and
     /// without this they blink. Driven by the same rate as the mark crossfade.
     alpha: f32 = 1,
@@ -108,11 +143,17 @@ pub const FocusLink = struct {
 
 /// Centre-to-centre distance between two ring-adjacent leaves, in units of `note_r`.
 ///
-/// A cell of `arity` leaves has radius `√arity · note_r`; its ring sits at
-/// `√arity · fill − note_r` and adjacent ring slots are one step apart, whose chord at arity 7 is
-/// the ring radius itself. A caller that needs notes a specific world distance apart — to match
-/// an existing lattice, say — divides that pitch by this.
-pub const leaf_pitch: f32 = 1.381;
+/// World distance between neighbouring notes, in `note_r`.
+///
+/// A caller that needs notes a specific distance apart — to match an existing lattice, say —
+/// divides that pitch by this to get `note_r`. Everything downstream is calibrated in those
+/// units: camera fit, zoom thresholds, `interiorWant`, label placement.
+///
+/// It used to be a *measurement*: `containment` settled its children by relaxation, so the pitch
+/// was whatever that settle happened to produce, and the constant had to be re-derived by test
+/// whenever the relaxation was retuned. The layout chooses its own spacing now and normalises to
+/// it, so this is simply that choice, and the two cannot drift apart.
+pub const leaf_pitch: f32 = layout.default_spacing;
 
 /// Liang–Barsky clip of the segment `(ax,ay)-(bx,by)` against the rect `(rx,ry,rw,rh)`.
 /// Null when the segment misses the rect entirely.
@@ -160,6 +201,43 @@ pub fn clipSegment(
     }
     if (t1 <= t0) return null;
     return .{ ax + dx * t0, ay + dy * t0, ax + dx * t1, ay + dy * t1 };
+}
+
+/// Bench-only per-phase counters for `liftLinks`.
+///
+/// The `--world --pan` sweep is the only caller that sets `prof_io`; with it null every helper
+/// below compiles down to a null test, so the panel pays nothing. It lives at module scope rather
+/// than on `World` because the sweep wants totals across frames, not a per-frame snapshot.
+pub const Prof = struct {
+    calls: u64 = 0,
+    recomputes: u64 = 0,
+    /// Crossfade bookkeeping, paid on *every* call including the cached one.
+    fade_ns: u64 = 0,
+    /// Leaf-precision links of the focused and open notes.
+    focus_ns: u64 = 0,
+    /// The per-cut-cell neighbour scan that produces `lifted`.
+    scan_ns: u64 = 0,
+    /// Neighbour entries read by that scan, and `cutOf` calls that missed the memo.
+    scanned: u64 = 0,
+    cut_walks: u64 = 0,
+    /// Materialising `lifted` out of `acc`.
+    build_ns: u64 = 0,
+    /// The budget sort, when `lifted` is over `keep`.
+    sort_ns: u64 = 0,
+};
+pub var prof: Prof = .{};
+pub var prof_io: ?std.Io = null;
+
+fn pnow() i96 {
+    const io = prof_io orelse return 0;
+    return std.Io.Clock.boot.now(io).nanoseconds;
+}
+
+fn plap(mark: *i96) u64 {
+    if (prof_io == null) return 0;
+    const n = pnow();
+    defer mark.* = n;
+    return @intCast(n - mark.*);
 }
 
 pub const View = struct {
@@ -219,6 +297,22 @@ pub const Params = struct {
     /// several times less work per frame. The caller is responsible for letting go periodically so
     /// the web cannot drift arbitrarily far, and for dropping it the moment the camera settles.
     lift_hold: bool = false,
+    /// Skip `decideTopology` and keep last frame's open set.
+    ///
+    /// A hand-driven zoom-in *flick* is asking the camera to move, not the LOD to explode.
+    /// Splitting on every tick is what hitchs the frame: each new cell pays a 128-step settle,
+    /// the cut churns, the web re-lifts. Holding the open set lets marks grow with zoom (they
+    /// already scale by `view.zoom`) and defers the split until the gesture slows.
+    ///
+    /// Do not set this for a click-to-focus chase. That flight *is* the dive, and holding until
+    /// it parks then dumping the split is a camera that settles and then a field that rearranges.
+    /// `max_expand` is what keeps the settle from hitching; the caller decides when to hold.
+    hold_topology: bool = false,
+    /// Cap on first-time `ensureChildren` calls this frame. 0 = unlimited.
+    ///
+    /// Catching up after a held zoom would otherwise settle hundreds of cells in one hitch.
+    /// Already-placed cells still open freely; only the boids settle is budgeted.
+    max_expand: usize = 0,
     /// Leaves of every *open* note, the focused one included.
     ///
     /// All of them get their links drawn at leaf precision, not just the focused one. They used to
@@ -259,7 +353,19 @@ pub const Params = struct {
     /// web — it costs draw time and shows nothing, since every cell appears joined to every
     /// other. Keeping the heaviest links keeps the structure that carries information.
     link_budget: usize = 900,
-
+    /// Ambient lines per drawn cell, as a second cap on `link_budget`.
+    ///
+    /// `link_budget` is a flat count, so at overview the same ten thousand lines are spread over
+    /// whatever the cut happens to hold — on simplewiki that is ~1,450 masses carrying ~7 lines
+    /// each, which is not a web, it is a wash. Worse, the drawn set is then a top-K cut a long way
+    /// down a jittering ranking, so most of what is drawn is near the boundary and swaps out as
+    /// soon as anything moves. Capping by the size of the *cut* keeps line density per drawn thing
+    /// roughly constant as you zoom, which is what cartographic generalisation does — a country
+    /// view draws motorways, not every alley — and it shortens the ranking's tail so far fewer
+    /// links sit near the cut at all.
+    ///
+    /// Set high enough to be inert by default; the panel supplies the real value.
+    links_per_cell: usize = 1_000_000,
     /// The ambient link budget that goes with a given mark budget.
     ///
     /// Lives here, on `Params`, rather than in the panel, because the `--world` bench builds its
@@ -274,6 +380,139 @@ pub const Params = struct {
     pub fn ambientLinkBudget(mark_budget: usize) usize {
         return @max(200, mark_budget * 5 / 2);
     }
+};
+
+/// An epoch-stamped answer for one cell. Kept as one struct rather than two parallel arrays so a
+/// lookup touches one cache line: these are indexed by cell id, which at Wikipedia scale means a
+/// random probe into megabytes, and the lift does one per neighbour.
+const Memo = struct { stamp: u32 = 0, of: u32 = fold.invalid };
+
+/// The heaviest line incident to one cell this frame, for the anchor pass in `liftLinks`.
+const Anchor = struct { stamp: u32 = 0, link: u32 = 0, w: f32 = 0 };
+
+/// The same, for one cut cell's running per-partner weight total.
+const SideAcc = struct { stamp: u32 = 0, w: f32 = 0 };
+
+/// How fast a link ramps in or out, in units of 1/s. See `fadeLinks`.
+const link_fade_rate: f32 = 30;
+
+/// One link's crossfade and the epoch it was last seen in the lifted set.
+/// One link's crossfade, keyed by its `(a, b)` cell pair. Held in a **key-sorted array**, not a
+/// hash map — see `fadeLinks` for why.
+const Fade = struct { key: u64, v: f32 };
+
+fn fadeKey(f: Fade) u64 {
+    return f.key;
+}
+
+/// One candidate's key beside where it lives in `lifted`.
+const KeyIdx = struct { key: u64, idx: u32 };
+
+fn keyIdxKey(k: KeyIdx) u64 {
+    return k.key;
+}
+
+/// A lifted link's identity. `a < b` by construction (the build packs `min`/`max`), so this is the
+/// same packing the accumulator keyed on and two lists of it can be merged directly.
+fn linkKey(l: LiftedLink) u64 {
+    return (@as(u64, l.a) << 32) | @as(u64, l.b);
+}
+
+/// How much heavier a newcomer must be to evict a link that is already on screen.
+///
+/// The drawn web is a budgeted top-K over a ranking that jitters as the cut moves, so links sitting
+/// near the budget boundary swap in and out between frames — measured at 8-11% of the web per frame
+/// while panning, which is a thousand lines flickering. Weight alone has no memory of what is
+/// already drawn; this gives it one. A newcomer still wins if it is genuinely heavier, so the web
+/// still tracks the graph — it just stops trading places with links it is tied with.
+const incumbent_bonus: f32 = 1.35;
+
+/// Ordering for the ambient link budget: focus first, then a note's own links, then weight.
+///
+/// A strict total order — the `(a, b)` tie-break is the pair identity, so no two distinct links
+/// ever compare equal. `selectTopK` depends on that: with ties possible, which of several equal
+/// links survived truncation would depend on partition order, and a parked camera would not keep
+/// the same web.
+fn heavier(x: LiftedLink, y: LiftedLink) bool {
+    if (x.focus != y.focus) return x.focus;
+    if (x.essential != y.essential) return x.essential;
+    // Before weight, so a light line that is some cell's only line outranks a heavy one that is
+    // merely another of many. See `LiftedLink.anchor`.
+    if (x.anchor != y.anchor) return x.anchor;
+    // `alpha` here is what the link was drawn at last frame, stamped before selection — see
+    // `stampIncumbency`. A link at zero is one the reader has never seen.
+    const wx = if (x.alpha > 0) x.w * incumbent_bonus else x.w;
+    const wy = if (y.alpha > 0) y.w * incumbent_bonus else y.w;
+    if (wx != wy) return wx > wy;
+    // deterministic tie-break, so a parked camera keeps the same web
+    if (x.a != y.a) return x.a < y.a;
+    return x.b < y.b;
+}
+
+/// Partition `items` so that `items[0..k]` holds the `k` that `heavier` ranks first.
+///
+/// Introselect: quickselect with a median-of-three pivot, falling back to a full sort of the
+/// remaining range if the pivots keep going badly, so the worst case is `n log n` rather than
+/// `n²`. Order *within* the kept prefix is unspecified — the caller wants a set, and the drawn
+/// ambient web is one colour whose per-line alpha is 1 at rest, so compositing it is
+/// order-invariant there. (The branch that keeps everything never sorted at all, so the draw has
+/// always taken this list in hash order at most zooms.)
+fn selectTopK(items: []LiftedLink, k: usize) void {
+    if (k == 0 or k >= items.len) return;
+    var lo: usize = 0;
+    var hi: usize = items.len; // exclusive
+    var budget: usize = 2 * std.math.log2_int_ceil(usize, items.len + 1) + 4;
+    while (hi - lo > 16) {
+        if (budget == 0) {
+            std.mem.sort(LiftedLink, items[lo..hi], {}, struct {
+                fn less(_: void, x: LiftedLink, y: LiftedLink) bool {
+                    return heavier(x, y);
+                }
+            }.less);
+            return;
+        }
+        budget -= 1;
+        const pivot_at = partitionLinks(items, lo, hi);
+        // Everything before `pivot_at` outranks everything after it, so exactly one side can still
+        // contain the k'th element; the other is already on its correct side of the cut.
+        if (k <= pivot_at) hi = pivot_at else lo = pivot_at + 1;
+    }
+    std.sort.insertion(LiftedLink, items[lo..hi], {}, struct {
+        fn less(_: void, x: LiftedLink, y: LiftedLink) bool {
+            return heavier(x, y);
+        }
+    }.less);
+}
+
+/// Lomuto partition of `items[lo..hi]` around a median-of-three pivot. Returns the pivot's final
+/// index; everything before it is heavier, everything after it lighter.
+fn partitionLinks(items: []LiftedLink, lo: usize, hi: usize) usize {
+    const last = hi - 1;
+    const mid = lo + (hi - lo) / 2;
+    if (heavier(items[mid], items[lo])) std.mem.swap(LiftedLink, &items[mid], &items[lo]);
+    if (heavier(items[last], items[lo])) std.mem.swap(LiftedLink, &items[last], &items[lo]);
+    if (heavier(items[last], items[mid])) std.mem.swap(LiftedLink, &items[last], &items[mid]);
+    // `items[mid]` is now the median of the three; park it at the end as the pivot.
+    std.mem.swap(LiftedLink, &items[mid], &items[last]);
+    const pivot = items[last];
+
+    var i = lo;
+    var j = lo;
+    while (j < last) : (j += 1) {
+        if (heavier(items[j], pivot)) {
+            std.mem.swap(LiftedLink, &items[i], &items[j]);
+            i += 1;
+        }
+    }
+    std.mem.swap(LiftedLink, &items[i], &items[last]);
+    return i;
+}
+
+/// The Hilbert box a rebuild should reuse, or empty (`half == 0`) to derive one from the
+/// positions' extent. Widened in place when a point falls outside.
+pub const Quant = struct {
+    centre: spatial.Vec2 = .{},
+    half: f32 = 0,
 };
 
 pub const World = struct {
@@ -302,27 +541,115 @@ pub const World = struct {
     /// they were culled. This *is* the drawn set's topology, and `liftLinks` reads nothing else.
     /// It replaces a per-note `owner` array whose every frame cost an `O(notes)` fill.
     cut: std.ArrayListUnmanaged(u32) = .empty,
-    /// Per-cell memo for `cutOf`, valid only while `cut_stamp[i] == cut_epoch`. The stamp exists
+    /// Per drawn link: how far in or out it is. Keyed by the cell pair, which is the identity the
+    /// lift produces — see `fadeLinks`.
+    /// Every link with a non-zero crossfade — drawn or departing — sorted by `linkKey`.
+    fades: std.ArrayListUnmanaged(Fade) = .empty,
+    /// Double buffer for the merge that rewrites `fades`, and radix scratch for the key sort.
+    sc_fades_next: std.ArrayListUnmanaged(Fade) = .empty,
+    sc_lift_scratch: std.ArrayListUnmanaged(LiftedLink) = .empty,
+    /// Key-plus-index view of the candidate set, for the incumbency stamp — see `stampIncumbency`.
+    sc_keys: std.ArrayListUnmanaged(KeyIdx) = .empty,
+    sc_keys_scratch: std.ArrayListUnmanaged(KeyIdx) = .empty,
+    /// Links that were fading out last frame — see the retire threshold in `fadeLinks`.
+    ghosts_prev: usize = 0,
+    /// Furthest any note sits from the origin, from the positions this world was built on. Zero
+    /// when unknown, which sends `extent` back to the cell-radius estimate.
+    note_extent: f32 = 0,
+    /// How many lifted pairs the last rebuild had to choose from, before `link_budget` truncated
+    /// them. The ratio of this to the budget is how arbitrary the drawn web's membership is: a cut
+    /// that keeps most of what it is offered is stable, one that keeps a fifth is a coin toss
+    /// re-thrown every time the ranking jitters.
+    last_candidates: usize = 0,
+    /// How many of those were routes rather than streets — the number that says whether ranking
+    /// routes first is a choice or a no-op.
+    last_cand_highway: usize = 0,
+    /// Per cell: stamped when it is an ancestor of one of the reader's open notes. See
+    /// `markOpenChains`.
+    open_chain: []u32,
+    open_chain_epoch: u32 = 1,
+    /// Scratch for the keys `fadeLinks` retires.
+    sc_dead: std.ArrayListUnmanaged(u64) = .empty,
+    /// Per-cell memo for `cutOf`, valid only while `cut[i].stamp == cut_epoch`. The stamp exists
     /// so a new frame costs nothing to invalidate — no 341k-entry memset.
-    cut_of: []u32,
-    cut_stamp: []u32,
-    cut_epoch: u32 = 0,
+    ///
+    /// Stamp and answer share one struct because they are never read apart: as two arrays, every
+    /// memo hit was two cache misses into two megabyte-sized arrays instead of one, and the lift
+    /// does this once per neighbour — 52,000 times on a hard pan frame at the coalesce boundary.
+    cut_of: []Memo,
+    /// Per cell: the heaviest lifted line touching it this frame. Stamped, so a new frame costs
+    /// nothing to invalidate.
+    anchor_of: []Anchor,
+    anchor_epoch: u32 = 1,
+    cut_epoch: u32 = 1,
+    /// Scratch for the lift and the crossfades, kept across frames rather than rebuilt inside it.
+    ///
+    /// Every one of these used to be `.empty` on entry and freed on exit, so a pan frame — which
+    /// misses the lift cache 119 times out of 120 — grew a 17k–29k-entry table up from nothing and
+    /// rehashed the whole way, then threw it away, sixty times a second. `clearRetainingCapacity`
+    /// pays that growth once for the life of the `World`. Nothing here is state: every field is
+    /// cleared before use, and the only thing that survives a frame is the allocation.
+    sc_acc: std.AutoHashMapUnmanaged(u64, f32) = .empty,
+    sc_focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_grow_live: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sc_grow_dead: std.ArrayListUnmanaged(u64) = .empty,
+    sc_frontier: std.ArrayListUnmanaged(u32) = .empty,
+    sc_next: std.ArrayListUnmanaged(u32) = .empty,
+    sc_vis: std.ArrayListUnmanaged(u32) = .empty,
+    sc_stack: std.ArrayListUnmanaged(u32) = .empty,
+    sc_classes: std.ArrayListUnmanaged(u32) = .empty,
+    sc_slots: std.ArrayListUnmanaged(u32) = .empty,
+
+    /// Cell -> index into `marks` for this frame, dense and epoch-stamped.
+    ///
+    /// Both the draw and the label placer need "where is the mark for this cell", once per link
+    /// endpoint — 40,000 lookups a frame between them at the top of the quality slider — and each
+    /// built its own `AutoHashMapUnmanaged(u32, Point)` from the mark list to answer it. The answer
+    /// is a property of the frame's marks, so the `World` publishes it once and both read it.
+    mark_of: []Memo,
+    /// Starts at 1, not 0: a never-written `Memo` is `.{ .stamp = 0, .of = fold.invalid }`, so an
+    /// epoch of 0 makes every unstamped entry read as a *hit* carrying `fold.invalid` as its mark
+    /// index. That is not hypothetical — `markIndex` is the one stamped memo with readers outside
+    /// the frame pipeline (`interiorAnchor`, hit testing, the label placer), and a `World` that has
+    /// been built but not yet `step`ped is exactly the state a vault has while its first notes are
+    /// being created. It handed out `marks.items[0xffffffff]` on an empty `marks` and took the
+    /// process with it. Every bump below skips back over 0 for the same reason.
+    mark_epoch: u32 = 1,
+
+    /// One cut cell's per-neighbour-cell weight totals, dense and epoch-stamped instead of hashed.
+    ///
+    /// The inner loop of the lift is "for each of this cell's neighbours, add its weight to
+    /// whichever cut cell owns it", which is a scatter-add over cell ids — exactly what an array
+    /// indexed by cell id does without hashing anything. The stamp is the same trick `cut_of` uses:
+    /// a new accumulation costs an epoch bump, not a memset of one entry per cell in the vault.
+    /// `side_hit` records which entries were touched so reading the totals back is O(touched).
+    side: []SideAcc,
+    side_epoch: u32 = 1,
+    side_hit: std.ArrayListUnmanaged(u32) = .empty,
+
     /// Fingerprint of the cut the cached `lifted` set was built from, plus the inputs that change
     /// what the lift produces. See `liftLinks`.
     lift_key: u64 = 0,
+    /// The focus/open/budget half of that fingerprint, kept apart because `Params.lift_hold` may
+    /// only excuse a stale *cut* — never a stale answer to what the reader just clicked.
+    lift_focus_key: u64 = 0,
     lift_valid: bool = false,
-    /// The lifted set itself, cached across frames. `links` is the per-frame *draw* list built
-    /// from this plus whatever is still fading out.
+    /// The lifted set itself, cached across frames. `links` is the per-frame *draw* list, now
+    /// the same pairs at full strength — fading them through the window fill flashed the web.
     lifted: std.ArrayListUnmanaged(LiftedLink) = .empty,
     /// The focused note's own links at leaf precision — see `FocusLink`. Rebuilt by `liftLinks`
     /// alongside `lifted`, and therefore covered by the same fingerprint early-out: a stale set is
     /// only reachable when the cut *and* the focus are unchanged, in which case it is still correct
     /// (leaf positions do not move between rebuilds).
     focus_links: std.ArrayListUnmanaged(FocusLink) = .empty,
-    /// Pair key -> crossfade, surviving across frames so a link that leaves the lifted set fades
-    /// out instead of blinking. Bounded: live links are capped by `link_budget`, and a dying entry
-    /// is dropped as soon as it is invisible.
-    link_fade: std.AutoHashMapUnmanaged(u64, f32) = .empty,
+    /// Pair key -> last-seen stamp, so a link that left the lifted set is dropped rather than
+    /// left in `links`. Used to be a crossfade; that mix-toward-background is what flashed.
+    ///
+    /// The stamp is how "is this pair still in the lifted set" is answered. It used to be a second
+    /// hash map built from scratch each frame — one insert per link, so ~22,000 of them at the top
+    /// of the quality slider, to answer a question this table can answer itself by recording which
+    /// frame last touched each entry.
     /// Per-link reach-out progress for the focused note's own links.
     ///
     /// Keyed by the **unordered** leaf pair, which is what lets the reader ride an edge. Following
@@ -351,6 +678,17 @@ pub const World = struct {
     /// otherwise freeze half-open until some unrelated event woke the app.
     settled: bool = true,
 
+    /// Drawn radius of a leaf, in world units, as `initFrom` was given it.
+    note_r: f32 = 1,
+    /// Hilbert quantisation box. Persisted so a rebuild does not rekey the vault when one
+    /// outlier appears; widened only when a point falls outside. See `spatial.Options`.
+    quant_centre: spatial.Vec2 = .{},
+    quant_half: f32 = 0,
+
+    pub fn hilbertBox(self: *const World) Quant {
+        return .{ .centre = self.quant_centre, .half = self.quant_half };
+    }
+
 
     /// `fold_opts.cancel`, when set, makes this abandonable — see `fold.Options.cancel`. The
     /// checks between phases below matter as much as the one inside the coarsening loop: the web
@@ -363,7 +701,68 @@ pub const World = struct {
         fold_opts: fold.Options,
         place_opts: containment.Options,
     ) !World {
-        var lad = try fold.build(gpa, n_notes, links, paths, fold_opts);
+        // Discount the stopword links once, here, and hand the same array to both consumers.
+        //
+        // `fold.build` would do it itself, and `cellweb` needs it too — but doing it in both places
+        // means two passes over 3.3M edges and two 40 MB allocations on every republish, for one
+        // answer. Computed once and passed down with the option zeroed so `fold` does not redo it.
+        const scored = try fold.degreeNormalised(gpa, n_notes, links, fold_opts.degree_norm);
+        defer gpa.free(scored);
+        var scored_opts = fold_opts;
+        scored_opts.degree_norm = 0;
+
+        var placed = try placementPositions(gpa, n_notes, scored, paths, scored_opts, place_opts);
+        defer placed.deinit(gpa);
+        return buildFrom(gpa, n_notes, scored, .{ .pos = placed.pos, .comp = placed.comp }, scored_opts, place_opts, .{});
+    }
+
+    /// Where every note is, and which component it belongs to.
+    ///
+    /// The layout's whole output, and the only thing the hierarchy below needs from it. Passing it
+    /// in rather than deriving it is what lets the expensive part be computed once and reused
+    /// across rebuilds — `World.init` runs on every save, so a position source that costs seconds
+    /// cannot live inside it.
+    pub const Positions = struct {
+        pos: []const spatial.Vec2,
+        comp: []const u32,
+    };
+
+    /// Build a world from positions someone else decided.
+    pub fn initFrom(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        links: []const fold.Edge,
+        positions: Positions,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+        quant: Quant,
+    ) !World {
+        const scored = try fold.degreeNormalised(gpa, n_notes, links, fold_opts.degree_norm);
+        defer gpa.free(scored);
+        var scored_opts = fold_opts;
+        scored_opts.degree_norm = 0;
+        return buildFrom(gpa, n_notes, scored, positions, scored_opts, place_opts, quant);
+    }
+
+    fn buildFrom(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        scored: []const fold.Edge,
+        positions: Positions,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+        quant: Quant,
+    ) !World {
+        // -- positions first, hierarchy second ---------------------------------------------
+        //
+        // The drawing hierarchy is built from where the notes *are*. `layout.solve` decided those
+        // positions; this only groups them. Caching, persisting, or skipping either side
+        // independently is what that split is for.
+        var used_quant = quant;
+        var spat = try spatialFrom(gpa, n_notes, scored, positions, fold_opts, place_opts, &used_quant);
+        errdefer spat.deinit(gpa);
+        var lad = spat.lad;
+        spat.lad = .{}; // ownership moves to the `World` below
         errdefer lad.deinit(gpa);
         const n_cells = lad.cells.len;
 
@@ -377,8 +776,11 @@ pub const World = struct {
             .py = try gpa.alloc(f32, n_cells),
             .mul = try gpa.alloc(f32, n_cells),
             .open = try gpa.alloc(bool, n_cells),
-            .cut_of = try gpa.alloc(u32, n_cells),
-            .cut_stamp = try gpa.alloc(u32, n_cells),
+            .cut_of = try gpa.alloc(Memo, n_cells),
+            .anchor_of = try gpa.alloc(Anchor, n_cells),
+            .side = try gpa.alloc(SideAcc, n_cells),
+            .mark_of = try gpa.alloc(Memo, n_cells),
+            .open_chain = try gpa.alloc(u32, n_cells),
         };
         @memset(w.anim, 0);
         @memset(w.px, 0);
@@ -387,26 +789,149 @@ pub const World = struct {
         @memset(w.open, false);
         // Zeroed once here so the first frame's `cut_epoch` of 1 cannot collide with uninitialised
         // memory and read a stale memo as valid.
-        @memset(w.cut_stamp, 0);
+        @memset(w.cut_of, .{});
+        @memset(w.anchor_of, .{});
+        // Same contract, but note what it rests on: a stamp of 0 means "never written", so it is
+        // the *epoch* starting at 1 that keeps these zeroed entries from reading as hits. It is not
+        // enough that each epoch is bumped before its own accumulation — `markIndex` is read from
+        // outside the frame pipeline too, on a `World` that may never have been stepped.
+        @memset(w.side, .{});
+        @memset(w.mark_of, .{});
+        @memset(w.open_chain, 0);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
-        w.web = try cellweb.build(gpa, &w.lad, links);
+        for (positions.pos) |q| {
+            w.note_extent = @max(w.note_extent, @sqrt(q.x * q.x + q.y * q.y));
+        }
+        // The same array the layout used, so the drawn web cannot disagree with the hierarchy
+        // about which links matter.
+        w.web = try cellweb.build(gpa, &w.lad, scored);
         if (fold_opts.cancel) |c| {
             if (c.load(.acquire)) return error.Cancelled;
         }
+        // Every position and every bound is already known, so the `Field` is a lookup table
+        // rather than a lazy placer: `expanded` is uniformly true, `ensureChildren` and
+        // `ensurePlaced` return immediately, and `radius` is one array read.
         w.field = try containment.init(gpa, n_cells, lad.roots.len, fold_opts.arity, place_opts);
-        // Islands are placed relative to each other once; everything below them is lazy.
-        containment.placeRoots(&w.field, &w.lad);
+        for (w.field.pos, spat.pos) |*dst, src| dst.* = .{ .x = src.x, .y = src.y };
+        @memcpy(w.field.bound_r, spat.bound_r);
+        @memset(w.field.expanded, true);
+        w.note_r = place_opts.note_r;
+        w.quant_centre = used_quant.centre;
+        w.quant_half = used_quant.half;
+        spat.deinit(gpa);
         return w;
+    }
+
+    /// Where `fold` + `containment` would put the notes. Not the panel path: `layout.solve`
+    /// decides positions; this remains for tests and the historical `World.init` entry.
+    pub const Placement = struct {
+        pos: []spatial.Vec2 = &.{},
+        comp: []u32 = &.{},
+
+        pub fn deinit(self: *Placement, gpa: std.mem.Allocator) void {
+            gpa.free(self.pos);
+            gpa.free(self.comp);
+            self.* = .{};
+        }
+    };
+
+    pub fn placementPositions(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        scored: []const fold.Edge,
+        paths: []const []const u8,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+    ) !Placement {
+        var out: Placement = .{};
+        errdefer out.deinit(gpa);
+        out.pos = try gpa.alloc(spatial.Vec2, n_notes);
+        out.comp = try gpa.alloc(u32, n_notes);
+
+        var src_lad = try fold.build(gpa, n_notes, scored, paths, fold_opts);
+        defer src_lad.deinit(gpa);
+        var src_field = try containment.init(gpa, src_lad.cells.len, src_lad.roots.len, fold_opts.arity, place_opts);
+        defer src_field.deinit(gpa);
+        // Eager, where the LOD's own use is lazy. Every note needs a position before any of them
+        // can be grouped by one, and this is the cost that buys it.
+        containment.placeAll(&src_field, &src_lad);
+
+        for (0..n_notes) |i| {
+            const leaf = if (i < src_lad.leaf_cell.len) src_lad.leaf_cell[i] else fold.invalid;
+            if (leaf == fold.invalid or leaf >= src_lad.cells.len) {
+                out.pos[i] = .{};
+                out.comp[i] = 0;
+                continue;
+            }
+            const p = src_field.pos[leaf];
+            out.pos[i] = .{ .x = p.x, .y = p.y };
+            out.comp[i] = src_lad.cells[leaf].comp;
+        }
+        return out;
+    }
+
+    /// Group positions by proximity into the ladder `world` and `cellweb` run on.
+    fn spatialFrom(
+        gpa: std.mem.Allocator,
+        n_notes: usize,
+        scored: []const fold.Edge,
+        positions: Positions,
+        fold_opts: fold.Options,
+        place_opts: containment.Options,
+        quant: *Quant,
+    ) !spatial.Result {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Per note: incident link weight, and file size. Summed up the tree for `Cell.weight` and
+        // `Cell.body`, which drive mass sizing and the interior's berth. Taken straight from the
+        // link array rather than from a `fold` cell, so the hierarchy no longer needs one to exist.
+        const weight = try arena.alloc(f32, n_notes);
+        @memset(weight, 0);
+        for (scored) |e| {
+            if (e.a < n_notes) weight[e.a] += e.w;
+            if (e.b < n_notes) weight[e.b] += e.w;
+        }
+        const body = try arena.alloc(f32, n_notes);
+        for (body, 0..) |*b, i| b.* = if (fold_opts.bodies.len == n_notes) fold_opts.bodies[i] else 0;
+
+        // Persist the quantisation square; only widen when a point falls outside. Keyed against
+        // a box that moves, one new outlier renumbers every Hilbert key in the vault.
+        const centre = quant.centre;
+        var half = quant.half;
+        if (half <= 0) {
+            half = 1e-3;
+            for (positions.pos) |q| half = @max(half, @max(@abs(q.x - centre.x), @abs(q.y - centre.y)));
+        } else {
+            for (positions.pos) |q| {
+                half = @max(half, @max(@abs(q.x - centre.x), @abs(q.y - centre.y)));
+            }
+        }
+        quant.centre = centre;
+        quant.half = half;
+
+        return spatial.build(gpa, n_notes, positions.pos, positions.comp, weight, body, .{
+            .arity = fold_opts.arity,
+            .note_r = place_opts.note_r,
+            .quant_centre = centre,
+            .quant_half = half,
+        });
     }
 
     pub fn deinit(self: *World) void {
         self.marks.deinit(self.gpa);
         self.links.deinit(self.gpa);
-        self.link_fade.deinit(self.gpa);
         self.focus_grow.deinit(self.gpa);
         self.cut.deinit(self.gpa);
+        self.fades.deinit(self.gpa);
+        self.sc_fades_next.deinit(self.gpa);
+        self.sc_lift_scratch.deinit(self.gpa);
+        self.sc_keys.deinit(self.gpa);
+        self.sc_keys_scratch.deinit(self.gpa);
+        self.sc_dead.deinit(self.gpa);
         self.web.deinit(self.gpa);
         self.gpa.free(self.anim);
         self.gpa.free(self.px);
@@ -414,7 +939,22 @@ pub const World = struct {
         self.gpa.free(self.mul);
         self.gpa.free(self.open);
         self.gpa.free(self.cut_of);
-        self.gpa.free(self.cut_stamp);
+        self.gpa.free(self.anchor_of);
+        self.gpa.free(self.side);
+        self.gpa.free(self.mark_of);
+        self.gpa.free(self.open_chain);
+        self.side_hit.deinit(self.gpa);
+        self.sc_acc.deinit(self.gpa);
+        self.sc_focus_pairs.deinit(self.gpa);
+        self.sc_edge_seen.deinit(self.gpa);
+        self.sc_grow_live.deinit(self.gpa);
+        self.sc_grow_dead.deinit(self.gpa);
+        self.sc_frontier.deinit(self.gpa);
+        self.sc_next.deinit(self.gpa);
+        self.sc_vis.deinit(self.gpa);
+        self.sc_stack.deinit(self.gpa);
+        self.sc_classes.deinit(self.gpa);
+        self.sc_slots.deinit(self.gpa);
         self.lifted.deinit(self.gpa);
         self.focus_links.deinit(self.gpa);
         self.field.deinit(self.gpa);
@@ -426,7 +966,15 @@ pub const World = struct {
     ///
     /// A disc, not a per-axis box, because the island pack is a disc: `pack_aspect` defaults to 1.
     /// Framing and bounding the vault as a circle is then exact rather than a conservative cover.
+    /// How far the vault actually reaches, in world units.
+    ///
+    /// Measured from the leaf positions at build time, not from the root cells' radii. A cell's
+    /// radius is `note_r · count^radius_exp` until the cell is opened — a *count-based estimate*,
+    /// and on a dense map a generous one: a 284k-note vault whose notes reach 7,244 units reported
+    /// 12,720. Every camera fit then framed a circle nearly twice the size of the thing in it, and
+    /// the map sat small in the middle of the pane with no padding constant to blame.
     pub fn extent(self: World) f32 {
+        if (self.note_extent > 0) return self.note_extent;
         var e: f32 = 1;
         for (self.lad.roots) |r| {
             const p = self.field.pos[r];
@@ -450,6 +998,14 @@ pub const World = struct {
     /// changes" true by construction rather than by luck.
     pub fn step(self: *World, view: View, p: Params, dt: f32) !void {
         self.focus_visible = self.leafOnScreen(p.focus_leaf, view);
+        if (p.hold_topology and self.cut.items.len > 0) {
+            // Same living set, new camera. Marks grow and slide with zoom; nothing splits.
+            self.marks.clearRetainingCapacity();
+            self.bound = false;
+            self.settled = true;
+            try self.present(view, p, dt);
+            return;
+        }
         self.clearFrame();
         if (self.lad.roots.len == 0) return;
         try self.decideTopology(view, p);
@@ -464,31 +1020,78 @@ pub const World = struct {
         self.cut.clearRetainingCapacity();
         @memset(self.open, false);
         self.bound = false;
+        // Assume rest, and let this frame's `present` say otherwise.
+        //
+        // Nothing else ever set this back to true. `settled` starts true, goes false the first
+        // time any cell crossfades or a focus link grows, and stayed false for the life of the
+        // `World` — so `wantsRepaintFor`'s `!w.settled` clause was true forever after the first
+        // animation and the panel repainted at full rate with a parked camera and nothing moving.
+        // It also hid `max_expand`'s deferred splits: those only ever caught up *because* frames
+        // kept arriving. A deferred cell is already sitting at its closed pose, so nothing about
+        // it animates and nothing would ask for the next frame — see the gate in
+        // `decideTopology`, which now reports the deferral instead of relying on this bug.
+        self.settled = true;
+        // `marks` is gone, so the cell -> mark index that points into it is too. `present` stamps a
+        // fresh one; until it does, `markIndex` must answer "no mark" rather than hand out an index
+        // into an array that no longer has it — which on a frame `step` returns early from (a world
+        // with no roots) would be a read past the end.
+        bumpEpoch(&self.mark_epoch, self.mark_of);
         // Invalidate the `cutOf` memo by moving the epoch, not by clearing 341k entries.
-        self.cut_epoch +%= 1;
+        bumpEpoch(&self.cut_epoch, self.cut_of);
+    }
+
+    /// Move a stamped memo array's epoch to a value nothing in it currently carries.
+    ///
+    /// Two things must not happen. The epoch must never land on 0, which is the stamp a
+    /// never-written entry has; and it must never wrap all the way onto a stamp still sitting in
+    /// the array, which is what the memset covers — that costs one clear per 2^32 bumps rather
+    /// than one per frame, which is the whole point of stamping.
+    fn bumpEpoch(epoch: *u32, memo: []Memo) void {
+        epoch.* +%= 1;
+        if (epoch.* == 0) {
+            @memset(memo, .{});
+            epoch.* = 1;
+        }
     }
 
     /// Pass 1 — which cells are open. Reads only the ladder, the view, and the budget.
     pub fn decideTopology(self: *World, view: View, p: Params) !void {
-        var frontier: std.ArrayListUnmanaged(u32) = .empty;
-        defer frontier.deinit(self.gpa);
-        var next: std.ArrayListUnmanaged(u32) = .empty;
-        defer next.deinit(self.gpa);
-        var vis: std.ArrayListUnmanaged(u32) = .empty;
-        defer vis.deinit(self.gpa);
+        self.markOpenChains(p);
+
+        const frontier = &self.sc_frontier;
+        const next = &self.sc_next;
+        const vis = &self.sc_vis;
+        frontier.clearRetainingCapacity();
+        next.clearRetainingCapacity();
+        vis.clearRetainingCapacity();
         for (self.lad.roots) |r| try frontier.append(self.gpa, r);
 
         // Cells already settled as closed at shallower levels. This is the budget's running
         // total, and it is topological — nothing here depends on a crossfade.
         var closed: usize = 0;
+        var expanded_n: usize = 0;
         var guard: u32 = 0;
 
         while (frontier.items.len > 0 and guard < 64) : (guard += 1) {
             // -- rule 1: cull first. Children live inside their parent's disc, so an off-screen
-            // cell's whole subtree is off-screen and this test is exact.
+            // cell's whole subtree is off-screen and this test is *nearly* exact.
+            //
+            // Nearly, because containment only guarantees it once a cell has been expanded and
+            // carries its settled bound. An unexpanded cell's radius is an estimate, and the
+            // packing is tighter than the drawing, so a parent's estimated disc can fail to
+            // contain a child that is genuinely on screen.
+            //
+            // For the field at large that is a rare, invisible miss — one mass drawn a level
+            // coarser than it might have been. For a note the reader has open it is the whole
+            // bug: the chain is severed *here*, before the never-coalesce rule below is ever
+            // consulted, so the note is never visited, never opened, and `present` never descends
+            // to it. Its pose then keeps whatever the walk last wrote, measured in the app at 18
+            // slots from where the note actually is, and since neither it nor any ancestor emits
+            // a mark, the note vanishes entirely while its links -- which fall back to the resting
+            // position -- carry on converging on empty space.
             vis.clearRetainingCapacity();
             for (frontier.items) |id| {
-                if (self.onScreen(id, view, p)) {
+                if (self.restOnScreen(id, view, p) or self.containsOpenSlot(id)) {
                     try vis.append(self.gpa, id);
                 } else {
                     // Still part of the cut, so a link leaving the viewport keeps a target. This
@@ -498,7 +1101,7 @@ pub const World = struct {
             }
             if (vis.items.len == 0) break;
 
-            // -- rule 2: a count threshold, never visit order (see the module header) --
+            // -- rule 2: a radius-class threshold, never visit order (see the module header) --
             var extra: usize = 0;
             var want_open: usize = 0;
             for (vis.items) |id| {
@@ -508,34 +1111,124 @@ pub const World = struct {
                 }
             }
 
-            var cutoff: u32 = 0;
+            var cutoff: ?u32 = null;
             if (closed + vis.items.len + extra > p.budget and want_open > 0) {
                 self.bound = true;
-                cutoff = try self.countCutoff(vis.items, view, p, closed, want_open);
+                cutoff = try self.radiusCutoff(vis.items, view, p, closed, want_open);
             }
 
             next.clearRetainingCapacity();
             for (vis.items) |id| {
-                const c = self.lad.cells[id];
-                const will_open = self.wantsSplit(id, view, p) and c.count > cutoff;
+                // A note you have open never coalesces.
+                //
+                // This is a *topology* guarantee, not a drawing trick. Without it the budget's
+                // radius cutoff moves as you zoom and can close an ancestor of the note you are
+                // zooming into: the leaf stops being its own mark, its pose slides back to the
+                // mass centre, and the note flies away from under the cursor just as you try to
+                // enter it. Nothing else on screen moves, because nothing else shares that
+                // cell's radius class — which is what made it look like one node misbehaving
+                // rather than a rule.
+                //
+                // Pinning the *pose* instead, which is what this used to do, cannot fix it: the
+                // note is then drawn somewhere its own mark no longer is, so its links terminate
+                // off the disc and the mass it belongs to still slides out from under it. The
+                // decision has to change, and then pose, links, label and camera all agree by
+                // construction.
+                //
+                // Costs at most depth x arity extra cells per open note against a budget in the
+                // thousands, bounded by the tab strip.
+                const holds_open_note = self.containsOpenSlot(id);
+                var will_open = holds_open_note or (self.wantsSplit(id, view, p) and
+                    (cutoff == null or self.radiusClass(id) > cutoff.?));
+                // First-time placement is the hitch: 128 relax steps per cell. Already-placed
+                // cells open for free; cap only the ones that still have to settle.
+                if (will_open and !holds_open_note and p.max_expand > 0 and !self.field.expanded[id]) {
+                    if (expanded_n >= p.max_expand) {
+                        will_open = false;
+                        // Deferred, not decided. A cell held back here is already at its closed
+                        // pose, so no crossfade will ask for the frame that would let it open on
+                        // the next pass — without this the field parks one or more generations
+                        // short of the budget and stays there until the pointer moves.
+                        self.settled = false;
+                    } else expanded_n += 1;
+                }
                 self.open[id] = will_open;
                 if (!will_open) {
                     closed += 1;
                     try self.cut.append(self.gpa, id);
                     continue;
                 }
+                // Place children now, not in `present`, so the next frontier's rest cull sees
+                // real positions rather than the origin, and `bound_r` is set before the next
+                // frame's radius-class cutoff would otherwise shift.
+                self.field.ensureChildren(&self.lad, id);
                 for (self.lad.childrenOf(id)) |k| try next.append(self.gpa, k);
             }
-            std.mem.swap(std.ArrayListUnmanaged(u32), &frontier, &next);
+            std.mem.swap(std.ArrayListUnmanaged(u32), frontier, next);
         }
     }
 
     fn onScreen(self: *const World, id: u32, view: View, p: Params) bool {
-        const sr = self.field.radius(&self.lad, id) * view.zoom;
-        const sx = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom;
-        const sy = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom;
+        return discOnScreen(self.px[id], self.py[id], self.field.radius(&self.lad, id), view, p);
+    }
+
+    /// Topology cull: resting placement, not the crossfade pose. `px`/`py` are presentation
+    /// state, and using them here is exactly "the budget reads animation" that this module
+    /// exists to forbid.
+    fn restOnScreen(self: *const World, id: u32, view: View, p: Params) bool {
+        const pos = self.field.pos[id];
+        return discOnScreen(pos.x, pos.y, self.field.radius(&self.lad, id), view, p);
+    }
+
+    fn discOnScreen(x: f32, y: f32, radius: f32, view: View, p: Params) bool {
+        const sr = radius * view.zoom;
+        const sx = view.w * 0.5 + (x - view.cx) * view.zoom;
+        const sy = view.h * 0.5 + (y - view.cy) * view.zoom;
         const m = sr + p.cull_pad_px;
         return sx >= -m and sx <= view.w + m and sy >= -m and sy <= view.h + m;
+    }
+
+    /// Does this cell hold one of the reader's open notes?
+    ///
+    /// `Cell.ls`/`le` bound a contiguous run of `note_at`, so a cell contains a note exactly when
+    /// that note's slot falls in the range. A leaf holding the note answers false: there is
+    /// nothing left to split, and forcing `open` on a childless cell would only cost the walk.
+    /// Mark every cell on the path from an open note up to its root.
+    ///
+    /// The set of cells that must not coalesce is exactly the ancestors of the reader's open
+    /// notes, and there are `depth` of them per note — eight or so. Walking down to mark them
+    /// costs that; asking each cell in turn whether it contains any open note costs `cells x
+    /// tabs`, at every level, every frame.
+    ///
+    /// Which is what it did. The check was a linear scan over the open set, and the open set grows
+    /// all session as the reader clicks through the map — so the graph started fast and got slower
+    /// the more of it you had visited, and a relaunch "fixed" it. Stamped rather than cleared, so
+    /// a frame costs nothing to invalidate.
+    fn markOpenChains(self: *World, p: Params) void {
+        self.open_chain_epoch +%= 1;
+        if (self.open_chain_epoch == 0) {
+            @memset(self.open_chain, 0);
+            self.open_chain_epoch = 1;
+        }
+        const epoch = self.open_chain_epoch;
+        var li: usize = 0;
+        while (li <= p.open_leaves.len) : (li += 1) {
+            const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
+            if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
+            // From the leaf's *parent*: a leaf has nothing to split, and forcing `open` on a
+            // childless cell only costs the walk.
+            var c = self.lad.cells[leaf].parent;
+            var guard: u8 = 0;
+            while (c != fold.invalid and c < self.open_chain.len and guard < 64) : (guard += 1) {
+                if (self.open_chain[c] == epoch) break; // this ancestry is already marked
+                self.open_chain[c] = epoch;
+                c = self.lad.cells[c].parent;
+            }
+        }
+    }
+
+    fn containsOpenSlot(self: *const World, id: u32) bool {
+        return id < self.open_chain.len and self.open_chain[id] == self.open_chain_epoch;
     }
 
     fn wantsSplit(self: *const World, id: u32, view: View, p: Params) bool {
@@ -543,41 +1236,51 @@ pub const World = struct {
         return c.child_count > 0 and self.field.radius(&self.lad, id) * view.zoom > p.split_px;
     }
 
-    /// Largest count class that does not fit. That class and every smaller one stay closed, so
-    /// cells of equal count never disagree and no order-dependent seam can appear.
-    fn countCutoff(
+    /// Bucket so equal-span cells always agree. ~3.5% steps in radius; visit order cannot
+    /// open one neighbour and refuse its twin.
+    fn radiusClass(self: *const World, id: u32) u32 {
+        const r = self.field.radius(&self.lad, id);
+        if (r <= 0) return 0;
+        return @intFromFloat(@max(0, @round(@log2(r) * 20)));
+    }
+
+    /// Largest radius class that does not fit. That class and every smaller one stay closed, so
+    /// cells of equal span never disagree and no order-dependent seam can appear. Unequal spans
+    /// at the same zoom — a large exclusive pair next to a still-coalesced dense mass — is the
+    /// point of gravity radii. Null when every class fits.
+    fn radiusCutoff(
         self: *World,
         vis: []const u32,
         view: View,
         p: Params,
         closed: usize,
         want_open: usize,
-    ) !u32 {
-        const counts = try self.gpa.alloc(u32, want_open);
-        defer self.gpa.free(counts);
-        var ci: usize = 0;
+    ) !?u32 {
+        const classes_buf = &self.sc_classes;
+        classes_buf.clearRetainingCapacity();
+        try classes_buf.ensureTotalCapacity(self.gpa, want_open);
         for (vis) |id| {
             if (self.wantsSplit(id, view, p)) {
-                counts[ci] = self.lad.cells[id].count;
-                ci += 1;
+                classes_buf.appendAssumeCapacity(self.radiusClass(id));
             }
         }
-        std.mem.sort(u32, counts, {}, comptime std.sort.desc(u32));
+        const classes = classes_buf.items;
+        std.mem.sort(u32, classes, {}, comptime std.sort.desc(u32));
 
         var spent = closed + vis.len;
         var prev: u32 = std.math.maxInt(u32);
-        for (counts) |cnt| {
-            if (cnt == prev) continue; // same class, already paid for
-            prev = cnt;
+        for (classes) |cls| {
+            if (cls == prev) continue; // same class, already paid for
+            prev = cls;
             var class_cost: usize = 0;
             for (vis) |id| {
                 const c = self.lad.cells[id];
-                if (c.count == cnt and self.wantsSplit(id, view, p)) class_cost += c.child_count - 1;
+                if (self.radiusClass(id) == cls and self.wantsSplit(id, view, p)) class_cost += c.child_count - 1;
             }
-            if (spent + class_cost > p.budget) return cnt;
+            if (spent + class_cost > p.budget) return cls;
             spent += class_cost;
         }
-        return 0;
+        return null;
     }
 
     /// Pass 2 — how the decided set looks right now. Chases `anim` toward `open`, lerps poses, and
@@ -585,9 +1288,20 @@ pub const World = struct {
     /// of popping, but never lets any of that feed back into the decision above.
     pub fn present(self: *World, view: View, p: Params, dt: f32) !void {
         const rate = @min(1.0, dt * p.rate);
-        self.settled = true;
-        var stack: std.ArrayListUnmanaged(u32) = .empty;
-        defer stack.deinit(self.gpa);
+
+        // Open notes must be placed so their leaf-precision links have real endpoints, even
+        // when the leaf itself is still inside a mass and is not a mark this frame.
+        {
+            var li: usize = 0;
+            while (li <= p.open_leaves.len) : (li += 1) {
+                const leaf = if (li == 0) p.focus_leaf else p.open_leaves[li - 1];
+                if (leaf == fold.invalid or leaf >= self.lad.cells.len) continue;
+                self.field.ensurePlaced(&self.lad, leaf);
+            }
+        }
+
+        const stack = &self.sc_stack;
+        stack.clearRetainingCapacity();
         for (self.lad.roots) |r| {
             self.px[r] = self.field.pos[r].x;
             self.py[r] = self.field.pos[r].y;
@@ -617,19 +1331,22 @@ pub const World = struct {
                     const r: f32 = if (is_note) p.note_r_px else blk: {
                         const full = @max(1.0, p.mass_cap_px *
                             (1 - @exp(-(sr * 0.82) / p.mass_cap_px)));
-                        // A splitting mass shrinks to a single note's size as it fades, rather
-                        // than hanging at full radius while children appear inside it. The ring
-                        // reads as collapsing into the point its children emerge from, which is
-                        // what makes a split look like one object becoming several instead of two
+                        // A splitting mass shrinks away entirely as it fades, rather than
+                        // hanging at full radius while children appear inside it. The ring reads
+                        // as collapsing into the point its children emerge from, which is what
+                        // makes a split look like one object becoming several instead of two
                         // unrelated things crossfading. Runs in reverse on merge, for free.
-                        break :blk full + (p.note_r_px - full) * self.anim[id];
+                        //
+                        // To *note* size rather than to nothing was the first cut, and it left the
+                        // parent standing at the centroid as a note-sized disc with a full-strength
+                        // outline — indistinguishable from one of the children it had just let go,
+                        // and popping out a moment later. The end of a split has to be nothing.
+                        break :blk full * (1 - self.anim[id]);
                     };
                     try self.marks.append(self.gpa, .{
                         .cell = id,
                         .wx = self.px[id],
                         .wy = self.py[id],
-                        .x = view.w * 0.5 + (self.px[id] - view.cx) * view.zoom,
-                        .y = view.h * 0.5 + (self.py[id] - view.cy) * view.zoom,
                         .r = r,
                         .alpha = alpha,
                         .is_note = is_note,
@@ -642,6 +1359,10 @@ pub const World = struct {
                 self.field.ensureChildren(&self.lad, id); // lazy placement pays off here
                 for (self.lad.childrenOf(id)) |k| {
                     const own = self.field.pos[k];
+                    // Same pose for every child: the layout, crossfaded from the parent as it
+                    // opens. Special-casing the hovered or focused leaf glued it back onto the
+                    // parent centre while its neighbours kept travelling — one note "coalescing"
+                    // as you zoom into it, edges still drawn at the true slot.
                     self.px[k] = self.px[id] + (own.x - self.px[id]) * self.anim[id];
                     self.py[k] = self.py[id] + (own.y - self.py[id]) * self.anim[id];
                     self.mul[k] = self.mul[id] * self.anim[id];
@@ -649,6 +1370,27 @@ pub const World = struct {
                 }
             }
         }
+
+        // Publish cell -> mark index for the frame. One pass over the marks (a few thousand at the
+        // top of the slider) so the draw and the label placer stop building a hash map each, and
+        // their tens of thousands of endpoint lookups become array indexing.
+        bumpEpoch(&self.mark_epoch, self.mark_of);
+        for (self.marks.items, 0..) |m, i| {
+            self.mark_of[m.cell] = .{ .stamp = self.mark_epoch, .of = @intCast(i) };
+        }
+    }
+
+    /// Index into `marks` of the mark drawn for `cell` this frame, or null when it has none.
+    pub fn markIndex(self: *const World, cell: u32) ?u32 {
+        if (cell >= self.mark_of.len) return null;
+        const m = self.mark_of[cell];
+        if (m.stamp != self.mark_epoch) return null;
+        // The stamp should already be enough. This is here because every caller uses the answer to
+        // index `marks` (or an array built parallel to it) directly, so the cost of the stamp ever
+        // being wrong is a wild read rather than a wrong position — and this is the one memo read
+        // from outside the frame pipeline, where "is the stamp current" is a harder thing to know.
+        if (m.of >= self.marks.items.len) return null;
+        return m.of;
     }
 
 
@@ -659,36 +1401,17 @@ pub const World = struct {
     ///
     /// The panel's `GraphNode.pos` is only written for notes that resolved as marks, so a note
     /// sitting inside a coalesced mass carries a stale one — and aiming the camera at that is why
-    /// opening a document flew somewhere near the note rather than to it, then found the note
-    /// elsewhere on arrival.
-    ///
-    /// Containment places lazily, so the answer is not sitting in `field.pos` yet; but it is fully
-    /// *determined*, and forcing it costs a walk of the ancestor chain. Root-down, because
-    /// `ensureChildren` positions a cell's children relative to the cell's own already-known
-    /// centre: going leaf-up would read positions that have not been decided. Depth is
-    /// `log_arity(n)` — seven levels at 283,878 notes — so this is a few dozen placements, not a
-    /// traversal of the vault.
-    pub fn noteWorldPos(self: *World, note: u32) ?struct { x: f32, y: f32 } {
+    /// opening a document flew somewhere near the note rather than to it. After `initFrom` every
+    /// leaf is already at its layout home in `field.pos`; this is that lookup, not a walk that
+    /// packs the leaf into a parent disc.
+    pub fn noteWorldPos(self: *const World, note: u32) ?struct { x: f32, y: f32 } {
         if (note >= self.lad.leaf_cell.len) return null;
         const leaf = self.lad.leaf_cell[note];
-        if (leaf == fold.invalid or leaf >= self.lad.cells.len) return null;
-
-        var chain: [64]u32 = undefined;
-        var n: usize = 0;
-        var c = leaf;
-        while (n < chain.len) {
-            chain[n] = c;
-            n += 1;
-            const parent = self.lad.cells[c].parent;
-            if (parent == fold.invalid) break;
-            c = parent;
-        }
-
-        var i = n;
-        while (i > 0) {
-            i -= 1;
-            self.field.ensureChildren(&self.lad, chain[i]);
-        }
+        if (leaf == fold.invalid or leaf >= self.field.pos.len) return null;
+        // Resting layout position, not the presentation pose. `ensureChildren` would pack the
+        // leaf into its parent's disc when that parent has never been expanded — the mass the
+        // camera used to fly to. After `initFrom` every cell is already placed at the layout
+        // home, so this is a lookup.
         const p = self.field.pos[leaf];
         return .{ .x = p.x, .y = p.y };
     }
@@ -720,9 +1443,10 @@ pub const World = struct {
     /// Stamping against `cut_epoch` means no per-frame clear of a 341k array: a stale stamp is
     /// simply a miss.
     fn cutOf(self: *World, cell: u32) ?u32 {
-        if (self.cut_stamp[cell] == self.cut_epoch) {
-            const memo = self.cut_of[cell];
-            return if (memo == fold.invalid) null else memo;
+        prof.cut_walks += 1;
+        const memo = self.cut_of[cell];
+        if (memo.stamp == self.cut_epoch) {
+            return if (memo.of == fold.invalid) null else memo.of;
         }
 
         // Climb to the root, then read back down. The ladder is at most `max_levels` deep, and a
@@ -745,8 +1469,7 @@ pub const World = struct {
         while (i > 0) {
             i -= 1;
             if (answer == fold.invalid and !self.open[chain[i]]) answer = chain[i];
-            self.cut_of[chain[i]] = answer;
-            self.cut_stamp[chain[i]] = self.cut_epoch;
+            self.cut_of[chain[i]] = .{ .stamp = self.cut_epoch, .of = answer };
         }
         return if (answer == fold.invalid) null else answer;
     }
@@ -806,8 +1529,8 @@ pub const World = struct {
         // animation was added to fix. Capping the step stretches a hitch instead of skipping it.
         const step_dt = @min(dt, 1.0 / 20.0);
         const base = step_dt / @max(0.01, p.focus_reach_secs);
-        var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer live.deinit(self.gpa);
+        const live = &self.sc_grow_live;
+        live.clearRetainingCapacity();
         try live.ensureTotalCapacity(self.gpa, @intCast(self.focus_links.items.len));
         for (self.focus_links.items) |*fl| {
             const key = (@as(u64, @min(fl.a, fl.b)) << 32) | @as(u64, @max(fl.a, fl.b));
@@ -842,70 +1565,159 @@ pub const World = struct {
         // focus note's own link set too, under the same unordered key, so it stays live and keeps
         // the extension it already had.
         var it = self.focus_grow.iterator();
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.gpa);
+        const dead = &self.sc_grow_dead;
+        dead.clearRetainingCapacity();
         while (it.next()) |kv| {
             if (!live.contains(kv.key_ptr.*)) try dead.append(self.gpa, kv.key_ptr.*);
         }
         for (dead.items) |k| _ = self.focus_grow.remove(k);
     }
 
+    /// Put `lifted` in `linkKey` order, in place.
+    ///
+    /// Radix rather than a comparison sort: the key is two cell ids packed into 64 bits, and a
+    /// vault of 353k cells leaves the top three bytes of each half zero, so five of the eight
+    /// passes are skipped outright.
+    fn sortLiftedByKey(self: *World) void {
+        if (self.lifted.items.len < 2) return;
+        self.sc_lift_scratch.resize(self.gpa, self.lifted.items.len) catch return;
+        const sorted = radix.sortByKey(LiftedLink, linkKey, self.lifted.items, self.sc_lift_scratch.items);
+        // `sortByKey` returns whichever buffer the last pass wrote into.
+        if (sorted.ptr != self.lifted.items.ptr) @memcpy(self.lifted.items, sorted);
+    }
+
+    /// Tell each candidate what it was drawn at last frame, so selection can prefer lines the
+    /// reader is already looking at.
+    ///
+    /// Sorts a `{key, index}` view rather than `lifted` itself. This runs on the *untruncated*
+    /// candidate set — tens of thousands of links, against a budget of ten — and a `LiftedLink` is
+    /// twenty-four bytes against twelve, so sorting the links here cost more than the hash map this
+    /// whole change was replacing. `lifted` is put in key order after truncation instead, where the
+    /// array is the budget's size.
+    fn stampIncumbency(self: *World) !void {
+        for (self.lifted.items) |*l| l.alpha = 0;
+        if (self.fades.items.len == 0 or self.lifted.items.len == 0) return;
+
+        try self.sc_keys.resize(self.gpa, self.lifted.items.len);
+        try self.sc_keys_scratch.resize(self.gpa, self.lifted.items.len);
+        for (self.sc_keys.items, self.lifted.items, 0..) |*k, l, i| {
+            k.* = .{ .key = linkKey(l), .idx = @intCast(i) };
+        }
+        const keys = radix.sortByKey(KeyIdx, keyIdxKey, self.sc_keys.items, self.sc_keys_scratch.items);
+
+        var j: usize = 0;
+        for (keys) |k| {
+            while (j < self.fades.items.len and self.fades.items[j].key < k.key) j += 1;
+            if (j >= self.fades.items.len) break;
+            if (self.fades.items[j].key == k.key) self.lifted.items[k.idx].alpha = self.fades.items[j].v;
+        }
+    }
+
     fn fadeLinks(self: *World, p: Params, dt: f32) !void {
         try self.stepFocusGrow(p, dt);
-        const rate = @min(1.0, dt * p.rate);
 
-        // The draw list is rebuilt every frame from the cached lift plus whatever is still fading;
-        // `lifted` itself is only recomputed when the cut changes.
+        // Links ramp in and out instead of blinking.
+        //
+        // Membership of the drawn web is a budgeted top-K over the cut, so panning replaces part
+        // of it every time the cut moves — measured on simplewiki at 8-11% of ~10,000 lines per
+        // frame at close zoom. That is a thousand lines appearing or vanishing between frames, and
+        // with nothing driving `LiftedLink.alpha` every one of them was a hard pop.
+        //
+        // This existed and was removed, for a reason that was true at the time: a dying line was
+        // mixed toward `.window.fill`, which is *not* the surface the graph is drawn on, so a fade
+        // did not end at the background — the web walked to a different colour, sat there, and
+        // popped back. `galaxy.panelFill` is the real backdrop now, so mixing toward it genuinely
+        // reaches invisible and the fade does what it says.
+        //
+        // Departed links are kept and drawn while they fade, which is why they are appended here
+        // rather than only in `lifted`: the lift is the *current* set, and a line on its way out is
+        // by definition not in it any more.
+        // Deliberately much faster than the mark crossfade, and bounded.
+        //
+        // A departing link is still drawn while it fades, so the drawn set is the budget *plus*
+        // whatever is on its way out. At the mark rate that tail ran about 23 frames, and a pan
+        // churning ~900 lines a frame stacked 20,000 ghosts on top of a 10,000-line budget — three
+        // times the work the budget exists to bound. Six frames is still a dissolve rather than a
+        // blink, and holds the overshoot to well under half the budget.
+        const rate = @min(1.0, dt * link_fade_rate);
+
+        // Retire early when the tail is running long.
+        //
+        // The drawn set is the budget plus whatever is fading out of it, so a cut that turns over
+        // hard enough can carry more ghosts than live links. Past the cap a departing link is
+        // retired outright: a fade says "this is the same web, changing", and when the whole web
+        // has been replaced that is not true — there is no continuity to draw, and snapping is both
+        // honest and free. Uses last frame's count, and a frame of lag on a cull threshold is not
+        // observable.
+        const ghost_cap = @max(p.link_budget / 8, 1);
+        const retire_at: f32 = if (self.ghosts_prev > ghost_cap) 0.25 else 0.02;
+
+        const next = &self.sc_fades_next;
+        next.clearRetainingCapacity();
+        try next.ensureTotalCapacity(self.gpa, self.lifted.items.len + self.fades.items.len);
         self.links.clearRetainingCapacity();
+        // The exact upper bound of the merge: every lifted link, plus at most one ghost per
+        // surviving fade. Deliberately not `ghost_cap`, which is derived from `link_budget` and is
+        // a *counter* limit — a caller that leaves the budget unbounded would ask for a
+        // `maxInt(usize)` allocation here.
+        try self.links.ensureTotalCapacity(self.gpa, self.lifted.items.len + self.fades.items.len);
 
-        // Rise the ones that are present, and remember them so the sweep below can tell which
-        // stored entries no longer are.
-        var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer live.deinit(self.gpa);
-        try live.ensureTotalCapacity(self.gpa, @intCast(self.lifted.items.len));
-        for (self.lifted.items) |l| {
-            const key = (@as(u64, l.a) << 32) | @as(u64, l.b);
-            live.putAssumeCapacity(key, {});
-            const gop = try self.link_fade.getOrPut(self.gpa, key);
-            const prev: f32 = if (gop.found_existing) gop.value_ptr.* else 0;
-            // The focused note's own links do not fade in. Everything else is ambient web whose
-            // arrival can be gentle, but these are the answer to a question the reader just asked
-            // — a link that eases in over half a second reads as one that was not there.
-            const next = if (l.focus) 1 else prev + (1 - prev) * rate;
-            gop.value_ptr.* = if (next > 0.996) 1 else next;
+        // One linear merge of two sorted arrays. `lifted` is key-sorted by the lift, `fades` came
+        // out of this same merge last frame and so is sorted too, and the output is written in key
+        // order — which is what keeps it sorted for next time without a sort of its own.
+        var ghosts: usize = 0;
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < self.lifted.items.len or j < self.fades.items.len) {
+            const kl: u64 = if (i < self.lifted.items.len) linkKey(self.lifted.items[i]) else std.math.maxInt(u64);
+            const kf: u64 = if (j < self.fades.items.len) self.fades.items[j].key else std.math.maxInt(u64);
 
-            var out = l;
-            out.alpha = gop.value_ptr.*;
-            if (out.alpha < 1) self.settled = false;
-            try self.links.append(self.gpa, out);
-        }
-
-        // Fall the ones that are not, and re-emit them until they are gone.
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.gpa);
-        var it = self.link_fade.iterator();
-        while (it.next()) |kv| {
-            if (live.contains(kv.key_ptr.*)) continue;
-            const next = kv.value_ptr.* * (1 - rate);
-            if (next < 0.02) {
-                try dead.append(self.gpa, kv.key_ptr.*);
-                continue;
+            if (kl < kf) {
+                // Arriving: nothing was drawn here last frame, so it starts at nothing.
+                var v: f32 = rate;
+                if (v > 0.996) v = 1 else self.settled = false;
+                var out = self.lifted.items[i];
+                out.alpha = v;
+                self.links.appendAssumeCapacity(out);
+                next.appendAssumeCapacity(.{ .key = kl, .v = v });
+                i += 1;
+            } else if (kl == kf) {
+                // Still drawn: rise toward full.
+                const prev = self.fades.items[j].v;
+                var v = prev + (1 - prev) * rate;
+                if (v > 0.996) v = 1 else self.settled = false;
+                var out = self.lifted.items[i];
+                out.alpha = v;
+                self.links.appendAssumeCapacity(out);
+                next.appendAssumeCapacity(.{ .key = kl, .v = v });
+                i += 1;
+                j += 1;
+            } else {
+                // Departed — no longer lifted, whether the cut dropped its cells or the budget
+                // dropped the link. Drawn while it fades, then forgotten.
+                const v = self.fades.items[j].v * (1 - rate);
+                j += 1;
+                if (v <= retire_at or ghosts >= ghost_cap) continue;
+                ghosts += 1;
+                self.settled = false;
+                self.links.appendAssumeCapacity(.{
+                    .a = @intCast(kf >> 32),
+                    .b = @truncate(kf),
+                    .w = 0,
+                    .alpha = v,
+                });
+                next.appendAssumeCapacity(.{ .key = kf, .v = v });
             }
-            kv.value_ptr.* = next;
-            self.settled = false;
-            try self.links.append(self.gpa, .{
-                .a = @intCast(kv.key_ptr.* >> 32),
-                .b = @intCast(kv.key_ptr.* & 0xffff_ffff),
-                .w = 0,
-                .alpha = next,
-            });
         }
-        for (dead.items) |k| _ = self.link_fade.remove(k);
+        std.mem.swap(std.ArrayListUnmanaged(Fade), &self.fades, next);
+        self.ghosts_prev = ghosts;
     }
 
     pub fn liftLinks(self: *World, p: Params, dt: f32) !void {
         self.links.clearRetainingCapacity();
         if (self.lad.roots.len == 0) return;
+        prof.calls += 1;
+        var pt = pnow();
 
         // Skip the whole lift when nothing that decides it has changed.
         //
@@ -922,23 +1734,40 @@ pub const World = struct {
             fp ^= c;
             fp *%= 0x100000001b3;
         }
-        fp ^= @as(u64, p.focus_leaf);
-        fp *%= 0x100000001b3;
+
+        // Two keys, because only one of them may be held.
+        //
+        // `lift_hold` exists to stop the *ambient* web being rebuilt on every frame of a camera
+        // flight, and a web that lags the marks by a few frames while the view is moving is
+        // invisible. The focused note's own links are not that: they are the answer to the click
+        // that started the flight, and holding them answers with the *previous* note's links —
+        // or, on the frame the focus first arrives, with nothing at all. So the connections of the
+        // note you just clicked go missing for as long as the camera is moving fast enough to hold,
+        // and reappear when it slows. One key covers what may lag; the other never may.
+        var focus_fp: u64 = 0xcbf29ce484222325;
+        focus_fp ^= @as(u64, p.focus_leaf);
+        focus_fp *%= 0x100000001b3;
         // The open set is part of the lift now that every open note's links are built here, so a
         // tab opening or closing has to invalidate the cache the same way a cut change does.
         for (p.open_leaves) |leaf| {
-            fp ^= @as(u64, leaf) +% 1;
-            fp *%= 0x100000001b3;
+            focus_fp ^= @as(u64, leaf) +% 1;
+            focus_fp *%= 0x100000001b3;
         }
-        fp ^= @as(u64, p.link_budget);
-        fp *%= 0x100000001b3;
+        focus_fp ^= @as(u64, p.link_budget);
+        focus_fp *%= 0x100000001b3;
 
-        if (self.lift_valid and (fp == self.lift_key or p.lift_hold)) {
+        if (self.lift_valid and focus_fp == self.lift_focus_key and
+            (fp == self.lift_key or p.lift_hold))
+        {
+            pt = pnow();
             try self.fadeLinks(p, dt);
+            prof.fade_ns += plap(&pt);
             return;
         }
         self.lift_key = fp;
+        self.lift_focus_key = focus_fp;
         self.lift_valid = true;
+        prof.recomputes += 1;
 
         // Two maps, because a pair's weight has to be *summed* within one side and *maxed* across
         // the two.
@@ -956,10 +1785,8 @@ pub const World = struct {
         // class of bug the sweep exists to catch. Taking the max needs no level reasoning at all:
         // whichever side sees the whole aggregate wins, a side that sees nothing contributes
         // nothing, and a side that sees part of it is dominated.
-        var acc: std.AutoHashMapUnmanaged(u64, f32) = .empty;
-        defer acc.deinit(self.gpa);
-        var side: std.AutoHashMapUnmanaged(u32, f32) = .empty;
-        defer side.deinit(self.gpa);
+        const acc = &self.sc_acc;
+        acc.clearRetainingCapacity();
         // How deep into one cell's neighbour list it is worth reading.
         //
         // `link_scan_cap` alone is a fixed ceiling, and a fixed ceiling is the wrong shape: on a
@@ -991,8 +1818,8 @@ pub const World = struct {
         // lifted the same way everything else is: each neighbour leaf mapped to whatever cell
         // currently stands in for it. So when the note is coalesced its links still point at the
         // right places, instead of the mass's entire incident set being painted as the document's.
-        var focus_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer focus_pairs.deinit(self.gpa);
+        const focus_pairs = &self.sc_focus_pairs;
+        focus_pairs.clearRetainingCapacity();
         // One entry per *edge*, not per (note, neighbour).
         //
         // The highlighted web is a set of edges: `A—B` and `B—A` are the same line. With both notes
@@ -1000,8 +1827,8 @@ pub const World = struct {
         // different reveal state, so the edge the reader had just travelled along could sweep again
         // from its far end. Claimed first-come, and the focused note is processed first, so an edge
         // belongs to the note being looked at and is drawn outward from it.
-        var edge_seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        defer edge_seen.deinit(self.gpa);
+        const edge_seen = &self.sc_edge_seen;
+        edge_seen.clearRetainingCapacity();
         self.focus_links.clearRetainingCapacity();
         // The focused leaf first and always, then every other open note. `focus_leaf` is not
         // required to appear in `open_leaves` — a caller may set only the focus, and the pinned
@@ -1047,6 +1874,8 @@ pub const World = struct {
             }
         }
 
+        prof.focus_ns += plap(&pt);
+
         for (self.cut.items) |u| {
             const lo, const hi = self.web.range(u);
             // Saturating: a caller that wants the cap off passes `maxInt`, and `lo + cap` would
@@ -1071,22 +1900,33 @@ pub const World = struct {
                 @min(hi, lo +| p.link_scan_cap)
             else
                 @min(hi, lo +| cap);
-            side.clearRetainingCapacity();
+            self.side_epoch +%= 1;
+            // Wrap is once every 4 billion cut cells — hours of continuous panning — but a stamp
+            // left over from the previous lap would read as current and silently drop a cell's
+            // whole neighbour weight, so clear on the way past rather than leave it to chance.
+            if (self.side_epoch == 0) {
+                @memset(self.side, .{});
+                self.side_epoch = 1;
+            }
+            self.side_hit.clearRetainingCapacity();
+            prof.scanned += end - lo;
             for (self.web.nbr[lo..end], self.web.w[lo..end]) |v, w| {
                 const cv = self.cutOf(v) orelse continue; // cut is deeper there; found from it
                 if (cv == u) continue; // both ends inside the same cut cell — nothing to draw
-                const gop = try side.getOrPut(self.gpa, cv);
-                gop.value_ptr.* = (if (gop.found_existing) gop.value_ptr.* else 0) + w;
+                if (self.side[cv].stamp != self.side_epoch) {
+                    self.side[cv] = .{ .stamp = self.side_epoch, .w = 0 };
+                    try self.side_hit.append(self.gpa, cv);
+                }
+                self.side[cv].w += w;
             }
-            var sit = side.iterator();
-            while (sit.next()) |kv| {
-                const cv = kv.key_ptr.*;
+            for (self.side_hit.items) |cv| {
                 const key = (@as(u64, @min(u, cv)) << 32) | @as(u64, @max(u, cv));
                 const gop = try acc.getOrPut(self.gpa, key);
                 const prev = if (gop.found_existing) gop.value_ptr.* else 0;
-                gop.value_ptr.* = @max(prev, kv.value_ptr.*);
+                gop.value_ptr.* = @max(prev, self.side[cv].w);
             }
         }
+        prof.scan_ns += plap(&pt);
         self.lifted.clearRetainingCapacity();
         var it = acc.iterator();
         while (it.next()) |kv| {
@@ -1100,7 +1940,46 @@ pub const World = struct {
                 // A note drawn as itself owns its whole link set.
                 .essential = self.lad.cells[la].child_count == 0 or
                     self.lad.cells[lb].child_count == 0,
+                .highway = self.lad.cells[la].parent != self.lad.cells[lb].parent,
+                // Filled by `stampIncumbency` from what this link was drawn at last frame. Zero
+                // until then, which is what "the reader has never seen this line" means.
+                .alpha = 0,
             });
+        }
+        prof.build_ns += plap(&pt);
+
+        try self.stampIncumbency();
+
+        // Every drawn cell keeps its own heaviest line — see `LiftedLink.anchor`.
+        //
+        // Two passes over the lifted set and one over the cut, all of them sequential, and the
+        // per-cell state is stamped so a new frame costs nothing to clear.
+        self.anchor_epoch +%= 1;
+        if (self.anchor_epoch == 0) {
+            @memset(self.anchor_of, .{});
+            self.anchor_epoch = 1;
+        }
+        for (self.lifted.items, 0..) |l, i| {
+            for ([_]u32{ l.a, l.b }) |c| {
+                if (c >= self.anchor_of.len) continue;
+                const m = &self.anchor_of[c];
+                if (m.stamp != self.anchor_epoch or l.w > m.w) {
+                    m.* = .{ .stamp = self.anchor_epoch, .link = @intCast(i), .w = l.w };
+                }
+            }
+        }
+        for (self.cut.items) |c| {
+            if (c >= self.anchor_of.len) continue;
+            const m = self.anchor_of[c];
+            if (m.stamp == self.anchor_epoch and m.link < self.lifted.items.len) {
+                self.lifted.items[m.link].anchor = true;
+            }
+        }
+
+        self.last_candidates = self.lifted.items.len;
+        self.last_cand_highway = 0;
+        for (self.lifted.items) |l| {
+            if (l.highway) self.last_cand_highway += 1;
         }
         // Count what may not be dropped before deciding whether to drop anything.
         var essential_n: usize = 0;
@@ -1111,7 +1990,7 @@ pub const World = struct {
         // where a hairball genuinely says nothing. It must not cap a link belonging to a note the
         // reader can see individually: a node drawn as itself showing three of its seven links is
         // worse than showing none, because there is no way to tell which are missing.
-        const keep = @max(p.link_budget, essential_n);
+        const keep = @max(@min(p.link_budget, self.cut.items.len *| p.links_per_cell), essential_n);
         if (self.lifted.items.len > keep) {
             // Focus-incident pairs sort first, ahead of weight.
             //
@@ -1121,21 +2000,23 @@ pub const World = struct {
             // one relationship set that was asked for, while everything below it still competes on
             // weight exactly as before. No second list and no second code path: the same sort,
             // with one more key in front, so determinism is unchanged.
-            const S = struct {
-                pub fn heavier(_: void, x: LiftedLink, y: LiftedLink) bool {
-                    if (x.focus != y.focus) return x.focus;
-                    if (x.essential != y.essential) return x.essential;
-                    if (x.w != y.w) return x.w > y.w;
-                    // deterministic tie-break, so a parked camera keeps the same web
-                    if (x.a != y.a) return x.a < y.a;
-                    return x.b < y.b;
-                }
-            };
-            std.mem.sort(LiftedLink, self.lifted.items, {}, S.heavier);
+            // Select, don't sort. What this needs is the *set* of the `keep` heaviest, and a full
+            // sort also puts the ~20,000 links it is about to discard in order — 2.0 ms a frame at
+            // 300k notes, the single largest item in a moving frame. `selectTopK` partitions to the
+            // same set for a fraction of that. The set is uniquely determined either way, because
+            // `heavier` is a strict total order: the `(a, b)` tie-break is the pair itself, so no
+            // two links can compare equal and there is no boundary ambiguity to resolve by luck.
+            selectTopK(self.lifted.items, keep);
             self.lifted.shrinkRetainingCapacity(keep);
         }
+        // `fadeLinks` merges against `fades`, and the merge is the whole reason the fade is no
+        // longer a hash map. This is the only place `lifted` is put in key order, and it runs on
+        // the kept set rather than every candidate.
+        self.sortLiftedByKey();
+        prof.sort_ns += plap(&pt);
 
         try self.fadeLinks(p, dt);
+        prof.fade_ns += plap(&pt);
     }
 
     pub fn noteMarks(self: World) usize {
@@ -1151,10 +2032,70 @@ pub const World = struct {
 
 const testing = std.testing;
 
+test "selectTopK keeps exactly the set a full sort would keep" {
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    const r = rng.random();
+    const gpa = testing.allocator;
+
+    for ([_]usize{ 1, 2, 17, 64, 1000, 9999 }) |n| {
+        const items = try gpa.alloc(LiftedLink, n);
+        defer gpa.free(items);
+        for (items, 0..) |*l, i| {
+            l.* = .{
+                .a = @intCast(i),
+                .b = r.int(u16),
+                // Heavy duplication on purpose: weight ties are the case where a selection can
+                // disagree with a sort, and the `(a, b)` tie-break is what stops it.
+                .w = @floatFromInt(r.intRangeAtMost(u8, 0, 8)),
+                .focus = r.boolean(),
+                .essential = r.boolean(),
+            };
+        }
+
+        const reference = try gpa.dupe(LiftedLink, items);
+        defer gpa.free(reference);
+        std.mem.sort(LiftedLink, reference, {}, struct {
+            fn less(_: void, x: LiftedLink, y: LiftedLink) bool {
+                return heavier(x, y);
+            }
+        }.less);
+
+        for ([_]usize{ 0, 1, n / 3, n / 2, n - 1, n }) |k| {
+            const scratch = try gpa.dupe(LiftedLink, items);
+            defer gpa.free(scratch);
+            selectTopK(scratch, k);
+            if (k == 0 or k >= n) continue;
+
+            // Sets, not orders: `selectTopK` promises the prefix holds the same links, not that it
+            // holds them in the same sequence.
+            var want: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer want.deinit(gpa);
+            for (reference[0..k]) |l| {
+                try want.put(gpa, (@as(u64, l.a) << 32) | @as(u64, l.b), {});
+            }
+            for (scratch[0..k]) |l| {
+                try testing.expect(want.remove((@as(u64, l.a) << 32) | @as(u64, l.b)));
+            }
+            try testing.expectEqual(@as(usize, 0), want.count());
+        }
+    }
+}
+
 fn chainLinks(gpa: std.mem.Allocator, n: u32) ![]fold.Edge {
     const e = try gpa.alloc(fold.Edge, n - 1);
     for (0..n - 1) |i| e[i] = .{ .a = @intCast(i), .b = @intCast(i + 1) };
     return e;
+}
+
+fn coveringMark(w: *const World, leaf: u32) ?Mark {
+    var c = leaf;
+    var guard: u8 = 0;
+    while (c != fold.invalid and guard < 64) : (guard += 1) {
+        if (w.markIndex(c)) |i| return w.marks.items[i];
+        if (c >= w.lad.cells.len) break;
+        c = w.lad.cells[c].parent;
+    }
+    return null;
 }
 
 fn settle(w: *World, view: View, p: Params, frames: usize) !void {
@@ -1268,6 +2209,48 @@ test "links lift onto living cells" {
     }
 }
 
+test "a cut change ramps links instead of blinking them" {
+    // Membership of the drawn web is a budgeted top-K over the cut, so any camera move replaces
+    // part of it — measured on a real vault at 8-11% of ten thousand lines per frame. Without a
+    // ramp every one of those is a hard pop, which is what "the connections keep disappearing and
+    // reappearing" is.
+    //
+    // Two properties, and the second is the one a previous fix got wrong: a link must be *mid*
+    // ramp right after the cut changes, and the ramp must finish — a web that settles anywhere
+    // other than full strength is the flash that had this removed.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 }, .{}, 80);
+    try w.liftLinks(.{}, 1.0 / 60.0);
+    const near: View = .{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 };
+    try settle(&w, near, .{}, 40);
+    try w.liftLinks(.{}, 1.0 / 60.0);
+
+    try testing.expect(w.links.items.len > 0);
+    var ramping: usize = 0;
+    for (w.links.items) |l| {
+        try testing.expect(l.alpha > 0 and l.alpha <= 1);
+        if (l.alpha < 1) ramping += 1;
+    }
+    try testing.expect(ramping > 0);
+
+    // And it converges: hold the camera still and every survivor reaches full strength, with the
+    // ghosts retired rather than left on screen at some fraction forever.
+    for (0..90) |_| {
+        try w.step(near, .{}, 1.0 / 60.0);
+        try w.liftLinks(.{}, 1.0 / 60.0);
+    }
+    try testing.expect(w.links.items.len > 0);
+    for (w.links.items) |l| {
+        try testing.expectEqual(@as(f32, 1), l.alpha);
+        try testing.expect(l.w > 0);
+    }
+}
+
 test "the focused note keeps every link however far the camera travels" {
     // The bug this pins down does not present as a wrong number, which is why it survived two
     // fixes: it presents as a *drifting* one. Lifting the focused note's links onto the cut means
@@ -1297,6 +2280,43 @@ test "the focused note keeps every link however far the camera travels" {
             try testing.expect(fl.b != p.focus_leaf);
         }
     }
+}
+
+test "a held lift still answers a new focus" {
+    // `lift_hold` lets the ambient web lag while the camera flies, which is invisible and saves the
+    // whole lift on the frames that can least afford it. It must not hold the focused note's own
+    // links: clicking a node *starts* the flight, so the frames where the hold is engaged are
+    // exactly the frames where the reader is waiting to see what they just clicked connect to.
+    // Held, they answer with the previous note's links — and on the first click of a session, with
+    // nothing — until the camera slows enough to release.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 4, .cx = 0, .cy = 0 };
+
+    var p: Params = .{ .focus_leaf = w.lad.leaf_cell[2000] };
+    try settle(&w, view, p, 8);
+    try w.liftLinks(p, 1.0 / 60.0);
+    for (w.focus_links.items) |fl| try testing.expectEqual(p.focus_leaf, fl.a);
+
+    // The click: a new focus arriving on a frame the camera is moving fast enough to hold.
+    p.focus_leaf = w.lad.leaf_cell[2400];
+    p.lift_hold = true;
+    try w.step(view, p, 1.0 / 60.0);
+    try w.liftLinks(p, 1.0 / 60.0);
+
+    try testing.expectEqual(@as(usize, 2), w.focus_links.items.len);
+    for (w.focus_links.items) |fl| try testing.expectEqual(p.focus_leaf, fl.a);
+
+    // And the hold still does its job for the ambient web: with the focus unchanged, a moved
+    // camera reuses the lifted set rather than rebuilding it.
+    const before = prof.recomputes;
+    try w.step(.{ .w = 900, .h = 600, .zoom = 4, .cx = 400, .cy = 0 }, p, 1.0 / 60.0);
+    try w.liftLinks(p, 1.0 / 60.0);
+    try testing.expectEqual(before, prof.recomputes);
 }
 
 test "a splitting mass shrinks toward a note's size as it fades" {
@@ -1335,6 +2355,165 @@ test "a splitting mass shrinks toward a note's size as it fades" {
         }
     }
     try testing.expect(saw_smaller);
+}
+
+test "the note you have open never coalesces, and never moves" {
+    // The symptom: zoom toward the note you are reading and it flies off, alone, while every
+    // other disc around it stays put — so you can never get close enough to enter it.
+    //
+    // The cause is the budget's radius cutoff, which moves with the zoom and can close an
+    // ancestor of that one leaf. The leaf stops being its own mark and its pose slides back down
+    // the chain toward the mass centre. Only that note moves, because only its ancestor happened
+    // to sit at the class the cutoff landed on.
+    //
+    // Both halves are asserted here: the leaf is its own mark at every zoom, and it is drawn at
+    // its resting position rather than somewhere along the way to it.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const leaf = w.lad.leaf_cell[2000];
+    w.field.ensurePlaced(&w.lad, leaf);
+    const own = w.field.pos[leaf];
+
+    // Tight enough that the cutoff is doing real work at every step.
+    const p: Params = .{ .budget = 120, .focus_leaf = leaf };
+    var zoom: f32 = 4;
+    while (zoom <= 400) : (zoom *= 1.4) {
+        const view: View = .{ .w = 900, .h = 600, .zoom = zoom, .cx = own.x, .cy = own.y };
+        try settle(&w, view, p, 300);
+
+        const mi = w.markIndex(leaf) orelse return error.TestUnexpectedResult;
+        const m = w.marks.items[mi];
+        try testing.expect(m.is_note);
+        try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
+        try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+    }
+}
+
+test "an open note is never lost to the cull" {
+    // The invariant, stated where it can be checked: whenever the note the reader has open is
+    // within the view, it is drawn as itself, at its resting position.
+    //
+    // Rule 1 culls a branch whose parent disc is off screen, on the grounds that children live
+    // inside that disc. That holds only for expanded cells with a settled bound; an estimated
+    // radius can be tighter than the subtree it stands for. When the miss lands on an ancestor of
+    // an open note, the chain is cut before the never-coalesce rule is reached, `present` stops
+    // descending, and the note keeps a stale pose with no mark anywhere above it to stand in.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const leaf = w.lad.leaf_cell[2000];
+    w.field.ensurePlaced(&w.lad, leaf);
+    const own = w.field.pos[leaf];
+    const p: Params = .{ .budget = 300, .focus_leaf = leaf };
+
+    // Walk the camera across the note from several directions and distances, so a branch that
+    // leaves the view and comes back is exercised rather than only the settled case.
+    const offs = [_]f32{ -600, -220, -80, -12, 0, 12, 80, 220, 600 };
+    for (offs) |ox| {
+        for (offs) |oy| {
+            const view: View = .{ .w = 900, .h = 600, .zoom = 30, .cx = own.x + ox, .cy = own.y + oy };
+            try settle(&w, view, p, 200);
+            if (!w.restOnScreen(leaf, view, p)) continue;
+            const mi = w.markIndex(leaf) orelse {
+                std.debug.print("no mark at cx {d:.0} cy {d:.0}\n", .{ ox, oy });
+                return error.TestUnexpectedResult;
+            };
+            const m = w.marks.items[mi];
+            try testing.expect(m.is_note);
+            try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
+            try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+        }
+    }
+}
+
+test "zooming in never un-resolves a note" {
+    // Half of the "it flies away as I zoom toward it" bug. The other half is in `graph.zig`:
+    // `split_px` is scaled by the motion bias, and zooming about a point moves the camera centre,
+    // which used to register as a pan and inflate it. This pins the half that lives here -- at a
+    // fixed `split_px`, resolution is monotone in zoom, so once a note is drawn as itself it stays
+    // that way however much further you go in. Anything that makes the LOD non-monotone would
+    // reintroduce the symptom no matter what the bias does.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const leaf = w.lad.leaf_cell[2000];
+    w.field.ensurePlaced(&w.lad, leaf);
+    const own = w.field.pos[leaf];
+
+    const p: Params = .{ .budget = 400 };
+    var resolved = false;
+    var zoom: f32 = 4;
+    while (zoom <= 600) : (zoom *= 1.25) {
+        const view: View = .{ .w = 900, .h = 600, .zoom = zoom, .cx = own.x, .cy = own.y };
+        try settle(&w, view, p, 300);
+        if (w.markIndex(leaf)) |mi| {
+            resolved = true;
+            const m = w.marks.items[mi];
+            try testing.expect(m.is_note);
+            // And at its resting position, not part-way along a crossfade from a mass centre.
+            try testing.expectApproxEqAbs(own.x, m.wx, 1e-3);
+            try testing.expectApproxEqAbs(own.y, m.wy, 1e-3);
+        } else {
+            // Coalesced is fine before it first resolves, never after.
+            try testing.expect(!resolved);
+        }
+    }
+    try testing.expect(resolved);
+}
+
+test "a parked camera comes to rest" {
+    // `settled` is what lets the panel stop asking for frames. It starts true, and *only* the
+    // per-frame reset in `clearFrame` ever puts it back — without that, the first crossfade in
+    // the life of a `World` pinned the flag false forever and Atlas repainted at full rate with
+    // nothing moving and no camera input.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 3000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 3000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 12, .cx = 0, .cy = 0 };
+    const p: Params = .{ .budget = 140 };
+    try settle(&w, view, p, 300);
+    try testing.expect(w.settled);
+
+    // A view change starts animating again, and then rests again.
+    const nearer: View = .{ .w = 900, .h = 600, .zoom = 48, .cx = 0, .cy = 0 };
+    try w.step(nearer, p, 1.0 / 60.0);
+    try settle(&w, nearer, p, 300);
+    try testing.expect(w.settled);
+}
+
+test "a split deferred by max_expand asks for another frame" {
+    // `max_expand` holds first-time placements back so a fast zoom does not settle hundreds of
+    // cells in one hitch. A held-back cell is already sitting at its closed pose, so nothing
+    // about it animates — if the deferral is not reported, the field parks short of the budget
+    // and stays there until something else happens to request a frame.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 3000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 3000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const view: View = .{ .w = 900, .h = 600, .zoom = 64, .cx = 0, .cy = 0 };
+    const capped: Params = .{ .budget = 400, .max_expand = 1 };
+    try w.step(view, capped, 1.0 / 60.0);
+    try testing.expect(!w.settled);
+
+    // Uncapped, the same view reaches a resting state.
+    const free: Params = .{ .budget = 400 };
+    try settle(&w, view, free, 600);
+    try testing.expect(w.settled);
 }
 
 test "topology does not depend on animation state" {
@@ -1430,9 +2609,17 @@ test "the cell-web lift matches a brute-force note-level lift" {
         try w.liftLinks(p, 1.0);
 
         // Brute force, over the same cut: every edge onto the cut cell owning each endpoint.
+        //
+        // Over the *same weights*, too. `World.init` discounts a link by the popularity of its
+        // endpoints before handing it to `cellweb` (see `fold.degreeNormalised`), so a brute force
+        // fed raw weights would be comparing the lift against a different graph and failing for a
+        // reason that has nothing to do with the lift.
+        const scored = try fold.degreeNormalised(gpa, n, edges.items, (fold.Options{}).degree_norm);
+        defer gpa.free(scored);
+
         var want: std.AutoHashMapUnmanaged(u64, f32) = .empty;
         defer want.deinit(gpa);
-        for (edges.items) |e| {
+        for (scored) |e| {
             const la = w.lad.leaf_cell[e.a];
             const lb = w.lad.leaf_cell[e.b];
             if (la == fold.invalid or lb == fold.invalid) continue;
@@ -1453,33 +2640,229 @@ test "the cell-web lift matches a brute-force note-level lift" {
     }
 }
 
-test "leaf_pitch matches the geometry it claims to describe" {
+test "leaf_pitch is the spacing the layout actually produces" {
     // A caller matching an existing lattice divides its slot spacing by `leaf_pitch` to get
     // `note_r`. If the constant drifts from the real geometry the whole vault comes out at the
-    // wrong scale — which reads as a speck at the centre of the view, with every LOD transition
-    // crammed into a sliver of the zoom range.
+    // wrong scale — a speck at the centre of the view, with every LOD transition crammed into a
+    // sliver of the zoom range.
+    //
+    // This used to measure `containment`'s relaxation and paste the number back, because the
+    // spacing was whatever that settle happened to produce. The layout picks its spacing and
+    // normalises to it now, so the assertion is that the two agree — and that the pitch clears
+    // `2.0`, below which discs of radius `note_r` overlap by construction.
+    //
+    // `leaf_pitch` is the *nearest-neighbour* spacing, which is what `note_r` has to be derived
+    // from: overlap is decided by whoever is closest. `Result.spacing` is the Hilbert-gap proxy and
+    // reads above it, so the check below is a floor and a ceiling rather than an equality — see
+    // `layout.Result.spacing`.
+    try testing.expectEqual(layout.default_spacing, leaf_pitch);
+    try testing.expect(leaf_pitch > 2.0);
+
     const gpa = testing.allocator;
-    const edges = try gpa.alloc(fold.Edge, 6);
+    const n: u32 = 600;
+    const edges = try gpa.alloc(fold.Edge, n - 1);
     defer gpa.free(edges);
-    for (0..6) |i| edges[i] = .{ .a = 0, .b = @intCast(i + 1) };
+    for (edges, 0..) |*e, i| e.* = .{ .a = @intCast(i), .b = @intCast(i + 1) };
+    const paths = try gpa.alloc([]const u8, n);
+    defer gpa.free(paths);
+    for (paths) |*q| q.* = "";
 
-    var lad = try fold.build(gpa, 7, edges, &.{}, .{ .arity = .seven });
-    defer lad.deinit(gpa);
-    var f = try containment.init(gpa, lad.cells.len, lad.roots.len, .seven, .{ .note_r = 1 });
-    defer f.deinit(gpa);
-    containment.placeAll(&f, &lad);
+    var res = try layout.solve(gpa, n, edges, paths, .{ .note_r = 4 });
+    defer res.deinit(gpa);
+    try testing.expect(res.spacing >= leaf_pitch - 0.25);
+    try testing.expect(res.spacing <= leaf_pitch * 1.6);
+}
 
-    // nearest neighbour distance among the leaves of a full cell
-    var best: f32 = std.math.floatMax(f32);
-    for (lad.cells, 0..) |a, ia| {
-        if (a.note == fold.invalid) continue;
-        for (lad.cells, 0..) |b, ib| {
-            if (ib <= ia or b.note == fold.invalid) continue;
-            const d = containment.Vec2.dist(f.pos[ia], f.pos[ib]);
-            if (d > 1e-4) best = @min(best, d);
+test "a small island vault resolves every note at overview zoom" {
+    // Budget is hundreds and the vault is six notes. The only reason this used to coalesce at
+    // the fitted view is the layout sitting each linked pair on one point, so the parent disc
+    // never cleared split_px and fit-to-extents framed empty ocean between the islands.
+    const gpa = testing.allocator;
+    const note_r: f32 = 4;
+    const edges = [_]fold.Edge{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 2, .b = 3 },
+        .{ .a = 4, .b = 5 },
+    };
+    const paths = [_][]const u8{ "a.md", "b.md", "c.md", "d.md", "e.md", "f.md" };
+    var lay = try layout.solve(gpa, 6, &edges, &paths, .{ .note_r = note_r });
+    defer lay.deinit(gpa);
+
+    var w = try World.initFrom(
+        gpa,
+        6,
+        &edges,
+        .{ .pos = lay.pos, .comp = lay.comp },
+        .{},
+        .{ .note_r = note_r },
+        .{},
+    );
+    defer w.deinit();
+
+    const e = w.extent();
+    const view: View = .{
+        .w = 900,
+        .h = 600,
+        .zoom = @min(900, 600) / (2 * @max(e, 1e-3)),
+        .cx = 0,
+        .cy = 0,
+    };
+    try settle(&w, view, .{ .budget = 360 }, 120);
+    try testing.expectEqual(@as(usize, 6), w.noteMarks());
+    for (w.marks.items) |m| try testing.expect(m.is_note);
+
+    // The Hilbert box is persisted on the world, so the next rebuild keys against the same
+    // square instead of renumbering every note because one outlier widened the extent.
+    const box = w.hilbertBox();
+    try testing.expect(box.half > 0);
+}
+
+test "holding topology keeps the open set while zoom changes" {
+    // The hitch this pins down: a flick-zoom used to re-decide the cut every frame, settle every
+    // newly opened cell, and re-lift the web. Holding the open set is what makes that a camera
+    // move instead of a LOD explosion.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const far: View = .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 };
+    try settle(&w, far, .{}, 200);
+    const held = try gpa.dupe(bool, w.open);
+    defer gpa.free(held);
+    const n_marks = w.marks.items.len;
+    try testing.expect(n_marks > 0);
+
+    var p: Params = .{ .hold_topology = true };
+    try w.step(.{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 }, p, 1.0 / 60.0);
+    try testing.expectEqualSlices(bool, held, w.open);
+
+    // Unheld, the same zoom opens further — otherwise the hold was a no-op because nothing
+    // wanted to split.
+    p.hold_topology = false;
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 80, .cx = 0, .cy = 0 }, p, 80);
+    var opened: usize = 0;
+    for (held, w.open) |was, now| {
+        if (!was and now) opened += 1;
+    }
+    try testing.expect(opened > 0);
+}
+
+test "an unheld zoom-in opens cells before the camera arrives" {
+    // Click-to-focus used to set `hold_topology` for the whole chase (zoom_speed stays high
+    // until the camera parks, then a while after). The open set froze, the camera settled,
+    // then everything split at once. The flight is the dive: with the hold off and
+    // `max_expand` capping the settle, cells open *during* the ease.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 2500);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 2500, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const far: View = .{ .w = 900, .h = 600, .zoom = 6, .cx = 0, .cy = 0 };
+    try settle(&w, far, .{}, 200);
+    var open_far: usize = 0;
+    for (w.open) |o| {
+        if (o) open_far += 1;
+    }
+
+    const p: Params = .{ .max_expand = 24 };
+    var z: f32 = 6;
+    const target: f32 = 80;
+    const t = 1.0 - @exp(-@as(f32, 7.0) / 60.0);
+    // Ten frames of the camera chase — well short of parked.
+    for (0..10) |_| {
+        z += (target - z) * t;
+        try w.step(.{ .w = 900, .h = 600, .zoom = z, .cx = 0, .cy = 0 }, p, 1.0 / 60.0);
+    }
+    var open_mid: usize = 0;
+    for (w.open) |o| {
+        if (o) open_mid += 1;
+    }
+    try testing.expect(open_mid > open_far);
+}
+
+test "resolved notes keep their layout position when zoom increases" {
+    // Once a note is drawn as itself, further zoom is a camera move, not another placement.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const p: Params = .{ .budget = 2000 };
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 40, .cx = 0, .cy = 0 }, p, 200);
+
+    var best: ?Mark = null;
+    var best_d: f32 = std.math.floatMax(f32);
+    for (w.marks.items) |m| {
+        if (!m.is_note) continue;
+        const d = m.wx * m.wx + m.wy * m.wy;
+        if (d < best_d) {
+            best_d = d;
+            best = m;
         }
     }
-    try testing.expectApproxEqAbs(leaf_pitch, best, 0.05);
+    const first = best orelse return error.TestUnexpectedResult;
+    const cell = first.cell;
+    const at = w.field.pos[cell];
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 40, .cx = at.x, .cy = at.y }, p, 80);
+    const mid_field = w.field.pos[cell];
+    const mid_mark = coveringMark(&w, cell) orelse return error.TestUnexpectedResult;
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 160, .cx = at.x, .cy = at.y }, p, 200);
+    const late_field = w.field.pos[cell];
+    const late_mark = coveringMark(&w, cell) orelse return error.TestUnexpectedResult;
+
+    const df = (late_field.x - mid_field.x) * (late_field.x - mid_field.x) +
+        (late_field.y - mid_field.y) * (late_field.y - mid_field.y);
+    const dm = (late_mark.wx - mid_mark.wx) * (late_mark.wx - mid_mark.wx) +
+        (late_mark.wy - mid_mark.wy) * (late_mark.wy - mid_mark.wy);
+    try testing.expect(dm < 0.01);
+    try testing.expect(df < 1e-8);
+}
+
+test "the note you zoom into does not leave its neighbours" {
+    // Gluing the hovered/focused leaf to the parent centroid while siblings kept interpolating
+    // toward their layout slots made one note look like it was coalescing as you zoomed into it.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 4000);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 4000, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 40, .cx = 0, .cy = 0 }, .{ .budget = 2000 }, 200);
+
+    var a: ?Mark = null;
+    var b: ?Mark = null;
+    for (w.marks.items) |m| {
+        if (!m.is_note) continue;
+        if (a == null) {
+            a = m;
+            continue;
+        }
+        const da = a.?;
+        const d = (m.wx - da.wx) * (m.wx - da.wx) + (m.wy - da.wy) * (m.wy - da.wy);
+        if (d > 0.01 and (b == null or d < (b.?.wx - da.wx) * (b.?.wx - da.wx) + (b.?.wy - da.wy) * (b.?.wy - da.wy))) {
+            b = m;
+        }
+    }
+    const first = a orelse return error.TestUnexpectedResult;
+    const neighbor = b orelse return error.TestUnexpectedResult;
+    const at = w.field.pos[first.cell];
+    const rel_x = neighbor.wx - first.wx;
+    const rel_y = neighbor.wy - first.wy;
+
+    const focused: Params = .{ .focus_leaf = first.cell, .budget = 2000 };
+    try settle(&w, .{ .w = 900, .h = 600, .zoom = 160, .cx = at.x, .cy = at.y }, focused, 200);
+
+    const late_a = coveringMark(&w, first.cell) orelse return error.TestUnexpectedResult;
+    const late_b = coveringMark(&w, neighbor.cell) orelse return error.TestUnexpectedResult;
+    const dx = (late_b.wx - late_a.wx) - rel_x;
+    const dy = (late_b.wy - late_a.wy) - rel_y;
+    try testing.expect(dx * dx + dy * dy < 0.01);
 }
 
 test "an empty vault does not crash" {
@@ -1517,4 +2900,93 @@ test "clipSegment keeps what crosses the rect and drops what misses" {
     try testing.expect(clipSegment(-10, 200, 110, 200, 0, 0, 100, 100) == null);
     // Degenerate: a zero-length segment has no interior to keep.
     try testing.expect(clipSegment(50, 50, 50, 50, 0, 0, 100, 100) == null);
+}
+
+test "a world that has never been stepped reports no marks" {
+    // The crash this guards: a `World` is built the moment the note set changes, but `markIndex`
+    // has readers that run *before* the first `step` — `graph.interiorAnchor`, hit testing, the
+    // label placer. A never-written `Memo` is `.{ .stamp = 0, .of = fold.invalid }`, so while the
+    // epoch also started at 0 every cell in the vault reported a mark, and the index it reported
+    // was `fold.invalid`. `marks` is empty at that point, so the read landed 32 GB past a
+    // zero-length allocation and took the process with it (SIGBUS).
+    //
+    // It is reachable with three notes in a brand-new vault, which is why it went unnoticed: at
+    // any real size the panel had already stepped the world before anything asked.
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 3, 8, 64 }) |n| {
+        var w = try World.init(gpa, n, &.{}, &.{}, .{}, .{});
+        defer w.deinit();
+        try testing.expectEqual(@as(usize, 0), w.marks.items.len);
+        for (0..w.lad.cells.len) |c| {
+            try testing.expect(w.markIndex(@intCast(c)) == null);
+        }
+        // And out past the ladder, which is the branch that was already guarded.
+        try testing.expect(w.markIndex(@intCast(w.lad.cells.len)) == null);
+        try testing.expect(w.markIndex(fold.invalid) == null);
+    }
+}
+
+test "an index into marks is never handed out for a cell that has none" {
+    // The same invariant one level up, held across the frame boundary rather than only at init:
+    // after any step, every answer `markIndex` gives indexes a mark that is actually there, and
+    // it is that cell's own mark.
+    const gpa = testing.allocator;
+    const links = try chainLinks(gpa, 300);
+    defer gpa.free(links);
+    var w = try World.init(gpa, 300, links, &.{}, .{}, .{});
+    defer w.deinit();
+
+    const p: Params = .{ .budget = 60 };
+    var zoom: f32 = 1;
+    while (zoom <= 200) : (zoom *= 2) {
+        try w.step(.{ .w = 900, .h = 600, .zoom = zoom, .cx = 0, .cy = 0 }, p, 1.0 / 60.0);
+        for (0..w.lad.cells.len) |c| {
+            const mi = w.markIndex(@intCast(c)) orelse continue;
+            try testing.expect(mi < w.marks.items.len);
+            try testing.expectEqual(@as(u32, @intCast(c)), w.marks.items[mi].cell);
+        }
+    }
+}
+
+test "a vault of one to a handful of notes resolves to one mark each" {
+    // A brand-new vault is the smallest input this pipeline ever sees, and the least exercised:
+    // the ladder is one root over a couple of leaves, there are no links to lift, and the budget
+    // is never anywhere near binding. Asserted here because it is where a new user starts, and
+    // because it is the case that produced a crash — see the never-stepped test above.
+    //
+    // The bar is the same as at any size: after the crossfade settles, every note is drawn as
+    // itself, nothing is left standing in as a coalesced mass, and the notes are actually apart
+    // on screen rather than stacked at the centre.
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 3, 4, 5, 12 }) |n| {
+        var w = try World.init(gpa, n, &.{}, &.{}, .{}, .{});
+        defer w.deinit();
+
+        // Fit-to-extents, the framing the panel opens on.
+        const view: View = .{
+            .w = 900,
+            .h = 600,
+            .zoom = 500.0 / (2 * @max(w.extent(), 1)),
+            .cx = 0,
+            .cy = 0,
+        };
+        try settle(&w, view, .{ .budget = 280 }, 400);
+
+        try testing.expectEqual(n, w.marks.items.len);
+        for (w.marks.items) |m| {
+            try testing.expect(m.is_note);
+            try testing.expect(m.note < n);
+            try testing.expectApproxEqAbs(@as(f32, 1), m.alpha, 1e-3);
+        }
+
+        // No two notes on top of each other. One disc is `note_r_px` across, so anything closer
+        // than a diameter is overlapping ink rather than two readable notes.
+        for (w.marks.items, 0..) |a, i| {
+            for (w.marks.items[i + 1 ..]) |b| {
+                const dx = (a.wx - b.wx) * view.zoom;
+                const dy = (a.wy - b.wy) * view.zoom;
+                try testing.expect(@sqrt(dx * dx + dy * dy) > a.r + b.r);
+            }
+        }
+    }
 }

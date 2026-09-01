@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const sqlite = @import("sqlite");
 const Db = @import("Db.zig");
 const resolve = @import("resolve.zig");
+const relpath = @import("relpath.zig");
 const schema = @import("schema.zig");
 // Named import, not a relative sibling path: `vault_synth.zig` (the synthetic producer of this
 // same type) needs the named form since its own standalone test module is rooted narrower than
@@ -22,8 +23,18 @@ pub const Backlink = struct {
     title: []const u8,
     line: u32,
     col: u32,
+    /// The link as it was written: the target text of `[[Target|alias]]`, or the label of a
+    /// markdown link. Carried so the backlinks filter has something on the *mention* to match —
+    /// without it the only searchable text is the source note's path and title, which is not
+    /// what someone typing in that box is looking for.
+    raw: []const u8 = "",
+    /// The `|alias` of a piped wikilink, empty otherwise. Searched alongside `raw`, since the
+    /// alias is the text actually visible in the source note.
+    alias: []const u8 = "",
     /// Filled by the *view* when a row is drawn, not by the query — see `backlinks.contextFor`.
-    /// Empty until then.
+    /// Empty until then, which is why it is deliberately **not** part of what the filter
+    /// searches: a row's context exists only once it has been on screen, so filtering on it
+    /// would match a different set depending on how far you had scrolled.
     context: []const u8 = "",
 };
 
@@ -105,20 +116,35 @@ pub fn headingLine(db: *Db, path: []const u8, heading: []const u8) !u32 {
     var fold_buf: [512]u8 = undefined;
     if (heading.len > fold_buf.len) return 0;
     const folded = foldInto(&fold_buf, heading);
-    const line = try db.reader().one(
+    if (try db.reader().one(
         i64,
         "SELECT line FROM headings WHERE note_id = ? AND text_fold = ? LIMIT 1",
         .{},
         .{ id, folded },
-    );
-    return @intCast(line orelse 0);
+    )) |line| return @intCast(@max(line, 0));
+
+    // Not the heading as written — try it as a slug (`#habitat-and-range`), the form a portable
+    // markdown link into a section carries. One pass over this note's headings, only on the miss.
+    var stmt = try db.reader().prepare("SELECT text, line FROM headings WHERE note_id = ? ORDER BY line");
+    defer stmt.deinit();
+    var iter = try stmt.iterator(struct { text: []const u8, line: i64 }, .{id});
+    var row_buf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&row_buf);
+    while (true) {
+        fba.reset();
+        const row = (iter.nextAlloc(fba.allocator(), .{}) catch break) orelse break;
+        var text_fold: [512]u8 = undefined;
+        if (row.text.len > text_fold.len) continue;
+        if (headingMatches(row.text, folded, &text_fold)) return @intCast(@max(row.line, 0));
+    }
+    return 0;
 }
 
 /// Inbound edges for `dst_path`, ordered by source path then line — ready to group in the UI.
 pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]Backlink {
     const id = (try noteIdForPath(db, dst_path)) orelse return &.{};
     var stmt = try db.reader().prepare(
-        \\SELECT n.path, n.title, n.stem, l.line, l.col
+        \\SELECT n.path, n.title, n.stem, l.line, l.col, l.raw, l.alias
         \\FROM links l
         \\JOIN notes n ON n.id = l.src_id
         \\WHERE l.dst_id = ? AND n.phantom = 0
@@ -133,6 +159,8 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
         stem: []const u8,
         line: i64,
         col: i64,
+        raw: []const u8,
+        alias: []const u8,
     }, .{id});
     while (true) {
         const row = (try iter.nextAlloc(arena, .{})) orelse break;
@@ -142,6 +170,8 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
             .title = title,
             .line = @intCast(row.line),
             .col = @intCast(row.col),
+            .raw = row.raw,
+            .alias = row.alias,
         });
     }
     return list.toOwnedSlice(arena);
@@ -442,9 +472,22 @@ fn sectionByHeading(root_and_headings: []const content_graph.Item, heading: []co
     for (root_and_headings[1..], 1..) |n, i| {
         var nb: [512]u8 = undefined;
         if (n.text.len > nb.len) continue;
-        if (std.mem.eql(u8, foldInto(&nb, n.text), want)) return i;
+        if (headingMatches(n.text, want, &nb)) return i;
     }
     return null;
+}
+
+/// Does `heading_text` answer to the folded anchor `want`?
+///
+/// Two spellings of the same anchor have to match: a wikilink carries the heading *as written*
+/// (`#Habitat and Range`), a portable markdown link carries its GitHub slug
+/// (`#habitat-and-range`). Comparing folded text first and the slug second accepts both without
+/// the caller having to know which syntax the link came from — and without the slug form being
+/// able to match a *different* heading, since the slug is derived from this heading's own text.
+fn headingMatches(heading_text: []const u8, want: []const u8, fold_buf: []u8) bool {
+    if (std.mem.eql(u8, foldInto(fold_buf[0..heading_text.len], heading_text), want)) return true;
+    var slug_buf: [512]u8 = undefined;
+    return std.mem.eql(u8, relpath.headingAnchor(heading_text, &slug_buf), want);
 }
 
 pub const CompleteRow = struct {
@@ -453,8 +496,41 @@ pub const CompleteRow = struct {
     title: []const u8,
 };
 
+/// Exclusive upper bound of the byte range holding every string that starts with `p`.
+///
+/// `stem_fold LIKE 'ab%'` cannot use an index — sqlite's LIKE is case-insensitive by default,
+/// so the optimizer refuses the BINARY-collated `notes_stem_fold` and falls back to scanning
+/// every note, then sorts the survivors in a temp b-tree. On Simple English Wikipedia that is
+/// 286k rows per keystroke: ~270 ms of frozen UI, and constant in the prefix, so typing more
+/// never made it faster. The same match written as `stem_fold >= 'ab' AND stem_fold < 'ac'` is
+/// an index seek that stops after `limit` rows, because the values are pre-folded so a byte
+/// range *is* the case-folded prefix set. It also stops `%` and `_` in what the user typed from
+/// being read as wildcards.
+///
+/// Null when the prefix is all `0xFF` (no successor exists) — the caller then scans from the
+/// lower bound alone, which is still an index seek, just an open-ended one.
+fn prefixEnd(buf: []u8, p: []const u8) ?[]const u8 {
+    @memcpy(buf[0..p.len], p);
+    var i = p.len;
+    while (i > 0) : (i -= 1) {
+        if (buf[i - 1] != 0xFF) {
+            buf[i - 1] += 1;
+            return buf[0..i];
+        }
+    }
+    return null;
+}
+
+/// Longest prefix `complete` will match on. Anything longer matches nothing in a real vault.
+pub const max_prefix: usize = 512;
+
 /// Prefix match for `complete`. Returns up to `limit` notes whose stem/alias starts with `prefix`
 /// (ASCII-folded).
+///
+/// Ordered by the *folded* key rather than the display one so the ordering is the index's own
+/// and no sort is needed. That also makes the list case-insensitively alphabetical, which is
+/// what someone typing a prefix expects: `Ab Anar` next to `AB Aurigae`, not two runs split by
+/// capitalisation.
 pub fn complete(
     db: *Db,
     arena: std.mem.Allocator,
@@ -462,27 +538,43 @@ pub fn complete(
     limit: usize,
 ) ![]CompleteRow {
     if (limit == 0) return &.{};
-    var fold_buf: [512]u8 = undefined;
+    var fold_buf: [max_prefix]u8 = undefined;
     if (prefix.len > fold_buf.len) return &.{};
-    const folded = foldInto(&fold_buf, prefix);
-    const like = try std.fmt.allocPrint(arena, "{s}%", .{folded});
+    const lo = foldInto(&fold_buf, prefix);
+    var end_buf: [max_prefix]u8 = undefined;
+    const hi: ?[]const u8 = if (lo.len == 0) null else prefixEnd(&end_buf, lo);
 
     var list: std.ArrayList(CompleteRow) = .empty;
 
+    const Note = struct { stem: []const u8, path: []const u8, title: []const u8 };
     {
-        var stmt = try db.reader().prepare(
-            \\SELECT stem, path, title FROM notes
-            \\WHERE phantom = 0 AND stem_fold LIKE ?
-            \\ORDER BY stem LIMIT ?
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(
-            struct { stem: []const u8, path: []const u8, title: []const u8 },
-            .{ like, @as(i64, @intCast(limit)) },
-        );
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try list.append(arena, .{
+        // Two spellings of the same seek: bounded when the prefix has a successor, open-ended
+        // when it doesn't (empty prefix, or the 0xFF edge). Both are `SEARCH … USING INDEX
+        // notes_stem_fold`; splitting them keeps the range constraint literal rather than
+        // hiding it behind an `IS NULL` the optimizer would have to see through.
+        const n: i64 = @intCast(limit);
+        if (hi) |h| {
+            var stmt = try db.reader().prepare(
+                \\SELECT stem, path, title FROM notes
+                \\WHERE phantom = 0 AND stem_fold >= ? AND stem_fold < ?
+                \\ORDER BY stem_fold LIMIT ?
+            );
+            defer stmt.deinit();
+            var iter = try stmt.iterator(Note, .{ lo, h, n });
+            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
+                .target = row.stem,
+                .path = row.path,
+                .title = if (row.title.len > 0) row.title else row.stem,
+            });
+        } else {
+            var stmt = try db.reader().prepare(
+                \\SELECT stem, path, title FROM notes
+                \\WHERE phantom = 0 AND stem_fold >= ?
+                \\ORDER BY stem_fold LIMIT ?
+            );
+            defer stmt.deinit();
+            var iter = try stmt.iterator(Note, .{ lo, n });
+            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
                 .target = row.stem,
                 .path = row.path,
                 .title = if (row.title.len > 0) row.title else row.stem,
@@ -490,21 +582,32 @@ pub fn complete(
         }
     }
     if (list.items.len < limit) {
-        var stmt = try db.reader().prepare(
-            \\SELECT a.alias, n.path, n.title, n.stem FROM aliases a
-            \\JOIN notes n ON n.id = a.note_id
-            \\WHERE n.phantom = 0 AND a.alias_fold LIKE ?
-            \\ORDER BY a.alias LIMIT ?
-        );
-        defer stmt.deinit();
+        const Alias = struct { alias: []const u8, path: []const u8, title: []const u8, stem: []const u8 };
         const remain: i64 = @intCast(limit - list.items.len);
-        var iter = try stmt.iterator(
-            struct { alias: []const u8, path: []const u8, title: []const u8, stem: []const u8 },
-            .{ like, remain },
-        );
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try list.append(arena, .{
+        if (hi) |h| {
+            var stmt = try db.reader().prepare(
+                \\SELECT a.alias, n.path, n.title, n.stem FROM aliases a
+                \\JOIN notes n ON n.id = a.note_id
+                \\WHERE a.alias_fold >= ? AND a.alias_fold < ? AND n.phantom = 0
+                \\ORDER BY a.alias_fold LIMIT ?
+            );
+            defer stmt.deinit();
+            var iter = try stmt.iterator(Alias, .{ lo, h, remain });
+            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
+                .target = row.alias,
+                .path = row.path,
+                .title = if (row.title.len > 0) row.title else row.stem,
+            });
+        } else {
+            var stmt = try db.reader().prepare(
+                \\SELECT a.alias, n.path, n.title, n.stem FROM aliases a
+                \\JOIN notes n ON n.id = a.note_id
+                \\WHERE a.alias_fold >= ? AND n.phantom = 0
+                \\ORDER BY a.alias_fold LIMIT ?
+            );
+            defer stmt.deinit();
+            var iter = try stmt.iterator(Alias, .{ lo, remain });
+            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
                 .target = row.alias,
                 .path = row.path,
                 .title = if (row.title.len > 0) row.title else row.stem,
@@ -624,34 +727,106 @@ pub fn isMediaPath(name: []const u8) bool {
     return false;
 }
 
+pub const HeadingHit = struct {
+    text: []const u8,
+    /// `#` depth, 1-6. Carried so the completion list can show the outline's shape.
+    level: u32,
+    /// 0-based line, for a caller that wants to jump there.
+    line: u32,
+};
+
+/// The headings of one note whose text starts with — or contains — `prefix` (folded), for
+/// `[[Note#Section]]` completion.
+///
+/// Document order, not alphabetical: the list *is* the note's outline, and someone who has
+/// already picked the note is looking for a place in it. Filtered here rather than by a
+/// `text_fold` range the way `complete` does, because one note's headings are a handful of rows
+/// — the whole set costs one indexed seek on `headings_note` — and that buys a substring match,
+/// which is what finds "Habitat and range" from "range".
+pub fn completeHeadings(
+    db: *Db,
+    arena: std.mem.Allocator,
+    note_path: []const u8,
+    prefix: []const u8,
+    limit: usize,
+) ![]HeadingHit {
+    if (limit == 0) return &.{};
+    var fold_buf: [max_prefix]u8 = undefined;
+    if (prefix.len > fold_buf.len) return &.{};
+    const want = foldInto(&fold_buf, prefix);
+
+    const id = (try noteIdForPath(db, note_path)) orelse return &.{};
+    var stmt = try db.reader().prepare(
+        "SELECT text, text_fold, level, line FROM headings WHERE note_id = ? ORDER BY line",
+    );
+    defer stmt.deinit();
+
+    var list: std.ArrayList(HeadingHit) = .empty;
+    var iter = try stmt.iterator(struct {
+        text: []const u8,
+        text_fold: []const u8,
+        level: i64,
+        line: i64,
+    }, .{id});
+    while (try iter.nextAlloc(arena, .{})) |row| {
+        if (list.items.len >= limit) break;
+        if (want.len > 0 and std.mem.indexOf(u8, row.text_fold, want) == null) continue;
+        try list.append(arena, .{
+            .text = row.text,
+            .level = @intCast(@max(row.level, 1)),
+            .line = @intCast(@max(row.line, 0)),
+        });
+    }
+    return list.toOwnedSlice(arena);
+}
+
 /// Media rows whose name starts with `prefix` (folded), for `![[…]]` completion. Ordered by
 /// name so the list is stable between keystrokes.
 pub fn completeMedia(db: *Db, arena: std.mem.Allocator, prefix: []const u8, limit: usize) ![]CompleteRow {
     if (limit == 0) return &.{};
-    var fold_buf: [resolve.max_path_len]u8 = undefined;
+    var fold_buf: [max_prefix]u8 = undefined;
     if (prefix.len > fold_buf.len) return &.{};
-    const folded = foldInto(fold_buf[0..prefix.len], prefix);
-    const pattern = try std.fmt.allocPrint(arena, "{s}%", .{folded});
+    const lo = foldInto(&fold_buf, prefix);
+    var end_buf: [max_prefix]u8 = undefined;
+    const hi: ?[]const u8 = if (lo.len == 0) null else prefixEnd(&end_buf, lo);
 
+    // `name_fold LIKE ? OR stem_fold LIKE ?` could use neither index — the LIKE for the reason
+    // in `prefixEnd`, and the `OR` because one scan cannot satisfy two columns. Two index seeks
+    // unioned can: `UNION` (not `UNION ALL`) also does the dedupe a file matching on both its
+    // name and its stem needs. Each arm still sorts, but over the rows the prefix already
+    // narrowed it to rather than over every media row in the vault.
+    const Row = struct { path: []const u8, name_fold: []const u8 };
     var list: std.ArrayList(CompleteRow) = .empty;
-    var stmt = try db.reader().prepare(
-        \\SELECT path, name_fold FROM media
-        \\WHERE name_fold LIKE ? OR stem_fold LIKE ?
-        \\ORDER BY name_fold LIMIT ?
-    );
-    defer stmt.deinit();
-    var iter = try stmt.iterator(
-        struct { path: []const u8, name_fold: []const u8 },
-        .{ pattern, pattern, @as(i64, @intCast(limit)) },
-    );
-    while (true) {
-        const row = (try iter.nextAlloc(arena, .{})) orelse break;
-        const name = std.fs.path.basenamePosix(row.path);
-        // Basename (with extension) is both the typed target and the image alt text — same
-        // default the converter uses when an embed has no `|alias`.
-        try list.append(arena, .{ .target = name, .path = row.path, .title = name });
+    const n: i64 = @intCast(limit);
+    if (hi) |h| {
+        var stmt = try db.reader().prepare(
+            \\SELECT path, name_fold FROM media WHERE name_fold >= ? AND name_fold < ?
+            \\UNION
+            \\SELECT path, name_fold FROM media WHERE stem_fold >= ? AND stem_fold < ?
+            \\ORDER BY 2 LIMIT ?
+        );
+        defer stmt.deinit();
+        var iter = try stmt.iterator(Row, .{ lo, h, lo, h, n });
+        while (try iter.nextAlloc(arena, .{})) |row| try appendMedia(arena, &list, row.path);
+    } else {
+        var stmt = try db.reader().prepare(
+            \\SELECT path, name_fold FROM media WHERE name_fold >= ?
+            \\UNION
+            \\SELECT path, name_fold FROM media WHERE stem_fold >= ?
+            \\ORDER BY 2 LIMIT ?
+        );
+        defer stmt.deinit();
+        var iter = try stmt.iterator(Row, .{ lo, lo, n });
+        while (try iter.nextAlloc(arena, .{})) |row| try appendMedia(arena, &list, row.path);
     }
     return list.toOwnedSlice(arena);
+}
+
+/// Basename (with extension) is both the typed target and the image alt text — same default the
+/// converter uses when an embed has no `|alias`.
+fn appendMedia(arena: std.mem.Allocator, list: *std.ArrayList(CompleteRow), path: []const u8) !void {
+    const name = std.fs.path.basenamePosix(path);
+    try list.append(arena, .{ .target = name, .path = path, .title = name });
 }
 
 /// Media files as resolution candidates. Kept a separate list from `loadCandidates` rather

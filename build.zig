@@ -52,6 +52,18 @@ pub fn build(b: *std.Build) void {
     // records out, with no filesystem, no database, and no dvui, which is the whole reason
     // they're separate files from the plumbing that uses them.
     const test_step = b.step("test", "Run atlas's unit tests");
+
+    // `graph.zig` lives on the plugin module (it needs `core` / `fizzy_sdk` / `dvui`). Testing
+    // that module is how its tests run — today, that the vault-switch drop forgets hover,
+    // interior, camera, and the previous generation, which is what made simplewiki → fizzy a
+    // SEGV. The test is field-reset only and does not need a window.
+    {
+        const graph_tests = b.addTest(.{
+            .name = "atlas-graph-tests",
+            .root_module = plugin.module,
+        });
+        test_step.dependOn(&b.addRunArtifact(graph_tests).step);
+    }
     inline for (.{
         .{ "atlas-resolve-tests", "src/index/resolve.zig" },
         .{ "atlas-schema-tests", "src/index/schema.zig" },
@@ -68,9 +80,16 @@ pub fn build(b: *std.Build) void {
         // Positions derived from the fold ladder: children inside the parent's disc, one rule,
         // no force solve. Plain `Vec2`, so it stays headless too.
         .{ "atlas-containment-tests", "src/ui/containment.zig" },
-        // The living set: budgeted, view-culled, level-uniform select over the fold ladder,
-        // emitting screen-space marks. Replaces quadlod + quad_agents + lod.
-        .{ "atlas-world-tests", "src/ui/world.zig" },
+        // The drawing hierarchy built *from* positions rather than the other way round: Hilbert
+        // order, gap-defined chunking, true bottom-up bounds. Plain `Vec2`, headless.
+        .{ "atlas-spatial-tests", "src/ui/spatial.zig" },
+        // Modularity clustering over plain `Edge` pairs — no dvui, no vault types.
+        .{ "atlas-louvain-tests", "src/ui/louvain.zig" },
+        // Layout-shape grade: classifier, Procrustes displacement, bimodality. Headless.
+        .{ "atlas-shape-metrics-tests", "src/ui/shape_metrics.zig" },
+        // Variable-height row windowing for virtualized lists: two float arrays and a binary
+        // search, no dvui and no vault types.
+        .{ "atlas-vrun-tests", "src/ui/vrun.zig" },
     }) |entry| {
         const t = b.addTest(.{
             .name = entry[0],
@@ -82,6 +101,33 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+
+    // The living set: budgeted, view-culled, level-uniform select over the derived ladder,
+    // emitting screen-space marks. Needs `dvui` because it reads `leaf_pitch` from the layout,
+    // which speaks `dvui.Point` through `multilevel`; nothing here is graphical either.
+    const world_tests = b.addTest(.{
+        .name = "atlas-world-tests",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/ui/world.zig"),
+        }),
+    });
+    world_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+    test_step.dependOn(&b.addRunArtifact(world_tests).step);
+
+    // The link-gravity layout that owns note positions. Needs `dvui` only because
+    // `multilevel.solve` speaks `dvui.Point`; there is nothing graphical in here.
+    const layout_tests = b.addTest(.{
+        .name = "atlas-layout-tests",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/ui/layout.zig"),
+        }),
+    });
+    layout_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+    test_step.dependOn(&b.addRunArtifact(layout_tests).step);
 
     // Scanner uses the SDK wikilink tokenizer so it and the markdown renderer can't drift.
     const scanner_tests = b.addTest(.{
@@ -219,7 +265,7 @@ pub fn build(b: *std.Build) void {
         bench.root_module.addImport("content_graph", cg_for_bench);
         const run_bench = b.addRunArtifact(bench);
         if (b.args) |a| run_bench.addArgs(a);
-        b.step("bench", "Scan/resolve timings, --stats structure, --world LOD sweep").dependOn(&run_bench.step);
+        b.step("bench", "Scan/resolve timings, --stats, --world, --shapes, --stability").dependOn(&run_bench.step);
     }
 
     // MediaWiki dump -> a vault of markdown notes with the wikilinks intact. Standalone: it needs

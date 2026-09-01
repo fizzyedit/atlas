@@ -37,13 +37,15 @@ const log = std.log.scoped(.atlas);
 /// but a rebuild frame on a large vault outlives *many* commits (a full scan publishes every
 /// 200 files), so the ring wrapped and the arena backing the strings the layout was walking got
 /// freed underneath it. Counts alone are pointer-free; see `counts`.
-pub const SnapNode = struct {
+    pub const SnapNode = struct {
     id: i64,
     path: []const u8,
     title: []const u8,
     phantom: bool,
     /// Distinct neighbour count (in ∪ out). Drives node radius.
     degree: u32,
+    /// File size in bytes. 0 for phantoms / synth notes that did not set one.
+    size: u32 = 0,
 };
 
 pub const SnapEdge = struct {
@@ -73,6 +75,39 @@ pub const Snapshot = struct {
     /// its own multi-minute phase on a large vault, and reporting it as "building notes" leaves
     /// the count frozen on the last file for the whole of it — which reads as a hang.
     phase: Phase = .idle,
+    /// Notes rewritten since the previous published snapshot.
+    ///
+    /// The indexer already knows this — `indexPending` returns `unchanged` / `rewrote` / `structural`
+    /// per file and the incremental path uses it to scope the *relink*. It then threw it away, and
+    /// every consumer downstream re-derived it: the graph re-solves the whole vault on every
+    /// commit because a whole snapshot is all it is given, so a one-note edit costs the same
+    /// seconds a first open does.
+    ///
+    /// Only meaningful when `dirty_known` is true.
+    dirty: []const i64 = &.{},
+    /// Is `dirty` an exhaustive account of what changed?
+    ///
+    /// False after a full scan, and false after a *structural* change — a note appearing or
+    /// vanishing moves where other notes' links resolve, so the edit is not confined to the notes
+    /// that were written. A consumer must treat false as "assume everything moved".
+    dirty_known: bool = false,
+    /// True when this publish left the edge array identical to the previous one.
+    ///
+    /// A prose save rewrites a note's body and republishes, but its outbound links are the same
+    /// rows. The graph already knows that case as `job.settled`; this flag lets it skip the copy
+    /// of every edge *and* the world rebuild, rather than discovering the no-op after walking
+    /// 3.3M of them. Only meaningful when `dirty_known` is true — a structural publish reloads
+    /// everything and leaves this false.
+    edges_same: bool = false,
+};
+
+/// Pointer-free layout inputs, so the graph can decide "identity skip" without copying 73 MB.
+pub const LayoutPeek = struct {
+    dirty_known: bool = false,
+    edges_same: bool = false,
+    complete: bool = false,
+    node_n: usize = 0,
+    dirty_n: usize = 0,
 };
 
 pub const Phase = enum(u8) {
@@ -103,8 +138,19 @@ pub const CandidateSet = struct {
     /// Backs both slices. The owner deinits it; `undefined` is never a valid state here, so this
     /// type is only ever constructed by `buildCandidates`.
     arena: std.heap.ArenaAllocator,
+    /// Lookup tables over `notes`, built here on the worker so the UI thread never resolves a
+    /// link by scanning the vault. Without it every `[[…]]` the markdown renderer draws costs
+    /// four passes over every candidate. Measured at Simple English Wikipedia's 284k notes:
+    /// **5.7 ms per link** scanning versus **1.2 µs** through the index, so a 100-link article
+    /// costs 570 ms of stalled UI on the frame after each generation bump — and the generation
+    /// moves on every commit, so a background scan re-froze the document repeatedly.
+    ///
+    /// Notes only. Attachments are a few hundred entries even in a vault full of images, so an
+    /// index over them would cost more to build than the scan it replaces.
+    index: resolve.Index,
 
     pub fn deinit(self: *CandidateSet) void {
+        self.index.deinit();
         self.arena.deinit();
     }
 };
@@ -183,6 +229,16 @@ snapshots: [2]Snapshot = .{ .{}, .{} },
 snap_arenas: [2]?std.heap.ArenaAllocator = .{ null, null },
 snap_pub: std.atomic.Value(u8) = .init(0),
 snap_mutex: std.Io.Mutex = .init,
+/// Notes rewritten since the last publish, accumulated by whichever path did the writing and
+/// drained by `commitAndPublish` into the snapshot it builds. Worker-thread only.
+pending_dirty: std.ArrayListUnmanaged(i64) = .empty,
+/// Notes a *full scan* rewrote, and whether it saw anything a scoped relink cannot describe.
+/// Same distinction the incremental path keeps; see the relink decision in `runFullScan`.
+scan_rewrote: std.ArrayListUnmanaged(i64) = .empty,
+scan_structural: bool = false,
+/// Set when the change cannot be described by `pending_dirty` alone — a full scan, a structural
+/// edit, or a failure to record an id. Cleared on publish along with the list.
+pending_broad: bool = true,
 
 /// The candidate lists for the generation `commitAndPublish` is about to announce, waiting for the
 /// UI thread to claim them. Written by the worker under `cand_mutex` *before* the generation bump,
@@ -354,6 +410,8 @@ pub fn deinit(self: *Indexer) void {
     self.stop();
     self.dropResolveCache();
     self.pending.deinit(self.gpa);
+    self.pending_dirty.deinit(self.gpa);
+    self.scan_rewrote.deinit(self.gpa);
     for (&self.snap_arenas) |*slot| {
         if (slot.*) |*a| a.deinit();
         slot.* = null;
@@ -511,11 +569,26 @@ pub fn snapshotCopy(self: *Indexer, arena: std.mem.Allocator) !Snapshot {
     defer self.snap_mutex.unlock(dvui.io);
     const src = self.snapshots[self.snap_pub.load(.acquire)];
 
+    // One allocation for every string, not two per note.
+    //
+    // `dupe` per path and per title is 568,000 allocations on a 284k-note vault, every rebuild, on
+    // the UI thread — and the strings are read-only for the life of the copy, so there is nothing
+    // the separate allocations buy. Sizing one block and slicing it is the same bytes with the
+    // allocator called once.
+    var text_len: usize = 0;
+    for (src.nodes) |s| text_len += s.path.len + s.title.len;
+    const text = try arena.alloc(u8, text_len);
+    var at: usize = 0;
+
     const nodes = try arena.alloc(SnapNode, src.nodes.len);
     for (src.nodes, nodes) |s, *d| {
         d.* = s;
-        d.path = try arena.dupe(u8, s.path);
-        d.title = try arena.dupe(u8, s.title);
+        @memcpy(text[at..][0..s.path.len], s.path);
+        d.path = text[at..][0..s.path.len];
+        at += s.path.len;
+        @memcpy(text[at..][0..s.title.len], s.title);
+        d.title = text[at..][0..s.title.len];
+        at += s.title.len;
     }
     const edges = try arena.dupe(SnapEdge, src.edges);
 
@@ -528,7 +601,47 @@ pub fn snapshotCopy(self: *Indexer, arena: std.mem.Allocator) !Snapshot {
         .complete = src.complete,
         .scan_total = src.scan_total,
         .phase = src.phase,
+        .dirty = try arena.dupe(i64, src.dirty),
+        .dirty_known = src.dirty_known,
+        .edges_same = src.edges_same,
     };
+}
+
+/// The facts a layout rebuild needs to choose a path, without copying the snapshot.
+pub fn peekLayout(self: *Indexer) LayoutPeek {
+    self.snap_mutex.lockUncancelable(dvui.io);
+    defer self.snap_mutex.unlock(dvui.io);
+    const src = self.snapshots[self.snap_pub.load(.acquire)];
+    return .{
+        .dirty_known = src.dirty_known,
+        .edges_same = src.edges_same,
+        .complete = src.complete,
+        .node_n = src.nodes.len,
+        .dirty_n = src.dirty.len,
+    };
+}
+
+/// Deep-copy the dirty notes (and only those) into `arena`.
+pub fn copyDirtyNotes(self: *Indexer, arena: std.mem.Allocator) ![]SnapNode {
+    self.snap_mutex.lockUncancelable(dvui.io);
+    defer self.snap_mutex.unlock(dvui.io);
+    const src = self.snapshots[self.snap_pub.load(.acquire)];
+    if (src.dirty.len == 0 or src.nodes.len == 0) return &.{};
+
+    var want = std.AutoHashMap(i64, void).init(arena);
+    try want.ensureTotalCapacity(@intCast(src.dirty.len));
+    for (src.dirty) |id| try want.put(id, {});
+
+    var out: std.ArrayList(SnapNode) = .empty;
+    try out.ensureTotalCapacity(arena, src.dirty.len);
+    for (src.nodes) |s| {
+        if (!want.contains(s.id)) continue;
+        var d = s;
+        d.path = try arena.dupe(u8, s.path);
+        d.title = try arena.dupe(u8, s.title);
+        out.appendAssumeCapacity(d);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 // -- worker -----------------------------------------------------------------------
@@ -614,10 +727,20 @@ fn worker(self: *Indexer) void {
                             // than leave its edges parked on the `dst_id = src_id` stand-in.
                             structural = true;
                         };
+                        // The same fact, kept for the *consumers* rather than for the relink.
+                        // Failing to record it is not fatal here either — it only means the next
+                        // snapshot says "assume everything moved", which is what every snapshot
+                        // used to say.
+                        self.pending_dirty.append(self.gpa, id) catch {
+                            self.pending_broad = true;
+                        };
                     },
                     .structural => {
                         changed = true;
                         structural = true;
+                        // A note appeared or vanished, so where *other* notes' links resolve can
+                        // have moved. No list of written notes describes that.
+                        self.pending_broad = true;
                         // The note set (or the names resolution reads) moved.
                         self.dropResolveCache();
                     },
@@ -657,6 +780,10 @@ pub const ScanMode = enum {
 /// Public only so the headless harness (`bench --index`) can drive one scan on the calling
 /// thread and read `timings` afterwards. The app always reaches this through `worker`.
 pub fn runFullScan(self: *Indexer, io: std.Io, mode: ScanMode) !void {
+    // A full walk rewrites whatever it finds and relinks everything; no list of notes describes
+    // it. Set before the walk, not after, so a publish from *inside* the scan is broad too.
+    self.pending_broad = true;
+
     // Hand the UI whatever the *previous* session already indexed, before walking anything.
     //
     // A scan of a Wikipedia-scale vault runs for minutes, and until it publishes there is no
@@ -749,7 +876,12 @@ pub fn runFullScan(self: *Indexer, io: std.Io, mode: ScanMode) !void {
     // Anything real that we didn't see is gone from disk. A note deleted outside the editor is
     // its own kind of stale edge, so these count as changes too.
     const drop_start = self.markNs();
-    if (try self.dropMissing(&seen)) changed = true;
+    // A note that vanished is structural by definition: every `[[Name]]` that resolved to it now
+    // resolves somewhere else or nowhere, and no list of *edited* notes describes that.
+    if (try self.dropMissing(&seen)) {
+        changed = true;
+        self.scan_structural = true;
+    }
     if (try self.dropMissingMedia(&media_seen)) changed = true;
     self.timings.drop_ns = self.sinceNs(drop_start);
 
@@ -790,7 +922,29 @@ pub fn runFullScan(self: *Indexer, io: std.Io, mode: ScanMode) !void {
     // open of a large vault fast instead of a repeat of the first.
     if (self.quit.load(.acquire)) return;
     const relink_start = self.markNs();
-    if (changed) try self.relinkAll();
+    // Scoped when the walk only found edited notes.
+    //
+    // Re-opening a large vault re-resolved every link in it because *anything* changing set one
+    // boolean. On simplewiki that is 4.2 s of an 8.1 s warm open to answer a question about three
+    // files. `structural` is still the escape hatch and still means the full pass: a note appearing,
+    // vanishing or being renamed moves where *other* notes' links resolve, and nothing narrower is
+    // correct for that. A note whose own body changed moves only its own links.
+    //
+    // The drop pass above deletes notes that vanished, and it sets `changed` without going through
+    // `indexOne` — so a deletion has to count as structural, which `dropMissing` marks.
+    if (changed) {
+        if (self.scan_structural or self.scan_rewrote.items.len == 0) {
+            try self.relinkAll();
+        } else {
+            for (self.scan_rewrote.items) |id| {
+                _ = self.relinkNote(id) catch |err| {
+                    log.warn("relink note {d}: {s}", .{ id, @errorName(err) });
+                };
+            }
+        }
+    }
+    self.scan_rewrote.clearRetainingCapacity();
+    self.scan_structural = false;
     self.timings.relink_ns = self.sinceNs(relink_start);
 
     self.publishProgress(.publishing, 0, 0);
@@ -857,6 +1011,12 @@ fn walk(
     };
     defer dir.close(io);
 
+    // Files this directory has decided to read, held until there are enough to read together.
+    var batch: std.ArrayListUnmanaged(ReadAhead) = .empty;
+    defer batch.deinit(self.gpa);
+    var batch_bytes: usize = 0;
+    defer self.flushReads(io, &batch, &batch_bytes, changed) catch {};
+
     var rel_buf: [query.max_rel_path]u8 = undefined;
     var iter = dir.iterate();
     while (iter.next(io) catch null) |entry| {
@@ -872,7 +1032,12 @@ fn walk(
         if (sdk.host().isPathIgnored(self.vault_root, abs, entry.name, entry.kind)) continue;
 
         switch (entry.kind) {
-            .directory => try self.walk(io, abs, seen, media_seen, files_since_commit, last_commit, changed, report_progress),
+            .directory => {
+                // Flush before descending: the batch holds `abs` buffers this frame owns, and a
+                // subdirectory's own batch would otherwise interleave with them.
+                try self.flushReads(io, &batch, &batch_bytes, changed);
+                try self.walk(io, abs, seen, media_seen, files_since_commit, last_commit, changed, report_progress);
+            },
             .file => {
                 if (query.isMediaPath(entry.name)) {
                     // Attachments are recorded by path only — never opened, never parsed, and
@@ -893,11 +1058,30 @@ fn walk(
                 errdefer self.gpa.free(rel_owned);
                 try seen.put(self.gpa, rel_owned, {});
 
-                const outcome = self.indexOne(io, rel_owned) catch |err| blk: {
+                // Decide now, read later. `probeFile` is the cheap half — one `stat` and one
+                // index lookup — and it is what says whether the file needs reading at all, so a
+                // warm open still touches no file contents.
+                const probe = self.probeFile(io, rel_owned, abs) catch |err| blk: {
                     log.warn("index {s}: {s}", .{ rel_owned, @errorName(err) });
-                    break :blk .unchanged;
+                    break :blk Probe.unchanged;
                 };
-                if (outcome != .unchanged) changed.* = true;
+                switch (probe) {
+                    .unchanged => {},
+                    .deleted => {
+                        changed.* = true;
+                        self.scan_structural = true;
+                    },
+                    .read => |r| {
+                        var pend = r;
+                        // The batch outlives this iteration, so it needs its own copy of the path.
+                        pend.abs = try self.gpa.dupe(u8, abs);
+                        try batch.append(self.gpa, pend);
+                        batch_bytes += @intCast(r.size);
+                        if (batch.items.len >= read_batch_files or batch_bytes >= read_batch_bytes) {
+                            try self.flushReads(io, &batch, &batch_bytes, changed);
+                        }
+                    },
+                }
 
                 files_since_commit.* += 1;
                 const now = std.Io.Clock.boot.now(io).nanoseconds;
@@ -983,21 +1167,154 @@ pub fn indexBuffer(self: *Indexer, rel: []const u8, bytes: []const u8) !IndexOut
     return .{ .rewrote = (try lookupNoteMeta(db, rel) orelse return .structural).id };
 }
 
-fn indexOne(self: *Indexer, io: std.Io, rel: []const u8) !IndexOutcome {
-    const db = self.db orelse return .unchanged;
+/// Most files read ahead in one batch, and the most bytes those may hold.
+///
+/// A cold index of a large vault spends most of its time waiting on the disk one file at a time:
+/// 37.7 s of an 82 s first open, at ~120 us a file, which is what a small read costs when nothing
+/// overlaps it. Reads are independent, so a batch of them can be in flight at once and the latency
+/// stacks instead of queueing. The byte cap is the real bound — notes are usually a couple of KB
+/// but `max_file_bytes` allows 4 MB, and a batch of those would be gigabytes.
+const read_batch_files: usize = 512;
+const read_batch_bytes: usize = 32 * 1024 * 1024;
+/// Workers the read-ahead may use. More than the core count on purpose: these threads are waiting
+/// on the disk, not computing, so the useful number is set by how many reads the device will
+/// overlap rather than by how many cores there are.
+const read_threads: usize = 12;
 
-    const abs = try std.fs.path.join(self.gpa, &.{ self.vault_root, rel });
-    defer self.gpa.free(abs);
+/// One file the walk has decided it must read, from the `stat` and index lookup it already did.
+const ReadAhead = struct {
+    /// Borrowed from `seen`, which owns it for the length of the scan.
+    rel: []const u8,
+    /// Owned by the batch.
+    abs: []u8,
+    mtime_ns: i64,
+    size: i64,
+    known_id: i64,
+    known_hash: i64,
+    had_known: bool,
+    /// Filled by `ReadCtx`; null when the read failed and the file is skipped.
+    bytes: ?[]u8 = null,
+};
+
+/// Read every pending file, several at a time.
+///
+/// Workers touch only their own `ReadAhead` — no database, no shared counters — so there is nothing
+/// to synchronise. Failures leave `bytes` null and are skipped by the caller, exactly as a failed
+/// read was before.
+const ReadCtx = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    items: []ReadAhead,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn run(self: *ReadCtx) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.items.len) return;
+            const it = &self.items[i];
+            var file = std.Io.Dir.cwd().openFile(self.io, it.abs, .{}) catch continue;
+            defer file.close(self.io);
+            const buf = self.gpa.alloc(u8, @intCast(it.size)) catch continue;
+            const n = file.readPositionalAll(self.io, buf, 0) catch {
+                self.gpa.free(buf);
+                continue;
+            };
+            // A file that shrank between the stat and the read is not an error; take what is there.
+            it.bytes = buf[0..n];
+        }
+    }
+};
+
+/// Read every file in `batch` at once, then apply them in walk order.
+///
+/// The reads run on their own threads and touch nothing but their own entry. Applying — hashing,
+/// parsing, writing the row — stays here, in the order the walk found the files, because SQLite is
+/// not shared and because the outcome accounting must not depend on which read finished first.
+fn flushReads(
+    self: *Indexer,
+    io: std.Io,
+    batch: *std.ArrayListUnmanaged(ReadAhead),
+    batch_bytes: *usize,
+    changed: *bool,
+) !void {
+    defer {
+        for (batch.items) |it| {
+            if (it.bytes) |b| self.gpa.free(b.ptr[0..@as(usize, @intCast(it.size))]);
+            self.gpa.free(it.abs);
+        }
+        batch.clearRetainingCapacity();
+        batch_bytes.* = 0;
+    }
+    if (batch.items.len == 0) return;
+
+    const read_start = self.markNs();
+    var ctx: ReadCtx = .{ .io = io, .gpa = self.gpa, .items = batch.items };
+    if (batch.items.len < 4) {
+        ctx.run();
+    } else {
+        var handles: [read_threads]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < @min(read_threads, batch.items.len)) : (spawned += 1) {
+            handles[spawned] = std.Thread.spawn(.{}, ReadCtx.run, .{&ctx}) catch break;
+        }
+        // Whatever could not be spawned, this thread does — and it takes work from the same queue,
+        // so a failure to spawn costs parallelism and never correctness.
+        ctx.run();
+        for (handles[0..spawned]) |h| h.join();
+    }
+    self.timings.read_ns += self.sinceNs(read_start);
+
+    for (batch.items) |it| {
+        const bytes = it.bytes orelse continue; // read failed; already warned about, skip it
+        const outcome = self.applyFile(it, bytes) catch |err| blk: {
+            log.warn("index {s}: {s}", .{ it.rel, @errorName(err) });
+            break :blk IndexOutcome.unchanged;
+        };
+        switch (outcome) {
+            .unchanged => {},
+            .rewrote => |id| {
+                changed.* = true;
+                // The same accounting the incremental path keeps, so a walk that found a handful
+                // of edited notes can relink those instead of all 3.35M links.
+                self.scan_rewrote.append(self.gpa, id) catch {
+                    self.scan_structural = true;
+                };
+            },
+            .structural => {
+                changed.* = true;
+                self.scan_structural = true;
+            },
+        }
+    }
+}
+
+/// What the walk should do with one file, decided from its `stat` and the row we already have.
+const Probe = union(enum) {
+    /// Same mtime and size as the indexed row: nothing to read.
+    unchanged,
+    /// The file is gone. Structural — every link that resolved to it now resolves elsewhere.
+    deleted,
+    /// Must be read; the fields the apply step needs afterwards.
+    read: ReadAhead,
+};
+
+/// The cheap half of indexing one file: `stat`, and the index row if we have one.
+///
+/// Split out from `indexOne` so the *expensive* half — the read — can be batched and run several
+/// files at a time. Everything here touches the database, so it stays on the walk's own thread.
+fn probeFile(self: *Indexer, io: std.Io, rel: []const u8, abs: []u8) !Probe {
+    const db = self.db orelse return .unchanged;
 
     const stat_start = self.markNs();
     const st = std.Io.Dir.cwd().statFile(io, abs, .{}) catch {
         self.timings.stat_ns += self.sinceNs(stat_start);
-        // Gone — delete the real note row if we had one. The graph loses a node, and every link
-        // that pointed at it has to fall back to a phantom, so this is structural.
         try deleteNote(db, rel);
-        return .structural;
+        return .deleted;
     };
-    if (st.size > max_file_bytes) return .unchanged;
+    if (st.size > max_file_bytes) {
+        self.timings.stat_ns += self.sinceNs(stat_start);
+        return .unchanged;
+    }
     const mtime_ns: i64 = @truncate(st.mtime.nanoseconds);
     const size: i64 = @intCast(st.size);
 
@@ -1011,32 +1328,63 @@ fn indexOne(self: *Indexer, io: std.Io, rel: []const u8) !IndexOutcome {
     }
     self.timings.stat_ns += self.sinceNs(stat_start);
     self.timings.files_read += 1;
+    return .{ .read = .{
+        .rel = rel,
+        .abs = abs,
+        .mtime_ns = mtime_ns,
+        .size = size,
+        .known_id = if (known) |m| m.id else 0,
+        .known_hash = if (known) |m| m.hash else 0,
+        .had_known = known != null,
+    } };
+}
 
-    const read_start = self.markNs();
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, abs, self.gpa, .limited(max_file_bytes)) catch |err| {
-        log.warn("read {s}: {s}", .{ rel, @errorName(err) });
-        return .unchanged;
-    };
-    defer self.gpa.free(bytes);
-    self.timings.read_ns += self.sinceNs(read_start);
-
+/// The half that writes: hash the bytes, and store the note if they differ from what we had.
+fn applyFile(self: *Indexer, it: ReadAhead, bytes: []const u8) !IndexOutcome {
+    const db = self.db orelse return .unchanged;
     const hash: i64 = @bitCast(std.hash.XxHash3.hash(0, bytes));
-    if (known) |meta| {
-        if (meta.hash == hash) {
-            // Metadata catch-up only — this is the save landing on a buffer we already
-            // indexed (which stamped `mtime_ns = 0`). Nothing the graph draws moved.
-            try touchNote(db, meta.id, mtime_ns, size);
-            return .unchanged;
-        }
+    if (it.had_known and it.known_hash == hash) {
+        // Metadata catch-up only — this is the save landing on a buffer we already indexed
+        // (which stamped `mtime_ns = 0`). Nothing the graph draws moved.
+        try touchNote(db, it.known_id, it.mtime_ns, it.size);
+        return .unchanged;
     }
-    const has_aliases = try self.writeNote(db, rel, bytes, mtime_ns, size, hash);
+    const has_aliases = try self.writeNote(db, it.rel, bytes, it.mtime_ns, it.size, hash);
     // A file we already had: only its own links moved. A file we had not seen is a new node, and
     // links elsewhere may have been parked on a phantom waiting for it. Aliases are structural for
     // the reason spelled out in `indexBuffer`.
-    if (!has_aliases) {
-        if (known) |meta| return .{ .rewrote = meta.id };
-    }
+    if (!has_aliases and it.had_known) return .{ .rewrote = it.known_id };
     return .structural;
+}
+
+/// One file, read and applied on this thread. The path `indexPending` and the tests take; the walk
+/// goes through `probeFile` and a batched read instead.
+fn indexOne(self: *Indexer, io: std.Io, rel: []const u8) !IndexOutcome {
+    const abs = try std.fs.path.join(self.gpa, &.{ self.vault_root, rel });
+    defer self.gpa.free(abs);
+
+    const probe = try self.probeFile(io, rel, abs);
+    const it = switch (probe) {
+        .unchanged => return .unchanged,
+        .deleted => return .structural,
+        .read => |r| r,
+    };
+
+    const read_start = self.markNs();
+    var file = std.Io.Dir.cwd().openFile(io, abs, .{}) catch |err| {
+        log.warn("open {s}: {s}", .{ rel, @errorName(err) });
+        return .unchanged;
+    };
+    defer file.close(io);
+    const buf = self.gpa.alloc(u8, @intCast(it.size)) catch return .unchanged;
+    defer self.gpa.free(buf);
+    const n_read = file.readPositionalAll(io, buf, 0) catch |err| {
+        log.warn("read {s}: {s}", .{ rel, @errorName(err) });
+        return .unchanged;
+    };
+    self.timings.read_ns += self.sinceNs(read_start);
+
+    return self.applyFile(it, buf[0..n_read]);
 }
 
 /// Scan `bytes` and replace every derived row for `rel`. Shared by the disk and live-buffer
@@ -1389,7 +1737,7 @@ fn upsertMedia(self: *Indexer, rel: []const u8) !void {
 fn dropMissingMedia(self: *Indexer, seen: *std.StringHashMapUnmanaged(void)) !bool {
     return self.dropMissingRows(
         "SELECT id, path FROM media",
-        "DELETE FROM media WHERE id = ?",
+        .media,
         seen,
     );
 }
@@ -1410,7 +1758,7 @@ fn dropMissingMedia(self: *Indexer, seen: *std.StringHashMapUnmanaged(void)) !bo
 fn dropMissingRows(
     self: *Indexer,
     comptime select_sql: []const u8,
-    comptime delete_sql: []const u8,
+    comptime kind: enum { note, media },
     seen: *std.StringHashMapUnmanaged(void),
 ) !bool {
     const db = self.db orelse return false;
@@ -1437,13 +1785,21 @@ fn dropMissingRows(
     if (to_delete.items.len == 0) return false;
     if (self.quit.load(.acquire)) return false;
 
-    var stmt = try db.conn.prepare(delete_sql);
-    defer stmt.deinit();
+    // Prepared once for media, where the drop really is one statement. A note is not: see
+    // `retireNote`, which runs a handful of already-cached statements per row.
+    var stmt = if (kind == .media) try db.conn.prepare("DELETE FROM media WHERE id = ?") else {};
+    defer if (kind == .media) stmt.deinit();
 
     self.beginBatch();
     for (to_delete.items, 0..) |id, i| {
-        stmt.reset();
-        stmt.exec(.{}, .{id}) catch |err| {
+        const dropped = switch (kind) {
+            .note => retireNote(db, id),
+            .media => blk: {
+                stmt.reset();
+                break :blk stmt.exec(.{}, .{id});
+            },
+        };
+        dropped catch |err| {
             self.endBatch();
             return err;
         };
@@ -1465,7 +1821,7 @@ const drop_chunk: usize = 20_000;
 fn dropMissing(self: *Indexer, seen: *std.StringHashMapUnmanaged(void)) !bool {
     return self.dropMissingRows(
         "SELECT id, path FROM notes WHERE phantom = 0",
-        "DELETE FROM notes WHERE id = ?",
+        .note,
         seen,
     );
 }
@@ -1540,6 +1896,21 @@ pub fn commitAndPublish(self: *Indexer) !void {
     // Building the snapshot is a full read of every note and every link — seconds on a large
     // vault, and pure waste if the vault is being closed. The UI thread is joining this worker.
     if (self.quit.load(.acquire)) return;
+
+    // A scoped edit already has a complete snapshot in the ring. Patch that slot in place
+    // rather than reloading every note and every link from SQLite — the common save is one
+    // note's title and body, and walking 284k rows to republish it is the hitch the graph
+    // then has to skip a second time.
+    const dirty_known = !self.pending_broad;
+    if (dirty_known) {
+        if (try self.tryPatchPublished(db, self.pending_dirty.items)) {
+            self.pending_dirty.clearRetainingCapacity();
+            self.pending_broad = false;
+            _ = self.generation.fetchAdd(1, .release);
+            return;
+        }
+    }
+
     const next: u8 = (self.snap_pub.load(.acquire) + 1) & 1;
 
     // Recycling this slot frees the strings a reader may be part-way through copying, so the
@@ -1559,6 +1930,12 @@ pub fn commitAndPublish(self: *Indexer) !void {
 
     const nodes = try loadSnapNodes(db, arena);
     const edges = try loadSnapEdges(db, arena);
+    // Drained here rather than by the caller, so every path that publishes — incremental, full
+    // scan, or a future one — gets the same accounting without having to remember to.
+    const dirty = try arena.dupe(i64, self.pending_dirty.items);
+    const known = !self.pending_broad;
+    self.pending_dirty.clearRetainingCapacity();
+    self.pending_broad = false;
     const snap = Snapshot{
         .note_count = try countOf(db, "SELECT count(*) FROM notes WHERE phantom = 0"),
         // From the rows just read, not a second full scan of `links` for a number we hold.
@@ -1568,6 +1945,9 @@ pub fn commitAndPublish(self: *Indexer) !void {
         .edges = edges,
         .complete = true,
         .scan_total = self.scan_total.load(.acquire),
+        .dirty = dirty,
+        .dirty_known = known,
+        .edges_same = false,
     };
 
     // Same trip through the notes table, one thread earlier.
@@ -1632,7 +2012,11 @@ fn buildCandidates(self: *Indexer, db: *Db, gpa: std.mem.Allocator) !CandidateSe
         try query.loadCandidatesOn(&db.conn, a);
 
     const media = try query.loadMediaCandidatesOn(&db.conn, a);
-    return .{ .notes = notes, .media = media, .arena = arena };
+    // `gpa`, not the set's arena: `Index` owns hash maps and an arena of its own and frees them
+    // in `deinit`, which the arena's free-all would not reach.
+    var index = try resolve.Index.init(gpa, notes);
+    errdefer index.deinit();
+    return .{ .notes = notes, .media = media, .arena = arena, .index = index };
 }
 
 /// Deep-copy a candidate list into `a`. The strings are owned by the source arena, so a shallow
@@ -1671,6 +2055,163 @@ pub fn takeCandidates(self: *Indexer) ?CandidateSet {
     return set;
 }
 
+/// Patch the published snapshot in place for a prose save. Returns false when the change cannot
+/// be described that way — no complete snapshot yet, a note appeared or vanished, a dirty id the
+/// snapshot does not know, or *any* link changed — and the caller then takes the full reload.
+///
+/// Deliberately limited to saves that leave the edge array alone. Splicing a note's rows into the
+/// published edge list was tried: the list lives in that slot's arena, which is only recycled by a
+/// full publish, so every link edit added another copy of all 3.3M rows — tens of megabytes a
+/// save, for the length of the session. A link save has to re-solve the whole layout anyway
+/// (seconds), so the ~180 ms reload it falls back to is not the cost worth that.
+///
+/// Nothing is written until every check has passed, so a `false` return leaves the published
+/// snapshot exactly as it was rather than half-patched.
+///
+/// Holds `snap_mutex` for the whole patch so a concurrent `snapshotCopy` either sees the previous
+/// generation or the patched one, never a half-written slot.
+fn tryPatchPublished(self: *Indexer, db: *Db, dirty_ids: []const i64) !bool {
+    const pub_i = self.snap_pub.load(.acquire);
+    self.snap_mutex.lockUncancelable(dvui.io);
+    defer self.snap_mutex.unlock(dvui.io);
+
+    const snap = &self.snapshots[pub_i];
+    if (!snap.complete or snap.nodes.len == 0) return false;
+    if (self.snap_arenas[pub_i] == null) return false;
+    const arena = self.snap_arenas[pub_i].?.allocator();
+
+    var scratch_state = std.heap.ArenaAllocator.init(self.gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const db_n = (try db.conn.one(usize, "SELECT count(*) FROM notes", .{}, .{})) orelse 0;
+    if (db_n != snap.nodes.len) return false;
+
+    // `loadSnapNodes` orders by id, so a dirty note is a binary search rather than a hash map
+    // built over the whole vault on every save. A snapshot that is not sorted (a synthetic
+    // publish) simply fails the lookup and takes the full reload.
+    const at = try scratch.alloc(usize, dirty_ids.len);
+    for (dirty_ids, at) |id, *slot| slot.* = indexOfId(snap.nodes, id) orelse return false;
+
+    if (dirty_ids.len == 0) {
+        snap.dirty = &.{};
+        snap.dirty_known = true;
+        snap.edges_same = true;
+        snap.phase = .idle;
+        return true;
+    }
+
+    if (!try outboundUnchanged(db, scratch, snap.edges, dirty_ids)) return false;
+
+    // Load every replacement row before installing any of them, so a note that vanished between
+    // the write and this read cannot leave half the dirty set patched.
+    const fresh = try scratch.alloc(SnapNode, dirty_ids.len);
+    for (dirty_ids, fresh) |id, *slot| {
+        slot.* = (try loadOneSnapNode(db, arena, id)) orelse return false;
+    }
+    const nodes = @constCast(snap.nodes);
+    for (at, fresh) |idx, row| nodes[idx] = row;
+
+    snap.dirty = try arena.dupe(i64, dirty_ids);
+    snap.dirty_known = true;
+    snap.edges_same = true;
+    snap.phase = .idle;
+    return true;
+}
+
+/// Index of `id` in an id-sorted node array, or null when it is absent or the array is not sorted.
+fn indexOfId(nodes: []const SnapNode, id: i64) ?usize {
+    var lo: usize = 0;
+    var hi: usize = nodes.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const at = nodes[mid].id;
+        if (at == id) return mid;
+        if (at < id) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+fn loadOneSnapNode(db: *Db, arena: std.mem.Allocator, id: i64) !?SnapNode {
+    var stmt = try db.conn.prepare(
+        \\SELECT n.id, n.path, n.title, n.stem, n.phantom, n.size
+        \\FROM notes n WHERE n.id = ?
+    );
+    defer stmt.deinit();
+
+    var iter = try stmt.iterator(struct {
+        id: i64,
+        path: []const u8,
+        title: []const u8,
+        stem: []const u8,
+        phantom: i64,
+        size: i64,
+    }, .{id});
+    const row = (try iter.nextAlloc(arena, .{})) orelse return null;
+    const title = if (row.title.len > 0) row.title else row.stem;
+    return .{
+        .id = row.id,
+        .path = row.path,
+        .title = title,
+        .phantom = row.phantom != 0,
+        .degree = 0,
+        .size = @intCast(@max(row.size, 0)),
+    };
+}
+
+fn outboundUnchanged(
+    db: *Db,
+    arena: std.mem.Allocator,
+    edges: []const SnapEdge,
+    dirty_ids: []const i64,
+) !bool {
+    var dirty = std.AutoHashMap(i64, void).init(arena);
+    try dirty.ensureTotalCapacity(@intCast(dirty_ids.len));
+    for (dirty_ids) |id| try dirty.put(id, {});
+
+    var old_n = std.AutoHashMap(i64, u32).init(arena);
+    var old_h = std.AutoHashMap(i64, u64).init(arena);
+    try old_n.ensureTotalCapacity(@intCast(dirty_ids.len));
+    try old_h.ensureTotalCapacity(@intCast(dirty_ids.len));
+    for (dirty_ids) |id| {
+        try old_n.put(id, 0);
+        try old_h.put(id, 0);
+    }
+    for (edges) |e| {
+        if (!dirty.contains(e.src_id)) continue;
+        const n = old_n.getPtr(e.src_id).?;
+        const h = old_h.getPtr(e.src_id).?;
+        n.* += 1;
+        h.* +%= mix64(@as(u64, @bitCast(e.dst_id)));
+    }
+
+    for (dirty_ids) |id| {
+        var n: u32 = 0;
+        var h: u64 = 0;
+        var stmt = try db.conn.prepare("SELECT dst_id FROM links WHERE src_id = ?");
+        defer stmt.deinit();
+        var iter = try stmt.iterator(struct { dst_id: i64 }, .{id});
+        while (true) {
+            const row = (try iter.next(.{})) orelse break;
+            n += 1;
+            h +%= mix64(@as(u64, @bitCast(row.dst_id)));
+        }
+        if (n != (old_n.get(id) orelse 0)) return false;
+        if (h != (old_h.get(id) orelse 0)) return false;
+    }
+    return true;
+}
+
+fn mix64(v: u64) u64 {
+    var x = v;
+    x ^= x >> 33;
+    x *%= 0xff51afd7ed558ccd;
+    x ^= x >> 33;
+    x *%= 0xc4ceb9fe1a85ec53;
+    x ^= x >> 33;
+    return x;
+}
+
 fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
     // Degree = distinct neighbours via a UNION so a mutual link isn't counted twice.
     // No degree here. It used to be computed in SQL — first as a correlated `UNION` subquery per
@@ -1680,9 +2221,12 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
     // edge onto its unordered `(min,max)` pair to build its own edge list, which is precisely
     // "distinct neighbours (in ∪ out)", so it counts degree there in one pass over an array it has
     // in hand. `SnapNode.degree` survives for `publishSynthetic`, which is handed real degrees.
+    // `ORDER BY n.id` is not cosmetic: `tryPatchPublished` locates a dirty note by binary search
+    // over this array, and without it every prose save had to build a 284k-entry hash map first.
+    // The rows come off the primary key, so SQLite pays nothing to hand them over sorted.
     var stmt = try db.conn.prepare(
-        \\SELECT n.id, n.path, n.title, n.stem, n.phantom, 0 AS degree
-        \\FROM notes n
+        \\SELECT n.id, n.path, n.title, n.stem, n.phantom, 0 AS degree, n.size
+        \\FROM notes n ORDER BY n.id
     );
     defer stmt.deinit();
 
@@ -1700,6 +2244,7 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
         stem: []const u8,
         phantom: i64,
         degree: i64,
+        size: i64,
     }, .{});
     while (true) {
         const row = (try iter.nextAlloc(arena, .{})) orelse break;
@@ -1710,6 +2255,7 @@ fn loadSnapNodes(db: *Db, arena: std.mem.Allocator) ![]const SnapNode {
             .title = title,
             .phantom = row.phantom != 0,
             .degree = @intCast(@max(row.degree, 0)),
+            .size = @intCast(@max(row.size, 0)),
         });
     }
     return list.toOwnedSlice(arena);
@@ -1827,7 +2373,68 @@ fn upsertNote(
 }
 
 fn deleteNote(db: *Db, path: []const u8) !void {
-    try db.conn.exec("DELETE FROM notes WHERE path = ? AND phantom = 0", .{}, .{path});
+    const id = (try db.conn.one(
+        i64,
+        "SELECT id FROM notes WHERE path = ? AND phantom = 0",
+        .{},
+        .{path},
+    )) orelse return;
+    try retireNote(db, id);
+}
+
+/// Take one note out of the vault: its file is gone, deleted or renamed away.
+///
+/// Deliberately not a plain `DELETE FROM notes`. `links.dst_id` is `ON DELETE CASCADE`, so
+/// deleting the row destroys the *inbound* link rows along with it — rows that belong to other
+/// notes, the ones still saying `[[Old Name]]`. Those are only rebuilt when their own file is
+/// re-parsed, so a rename silently dropped every backlink to the old name until something
+/// incidental re-read the notes holding them, and the graph's picture of the vault depended on
+/// which files had happened to be re-read since. The old name then reappeared as a phantom, one
+/// note at a time, long after the rename.
+///
+/// So the row only goes when nothing points at it. When something does, it *becomes* the phantom
+/// those links resolve to — exactly the row `ensurePhantom` would insert for them, minus the
+/// churn of moving every edge onto a new id — which is what `enqueueDelete` has always promised:
+/// "inbound edges keep their phantoms so the graph still shows N notes pointed here". Writing the
+/// file again promotes this same row back through `upsertNote`'s stem lookup.
+fn retireNote(db: *Db, id: i64) !void {
+    // Everything derived from bytes that no longer exist, this note's own outbound links
+    // included. Inbound links are `dst_id` rows on *other* notes and are not ours to drop.
+    const st = try db.cached();
+    inline for (.{ "del_aliases", "del_headings", "del_links", "del_tags", "del_blocks" }) |name| {
+        const stmt = &@field(st, name);
+        stmt.reset();
+        try stmt.exec(.{}, .{id});
+    }
+
+    const inbound = (try db.conn.one(i64, "SELECT 1 FROM links WHERE dst_id = ? LIMIT 1", .{}, .{id})) != null;
+    if (!inbound) {
+        try db.conn.exec("DELETE FROM notes WHERE id = ?", .{}, .{id});
+        return;
+    }
+
+    // A phantom for this name may already exist — a link somewhere spelled it differently, or
+    // pointed at it before this note was written. Two phantoms sharing a stem draw as two nodes
+    // with the same name, so move the edges over and let this row go instead.
+    if (try db.conn.one(
+        i64,
+        \\SELECT p.id FROM notes p
+        \\JOIN notes n ON n.id = ?
+        \\WHERE p.phantom = 1 AND p.stem_fold = n.stem_fold LIMIT 1
+    ,
+        .{},
+        .{id},
+    )) |existing| {
+        try db.conn.exec("UPDATE links SET dst_id = ? WHERE dst_id = ?", .{}, .{ existing, id });
+        try db.conn.exec("DELETE FROM notes WHERE id = ?", .{}, .{id});
+        return;
+    }
+
+    try db.conn.exec(
+        "UPDATE notes SET path = '', title = stem, mtime_ns = 0, size = 0, hash = 0, phantom = 1 WHERE id = ?",
+        .{},
+        .{id},
+    );
 }
 
 /// `created` is raised when this call *inserts* a phantom row, i.e. when the note set grew. The
@@ -2266,4 +2873,296 @@ test "relinkNote resolves the edited note's links and leaves the rest alone" {
     };
     _ = try v.indexer.relinkNote(id);
     try testing.expectEqual(@as(usize, 2), try v.realEdgeCount());
+}
+
+test "a published snapshot says which notes were rewritten, and when it cannot" {
+    // The layout re-solves the whole vault on every commit because a whole snapshot is all it is
+    // handed — a one-note edit costs the seconds a first open does. The indexer has always known
+    // better: `indexPending` classifies every file and the incremental path already uses that to
+    // scope the *relink*. This is the same fact, carried as far as the consumers.
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+
+    // A body edit to an existing note: exactly the notes that were written, and nothing else.
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]] twice\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    var scoped_arena = std.heap.ArenaAllocator.init(gpa);
+    defer scoped_arena.deinit();
+    const scoped = try v.indexer.snapshotCopy(scoped_arena.allocator());
+    try testing.expect(scoped.dirty_known);
+    try testing.expectEqual(@as(usize, 1), scoped.dirty.len);
+    try testing.expectEqual(id, scoped.dirty[0]);
+
+    // Draining is what makes the account per-publish rather than cumulative — a second commit with
+    // nothing new must not re-report the first commit's note as dirty.
+    try v.indexer.commitAndPublish();
+    var empty_arena = std.heap.ArenaAllocator.init(gpa);
+    defer empty_arena.deinit();
+    const empty = try v.indexer.snapshotCopy(empty_arena.allocator());
+    try testing.expect(empty.dirty_known);
+    try testing.expect(empty.edges_same);
+    try testing.expectEqual(@as(usize, 0), empty.dirty.len);
+
+    // A structural change cannot be described by a list of written notes: a note appearing moves
+    // where *other* notes' links resolve. The snapshot has to say so rather than under-report.
+    v.indexer.pending_broad = true;
+    try v.indexer.commitAndPublish();
+    var broad_arena = std.heap.ArenaAllocator.init(gpa);
+    defer broad_arena.deinit();
+    const broad = try v.indexer.snapshotCopy(broad_arena.allocator());
+    try testing.expect(!broad.dirty_known);
+    try testing.expect(!broad.edges_same);
+}
+
+test "a prose save patches the snapshot and leaves edges in place" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+    try v.indexer.commitAndPublish();
+    var before_arena = std.heap.ArenaAllocator.init(gpa);
+    defer before_arena.deinit();
+    const before_snap = try v.indexer.snapshotCopy(before_arena.allocator());
+    const before = v.indexer.peekLayout();
+    try testing.expect(before.complete);
+    const edge_n = before_snap.edges.len;
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]] — more words\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    _ = try v.indexer.relinkNote(id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(peek.edges_same);
+    try testing.expectEqual(before.node_n, peek.node_n);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const dirty = try v.indexer.copyDirtyNotes(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), dirty.len);
+    try testing.expectEqual(id, dirty[0].id);
+    try testing.expect(std.mem.endsWith(u8, dirty[0].path, "README.md"));
+
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(edge_n, snap.edges.len);
+}
+
+test "adding a wikilink falls back to a full reload rather than a patch" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("Optics.md", "# Optics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+    try v.indexer.commitAndPublish();
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]] and [[Optics]]\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    _ = try v.indexer.relinkNote(id);
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(!peek.edges_same);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(@as(usize, 2), snap.edges.len);
+}
+
+test "removing a wikilink falls back to a full reload rather than counting as prose" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("Optics.md", "# Optics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]] and [[Optics]]\n");
+    try v.indexer.commitAndPublish();
+
+    var before_arena = std.heap.ArenaAllocator.init(gpa);
+    defer before_arena.deinit();
+    const before = try v.indexer.snapshotCopy(before_arena.allocator());
+    try testing.expectEqual(@as(usize, 2), before.edges.len);
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n\nsee [[Physics]]\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    _ = try v.indexer.relinkNote(id);
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(!peek.edges_same);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), snap.edges.len);
+    try testing.expectEqual(id, snap.edges[0].src_id);
+}
+
+test "removing every wikilink falls back to a full reload rather than counting as prose" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+
+    try v.write("Physics.md", "# Physics\n");
+    try v.write("README.md", "# Readme\n\nsee [[Physics]]\n");
+    try v.indexer.commitAndPublish();
+
+    const outcome = try v.indexer.indexBuffer("README.md", "# Readme\n");
+    const id = switch (outcome) {
+        .rewrote => |note_id| note_id,
+        else => return error.TestExpectedRewrote,
+    };
+    _ = try v.indexer.relinkNote(id);
+    v.indexer.pending_dirty.clearRetainingCapacity();
+    v.indexer.pending_broad = false;
+    try v.indexer.pending_dirty.append(gpa, id);
+    try v.indexer.commitAndPublish();
+
+    const peek = v.indexer.peekLayout();
+    try testing.expect(peek.dirty_known);
+    try testing.expect(!peek.edges_same);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const snap = try v.indexer.snapshotCopy(arena.allocator());
+    try testing.expectEqual(@as(usize, 0), snap.edges.len);
+}
+
+// A rename in the file explorer is two facts on disk — the old path is gone, the new one is
+// there — and the watcher hands both to the indexer as ordinary paths to re-read. What must not
+// survive it is a node under the old name: the old row has to leave the notes table, and every
+// link that pointed at the old name has to move (or become a phantom) rather than keep the old
+// row alive. Reported as "renaming a note leaves both names in the graph".
+test "renaming a note on disk leaves only the new name" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+    const io = v.threaded.io();
+
+    try v.tmp.dir.createDirPath(io, "vault");
+    const vault = try v.tmp.dir.realPathFileAlloc(io, "vault", gpa);
+    defer gpa.free(vault);
+    v.indexer.vault_root = vault;
+
+    var vd = try std.Io.Dir.cwd().openDir(io, vault, .{});
+    defer vd.close(io);
+    try vd.writeFile(io, .{ .sub_path = "Alpha.md", .data = "# Alpha\n" });
+    try vd.writeFile(io, .{ .sub_path = "Beta.md", .data = "# Beta\n\nsee [[Alpha]]\n" });
+
+    // Seeded through `indexOne` rather than `runFullScan`: the walk reads the clock, and
+    // `dvui.io` is not valid headlessly (see `markNs`). Same write path either way.
+    _ = try v.indexer.indexOne(io, "Alpha.md");
+    _ = try v.indexer.indexOne(io, "Beta.md");
+    try v.indexer.relinkAll();
+    try testing.expectEqual(@as(usize, 2), try v.noteCount());
+    try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
+
+    try vd.rename("Alpha.md", vd, "Gamma.md", io);
+
+    // Exactly what `Watcher.onPathsChanged` enqueues for a rename on macOS, where the halves
+    // arrive unpaired: the old path (delivered as `.deleted`) and the new one (`.created`),
+    // both as "re-read this".
+    _ = try v.indexer.indexOne(io, "Alpha.md");
+    _ = try v.indexer.indexOne(io, "Gamma.md");
+    try v.indexer.relinkAll();
+
+    // One note under the new name, and no second row under the old one.
+    try testing.expectEqual(@as(usize, 2), try v.noteCount());
+    try testing.expectEqual(
+        @as(usize, 0),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE path = 'Alpha.md'", .{}, .{})).?,
+    );
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE path = 'Gamma.md'", .{}, .{})).?,
+    );
+
+    // Beta still says `[[Alpha]]`, and that is a broken link, not a link that never existed:
+    // its row must survive the note it pointed at (see `retireNote`) and land on a phantom.
+    try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE phantom = 1 AND stem = 'Alpha'", .{}, .{})).?,
+    );
+
+    // And re-reading a backlink source later changes nothing. Before `retireNote`, the cascade
+    // had already destroyed Beta's row, so the phantom appeared only here — the graph grew a
+    // node under the old name minutes after the rename, whenever something touched Beta.
+    _ = try v.indexer.indexBuffer("Beta.md", "# Beta\n\nsee [[Alpha]]\n\nmore\n");
+    try v.indexer.relinkAll();
+    try testing.expectEqual(@as(usize, 2), try v.noteCount());
+    try testing.expectEqual(@as(usize, 1), try v.realEdgeCount());
+    try testing.expectEqual(
+        @as(usize, 1),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes WHERE phantom = 1", .{}, .{})).?,
+    );
+}
+
+// The other half of `retireNote`: when nothing points at the note, the row goes entirely rather
+// than lingering as a phantom nobody links to — which would draw as a node for a file that does
+// not exist and that no note mentions.
+test "deleting an unlinked note removes its row" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+    const io = v.threaded.io();
+
+    try v.tmp.dir.createDirPath(io, "vault");
+    const vault = try v.tmp.dir.realPathFileAlloc(io, "vault", gpa);
+    defer gpa.free(vault);
+    v.indexer.vault_root = vault;
+
+    var vd = try std.Io.Dir.cwd().openDir(io, vault, .{});
+    defer vd.close(io);
+    try vd.writeFile(io, .{ .sub_path = "Lonely.md", .data = "# Lonely\n" });
+    _ = try v.indexer.indexOne(io, "Lonely.md");
+    try testing.expectEqual(@as(usize, 1), try v.noteCount());
+
+    try vd.deleteFile(io, "Lonely.md");
+    _ = try v.indexer.indexOne(io, "Lonely.md");
+    try v.indexer.relinkAll();
+
+    try testing.expectEqual(@as(usize, 0), try v.noteCount());
+    try testing.expectEqual(
+        @as(usize, 0),
+        (try v.db.conn.one(usize, "SELECT count(*) FROM notes", .{}, .{})).?,
+    );
 }

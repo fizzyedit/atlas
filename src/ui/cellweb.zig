@@ -98,6 +98,56 @@ pub const CellWeb = struct {
     }
 };
 
+/// Workers the per-cell neighbour sort may use. Capped for the same reason the interior solves are:
+/// this runs behind an editor.
+const max_sort_threads: usize = 8;
+
+/// One worker's stripe of cells for the heaviest-first sort in `build`.
+const SortCtx = struct {
+    web: *CellWeb,
+    gpa: std.mem.Allocator,
+
+    fn range(self: *SortCtx, lo_cell: usize, hi_cell: usize) void {
+        var run: std.ArrayListUnmanaged(u64) = .empty;
+        defer run.deinit(self.gpa);
+        const web = self.web;
+        for (lo_cell..hi_cell) |u| {
+            const lo = web.start[u];
+            const hi = web.start[u + 1];
+            if (hi - lo < 2) continue;
+
+            if (hi - lo <= 24) {
+                var i = lo + 1;
+                while (i < hi) : (i += 1) {
+                    const nv = web.nbr[i];
+                    const wv = web.w[i];
+                    var j = i;
+                    while (j > lo and (web.w[j - 1] < wv or (web.w[j - 1] == wv and web.nbr[j - 1] > nv))) : (j -= 1) {
+                        web.nbr[j] = web.nbr[j - 1];
+                        web.w[j] = web.w[j - 1];
+                    }
+                    web.nbr[j] = nv;
+                    web.w[j] = wv;
+                }
+                continue;
+            }
+
+            // Weight in the high half, inverted so ascending integer order is descending weight; the
+            // neighbour id in the low half, so it breaks ties ascending for free. Sound because these
+            // weights are sums of positive weights, and positive floats order as their bit patterns do.
+            run.resize(self.gpa, hi - lo) catch continue;
+            for (run.items, web.nbr[lo..hi], web.w[lo..hi]) |*r, nv, wv| {
+                r.* = (@as(u64, ~@as(u32, @bitCast(wv))) << 32) | nv;
+            }
+            std.mem.sort(u64, run.items, {}, std.sort.asc(u64));
+            for (run.items, web.nbr[lo..hi], web.w[lo..hi]) |r, *nv, *wv| {
+                nv.* = @truncate(r);
+                wv.* = @bitCast(~@as(u32, @truncate(r >> 32)));
+            }
+        }
+    }
+};
+
 /// Aggregate `edges` (note ids) onto cells, level by level, and return the CSR.
 ///
 /// Ascending in lockstep would be wrong for an unbalanced ladder: a shallow leaf reaches its root
@@ -108,22 +158,31 @@ pub fn build(
     lad: *const fold.Ladder,
     edges: []const fold.Edge,
 ) !CellWeb {
+    const n_cells = lad.cells.len;
+    if (n_cells == 0) return .{};
+    const all = try climbPairs(gpa, lad, edges);
+    defer gpa.free(all);
+    return csrFromPairs(gpa, n_cells, all);
+}
+
+/// Lift note-level edges onto cell pairs at every level they survive.
+fn climbPairs(
+    gpa: std.mem.Allocator,
+    lad: *const fold.Ladder,
+    edges: []const fold.Edge,
+) ![]Pair {
     var all: std.ArrayListUnmanaged(Pair) = .empty;
-    defer all.deinit(gpa);
+    errdefer all.deinit(gpa);
     var cur: std.ArrayListUnmanaged(Pair) = .empty;
     defer cur.deinit(gpa);
     var next: std.ArrayListUnmanaged(Pair) = .empty;
     defer next.deinit(gpa);
 
-    const n_cells = lad.cells.len;
-    if (n_cells == 0) return .{};
+    if (lad.cells.len == 0 or edges.len == 0) return all.toOwnedSlice(gpa);
 
-    // One scratch buffer for every `dedupe` on the way up: level 0 is the widest, and each level
-    // above it is strictly smaller.
     const scratch = try gpa.alloc(Pair, edges.len);
     defer gpa.free(scratch);
 
-    // Level 0: note ids -> the leaf cell holding them.
     try cur.ensureTotalCapacity(gpa, edges.len);
     for (edges) |e| {
         if (e.a >= lad.leaf_cell.len or e.b >= lad.leaf_cell.len) continue;
@@ -139,7 +198,6 @@ pub fn build(
     cur.shrinkRetainingCapacity(dedupe(cur.items, scratch));
     try all.appendSlice(gpa, cur.items);
 
-    // Climb. `depth + 2` is a safety stop; a correct ladder collapses in `depth` rounds.
     var round: u32 = 0;
     while (cur.items.len > 0 and round < @as(u32, lad.depth) + 2) : (round += 1) {
         next.clearRetainingCapacity();
@@ -147,7 +205,7 @@ pub fn build(
         for (cur.items) |p| {
             const pu = if (lad.cells[p.u].parent == fold.invalid) p.u else lad.cells[p.u].parent;
             const pv = if (lad.cells[p.v].parent == fold.invalid) p.v else lad.cells[p.v].parent;
-            if (pu == pv) continue; // met at their LCA; nothing coarser can separate them
+            if (pu == pv) continue;
             next.appendAssumeCapacity(.{
                 .u = @min(pu, pv),
                 .v = @max(pu, pv),
@@ -158,17 +216,19 @@ pub fn build(
         try all.appendSlice(gpa, next.items);
         std.mem.swap(std.ArrayListUnmanaged(Pair), &cur, &next);
     }
+    return all.toOwnedSlice(gpa);
+}
 
-    // CSR, both directions.
+fn csrFromPairs(gpa: std.mem.Allocator, n_cells: usize, all: []const Pair) !CellWeb {
     var web: CellWeb = .{
         .start = try gpa.alloc(u32, n_cells + 1),
-        .nbr = try gpa.alloc(u32, all.items.len * 2),
-        .w = try gpa.alloc(f32, all.items.len * 2),
+        .nbr = try gpa.alloc(u32, all.len * 2),
+        .w = try gpa.alloc(f32, all.len * 2),
     };
     errdefer web.deinit(gpa);
     @memset(web.start, 0);
 
-    for (all.items) |p| {
+    for (all) |p| {
         web.start[p.u] += 1;
         web.start[p.v] += 1;
     }
@@ -178,11 +238,10 @@ pub fn build(
         s.* = acc;
         acc += c;
     }
-    // `start` now holds each cell's begin offset; use a scratch cursor so it survives the fill.
     const cursor = try gpa.alloc(u32, n_cells);
     defer gpa.free(cursor);
     @memcpy(cursor, web.start[0..n_cells]);
-    for (all.items) |p| {
+    for (all) |p| {
         web.nbr[cursor[p.u]] = p.v;
         web.w[cursor[p.u]] = p.w;
         cursor[p.u] += 1;
@@ -193,39 +252,43 @@ pub fn build(
     web.start[n_cells] = acc;
 
     // Heaviest first within each cell, so `link_scan_cap` truncates the least interesting tail
-    // rather than an arbitrary one. Sorting two parallel arrays means sorting an index permutation.
-    var order: std.ArrayListUnmanaged(u32) = .empty;
-    defer order.deinit(gpa);
-    var buf_n: std.ArrayListUnmanaged(u32) = .empty;
-    defer buf_n.deinit(gpa);
-    var buf_w: std.ArrayListUnmanaged(f32) = .empty;
-    defer buf_w.deinit(gpa);
-    for (0..n_cells) |u| {
-        const lo = web.start[u];
-        const hi = web.start[u + 1];
-        if (hi - lo < 2) continue;
-        const len = hi - lo;
-        order.clearRetainingCapacity();
-        try order.ensureTotalCapacity(gpa, len);
-        for (0..len) |k| order.appendAssumeCapacity(@intCast(k));
-        const S = struct {
-            ws: []const f32,
-            base: u32,
-            pub fn heavier(self: @This(), a: u32, b: u32) bool {
-                return self.ws[self.base + a] > self.ws[self.base + b];
-            }
-        };
-        std.mem.sortUnstable(u32, order.items, S{ .ws = web.w, .base = lo }, S.heavier);
-        buf_n.clearRetainingCapacity();
-        buf_w.clearRetainingCapacity();
-        try buf_n.ensureTotalCapacity(gpa, len);
-        try buf_w.ensureTotalCapacity(gpa, len);
-        for (order.items) |k| {
-            buf_n.appendAssumeCapacity(web.nbr[lo + k]);
-            buf_w.appendAssumeCapacity(web.w[lo + k]);
+    // rather than an arbitrary one.
+    //
+    // Sorted in place on the two parallel arrays. This used to sort an *index permutation* per cell
+    // through three `ArrayList`s and a comparator that indirected through the weight array, which
+    // on a Wikipedia-sized ladder is 353,000 small sorts and was 317-496 ms — more than the level
+    // climb and the CSR fill together, and the largest single item in a rebuild after clustering.
+    //
+    // Two shapes, because the runs are overwhelmingly short. A handful of neighbours is an
+    // insertion sort that moves both arrays together and allocates nothing; a long run is packed
+    // into one `u64` key so it sorts as plain integers with no comparator at all.
+    //
+    // Both break ties by neighbour id, which the old comparator did not: `link_scan_cap` truncates
+    // this list, so which of two equally-heavy neighbours survives was being decided by the sort's
+    // internal order. Now it is decided by the graph.
+    // Sorted in parallel: each cell's run is its own slice of `nbr`/`w`, so the workers share no
+    // writes. This was 214 ms of a 637 ms `cellweb.build` on a Wikipedia-sized ladder, and it is
+    // 353,000 independent sorts — the shape a thread pool exists for.
+    var ctx: SortCtx = .{ .web = &web, .gpa = gpa };
+    const want = @min(@max(std.Thread.getCpuCount() catch 1, 1), max_sort_threads);
+    if (want <= 1 or n_cells < 4096) {
+        ctx.range(0, n_cells);
+    } else {
+        var handles: [max_sort_threads]std.Thread = undefined;
+        var spawned: usize = 0;
+        const step = n_cells / want + 1;
+        var lo: usize = 0;
+        while (lo < n_cells) : (lo += step) {
+            const hi = @min(lo + step, n_cells);
+            handles[spawned] = std.Thread.spawn(.{}, SortCtx.range, .{ &ctx, lo, hi }) catch {
+                ctx.range(lo, hi);
+                continue;
+            };
+            spawned += 1;
+            if (spawned == max_sort_threads) break;
         }
-        @memcpy(web.nbr[lo..hi], buf_n.items);
-        @memcpy(web.w[lo..hi], buf_w.items);
+        if (spawned > 0 and lo < n_cells) ctx.range(lo, n_cells);
+        for (handles[0..spawned]) |h| h.join();
     }
 
     return web;

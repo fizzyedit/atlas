@@ -32,8 +32,8 @@ pub const SimSpec = struct {
 /// The six shapes exposed in the sidebar — `vault_synth.Shape` also has `lfr`, which needs a
 /// handful of extra community-model fields (`tau_degree`, `mu`, ...) this window doesn't expose;
 /// left out to keep the control set matching what the old Settings-pane knobs offered.
-const shape_choices: []const vault_synth.Shape = &.{ .scale_free, .islands, .hub, .bipartite, .chain, .orphans };
-const shape_labels: []const []const u8 = &.{ "scale-free", "islands", "hub", "bipartite", "chain", "orphans" };
+const shape_choices: []const vault_synth.Shape = &.{ .scale_free, .islands, .hub, .bipartite, .chain, .orphans, .motifs };
+const shape_labels: []const []const u8 = &.{ "scale-free", "islands", "hub", "bipartite", "chain", "orphans", "motifs" };
 
 /// Width of the numeric readout rows, in M-widths of the mono font — which is also why the rows
 /// are mono: with uniform digit widths a pinned width is exact rather than a guess, and the
@@ -203,6 +203,14 @@ fn regenWorker(job: *RegenJob) void {
                 "",
             .phantom = false,
             .degree = g.degrees[i],
+            // Degree-squared so a hub reads heavier than a stub; the salt spreads sizes
+            // inside an exclusive pair so gravity has a mass contrast to show.
+            .size = size: {
+                const d: u64 = g.degrees[i];
+                const salt: u64 = i % 5;
+                const bytes = 128 + d * d * 256 + salt * salt * 8_000;
+                break :size @intCast(@min(bytes, std.math.maxInt(u32)));
+            },
         };
     }
 
@@ -238,9 +246,11 @@ pub const Sim = struct {
     hex_lattice: bool = false,
     /// Live `containment.Options`, mirrored into `panel.place_opts` on edit. Starts at the
     /// no-overlap `radius_exp` rather than 0.5 so the spread fix is what you see first.
-    place: containment.Options = .{ .radius_exp = 0.619 },
+    place: containment.Options = .{ .radius_exp = 0.619, .gravity = true },
     /// Collapsed by default — five more sliders is a lot of sidebar when you only want a shape.
     show_tuning: bool = false,
+    /// Faint push-radius rings on living notes — gravity debug, off by default.
+    show_push: bool = false,
     /// The counters the sidebar is currently displaying, resampled every `readout_period_s`
     /// rather than every frame. A number that changes 120 times a second is unreadable, and
     /// re-measuring it is not why the readout exists.
@@ -267,6 +277,7 @@ pub const Sim = struct {
         // Match the sidebar's own starting value, or the first frame would draw the
         // area-conserving layout under a slider that says otherwise.
         p.place_opts.radius_exp = 0.619;
+        p.place_opts.gravity = true;
         return .{ .gpa = gpa, .panel = p };
     }
 
@@ -312,6 +323,11 @@ pub const Sim = struct {
             }
         }
         self.pollJob();
+        // Belt and braces with this file's `needsContinuousRepaint`, for the reason spelled out at
+        // the tail of `graph.drawPanel`: the host polls that hook before the draw, so it answers
+        // for the previous frame, while the debounce and the regen poll above are advanced by
+        // *this* one. Without either, the window sits on "regenerating" until the mouse moves.
+        if (self.job != null or self.reload_frames != null) dvui.refresh(null, @src(), null);
     }
 
     /// `.detach` leaves an unfinished worker to claim and free itself — right for an interactive
@@ -449,6 +465,12 @@ pub const Sim = struct {
             graph.invalidateWorld(&self.panel);
         }
 
+        if (dvui.checkbox(@src(), &self.place.gravity, "Gravity placement", .{ .margin = .{ .y = 4 } })) {
+            self.panel.place_opts = self.place;
+            graph.invalidateWorld(&self.panel);
+        }
+        _ = dvui.checkbox(@src(), &self.show_push, "Show push radii", .{ .margin = .{ .y = 2 } });
+
         self.drawTuning();
 
         if (self.job != null) {
@@ -550,6 +572,11 @@ pub const Sim = struct {
             .{ "Mass pull: {d:.2}", "mass_k", 0.0, 2.0, 0.05, "0 = links alone decide slots" },
             .{ "Island gap: {d:.2}", "pack_gap", 1.0, 12.0, 0.1, "air between top-level islands" },
             .{ "Island aspect: {d:.2}", "pack_aspect", 0.6, 2.5, 0.05, "horizontal stretch of the island pack" },
+            .{ "Gravity G: {d:.2}", "gravity_g", 0.02, 0.5, 0.01, "exclusive-link attraction" },
+            .{ "COM pull: {d:.3}", "gravity_com", 0.0, 0.15, 0.005, "weak centre-of-universe" },
+            .{ "Exclusive: {d:.2}", "exclusive_k", 0.0, 4.0, 0.05, "low-degree cells claim more space" },
+            .{ "Sibling push: {d:.2}", "sib_push", 0.4, 2.5, 0.05, "pair sits far; more siblings pack tighter" },
+            .{ "File mass: {d:.2}", "body_k", 0.0, 1.2, 0.05, "log(file size) extra push / inertia" },
         }, 0..) |k, i| {
             // Every iteration shares one `@src()`, so dvui would derive the same widget id for
             // all six — `id_extra` is what separates them. The slider's own internal label is
@@ -593,6 +620,29 @@ pub const Sim = struct {
         });
         defer box.deinit();
         try graph.drawPanel(&self.panel, &self.state);
+        if (self.show_push) self.drawPushRadii();
+    }
+
+    /// Faint rings at each living note's invisible push radius — the interior-entry gap.
+    fn drawPushRadii(self: *Sim) void {
+        const w = if (self.panel.world_state) |*ws| ws else return;
+        const cam = self.panel.camera;
+        const col = dvui.themeGet().color(.highlight, .fill).opacity(0.35);
+        for (w.marks.items) |m| {
+            if (!m.is_note) continue;
+            const sr = w.field.separationRadius(&w.lad, m.cell);
+            const r_px = sr * cam.zoom;
+            if (r_px < 2 or r_px > 400) continue;
+            const scr = cam.worldToScreen(.{ .x = m.wx, .y = m.wy });
+            const n_pts: usize = 24;
+            var pts: [25]dvui.Point.Physical = undefined;
+            for (0..n_pts + 1) |i| {
+                const a = std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_pts));
+                pts[i] = .{ .x = scr.x + @cos(a) * r_px, .y = scr.y + @sin(a) * r_px };
+            }
+            var path: dvui.Path = .{ .points = pts[0 .. n_pts + 1] };
+            path.stroke(.{ .color = col, .thickness = 1 });
+        }
     }
 };
 

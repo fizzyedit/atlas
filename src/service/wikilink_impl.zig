@@ -42,7 +42,7 @@ fn resolveFn(
         (if (source_path.len == 0) "" else source_path);
 
     var buf: [resolve.max_path_len]u8 = undefined;
-    const match = resolve.resolve(target, src_rel, cands, &buf) orelse {
+    const match = resolve.resolveIndexed(target, src_rel, cands, st.candidateIndex(), &buf) orelse {
         return .{ .status = .unresolved };
     };
 

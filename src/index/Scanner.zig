@@ -500,8 +500,15 @@ fn scanLine(
             if (parseMarkdownLink(line, i)) |md| {
                 if (resolve.isNoteLikeTarget(md.url)) {
                     const context = try arena.dupe(u8, line);
+                    // `raw` stays exactly as written (the backlinks filter searches it), but the
+                    // `#fragment` is also split out into `heading`, the same column a wikilink's
+                    // `#anchor` fills. Without that, a link into a section is indistinguishable
+                    // from a link to the whole note once it's in the DB — which is what left the
+                    // interior view's section-to-section edges wikilink-only.
+                    const frag = if (std.mem.indexOfScalar(u8, md.url, '#')) |h| md.url[h + 1 ..] else "";
                     try links.append(arena, .{
                         .raw = try arena.dupe(u8, md.url),
+                        .heading = try arena.dupe(u8, frag),
                         .alias = try arena.dupe(u8, md.text),
                         .kind = .markdown,
                         .line = line_no,
@@ -639,6 +646,10 @@ pub fn convertWikilinks(
     bytes: []const u8,
     src_rel: []const u8,
     candidates: []const resolve.Candidate,
+    /// Lookup tables over `candidates`; null falls back to scanning them. A document being
+    /// converted has as many links as it has, and each one would otherwise be a pass over the
+    /// whole vault — on a save, on the UI thread.
+    index: ?*const resolve.Index,
     media: []const resolve.Candidate,
 ) !?[]const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -667,7 +678,7 @@ pub fn convertWikilinks(
             fence_char = f.char;
             fence_len = f.len;
             try out.appendSlice(arena, line);
-        } else if (try convertLine(arena, &out, content, src_rel, candidates, media)) {
+        } else if (try convertLine(arena, &out, content, src_rel, candidates, index, media)) {
             changed = true;
             // `content` dropped a trailing `\r`; put it back so line endings survive.
             if (content.len != line.len) try out.appendSlice(arena, line[content.len..]);
@@ -695,6 +706,7 @@ fn convertLine(
     line: []const u8,
     src_rel: []const u8,
     candidates: []const resolve.Candidate,
+    index: ?*const resolve.Index,
     media: []const resolve.Candidate,
 ) !bool {
     var scratch: std.ArrayList(u8) = .empty;
@@ -720,6 +732,8 @@ fn convertLine(
                 if (embed) {
                     // The `!` sits before the slice we tokenized, so it is already in `scratch`
                     // (or is `tok.embed`'s own leading byte). Emit only the `[...](...)` part.
+                    // Media stays a linear scan: `index` covers notes, and there are few
+                    // enough attachments that building a second one would not pay for itself.
                     if (resolve.resolve(tok.target, src_rel, media, &buf)) |m| {
                         const label = if (tok.alias.len > 0) tok.alias else tok.target;
                         try writeMarkdownLink(arena, &scratch, label, media[m.index].path, src_rel, "");
@@ -728,7 +742,7 @@ fn convertLine(
                         continue;
                     }
                 } else if (resolve.isNoteLikeTarget(tok.target)) {
-                    if (resolve.resolve(tok.target, src_rel, candidates, &buf)) |m| {
+                    if (resolve.resolveIndexed(tok.target, src_rel, candidates, index, &buf)) |m| {
                         const label = if (tok.alias.len > 0) tok.alias else tok.target;
                         try writeMarkdownLink(arena, &scratch, label, candidates[m.index].path, src_rel, tok.heading);
                         i += tok.end;
@@ -1028,6 +1042,22 @@ test "local markdown links are recorded; http links are not" {
     }.body);
 }
 
+test "a markdown link's fragment is recorded as its heading" {
+    const src =
+        \\[Daphne > Habitat and Range](Daphne.md#habitat-and-range) and [plain](B.md)
+        \\
+    ;
+    try withScan(src, struct {
+        fn body(note: Note) !void {
+            try testing.expectEqual(@as(usize, 2), note.links.len);
+            // `raw` is still the destination exactly as written — the fragment is *also* split out.
+            try testing.expectEqualStrings("Daphne.md#habitat-and-range", note.links[0].raw);
+            try testing.expectEqualStrings("habitat-and-range", note.links[0].heading);
+            try testing.expectEqualStrings("", note.links[1].heading);
+        }
+    }.body);
+}
+
 test "non-note file links are not recorded as edges" {
     const src =
         \\[code](src/foo.zig) and [[bar.zig]] and [note](Idea) and [img](pic.png)
@@ -1249,7 +1279,7 @@ const conv_media = [_]resolve.Candidate{
 };
 
 fn convert(src: []const u8, src_rel: []const u8) !?[]const u8 {
-    return convertWikilinks(testing.allocator, src, src_rel, &conv_candidates, &conv_media);
+    return convertWikilinks(testing.allocator, src, src_rel, &conv_candidates, null, &conv_media);
 }
 
 fn expectConverted(src: []const u8, src_rel: []const u8, want: []const u8) !void {

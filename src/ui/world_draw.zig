@@ -30,6 +30,16 @@ pub const MarkStyle = struct {
     border: dvui.Color,
     r_px: f32,
     is_note: bool,
+    /// Vector dashed overlay. Open notes, hovered masses — see `galaxy.StyledMark`.
+    dashed: bool = false,
+    /// Redraw after fills so a piled-in disc stays visible.
+    on_top: bool = false,
+    /// Among overlay marks, paint this one last.
+    hover: bool = false,
+    /// Skip this mark. The interior sun replaces the overview node it grew out of, so that
+    /// node is omitted rather than crossfaded — two copies of the same ring fading past each
+    /// other is the dip that read as the ring disappearing.
+    omit: bool = false,
 };
 
 pub const DrawCtx = struct {
@@ -45,46 +55,37 @@ pub const DrawCtx = struct {
 
 pub const DrawStats = struct { notes_drawn: u32 = 0, clusters_drawn: u32 = 0, links_drawn: u32 = 0 };
 
-/// Ambient-web opacity, as a function of how many lines the web is drawing at once.
+/// How wide a web line is drawn, in the same tuned units everything else on the panel uses.
 ///
-/// A fixed opacity cannot serve both ends of the quality slider. Two hundred lines at the old flat
-/// 0.22 are a legible web; ten thousand at the same value are a grey wash that says only
-/// "everything touches everything" — and raising the quality slider is precisely how you ask for
-/// ten thousand. So the ink thins as the web thickens: the whole vault's connections can appear at
-/// once without drowning the marks, and as you zoom in and the viewport culls most of them away,
-/// the survivors darken until an individual link reads as a line you can follow.
+/// Scaled by the display, which it was not: the thickness went to `LineBatch` as a raw physical
+/// pixel count, so on a 2x screen the whole web was drawn half a logical pixel wide. A quad
+/// narrower than a pixel never covers one — the rasteriser gives it partial coverage that shifts
+/// as the line moves sub-pixel, and the blend against the background makes that read as the web
+/// shimmering. The colour was never the problem: `intoBg` returns an opaque mix, so a line is a
+/// solid colour and its *coverage* is what was flickering.
+const web_px: f32 = 1.0;
+/// The heaviest routes, against `web_px` for the lightest.
 ///
-/// Keyed on the *drawn* count — what survives the viewport — and not on the lifted count, which
-/// fills its budget at every zoom (a 300k sweep reports the full budget on every row) and so pinned
-/// the web at its faintest no matter how far in you were. Zoom alone is the wrong variable too: the
-/// same zoom is a wash on a hub vault and nearly empty on a sparse one, and the number that
-/// actually decides legibility is lines per screen.
-///
-/// The bounds are chosen so the shipped default lands where it already was: at `graph_detail`'s
-/// 360 the web is 900 lines, which comes out at ~0.26 against the 0.22 this replaced.
-const ambient_alpha_lit: f32 = 0.40;
-const ambient_alpha_wash: f32 = 0.08;
-/// At or below this many drawn lines the web is at full strength; at or above the second, at its
-/// faintest. Interpolated in log space, since what reads as "twice as busy" is a doubling.
-const ambient_lines_lit: f32 = 200;
-const ambient_lines_wash: f32 = 6000;
+/// A coalesced view is *all* routes between places — coalescing already removed the links inside
+/// one place — so "street versus highway" has nothing left to separate. What is left to separate is
+/// how much traffic a route carries, which is what a road map grades: a few thick trunk roads read
+/// as structure, and a field of eight hundred identical strokes reads as noise, even when it is the
+/// same eight hundred lines. Graded by weight against the frame's own median, so the scale follows
+/// the vault instead of a constant that only suits one.
+const web_px_heavy: f32 = 2.2;
+const web_ink_heavy: f32 = 1.5;
+const focus_web_px: f32 = 1.8;
 
-fn ambientAlpha(drawn: usize) f32 {
-    const n: f32 = @floatFromInt(@max(1, drawn));
-    const t = std.math.clamp(
-        @log2(n / ambient_lines_lit) / @log2(ambient_lines_wash / ambient_lines_lit),
-        0,
-        1,
-    );
-    return std.math.lerp(ambient_alpha_lit, ambient_alpha_wash, t);
-}
-
-/// Scale a colour's alpha by `t`, for the per-link crossfade.
-fn withAlpha(c: dvui.Color, t: f32) dvui.Color {
-    var out = c;
-    out.a = @intFromFloat(@as(f32, @floatFromInt(c.a)) * std.math.clamp(t, 0, 1));
-    return out;
-}
+/// Ambient-web mix. Constant, not a function of how many lines are on screen.
+///
+/// Density used to walk this toward the background as the viewport filled, so a zoom that
+/// added or culled lines recoloured *every* surviving edge. That was the flash. Overlaps
+/// already stay one shade (`intoBg` is opaque), so a dense web is a texture of this colour
+/// rather than a glow — there is nothing left for a count-based mix to do except pulse.
+const ambient_mix: f32 = 0.14;
+/// Focused-note links, also constant, and kept well above the ambient web so the answer to
+/// "what does this note connect to" stays the brightest lines on screen.
+const focus_mix: f32 = 0.55;
 
 /// dvui-typed wrapper over `world_mod.clipSegment`. Null when the segment misses `r` entirely.
 ///
@@ -140,6 +141,7 @@ pub fn draw(
     if (fade <= 0.004) return .{};
     const arena = dvui.currentWindow().arena();
     const theme = dvui.themeGet();
+    const bg = galaxy.panelFill(theme);
     const border_rest = theme.color(.window, .text);
 
     const toScreen = struct {
@@ -150,30 +152,76 @@ pub fn draw(
 
     var stats: DrawStats = .{};
 
-    // Links first so the web passes under the marks rather than over them.
-    if (w.links.items.len > 0) {
+    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return stats;
+    var n: usize = 0;
+    for (w.marks.items) |m| {
+        const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
+        const style = dctx.style(dctx.ctx, w, m, holds_open);
+        if (style.omit) continue;
+        // Split and merge stay continuous through pose, not through colour.
+        //
+        // `present` chases `anim`, slides a closing cell's children in toward their parent's
+        // centre, and shrinks the parent toward a note. Notes and masses share a fill, so
+        // overlapping discs read as one object becoming several — or several becoming one.
+        // Mixing each mark toward the window fill as `alpha` fell used to punch opaque holes
+        // in the parent: `intoBg` is opaque, so a dying child painted the background *over*
+        // the mass it was joining. Colour that has to change (a hovered note, an open one)
+        // walks to the shared rest fill in `overviewMarkStyle` instead.
+        buf[n] = .{
+            .screen = toScreen(cam, dctx, m),
+            .r_px = style.r_px,
+            .fill = style.fill,
+            .border = style.border,
+            .is_note = style.is_note,
+            .dying = false,
+            .dashed = style.dashed,
+            .on_top = style.on_top,
+            .hover = style.hover,
+        };
+        n += 1;
+        if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
+    }
+    const prepared = galaxy.prepareStyledMarks(&dens.soft, cam, fade, buf[0..n]);
+
+    // Web first, under every ring and fill, so overlapping discs merge on top of their
+    // connections rather than the lines cutting the outlines.
+    //
+    // The focused note's own links are drawn by this block too, and they are a *separate* set with
+    // a separate reason to exist — so the gate has to admit either one. Keyed on the ambient list
+    // alone, a frame whose lift produced no cell-to-cell web took the reader's highlighted
+    // connections down with it: the note stays drawn as itself, its neighbours stay drawn as
+    // themselves, and the lines between them simply are not there.
+    if (w.links.items.len > 0 or w.focus_links.items.len > 0) {
         // One pass over the marks instead of a scan per endpoint: the web is budgeted at 900 and
         // the marks at a few hundred, so the naive version was ~250k comparisons a frame.
-        var pos = std.AutoHashMapUnmanaged(u32, dvui.Point.Physical){};
-        defer pos.deinit(arena);
-        pos.ensureTotalCapacity(arena, @intCast(w.marks.items.len)) catch {};
-        for (w.marks.items) |m| {
-            pos.put(arena, m.cell, toScreen(cam, dctx, m)) catch {};
-        }
+        //
+        // A plain array parallel to `marks`, not a map: `World.markIndex` already answers
+        // "which mark is this cell's" from a dense stamped array, so the two lookups every link
+        // endpoint needs — 40,000 a frame at the top of the quality slider — are index reads.
+        const scr = arena.alloc(dvui.Point.Physical, w.marks.items.len) catch return stats;
+        defer arena.free(scr);
+        for (w.marks.items, scr) |m, *q| q.* = toScreen(cam, dctx, m);
 
         var batch = galaxy.LineBatch.init(arena);
-        // Ambient segments are collected before any are emitted, because their opacity depends on
-        // how many of them there turn out to be — and that is knowable only *after* culling. What
-        // falls as you zoom in is the number that survives the viewport, so that is what sets the
-        // ink.
-        var segs: std.ArrayListUnmanaged(struct {
+        var lit_segs: std.ArrayListUnmanaged(struct {
             a: dvui.Point.Physical,
             b: dvui.Point.Physical,
-            alpha: f32,
         }) = .empty;
-        defer segs.deinit(arena);
-        var lit = theme.color(.highlight, .fill);
-        lit.a = @intFromFloat(@as(f32, @floatFromInt(lit.a)) * 0.95 * fade);
+        defer lit_segs.deinit(arena);
+        const lit_base = theme.color(.highlight, .fill);
+        const ambient_t = ambient_mix * fade;
+        // Median weight of the ambient web this frame, for the stroke grading below. Nth-element
+        // over a scratch copy — the frame arena already holds the link list, and a full sort of ten
+        // thousand weights to read one of them is the kind of thing that ends up in a trace.
+        const w_median: f32 = blk: {
+            const count = w.links.items.len;
+            if (count == 0) break :blk 0;
+            const ws = arena.alloc(f32, count) catch break :blk 0;
+            for (ws, w.links.items) |*x, l| x.* = l.w;
+            std.mem.sort(f32, ws, {}, std.sort.asc(f32));
+            break :blk ws[count / 2];
+        };
+        const focus_t = focus_mix * fade;
 
         // Where a link's endpoint is, even when that endpoint has no mark this frame.
         //
@@ -197,13 +245,13 @@ pub fn draw(
         const standIn = struct {
             fn f(
                 world: *const world_mod.World,
-                live: std.AutoHashMapUnmanaged(u32, dvui.Point.Physical),
+                live: []const dvui.Point.Physical,
                 cell: u32,
             ) ?dvui.Point.Physical {
                 var c = cell;
                 var guard: u8 = 0;
                 while (c != world_mod.fold.invalid and guard < 64) : (guard += 1) {
-                    if (live.get(c)) |pt| return pt;
+                    if (world.markIndex(c)) |i| return live[i];
                     if (c >= world.lad.cells.len) return null;
                     c = world.lad.cells[c].parent;
                 }
@@ -216,10 +264,10 @@ pub fn draw(
                 world: *const world_mod.World,
                 c: *const Camera,
                 d: DrawCtx,
-                live: std.AutoHashMapUnmanaged(u32, dvui.Point.Physical),
+                live: []const dvui.Point.Physical,
                 cell: u32,
             ) ?dvui.Point.Physical {
-                if (live.get(cell)) |p| return p;
+                if (world.markIndex(cell)) |i| return live[i];
                 if (cell >= world.field.pos.len) return null;
                 const fp = world.field.pos[cell];
                 return c.worldToScreen(d.toWorld(d.ctx, .{ .x = fp.x, .y = fp.y }));
@@ -247,28 +295,54 @@ pub fn draw(
             //
             // That guard was a cheap stand-in for "is any of this on screen", and it is wrong at
             // exactly the moment the picture changes: when a node coalesces, the cells this link
-            // was lifted onto stop being marks *that frame*, so the line was dropped outright — it
-            // vanished, and only came back once the next lift rebuilt it against the new cut and
-            // its fade rose from zero, a second or more later. The crossfade in `fadeLinks` exists
-            // to make that transition continuous and never got the chance.
-            //
+            // was lifted onto stop being marks *that frame*, so the line was dropped outright.
             // Both endpoints are still *placed* (`field.pos` survives coalescing — the cell simply
             // sits inside its parent's disc now), so the line keeps a true position throughout and
             // `clipToRect` below is the honest test of whether any of it is visible. It is also
             // strictly more correct: a link between two off-screen cells whose segment crosses the
             // viewport used to be discarded by the guard and is now drawn, which is the whole point
             // of clipping rather than culling by endpoint.
-            const a = endpoint(w, cam, dctx, pos, l.a) orelse continue;
-            const b = endpoint(w, cam, dctx, pos, l.b) orelse continue;
+            const a = endpoint(w, cam, dctx, scr, l.a) orelse continue;
+            const b = endpoint(w, cam, dctx, scr, l.b) orelse continue;
             const seg = clipToRect(a, b, clip_rect) orelse continue;
-            segs.append(arena, .{ .a = seg.a, .b = seg.b, .alpha = l.alpha }) catch {};
-        }
-
-        // Now the count is known, so the ink can be mixed and the ambient web emitted.
-        var ink = border_rest;
-        ink.a = @intFromFloat(@as(f32, @floatFromInt(ink.a)) * ambientAlpha(segs.items.len) * fade);
-        for (segs.items) |seg| {
-            batch.add(seg.a, seg.b, 1.0, withAlpha(ink, seg.alpha));
+            // `alpha` carries the arrival and departure ramp — see `world.fadeLinks`. Mixing it
+            // into `ambient_t` walks the line between the web's ink and the panel colour, and
+            // because `panelFill` is the surface actually behind it, zero really is invisible.
+            //
+            // Dying links used to be skipped outright here, on the grounds that fading them was
+            // worse than blinking them: the mix targeted `.window.fill`, which is not the graph's
+            // backdrop, so a fade ended on a *different colour* instead of on nothing. That was a
+            // true observation about a broken target, not about crossfading.
+            // 0 at the median, 1 at four times it. Heavy-tailed weights, so the median is the
+            // honest middle and the cap stops one hub-to-hub aggregate owning the whole scale.
+            const grade = if (w_median > 0)
+                std.math.clamp((l.w / w_median - 1) / 3, 0, 1)
+            else
+                0;
+            // Arrive on the *split's* clock, not a clock of the web's own.
+            //
+            // `mul` is a cell's accumulated parent openness: 1 at rest, and ramping 0 -> 1 exactly
+            // while the parent that contains it is opening. `present` already slides the cell's
+            // pose out from that parent's centre over the same ramp, so both ends of a line born
+            // from a split begin *at the parent point* and travel outward. Keying the line's
+            // strength to the same number is what makes it extend to meet the notes instead of
+            // fading in beside them on an unrelated six-frame timer — and it costs two array reads,
+            // because the world computed it for the marks already.
+            //
+            // Runs in reverse on a merge, for free: as children retract into their parent, `mul`
+            // falls and their lines retract with them.
+            //
+            // Live links only. A ghost's cells may not have been walked for many frames, so its
+            // `mul` is whatever it was when the cut last touched it; departures stay on the
+            // crossfade, which is the thing that knows they are leaving.
+            var t = @min(ambient_t * std.math.clamp(l.alpha, 0, 1) *
+                std.math.lerp(@as(f32, 1), web_ink_heavy, grade), 1);
+            if (l.w > 0 and l.a < w.mul.len and l.b < w.mul.len) {
+                t *= @min(w.mul[l.a], w.mul[l.b]);
+            }
+            if (t <= 0.004) continue;
+            const px = std.math.lerp(web_px, web_px_heavy, grade);
+            batch.add(seg.a, seg.b, px * galaxy.dpiScale(), galaxy.intoBg(border_rest, bg, t));
             stats.links_drawn += 1;
         }
 
@@ -282,10 +356,10 @@ pub fn draw(
         for (w.focus_links.items) |fl| {
             const a_snap = focus_endpoints != .true_position;
             const b_snap = focus_endpoints == .stand_in;
-            const a = (if (a_snap) standIn(w, pos, fl.a) else null) orelse
-                endpoint(w, cam, dctx, pos, fl.a) orelse continue;
-            const b = (if (b_snap) standIn(w, pos, fl.b) else null) orelse
-                endpoint(w, cam, dctx, pos, fl.b) orelse continue;
+            const a = (if (a_snap) standIn(w, scr, fl.a) else null) orelse
+                endpoint(w, cam, dctx, scr, fl.a) orelse continue;
+            const b = (if (b_snap) standIn(w, scr, fl.b) else null) orelse
+                endpoint(w, cam, dctx, scr, fl.b) orelse continue;
             // This link's own reach, not the frame's: `World.stepFocusGrow` advances one value per
             // link, so clicking a new node leaves an already-extended connection where it is and
             // only the newly focused ones travel.
@@ -294,43 +368,41 @@ pub fn draw(
                 .x = a.x + (b.x - a.x) * fgrow,
                 .y = a.y + (b.y - a.y) * fgrow,
             };
-            // The whole line first, in ambient ink, and *then* the highlight sweeping along it.
+            // The unreached remainder in ambient colour, and the grown part in highlight — not
+            // both on top of each other.
             //
             // The reach used to draw only the lit part, growing from the note. That is right for a
             // connection which was not on screen — but at any zoom where the note is drawn as
             // itself, its links are already visible as ambient web. Clicking then handed them to
             // this pass, which drew nothing at `grow = 0`: a line that was plainly there vanished
-            // and grew back, which is the "connections show, disappear, and then animate" the
-            // reader kept hitting. Keeping the full line underneath means nothing is ever removed;
-            // the reveal is the *highlight* travelling out to the far end, which is also what the
-            // animation was trying to say in the first place.
-            if (clipToRect(a, b, clip_rect)) |whole| {
-                batch.add(whole.a, whole.b, 1.0, withAlpha(ink, 1));
+            // and grew back. Drawing the remainder keeps that line present. Drawing the two as
+            // *translucent* overlays used to mix orange-over-grey into yellow and red; splitting
+            // them means each pixel is one colour.
+            if (fgrow < 0.996 and ambient_t > 0.004) {
+                if (clipToRect(tip, b, clip_rect)) |rest| {
+                    batch.add(rest.a, rest.b, web_px * galaxy.dpiScale(), galaxy.intoBg(border_rest, bg, ambient_t));
+                    stats.links_drawn += 1;
+                }
+            }
+            if (fgrow <= 0.004) continue;
+            const seg = clipToRect(a, tip, clip_rect) orelse continue;
+            lit_segs.append(arena, .{ .a = seg.a, .b = seg.b }) catch {};
+        }
+
+        if (focus_t > 0.004) {
+            const lit = galaxy.intoBg(lit_base, bg, focus_t);
+            for (lit_segs.items) |seg| {
+                batch.add(seg.a, seg.b, focus_web_px * galaxy.dpiScale(), lit);
                 stats.links_drawn += 1;
             }
-            const seg = clipToRect(a, tip, clip_rect) orelse continue;
-            batch.add(seg.a, seg.b, 1.8, lit);
-            stats.links_drawn += 1;
         }
         batch.flush();
     }
 
-    const buf = arena.alloc(galaxy.StyledMark, w.marks.items.len) catch return stats;
-    var n: usize = 0;
-    for (w.marks.items) |m| {
-        const holds_open = dctx.holdsOpen(dctx.ctx, w, m);
-        const style = dctx.style(dctx.ctx, w, m, holds_open);
-        buf[n] = .{
-            .screen = toScreen(cam, dctx, m),
-            .r_px = style.r_px,
-            .fill = style.fill,
-            .border = style.border,
-            .is_note = style.is_note,
-            .dying = false,
-        };
-        n += 1;
-        if (style.is_note) stats.notes_drawn += 1 else stats.clusters_drawn += 1;
+    if (prepared) |stack| {
+        stack.drawRims();
+        stack.drawFills();
+        stack.drawOverlay();
     }
-    _ = galaxy.drawStyledMarks(&dens.soft, cam, fade, buf[0..n]);
     return stats;
 }

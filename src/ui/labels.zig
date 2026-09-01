@@ -83,6 +83,207 @@ pub const Placement = struct { slot: Slot, rect: Rect };
 /// doesn't wall off a whole quadrant of the panel from labels that never came near the line.
 pub const Segment = struct { a: Point, b: Point };
 
+
+/// A uniform grid over the panel holding, per cell, the link segments that pass through it.
+///
+/// The placer's collision test is "does this candidate rect cross a drawn link", and it used to
+/// answer that by walking every segment for every slot of every candidate. At the coalesce
+/// boundary — the zoom where every note has just resolved and the web is at its densest — that is
+/// tens of thousands of segments against a couple of hundred candidates times their slots, so the
+/// placer alone ran into the millions of segment/rect tests per frame, on every frame of a pan.
+///
+/// A label is small, so it covers a handful of cells and only the segments in those need testing.
+/// The answer is identical: `segmentHitsRect` still decides, this only decides who it is asked
+/// about. Missing a cell would let a name sit on a line, so the walk below is deliberately
+/// conservative — per column it takes the segment's exact y-span within that column, widened.
+pub const SegGrid = struct {
+    bounds: Rect,
+    cell: f32,
+    cols: u32,
+    rows: u32,
+    /// `starts[i]..starts[i+1]` indexes `items` for cell `i`.
+    starts: []u32,
+    items: []u32,
+
+    /// Sized against a label rather than against the panel: a name is roughly 120x24 px, so this
+    /// spans a few cells while keeping each cell's segment list short. Larger cells mean fewer
+    /// lookups but longer lists, and at the boundary the lists are what hurt. The total is capped
+    /// so a very large panel does not turn this into a big allocation.
+    const target_cell: f32 = 48;
+    const max_cells: u32 = 4096;
+
+    pub fn build(arena: std.mem.Allocator, bounds: Rect, segs: []const Segment) ?SegGrid {
+        if (segs.len == 0 or bounds.w <= 0 or bounds.h <= 0) return null;
+
+        var cell = target_cell;
+        var cols = spanCells(bounds.w, cell);
+        var rows = spanCells(bounds.h, cell);
+        while (cols * rows > max_cells) {
+            cell *= 2;
+            cols = spanCells(bounds.w, cell);
+            rows = spanCells(bounds.h, cell);
+        }
+
+        const n = cols * rows;
+        const starts = arena.alloc(u32, n + 1) catch return null;
+        @memset(starts, 0);
+
+        var g: SegGrid = .{
+            .bounds = bounds,
+            .cell = cell,
+            .cols = cols,
+            .rows = rows,
+            .starts = starts,
+            .items = &.{},
+        };
+
+        // `CellWalk` is supposed to stay inside the grid, but a leftover camera / world
+        // (simplewiki → fizzy) can feed infinities here. `starts[c + 1] += 1` past `n` is
+        // a byte write into unmapped memory — the SEGV that showed up as updateLabels → memcpy.
+        for (segs) |sg| {
+            var it = CellWalk.init(&g, sg);
+            while (it.next()) |c| {
+                if (c >= n) continue;
+                starts[c + 1] += 1;
+            }
+        }
+        for (1..n + 1) |i| starts[i] += starts[i - 1];
+
+        const items = arena.alloc(u32, starts[n]) catch return null;
+        const cursor = arena.alloc(u32, n) catch return null;
+        @memcpy(cursor, starts[0..n]);
+        for (segs, 0..) |sg, i| {
+            var it = CellWalk.init(&g, sg);
+            while (it.next()) |c| {
+                if (c >= n) continue;
+                items[cursor[c]] = @intCast(i);
+                cursor[c] += 1;
+            }
+        }
+        g.items = items;
+        return g;
+    }
+
+    fn spanCells(extent: f32, cell: f32) u32 {
+        return @max(1, @as(u32, @intFromFloat(@ceil(extent / cell))));
+    }
+
+    fn colOf(self: SegGrid, x: f32) u32 {
+        const i = (x - self.bounds.x) / self.cell;
+        if (i < 0) return 0;
+        const c: u32 = @intFromFloat(i);
+        return @min(c, self.cols - 1);
+    }
+
+    fn rowOf(self: SegGrid, y: f32) u32 {
+        const i = (y - self.bounds.y) / self.cell;
+        if (i < 0) return 0;
+        const r: u32 = @intFromFloat(i);
+        return @min(r, self.rows - 1);
+    }
+};
+
+/// The cells one segment passes through, column by column.
+const CellWalk = struct {
+    g: *const SegGrid,
+    seg: Segment,
+    /// Clipped to the grid; `done` when the segment never enters it.
+    min_x: f32,
+    max_x: f32,
+    cx: u32,
+    cx_end: u32,
+    ry: u32,
+    ry_end: u32,
+    done: bool,
+
+    /// How far the per-column y-span is widened, in pixels. A cell missed here is a name allowed
+    /// to sit on a link, so the rounding goes outward.
+    const slack: f32 = 2;
+
+    fn init(g: *const SegGrid, seg: Segment) CellWalk {
+        var w: CellWalk = .{
+            .g = g,
+            .seg = seg,
+            .min_x = 0,
+            .max_x = 0,
+            .cx = 0,
+            .cx_end = 0,
+            .ry = 1,
+            .ry_end = 0,
+            .done = true,
+        };
+        const b = g.bounds;
+        w.min_x = @max(@min(seg.a.x, seg.b.x), b.x);
+        w.max_x = @min(@max(seg.a.x, seg.b.x), b.x + b.w);
+        const min_y = @max(@min(seg.a.y, seg.b.y), b.y);
+        const max_y = @min(@max(seg.a.y, seg.b.y), b.y + b.h);
+        if (w.min_x > w.max_x or min_y > max_y) return w;
+
+        w.done = false;
+        // One before the first column: `next` advances and opens, so the walk has a single entry
+        // point instead of a special case for the first cell.
+        w.cx_end = g.colOf(w.max_x);
+        const first = g.colOf(w.min_x);
+        if (first == 0) {
+            w.cx = 0;
+            w.ry = 1;
+            w.ry_end = 0;
+            if (!w.openColumn()) w.done = true;
+            return w;
+        }
+        w.cx = first - 1;
+        w.ry = 1;
+        w.ry_end = 0;
+        return w;
+    }
+
+    fn openColumn(self: *CellWalk) bool {
+        if (self.cx > self.cx_end) return false;
+        const b = self.g.bounds;
+        const x0 = @max(b.x + @as(f32, @floatFromInt(self.cx)) * self.g.cell, self.min_x);
+        const x1 = @min(x0 + self.g.cell, self.max_x);
+
+        var y_lo: f32 = undefined;
+        var y_hi: f32 = undefined;
+        const dx = self.seg.b.x - self.seg.a.x;
+        const dy = self.seg.b.y - self.seg.a.y;
+        if (@abs(dx) < 1e-6) {
+            y_lo = @min(self.seg.a.y, self.seg.b.y);
+            y_hi = @max(self.seg.a.y, self.seg.b.y);
+        } else {
+            const ya = self.seg.a.y + dy * std.math.clamp((x0 - self.seg.a.x) / dx, 0, 1);
+            const yb = self.seg.a.y + dy * std.math.clamp((x1 - self.seg.a.x) / dx, 0, 1);
+            y_lo = @min(ya, yb);
+            y_hi = @max(ya, yb);
+        }
+        y_lo = @max(y_lo - slack, b.y);
+        y_hi = @min(y_hi + slack, b.y + b.h);
+        if (y_lo > y_hi) {
+            self.cx += 1;
+            return self.openColumn();
+        }
+        self.ry = self.g.rowOf(y_lo);
+        self.ry_end = self.g.rowOf(y_hi);
+        return true;
+    }
+
+    fn next(self: *CellWalk) ?u32 {
+        if (self.done) return null;
+        while (true) {
+            if (self.ry <= self.ry_end) {
+                const c = self.ry * self.g.cols + self.cx;
+                self.ry += 1;
+                return c;
+            }
+            self.cx += 1;
+            if (!self.openColumn()) {
+                self.done = true;
+                return null;
+            }
+        }
+    }
+};
+
 /// Greedy occupancy set for one frame. Linear scan on purpose: the caller caps how much can
 /// go in (a viewport only holds so many readable names), and a linear scan over a few hundred
 /// rects beats a spatial index that has to be rebuilt every frame anyway.
@@ -100,6 +301,9 @@ pub const Placer = struct {
     /// Link segments in screen space. A candidate whose padded rect crosses one is refused —
     /// same rule as a reserved bubble, just tested geometrically rather than as a rect.
     segs: []const Segment = &.{},
+    /// Spatial index over `segs`, when the caller built one. Optional: a small cloud is faster
+    /// tested linearly, and the interior view has no gathered web to index.
+    seg_grid: ?SegGrid = null,
     /// Half-thickness of the corridor around each segment, in the same space as `pad`.
     seg_pad: f32 = 0,
     /// Retry ignoring links when no slot avoids them. See `place`.
@@ -145,10 +349,30 @@ pub const Placer = struct {
         for (self.buf[0..self.n]) |o| {
             if (overlaps(o, padded)) return false;
         }
-        if (self.seg_pad > 0 or self.segs.len > 0) {
+        if (self.segs.len > 0) {
             const against = if (self.seg_pad > 0) padded.outsetAll(self.seg_pad) else padded;
-            for (self.segs) |s| {
-                if (segmentHitsRect(s.a, s.b, against)) return false;
+            if (self.seg_grid) |g| {
+                // Only the cells the candidate covers. A segment listed in two of them is simply
+                // tested twice, which is cheaper than de-duplicating.
+                const c0 = g.colOf(against.x);
+                const c1 = g.colOf(against.x + against.w);
+                const r0 = g.rowOf(against.y);
+                const r1 = g.rowOf(against.y + against.h);
+                var gy = r0;
+                while (gy <= r1) : (gy += 1) {
+                    var gx = c0;
+                    while (gx <= c1) : (gx += 1) {
+                        const cell = gy * g.cols + gx;
+                        for (g.items[g.starts[cell]..g.starts[cell + 1]]) |si| {
+                            const sg = self.segs[si];
+                            if (segmentHitsRect(sg.a, sg.b, against)) return false;
+                        }
+                    }
+                }
+            } else {
+                for (self.segs) |s| {
+                    if (segmentHitsRect(s.a, s.b, against)) return false;
+                }
             }
         }
         return true;
@@ -197,6 +421,8 @@ pub const Placer = struct {
             const saved = self.segs;
             self.segs = &.{};
             defer self.segs = saved;
+            // `fitsWithin` gates on `segs`, so the index goes quiet with it — left in place so the
+            // restore is one assignment and cannot get out of step with the segment list.
             return self.tryOrder(anchor, bubble_r, w, h, gap, order, sticky, self.bounds);
         }
         return null;
@@ -287,6 +513,76 @@ fn pointInRect(p: Point, r: Rect) bool {
 const testing = std.testing;
 
 const big_bounds: Rect = .{ .x = -1000, .y = -1000, .w = 2000, .h = 2000 };
+
+test "the segment grid accepts and rejects exactly what a linear walk does" {
+    // The index only decides *which* segments `segmentHitsRect` is asked about, so any disagreement
+    // is a cell the walk failed to visit — which shows up as a label sitting on a link, and only at
+    // the zooms where the web is dense enough for the index to be used at all.
+    var rng = std.Random.DefaultPrng.init(0x5117);
+    const r = rng.random();
+    const gpa = testing.allocator;
+
+    const bounds: Rect = .{ .x = -37, .y = 11, .w = 1200, .h = 700 };
+    const segs = try gpa.alloc(Segment, 900);
+    defer gpa.free(segs);
+    for (segs) |*sg| {
+        // A mix of short local links and long ones running well off the panel, which is what the
+        // per-column walk has to get right.
+        const ax = bounds.x + r.float(f32) * bounds.w;
+        const ay = bounds.y + r.float(f32) * bounds.h;
+        const reach: f32 = if (r.boolean()) 60 else 1800;
+        sg.* = .{
+            .a = .{ .x = ax, .y = ay },
+            .b = .{
+                .x = ax + (r.float(f32) * 2 - 1) * reach,
+                .y = ay + (r.float(f32) * 2 - 1) * reach,
+            },
+        };
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const grid = SegGrid.build(arena_state.allocator(), bounds, segs) orelse return error.NoGrid;
+    try testing.expectEqual(grid.cols * grid.rows + 1, grid.starts.len);
+
+    var buf: [1]Rect = undefined;
+    var linear = Placer.init(buf[0..0], bounds, 2);
+    linear.segs = segs;
+    linear.seg_pad = 3;
+    var indexed = linear;
+    indexed.seg_grid = grid;
+
+    var disagreements: usize = 0;
+    for (0..20_000) |_| {
+        const w = 20 + r.float(f32) * 160;
+        const h = 12 + r.float(f32) * 20;
+        const q: Rect = .{
+            .x = bounds.x + r.float(f32) * (bounds.w - w),
+            .y = bounds.y + r.float(f32) * (bounds.h - h),
+            .w = w,
+            .h = h,
+        };
+        if (linear.fits(q) != indexed.fits(q)) disagreements += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), disagreements);
+}
+
+test "the segment grid never writes a cell past starts" {
+    // Off-panel, inverted, and huge segments — the walk clips, and the cap in `build` is what
+    // makes a leftover Wikipedia-scale web against a tiny panel a no-op rather than an OOB store.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const bounds: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 120 };
+    const segs = [_]Segment{
+        .{ .a = .{ .x = -1e9, .y = -1e9 }, .b = .{ .x = 1e9, .y = 1e9 } },
+        .{ .a = .{ .x = 50, .y = 50 }, .b = .{ .x = 60, .y = 55 } },
+        .{ .a = .{ .x = 10_000, .y = 10_000 }, .b = .{ .x = 10_010, .y = 10_010 } },
+    };
+    const grid = SegGrid.build(arena_state.allocator(), bounds, &segs) orelse return error.NoGrid;
+    const n = grid.cols * grid.rows;
+    try testing.expectEqual(n + 1, grid.starts.len);
+    try testing.expect(grid.starts[n] <= segs.len * n);
+}
 
 test "slots are centred on / clear of the bubble" {
     const anchor: Point = .{ .x = 100, .y = 100 };

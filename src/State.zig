@@ -72,6 +72,10 @@ cand_ready: bool = false,
 cand_owned: ?Indexer.CandidateSet = null,
 cand_gen: u64 = std.math.maxInt(u64),
 candidates: []const resolve.Candidate = &.{},
+/// Lookup tables over `candidates`, for the **fallback** path only — the adopted set carries
+/// its own (`Indexer.CandidateSet.index`), built on the worker. Read through `candidateIndex`,
+/// which picks whichever of the two is live.
+cand_index: ?resolve.Index = null,
 /// Media (image) candidates, loaded from the same arena and generation as `candidates`.
 /// Separate list so an embed resolves against attachments and a plain wikilink against notes,
 /// with no precedence rule that could land `[[Target]]` on `Target.png`.
@@ -102,6 +106,8 @@ pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
     self.indexer_ready = false;
     if (self.cand_owned) |*set| set.deinit();
     self.cand_owned = null;
+    if (self.cand_index) |*ix| ix.deinit();
+    self.cand_index = null;
     if (self.cand_ready) self.cand_arena.deinit();
     self.cand_ready = false;
     self.clearDirty();
@@ -267,7 +273,7 @@ pub fn convertWikilinks(self: *State, arena: std.mem.Allocator, path: []const u8
     const media = try self.ensureMediaCandidates();
     const candidates = self.candidates;
     if (candidates.len == 0 and media.len == 0) return null;
-    return Scanner.convertWikilinks(arena, bytes, rel, candidates, media);
+    return Scanner.convertWikilinks(arena, bytes, rel, candidates, self.candidateIndex(), media);
 }
 
 /// The candidates for the current generation. Cheap once warm, and cheap to *become* warm — the
@@ -310,8 +316,22 @@ pub fn ensureCandidates(self: *State) ![]const resolve.Candidate {
     self.releaseCandidates();
     self.candidates = try query.loadCandidates(db, self.cand_arena.allocator());
     self.media_candidates = try query.loadMediaCandidates(db, self.cand_arena.allocator());
+    // Built here too, not just on the worker: this path is rare, but the callers below are the
+    // per-link ones, and "rare" is no reason to hand them a linear scan of the whole vault.
+    self.cand_index = resolve.Index.init(self.cand_arena.child_allocator, self.candidates) catch null;
     self.cand_gen = gen;
     return self.candidates;
+}
+
+/// Lookup tables for `resolve.resolveIndexed` over the current `candidates`, or null when there
+/// are none — in which case resolution falls back to scanning, which is correct and slow.
+///
+/// Borrowed: valid only until the next `ensureCandidates` adopts a newer set, so call it after
+/// `ensureCandidates` and don't hold it across one.
+pub fn candidateIndex(self: *State) ?*const resolve.Index {
+    if (self.cand_owned) |*set| return &set.index;
+    if (self.cand_index) |*ix| return ix;
+    return null;
 }
 
 /// Drop whatever backs the current lists — the adopted set, the fallback arena, or neither — and
@@ -319,6 +339,8 @@ pub fn ensureCandidates(self: *State) ![]const resolve.Candidate {
 fn releaseCandidates(self: *State) void {
     if (self.cand_owned) |*set| set.deinit();
     self.cand_owned = null;
+    if (self.cand_index) |*ix| ix.deinit();
+    self.cand_index = null;
     if (self.cand_ready) _ = self.cand_arena.reset(.free_all);
     self.candidates = &.{};
     self.media_candidates = &.{};
@@ -425,9 +447,10 @@ pub fn dirtyBacklinks(
         defer scan_arena.deinit();
         const note = Scanner.scan(scan_arena.allocator(), e.value_ptr.*) catch continue;
         const cands = try self.ensureCandidates();
+        const ix = self.candidateIndex();
 
         for (note.links) |l| {
-            const match = resolve.resolve(l.raw, src_rel, cands, &path_buf) orelse continue;
+            const match = resolve.resolveIndexed(l.raw, src_rel, cands, ix, &path_buf) orelse continue;
             if (!std.mem.eql(u8, cands[match.index].path, dst_rel)) continue;
             const title = query.stemOf(src_rel);
             try list.append(arena, .{
@@ -435,6 +458,8 @@ pub fn dirtyBacklinks(
                 .title = try arena.dupe(u8, title),
                 .line = l.line,
                 .col = l.col,
+                .raw = try arena.dupe(u8, l.raw),
+                .alias = try arena.dupe(u8, l.alias),
                 .context = try arena.dupe(u8, l.context),
             });
         }

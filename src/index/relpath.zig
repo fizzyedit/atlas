@@ -67,6 +67,59 @@ pub fn formatLink(allocator: std.mem.Allocator, title: []const u8, rel_path: []c
     return std.fmt.allocPrint(allocator, "[{s}]({s})", .{ safe_title, enc });
 }
 
+/// `[Title > Heading](encoded/rel/path.md#anchor)` — a link into a section of another note.
+///
+/// The fragment is the GitHub heading slug (see `headingAnchor`), so the link lands on the
+/// section in any renderer that follows that convention. fizzy's own preview currently strips
+/// the fragment and opens the note at the top; when it learns heading→line, the same links start
+/// jumping without anything being rewritten.
+pub fn formatHeadingLink(
+    allocator: std.mem.Allocator,
+    title: []const u8,
+    heading: []const u8,
+    rel_path: []const u8,
+) ![]u8 {
+    var enc_buf: [1024]u8 = undefined;
+    const enc = try encodeUrlPath(rel_path, &enc_buf);
+    var title_buf: [256]u8 = undefined;
+    const safe_title = sanitizeTitle(title, &title_buf);
+    var heading_buf: [256]u8 = undefined;
+    const safe_heading = sanitizeTitle(heading, &heading_buf);
+    var anchor_buf: [512]u8 = undefined;
+    const anchor = headingAnchor(heading, &anchor_buf);
+    return std.fmt.allocPrint(allocator, "[{s} > {s}]({s}#{s})", .{ safe_title, safe_heading, enc, anchor });
+}
+
+/// GitHub's heading slug: lowercased, punctuation dropped, runs of whitespace collapsed to a
+/// single `-`. Truncated (never split mid-escape — there are none) when it doesn't fit `buf`.
+///
+/// Not percent-encoded: every byte it emits is already URL-safe, and non-ASCII passes through
+/// lowercased-as-is, which is what GitHub does with a Unicode heading.
+pub fn headingAnchor(heading: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    var pending_dash = false;
+    for (heading) |c| {
+        if (c == ' ' or c == '\t' or c == '-' or c == '_') {
+            // A separator only becomes a `-` once something follows it, so the slug never
+            // leads or trails with one.
+            if (n > 0) pending_dash = true;
+            continue;
+        }
+        const keep = std.ascii.isAlphanumeric(c) or c >= 0x80;
+        if (!keep) continue;
+        if (pending_dash) {
+            if (n >= buf.len) break;
+            buf[n] = '-';
+            n += 1;
+            pending_dash = false;
+        }
+        if (n >= buf.len) break;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 fn sanitizeTitle(title: []const u8, buf: []u8) []const u8 {
     var n: usize = 0;
     for (title) |c| {
@@ -127,4 +180,18 @@ test "formatLink" {
     const s = try formatLink(testing.allocator, "Physics", "notes/physics.md");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("[Physics](notes/physics.md)", s);
+}
+
+test "headingAnchor slugs like GitHub" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("habitat-and-range", headingAnchor("Habitat and Range", &buf));
+    try testing.expectEqualStrings("whats-new", headingAnchor("What's new?", &buf));
+    try testing.expectEqualStrings("a-b", headingAnchor("  A   B  ", &buf));
+    try testing.expectEqualStrings("", headingAnchor("!!!", &buf));
+}
+
+test "formatHeadingLink" {
+    const s = try formatHeadingLink(testing.allocator, "Daphne", "Habitat and Range", "notes/daphne.md");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("[Daphne > Habitat and Range](notes/daphne.md#habitat-and-range)", s);
 }

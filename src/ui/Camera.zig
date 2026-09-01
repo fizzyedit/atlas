@@ -33,6 +33,15 @@ zoom_target: f32 = 1.0,
 /// Set while the user is dragging/pinching/wheeling; suppresses the automatic chase.
 user_driving: bool = false,
 
+/// The flight `chase` is currently flying, and how far along it is. See `chase`.
+fly_from: dvui.Point = .{},
+fly_from_zoom: f32 = 0,
+fly_to: dvui.Point = .{},
+fly_to_zoom: f32 = 0,
+/// Path length in perceptually-uniform units. Zero means no flight is planned.
+fly_len: f32 = 0,
+fly_t: f32 = 0,
+
 /// Viewport rectangle in screen (physical) coordinates — set each frame before converting.
 viewport: dvui.Rect.Physical = .{},
 
@@ -48,6 +57,11 @@ zoom_floor: f32 = min_zoom,
 pub fn syncTargets(self: *Camera) void {
     self.center_target = self.center;
     self.zoom_target = self.zoom;
+    // Abandon any planned arc. Every hand-driven path — drag, wheel, pinch, fit — funnels through
+    // here, and a flight is a path from a start the camera has just left. `chase` would re-plan on
+    // its own, but stating it here is what makes "the user's hand wins immediately" a property of
+    // the one function they all call rather than of the one they don't.
+    self.fly_len = 0;
 }
 
 /// Clamp against the default stop only. Prefer `Camera.clamp`, which also honours the extent
@@ -124,6 +138,24 @@ pub fn zoomAtScreen(self: *Camera, factor: f32, focal: dvui.Point.Physical) void
 /// A camera pose — where `fitBounds` would land, without committing to it.
 pub const Pose = struct { center: dvui.Point, zoom: f32 };
 
+/// Pose that applies `new_zoom` while keeping `world` at its current screen position.
+///
+/// Zooming around a point always moves `center` (that is how the point stays put). It does
+/// **not** slide `world` to the middle of the viewport — that is `poseForBounds`, and it is
+/// what made diving into a note at the edge of the panel yank the whole view.
+pub fn poseZoomAround(self: *const Camera, world: dvui.Point, new_zoom: f32) Pose {
+    const z = self.clamp(new_zoom);
+    const screen = self.worldToScreen(world);
+    const o = self.screenOrigin();
+    return .{
+        .zoom = z,
+        .center = .{
+            .x = world.x - (screen.x - o.x) / z,
+            .y = world.y - (screen.y - o.y) / z,
+        },
+    };
+}
+
 /// Compute the pose that makes `bounds` (world AABB) fill the viewport with `padding`
 /// screen pixels. Pure — callers snap (`fitBounds`) or retarget (`center_target`/`zoom_target`).
 pub fn poseForBounds(self: *const Camera, bounds: dvui.Rect, padding: f32) Pose {
@@ -176,17 +208,31 @@ pub fn chasing(self: *const Camera) bool {
         self.zoom != self.zoom_target;
 }
 
-/// Ease `center`/`zoom` toward their targets. `k` is the chase rate (1/s); higher is snappier.
-/// Returns true if anything moved. Snaps the last sliver so `chasing()` can actually go false.
+/// Ease `center`/`zoom` toward their targets along a path that moves at a constant *apparent*
+/// speed. `k` is the chase rate (1/s); higher is snappier. Returns true if anything moved.
 ///
-/// Zoom eases **multiplicatively** — the step is a constant *ratio* per unit time, not a
-/// constant difference. Zoom is perceived in octaves: a linear chase from 0.3 to 2.5 covers
-/// half the octaves in the first few frames and then crawls through the last few percent, so a
-/// flight from overview onto one note lurched and then dawdled. Geometric easing spends equal
-/// time per doubling and reads as one continuous move. Neither form overshoots — both approach
-/// their target from one side only.
+/// Easing the two independently — which is what this did — is why flying to a note read as "zoom
+/// in on the middle of the blob, then slide sideways to the note". The centre offset costs
+/// `offset · zoom` screen pixels, so while the camera is still zoomed out the pan is worth almost
+/// no pixels and appears not to be happening, and once it has zoomed in the same small world offset
+/// is suddenly worth a screenful and everything lurches. The two motions have one time constant and
+/// two completely different perceived effects.
+///
+/// The fix is the standard one: van Wijk & Nuij's smooth zoom-and-pan (2003), the same path
+/// `d3.interpolateZoom` walks. Treat the view as a point in `(x, y, w)` — `w` being how much world
+/// the viewport spans — and follow the path through that space along which the image moves at
+/// constant speed on screen. It falls out as a hyperbolic curve: the camera zooms *out* on its way
+/// across when the two ends are far apart, which is what makes a long flight read as one arc
+/// instead of two moves, and is exactly what a reader does by hand when moving between two distant
+/// places on a map.
+///
+/// `fly_t` still eases exponentially, so the flight keeps the feel and the convergence the chase
+/// always had; what changed is what `t` is interpolating *along*.
 pub fn chase(self: *Camera, dt: f32, k: f32) bool {
-    if (!self.chasing()) return false;
+    if (!self.chasing()) {
+        self.fly_len = 0;
+        return false;
+    }
     const t = 1.0 - @exp(-k * dt);
 
     const dx = self.center_target.x - self.center.x;
@@ -199,17 +245,133 @@ pub fn chase(self: *Camera, dt: f32, k: f32) bool {
     if (done_pos and done_zoom) {
         self.center = self.center_target;
         self.zoom = self.zoom_target;
+        self.fly_len = 0;
         return true;
     }
 
-    self.center.x += dx * t;
-    self.center.y += dy * t;
-    if (self.zoom > 0 and self.zoom_target > 0) {
-        self.zoom *= @exp(@log(self.zoom_target / self.zoom) * t);
-    } else {
-        self.zoom += dz * t;
+    // Re-plan whenever the destination moves. A flight is a path from where the camera *was*, so a
+    // retarget mid-flight starts a fresh one from wherever it has reached — no discontinuity,
+    // because the new path begins at the current view by construction.
+    if (self.fly_len <= 0 or
+        self.fly_to.x != self.center_target.x or
+        self.fly_to.y != self.center_target.y or
+        self.fly_to_zoom != self.zoom_target)
+    {
+        self.beginFlight();
     }
+
+    self.fly_t += (1.0 - self.fly_t) * t;
+    self.applyFlight(self.fly_t);
     return true;
+}
+
+/// Perceived-speed constant. √2 is van Wijk's recommended value: lower makes a long flight arc out
+/// further and feel slower to commit, higher flattens it back toward the two-phase motion this
+/// exists to avoid.
+const fly_rho: f32 = std.math.sqrt2;
+
+/// Plan a flight from the current view to the current target.
+fn beginFlight(self: *Camera) void {
+    self.fly_from = self.center;
+    self.fly_from_zoom = self.zoom;
+    self.fly_to = self.center_target;
+    self.fly_to_zoom = self.zoom_target;
+    self.fly_t = 0;
+    self.fly_len = 0;
+
+    const w0 = self.worldSpan(self.zoom);
+    const w1 = self.worldSpan(self.zoom_target);
+    if (!(w0 > 0) or !(w1 > 0)) return;
+
+    const ux = self.center_target.x - self.center.x;
+    const uy = self.center_target.y - self.center.y;
+    const dist = @sqrt(ux * ux + uy * uy);
+
+    // Pure zoom: no path to walk, just a scale ramp. `u1` in the denominators below would divide
+    // by zero, and the limit is this.
+    if (dist < w0 * 1e-4) {
+        self.fly_len = @abs(@log(w1 / w0)) / fly_rho;
+        return;
+    }
+
+    const rho2 = fly_rho * fly_rho;
+    const rho4 = rho2 * rho2;
+    const b0 = (w1 * w1 - w0 * w0 + rho4 * dist * dist) / (2 * w0 * rho2 * dist);
+    const b1 = (w1 * w1 - w0 * w0 - rho4 * dist * dist) / (2 * w1 * rho2 * dist);
+    const r0 = @log(@sqrt(b0 * b0 + 1) - b0);
+    const r1 = @log(@sqrt(b1 * b1 + 1) - b1);
+    const len = (r1 - r0) / fly_rho;
+    if (!std.math.isFinite(len) or @abs(len) < 1e-6) {
+        // Degenerate geometry (the two views nearly coincide in path space). Fall back to the
+        // scale ramp rather than emit a NaN into the view matrix.
+        self.fly_len = @abs(@log(w1 / w0)) / fly_rho;
+        return;
+    }
+    self.fly_len = len;
+}
+
+/// Evaluate the planned flight at `f` in 0..1 and write it to `center`/`zoom`.
+fn applyFlight(self: *Camera, f: f32) void {
+    const w0 = self.worldSpan(self.fly_from_zoom);
+    const w1 = self.worldSpan(self.fly_to_zoom);
+    if (!(w0 > 0) or !(w1 > 0) or self.fly_len <= 0) {
+        // No usable path — ease straight there rather than stall.
+        self.center.x = std.math.lerp(self.fly_from.x, self.fly_to.x, f);
+        self.center.y = std.math.lerp(self.fly_from.y, self.fly_to.y, f);
+        self.zoom = self.fly_from_zoom * @exp(@log(self.fly_to_zoom / self.fly_from_zoom) * f);
+        return;
+    }
+
+    // Same zoom at both ends: slide. van Wijk's path still arcs *out* when the two centres
+    // are far apart, which is right for a click-to-focus flight and wrong for a save that
+    // asked to keep zoom — the reader would watch the map zoom out and lose the note.
+    if (@abs(self.fly_from_zoom - self.fly_to_zoom) < @max(self.fly_from_zoom, 0.01) * 1e-3) {
+        self.center.x = std.math.lerp(self.fly_from.x, self.fly_to.x, f);
+        self.center.y = std.math.lerp(self.fly_from.y, self.fly_to.y, f);
+        self.zoom = self.fly_to_zoom;
+        return;
+    }
+
+    const ux = self.fly_to.x - self.fly_from.x;
+    const uy = self.fly_to.y - self.fly_from.y;
+    const dist = @sqrt(ux * ux + uy * uy);
+
+    if (dist < w0 * 1e-4) {
+        self.center = self.fly_to;
+        self.zoom = self.zoomForSpan(w0 * @exp(@log(w1 / w0) * f));
+        return;
+    }
+
+    const rho2 = fly_rho * fly_rho;
+    const rho4 = rho2 * rho2;
+    const b0 = (w1 * w1 - w0 * w0 + rho4 * dist * dist) / (2 * w0 * rho2 * dist);
+    const r0 = @log(@sqrt(b0 * b0 + 1) - b0);
+    const s = f * self.fly_len;
+
+    const cosh_r0 = std.math.cosh(r0);
+    const sinh_r0 = std.math.sinh(r0);
+    const arg = fly_rho * s + r0;
+    const w = w0 * cosh_r0 / std.math.cosh(arg);
+    const u = w0 / rho2 * (cosh_r0 * std.math.tanh(arg) - sinh_r0);
+    const along = std.math.clamp(u / dist, 0, 1);
+
+    if (!std.math.isFinite(w) or !std.math.isFinite(along)) return;
+    self.center.x = self.fly_from.x + ux * along;
+    self.center.y = self.fly_from.y + uy * along;
+    self.zoom = self.zoomForSpan(w);
+}
+
+/// How much world the viewport spans at `z`. The unit the flight path is measured in — it has to
+/// be world *distance*, the same as the gap between the two centres, or the two halves of the
+/// path equation are in different units.
+fn worldSpan(self: *const Camera, z: f32) f32 {
+    const vw = if (self.viewport.w > 0) self.viewport.w else 1;
+    return vw / @max(z, abs_min_zoom);
+}
+
+fn zoomForSpan(self: *const Camera, w: f32) f32 {
+    const vw = if (self.viewport.w > 0) self.viewport.w else 1;
+    return vw / @max(w, 1e-6);
 }
 
 // -- tests ------------------------------------------------------------------------
@@ -248,6 +410,25 @@ test "round-trip holds across zooms" {
         try testing.expectApproxEqAbs(world.x, back.x, 1e-4);
         try testing.expectApproxEqAbs(world.y, back.y, 1e-4);
     }
+}
+
+test "poseZoomAround keeps the world point on screen and off the viewport centre" {
+    const vp: dvui.Rect.Physical = .{ .x = 0, .y = 0, .w = 800, .h = 600 };
+    var c = camAt(.{ .x = 0, .y = 0 }, 1.0, vp);
+    const world: dvui.Point = .{ .x = 200, .y = -100 };
+    const before = c.worldToScreen(world);
+    // Not in the middle of the pane — that is the whole point of pinning rather than fitting.
+    try testing.expect(@abs(before.x - 400) > 50);
+    const pose = c.poseZoomAround(world, 4.0);
+    c.center = pose.center;
+    c.zoom = pose.zoom;
+    const after = c.worldToScreen(world);
+    try testing.expectApproxEqAbs(before.x, after.x, 1e-3);
+    try testing.expectApproxEqAbs(before.y, after.y, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.zoom, 1e-5);
+    // Fitting would have put this point at the viewport centre; pinning must not.
+    const origin = c.screenOrigin();
+    try testing.expect(@abs(after.x - origin.x) > 50);
 }
 
 test "zoomAtScreen keeps the focal world point fixed" {
@@ -353,18 +534,48 @@ test "zoom chase is geometric and never overshoots" {
     try testing.expect(!c.chasing());
     try testing.expectEqual(@as(f32, 4.0), c.zoom);
 
-    // Mid-flight, progress through the octaves must match progress across the pan exactly —
-    // that is what makes zoom and pan read as one move. A linear zoom chase would be well
-    // ahead of the pan by this point.
+    // The destination must never drift *away* from the middle of the viewport.
+    //
+    // This used to assert that progress through the octaves matched progress across the pan
+    // exactly, on the reasoning that moving both in lockstep is what makes them read as one move.
+    // It is not, and the arithmetic says so: screen offset is `world_offset · zoom`, so easing the
+    // octaves linearly while the world offset falls linearly makes the product *rise* through the
+    // middle of the flight. Flying 1000 units while zooming 0.25 -> 4, the destination starts 250
+    // px off centre, drifts out to 522 px by two thirds of the way through, and only then rushes
+    // back in. That is the "zoom into the middle of the blob, then pan to the note" the reader
+    // reported, and the old test was holding it in place.
     var d = camAt(.{}, 0.25, .{ .x = 0, .y = 0, .w = 800, .h = 300 });
     d.zoom_target = 4.0;
     d.center_target = .{ .x = 1000, .y = 0 };
-    for (0..8) |_| _ = d.chase(1.0 / 60.0, 7);
+    const origin = d.screenOrigin();
+    const start_off = @abs(d.worldToScreen(d.center_target).x - origin.x);
+    var far: f32 = 0;
+    var steps: usize = 0;
+    while (d.chasing() and steps < 600) : (steps += 1) {
+        _ = d.chase(1.0 / 60.0, 7);
+        far = @max(far, @abs(d.worldToScreen(d.center_target).x - d.screenOrigin().x));
+    }
+    try testing.expect(!d.chasing());
+    // A little slack for the arc's own overshoot in screen terms; the failure this guards is a
+    // doubling, not a few percent.
+    try testing.expect(far <= start_off * 1.1);
+}
 
-    const zoom_progress = @log2(d.zoom / 0.25) / @log2(4.0 / 0.25);
-    const pan_progress = d.center.x / 1000.0;
-    try testing.expectApproxEqAbs(pan_progress, zoom_progress, 1e-3);
-    try testing.expect(zoom_progress < 0.75); // still mid-flight, so the check means something
+test "equal-zoom chase slides without arcing out" {
+    // A save follow keeps zoom_target. van Wijk would still zoom out on a long pan; that is
+    // how a link save lost the note even after the camera started chasing.
+    var c = camAt(.{ .x = 0, .y = 0 }, 2.0, .{ .x = 0, .y = 0, .w = 800, .h = 600 });
+    c.center_target = .{ .x = 4000, .y = -2500 };
+    c.zoom_target = 2.0;
+    var frames: usize = 0;
+    while (c.chasing() and frames < 600) : (frames += 1) {
+        _ = c.chase(1.0 / 60.0, 7);
+        try testing.expectApproxEqAbs(@as(f32, 2.0), c.zoom, 1e-4);
+    }
+    try testing.expect(!c.chasing());
+    try testing.expectApproxEqAbs(@as(f32, 4000), c.center.x, 0.02);
+    try testing.expectApproxEqAbs(@as(f32, -2500), c.center.y, 0.02);
+    try testing.expectEqual(@as(f32, 2.0), c.zoom);
 }
 
 test "chase is a no-op once targets are met" {

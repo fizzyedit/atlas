@@ -1,12 +1,10 @@
-//! One hierarchy for the whole vault.
+//! Components, degree-normalised weights, and the `Ladder` type the spatial hierarchy occupies.
 //!
-//! Today the graph carries four overlapping structures: `multilevel.Ladder` (link coarsening),
-//! `layout_full`'s flat positions, `lod.Pyramid` (the ladder, then continued *by position* once
-//! link structure runs out), and `quadlod.Tree` (a component forest rebuilt from those positions).
-//! They disagree, which is what a "half-fine/half-coarse" frame actually is.
-//!
-//! This file is the replacement for all four: a single arity-N coarsening ladder, and nothing
-//! else. Positions are derived from it (`containment.zig`) rather than being an input to it.
+//! This used to be the drawing tree: `fold.build` coarsened links and `containment` placed each
+//! note inside its parent's disc. Positions now come from `layout.zig`; the LOD tree from
+//! `spatial.zig`. What remains here is the shared graph plumbing those two still call —
+//! `degreeNormalised`, `linkComponents`, `addOrphanDrawer` — and `Ladder`/`Cell`, which spatial
+//! fills from Hilbert order rather than from link coarsening.
 //!
 //! Two design choices carry most of the weight:
 //!
@@ -79,7 +77,27 @@ pub const Cell = struct {
     ext_count: u16 = 0,
     /// Real notes beneath this cell. Folder nodes never count.
     count: u32 = 0,
+    /// Depth *below the root*, assigned by `assignRanges` — which overwrites whatever the
+    /// coarsening put here, so during a build it counts up from the leaves and after one it counts
+    /// down from the root. Read it only after `build` returns.
     level: u16 = 0,
+    /// Levels of ladder *beneath* this cell: 0 for a leaf, the subtree's depth for a root. The
+    /// counterpart to `level`, and the one anything reasoning about how much room a subtree needs
+    /// wants.
+    height: u16 = 0,
+    /// Total incident link *count* of the notes beneath this cell — raw degree, summed.
+    ///
+    /// `count` is how many notes a cell holds, which is the right measure of the *area* it needs
+    /// and the wrong one for how much it matters. Every leaf has a count of exactly one, so at the
+    /// zoom where notes are drawn individually — the one a reader spends most of their time at —
+    /// every body in the field has identical mass and nothing can behave like a star. Link weight
+    /// is the measure that separates a hub from a stub, and it is free: the edge list is already
+    /// here. Real links only; the folder chain is a placement prior, not evidence of importance.
+    weight: f32 = 0,
+    /// Sum of file sizes (bytes) of notes beneath this cell. Gravity uses a log of this as
+    /// extra inertial mass and push — a long note claims more interior-entry room than a stub
+    /// with the same degree. 0 when the caller did not pass `Options.bodies`.
+    body: f32 = 0,
     /// Set iff this cell is a single real note.
     note: u32 = invalid,
     /// Connected component of the *link* graph this cell belongs to. Coarsening never merges
@@ -142,8 +160,12 @@ pub const Ladder = struct {
 
 pub const Options = struct {
     arity: Arity = .seven,
-    /// Weight of note↔folder and folder↔parent-folder edges, against 1.0 for a real link.
+    /// Weight of note↔folder and folder↔parent-folder edges, against 1.0 for a *typical* real
+    /// link — see `degree_norm`, which is what keeps "typical" meaning 1.0.
     folder_w: f32 = 0.25,
+    /// How hard to discount a link for the popularity of its endpoints. 0 is off; 1 is the full
+    /// `1/√(deg_a · deg_b)` normalisation. See `degreeNormalised`.
+    degree_norm: f32 = 1.0,
     /// Safety stop. A correct run terminates in ~log_arity(n) levels.
     max_levels: u16 = 40,
     /// Checked between coarsening levels so a caller running this on a worker can abandon it.
@@ -153,7 +175,109 @@ pub const Options = struct {
     /// it is running lives in a dylib that is about to be unloaded. Without a check in here that
     /// join is the whole build, and closing the editor mid-build looks like a hang.
     cancel: ?*std.atomic.Value(bool) = null,
+    /// Parallel to notes `0..n_notes`: file size in bytes. Empty means every body is 0.
+    /// Gravity placement uses `log(1+body)` as extra mass and personal space, so a save that
+    /// grows a document without adding links still opens more room for its interior.
+    bodies: []const f32 = &.{},
 };
+
+/// Discount every link by how popular its endpoints are: `w · K^p / (deg_a · deg_b)^(p/2)`.
+///
+/// On a wiki most links are stopwords. Two thirds of Simple English Wikipedia's edges have an
+/// endpoint above degree 128 — links to *France*, *country*, *year* — and they say almost nothing
+/// about the note that carries them, because nearly every note carries them. Weighted equally with
+/// everything else they dominate three separate decisions at once: which notes coarsen together,
+/// which lines the ambient web spends its budget on, and which neighbours a focused note shows.
+///
+/// This is Salton's cosine normalisation, and the intuition is the same one that makes it work for
+/// text: a term that appears everywhere carries no information about the document it appears in. A
+/// link between two obscure notes is evidence that they are related; a link to *France* is evidence
+/// of nothing.
+///
+/// `K` is the mean degree, so a link between two typical notes comes out at 1.0 and every constant
+/// calibrated against "a real link" — `folder_w` above, the link budgets downstream — keeps its
+/// meaning. At `p = 1` on the reference corpus this runs from about 0.06 for a link to the largest
+/// hub up to about 4 for a link between two rarely-cited notes.
+/// Round `x` to `digits` significant figures.
+///
+/// For constants that scale a whole vault's weights: the exact value carries no meaning the layout
+/// depends on, while its *stability* under an edit decides whether the map holds still. See the use
+/// in `degreeNormalised`.
+/// Round to `digits` significant figures. Used wherever a float has to be *hashed* rather than
+/// compared: a value carried through a float sum differs in its last bits for reasons that are
+/// not visible on screen, and a hash of the raw bits turns that into a cache miss.
+pub fn quantiseSignificant(x: f32, digits: i32) f32 {
+    if (!(x > 0) or !std.math.isFinite(x)) return x;
+    const mag = @floor(@log10(x));
+    const step = std.math.pow(f32, 10, mag - @as(f32, @floatFromInt(digits - 1)));
+    if (!(step > 0) or !std.math.isFinite(step)) return x;
+    return @round(x / step) * step;
+}
+
+pub fn degreeNormalised(
+    gpa: std.mem.Allocator,
+    n_notes: usize,
+    links: []const Edge,
+    p: f32,
+) ![]Edge {
+    const out = try gpa.alloc(Edge, links.len);
+    errdefer gpa.free(out);
+    if (p == 0 or links.len == 0) {
+        @memcpy(out, links);
+        return out;
+    }
+
+    const deg = try gpa.alloc(f32, n_notes);
+    defer gpa.free(deg);
+    @memset(deg, 0);
+    var counted: usize = 0;
+    for (links) |e| {
+        if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+        deg[e.a] += 1;
+        deg[e.b] += 1;
+        counted += 1;
+    }
+    if (counted == 0) {
+        @memcpy(out, links);
+        return out;
+    }
+    // Quantised, because this one number scales *every* edge weight in the vault.
+    //
+    // `mean_deg` is global: it is derived from the total link count, so adding a single link moves
+    // it, and moving it re-weights all 3.35M edges at once. Each weight changes by about three
+    // parts in ten million — invisible on its own, and decisive in aggregate. The region-graph
+    // force solve reads those weights, so it settles somewhere fractionally different *everywhere*,
+    // and one added link moves the median note 14 radii with the whole map reshuffling behind it.
+    // That is the "a single link changes the entire graph" symptom the territories design exists to
+    // remove, and it survived every structural fix because it was never structural.
+    //
+    // Rounding to four significant figures makes the constant a step function of vault size: an
+    // ordinary edit cannot cross a step, so the weights come back bit-identical and everything
+    // downstream — the memo, the placement, the reader's view — holds still. It stays a pure
+    // function of the vault, so a cold open still reproduces the same map.
+    const mean_raw: f32 = 2.0 * @as(f32, @floatFromInt(counted)) / @as(f32, @floatFromInt(n_notes));
+    const mean_deg: f32 = quantiseSignificant(mean_raw, 4);
+
+    const k2 = mean_deg * mean_deg;
+    if (p == 1) {
+        // The overwhelmingly common case, and `pow(x, 0.5)` is a library call where `@sqrt` is one
+        // instruction. Over 3.3M edges that is most of the cost of this function.
+        for (links, out) |e, *o| {
+            o.* = e;
+            if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+            o.w = e.w * @sqrt(k2 / (@max(deg[e.a], 1) * @max(deg[e.b], 1)));
+        }
+        return out;
+    }
+    for (links, out) |e, *o| {
+        o.* = e;
+        if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+        const da = @max(deg[e.a], 1);
+        const db = @max(deg[e.b], 1);
+        o.w = e.w * std.math.pow(f32, k2 / (da * db), p * 0.5);
+    }
+    return out;
+}
 
 /// Build the ladder. `paths` may be empty (no folder nodes); otherwise `paths[i]` is note `i`'s
 /// vault-relative path and only its directory part is used.
@@ -171,9 +295,11 @@ pub fn build(
     const arena = arena_state.allocator();
 
     // ---- augment: folder nodes -------------------------------------------------------------
+    const scored = try degreeNormalised(arena, n_notes, links, opts.degree_norm);
+
     var edges: std.ArrayListUnmanaged(Edge) = .empty;
     try edges.ensureTotalCapacity(arena, links.len + n_notes * 2);
-    for (links) |e| {
+    for (scored) |e| {
         if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
         edges.appendAssumeCapacity(.{ .a = e.a, .b = e.b, .w = e.w });
     }
@@ -191,8 +317,20 @@ pub fn build(
         } else {
             // Flat vault: no folder tree to express, but the notes with *no links at all* still
             // need something to group on, and their titles are the only information there is.
-            try addOrphanChain(arena, &edges, paths, links, n_notes, opts.folder_w);
+            try addOrphanDrawer(arena, &edges, paths, links, n_notes, opts.folder_w);
         }
+    }
+
+    // Link mass per note — see `Cell.weight`. Raw degree, deliberately *not* the normalised
+    // weight: normalisation exists to stop a hub dominating the *grouping*, while mass exists to
+    // make a hub look like the star it is. Counting edges rather than summing weights keeps the two
+    // independent, so tuning `degree_norm` never quietly resizes anything.
+    const wnote = try arena.alloc(f32, n_notes);
+    @memset(wnote, 0);
+    for (links) |e| {
+        if (e.a == e.b or e.a >= n_notes or e.b >= n_notes) continue;
+        wnote[e.a] += 1;
+        wnote[e.b] += 1;
     }
 
     // ---- coarsen ---------------------------------------------------------------------------
@@ -204,6 +342,8 @@ pub fn build(
             .count = 1,
             .note = @intCast(i),
             .comp = comp[i],
+            .weight = wnote[i],
+            .body = if (opts.bodies.len == n_notes) opts.bodies[i] else 0,
         });
     }
 
@@ -246,12 +386,11 @@ pub fn build(
     var cursor: u32 = 0;
     var deepest: u16 = 0;
     for (lad.roots) |r| {
-        assignRanges(&lad, r, 0, &cursor);
-        deepest = @max(deepest, maxDepth(lad, r));
+        deepest = @max(deepest, assignRanges(&lad, r, 0, &cursor));
     }
     lad.depth = deepest;
 
-    try buildPairs(gpa, &lad, links, n_notes);
+    try buildPairs(gpa, &lad, scored, n_notes);
     return lad;
 }
 
@@ -265,7 +404,7 @@ pub fn build(
 /// slot in the pack forever. Pooled, they coarsen among themselves — and since their only edges are
 /// the folder chain, they group by directory, which is also how a person reads them: not a topic,
 /// just the unfiled drawer.
-fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_notes: usize) !u32 {
+pub fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_notes: usize) !u32 {
     const uf = try arena.alloc(u32, n_notes);
     for (uf, 0..) |*x, i| x.* = @intCast(i);
     const has_link = try arena.alloc(bool, n_notes);
@@ -329,7 +468,7 @@ fn linkComponents(arena: std.mem.Allocator, comp: []u32, links: []const Edge, n_
 /// the layout. A chain over notes that have no links competes with nothing — it is the only signal
 /// available for them, and it makes a coalesced orphan group mean something ("titles around Ka…")
 /// instead of nothing.
-fn addOrphanChain(
+pub fn addOrphanDrawer(
     arena: std.mem.Allocator,
     edges: *std.ArrayListUnmanaged(Edge),
     paths: []const []const u8,
@@ -350,6 +489,27 @@ fn addOrphanChain(
     }
     if (orphans.items.len < 2) return;
 
+    // A star, not a chain.
+    //
+    // These notes link to nothing, so any topology given to them is invented — the only honest
+    // claim is "all of these are unplaced", and a star says exactly that and nothing more. A path
+    // says something else: that each note belongs beside the two it happens to sort between.
+    //
+    // It is also the difference between a drawer and a thread. A force layout settles a star of
+    // `k` nodes into a disc of radius ~sqrt(k), and a path of `k` into a line. Measured on a flat
+    // 284k vault, 2,817 orphans chained came out at radius 1,269 — a twelfth the density of the
+    // real vault, and packed outside it, which set the whole extent. The 281k notes that *do*
+    // link to each other were then squeezed into the innermost ring: 97.6% of the vault in an
+    // eighth of its area, which is why nothing on the map looked related to anything near it.
+    if (!hasFolders(paths)) {
+        // Nothing to group by. `hasFolders` exists because lexicographic order in a flat vault is
+        // not folder structure, it is the alphabet — chaining it wired `Mitsuhiro Toda` to
+        // `Mitsuhiro Kawamoto` and called it a relationship.
+        const hub = orphans.items[0];
+        for (orphans.items[1..]) |b| try edges.append(arena, .{ .a = hub, .b = b, .w = w });
+        return;
+    }
+
     const ByPath = struct {
         paths: []const []const u8,
         pub fn lessThan(self: @This(), a: u32, b: u32) bool {
@@ -358,9 +518,28 @@ fn addOrphanChain(
     };
     std.mem.sortUnstable(u32, orphans.items, ByPath{ .paths = paths }, ByPath.lessThan);
 
-    for (orphans.items[1..], 0..) |b, i| {
-        try edges.append(arena, .{ .a = orphans.items[i], .b = b, .w = w });
+    // One star per directory, and the directory representatives strung together in path order —
+    // so a folder's orphans sit together, sibling folders abut, and the whole drawer stays one
+    // component that packs as a single disc.
+    var prev_rep: ?u32 = null;
+    var i: usize = 0;
+    while (i < orphans.items.len) {
+        const rep = orphans.items[i];
+        const dir = dirOf(paths[rep]);
+        var j = i + 1;
+        while (j < orphans.items.len and std.mem.eql(u8, dirOf(paths[orphans.items[j]]), dir)) : (j += 1) {
+            try edges.append(arena, .{ .a = rep, .b = orphans.items[j], .w = w });
+        }
+        if (prev_rep) |pv| try edges.append(arena, .{ .a = pv, .b = rep, .w = w });
+        prev_rep = rep;
+        i = j;
     }
+}
+
+/// Everything before the last path separator; empty for a note at the vault root.
+fn dirOf(path: []const u8) []const u8 {
+    const cut = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return path[0..0];
+    return path[0..cut];
 }
 
 /// Whether these paths describe a folder tree at all.
@@ -377,7 +556,7 @@ fn addOrphanChain(
 /// with none has nothing to say about grouping, and saying nothing is strictly better than saying
 /// something false — links then decide alone, which is what `folder_w`'s "folders only decide
 /// where links don't" was always meant to degrade to.
-fn hasFolders(paths: []const []const u8) bool {
+pub fn hasFolders(paths: []const []const u8) bool {
     for (paths) |path| {
         if (std.mem.indexOfAny(u8, path, "/\\") != null) return true;
     }
@@ -389,7 +568,7 @@ fn hasFolders(paths: []const []const u8) bool {
 /// same-directory notes are contiguous, sibling directories abut, and a directory sits next to its
 /// children. Weight is `folder_w` against 1.0 for a real link, so links always win where they
 /// exist and folders only decide where they don't.
-fn addPathChain(
+pub fn addPathChain(
     arena: std.mem.Allocator,
     edges: *std.ArrayListUnmanaged(Edge),
     paths: []const []const u8,
@@ -687,11 +866,20 @@ fn prune(lad: *Ladder, id: u32) ?u32 {
     return id;
 }
 
-fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) void {
-    const c = &lad.cells[id];
-    c.level = level;
-    c.ls = cursor.*;
-    if (c.child_count == 0) {
+/// One walk that assigns depth, note ranges and height. Returns the height so the parent can take
+/// the max of its children without a second traversal.
+fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) u16 {
+    var h: u16 = 0;
+    {
+        const c = &lad.cells[id];
+        c.level = level;
+        c.ls = cursor.*;
+    }
+    const child_count = lad.cells[id].child_count;
+    var w: f32 = 0;
+    var body: f32 = 0;
+    if (child_count == 0) {
+        const c = &lad.cells[id];
         if (c.note != invalid) {
             lad.note_at[cursor.*] = c.note;
             lad.slot_of[c.note] = cursor.*;
@@ -699,11 +887,23 @@ fn assignRanges(lad: *Ladder, id: u32, level: u16, cursor: *u32) void {
             cursor.* += 1;
         }
     } else {
-        for (0..c.child_count) |i| {
-            assignRanges(lad, lad.children[c.child_start + i], level + 1, cursor);
+        const start = lad.cells[id].child_start;
+        for (0..child_count) |i| {
+            const kid = lad.children[start + i];
+            h = @max(h, 1 + assignRanges(lad, kid, level + 1, cursor));
+            w += lad.cells[kid].weight;
+            body += lad.cells[kid].body;
         }
     }
+    const c = &lad.cells[id];
     c.le = cursor.*;
+    c.height = h;
+    // Leaves carry the weight/body they were created with; everything above is the sum beneath.
+    if (child_count > 0) {
+        c.weight = w;
+        c.body = body;
+    }
+    return h;
 }
 
 fn maxDepth(lad: Ladder, id: u32) u16 {
@@ -937,7 +1137,7 @@ test "a flat vault gets no folder chain" {
 
 test "orphans on a flat vault group by title, not by note id" {
     // The folder chain is suppressed on a flat vault (it would group everything alphabetically),
-    // which leaves unlinked notes with no signal at all. `addOrphanChain` restores exactly the
+    // which leaves unlinked notes with no signal at all. `addOrphanDrawer` restores exactly the
     // ordering the folder chain used to supply, scoped to notes that have nothing to compete with.
     const gpa = testing.allocator;
 
