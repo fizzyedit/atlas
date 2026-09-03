@@ -1,8 +1,8 @@
 .{
     .id = "atlas",
     .name = "Atlas",
-    .version = "0.0.4",
-    .min_sdk_version = "0.1.50",
+    .version = "0.0.5",
+    .min_sdk_version = "0.1.51",
     .description = "Wiki-style notes for fizzy: [[wikilinks]], backlinks, and a graph of how your markdown connects.",
     .tags = .{ "notes", "markdown", "wiki" },
     .author = "foxnne",

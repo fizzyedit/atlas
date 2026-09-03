@@ -12,10 +12,6 @@
     },
     .fingerprint = 0x720ad60ff03945c1,
     .dependencies = .{
-        .fizzy = .{
-            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.50/fizzy-sdk-v0.1.50.tar.gz",
-            .hash = "fizzy-0.1.50-SGBwY0IKDQAV2eW05TlOZbWQMAi0j3SFDLv4geR9AKfw",
-        },
         // SQLite, as a hash-pinned package rather than a vendored amalgamation. This one wraps
         // the official sqlite.org amalgamation zip in its own hash-pinned dependency and adds
         // Zig bindings, so the C never lands in this repo and both hops are content-addressed.
@@ -27,6 +23,10 @@
             .url = "https://github.com/foxnne/zig-lib-icons/archive/db034786a1286ab28dc35aba534c098aa4f1a3aa.tar.gz",
             .hash = "icons-0.0.0-iJxA-VvGMwAgiKSXRe_Y0O7RpasdtEJhBfVx8IGGEBl_",
             .lazy = true,
+        },
+        .fizzy = .{
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.1.51/fizzy-sdk-v0.1.51.tar.gz",
+            .hash = "fizzy-0.1.51-SGBwY_MoDQAaQRD9W0axvl7I1t7egfhA78eSsyiYtvy7",
         },
     },
 }
