@@ -89,21 +89,20 @@ const dpiScale = galaxy.dpiScale;
 const base_screen_r: f32 = 9;
 
 /// Interior content. A document is its own fold/containment/world cloud — the same machinery the
-/// vault overview uses, fed the note's headings/paragraphs/lists/tags/embeds instead of the
+/// vault overview uses, fed the note's headings instead of the
 /// vault's notes (see `buildInteriorWorld`). The document itself (item 0, the "sun") is pinned at
 /// the cloud's centre outside that system entirely, so it can never be coalesced away.
 /// The reach-out rate now lives on `world.Params.focus_reach_rate`, because the animation is per
 /// link and advanced by `World.stepFocusGrow` rather than by a panel-wide scalar. Kept as a note
 /// rather than a constant so nobody reintroduces a second source of truth for the same timing.
 /// Draw-time size multiplier by content kind, layered on top of `bubbleScreenRadius`'s base
-/// sizing. Carries the same role-by-size language the old orbit system used (sun > heading >
-/// body > tag/embed) without feeding layout — see `content_graph.Item.weight`'s doc comment.
+/// sizing. Carries the same role-by-size language the old orbit system used (sun > heading)
+/// without feeding layout — see `content_graph.Item.weight`'s doc comment. Only root and headings
+/// are drawn (`buildInteriorWorld`); anything else would be sized as a heading.
 fn contentKindRadiusMul(kind: content_graph.ItemKind) f32 {
     return switch (kind) {
         .root => 1.35,
-        .heading => 0.85,
-        .paragraph, .list, .code, .blockquote, .table => 0.55,
-        .tag, .embed => 0.36,
+        else => 0.85,
     };
 }
 const open_screen_r: f32 = 12;
@@ -2924,16 +2923,15 @@ fn updateInterior(p: *Panel, st: anytype) void {
 /// World-space radial gap between one outline depth and the next, in the interior's own local
 /// units — headings on inner rings, their attached content a band further out.
 const interior_ring_gap: f32 = 1.6;
-/// How far outside its own heading's ring a non-heading item (paragraph, list, tag, ...) sits.
-const interior_content_offset: f32 = 0.6;
 /// Radial jitter within a depth band, as a fraction of `interior_ring_gap` — an asteroid belt
 /// scattered roughly at one radius, not every item pinned to exactly one fine circle.
 const interior_ring_band: f32 = 0.85;
 
-/// Build a note's interior as an "asteroid field": every content item placed directly by polar
+/// Build a note's interior as an "asteroid field": every heading placed directly by polar
 /// position, angle from document order (swept clockwise around the full circle) and radius from
-/// outline depth — headings inner, their own content a band further out, deeper headings further
-/// still. Not fold/containment: that pipeline packs a *tree* by disc-in-disc containment, which
+/// outline depth — `h1`s inner, deeper headings further out.
+///
+/// Not fold/containment: that pipeline packs a *tree* by disc-in-disc containment, which
 /// needs real branching to look like anything but a curling spiral — a typical document's
 /// headings are tied to each other only by document order (no `[[Note#Heading]]` cross-links most
 /// of the time), which is a flat chain topologically, and a chain packed as a tree is a spiral.
@@ -2942,113 +2940,42 @@ const interior_ring_band: f32 = 0.85;
 ///
 /// Item 0 (the document root) is not part of this field at all: it is pinned at the centre as the
 /// "sun," the same invariant `fitInteriorSun` already relies on (`p.interior.nodes[0]` equals
-/// `p.interior.parent` by construction). `.outline` edges from the root to a top-level heading are
-/// dropped from the fields below (`parent_level`/`item_kind` walks) for the same reason they no
-/// longer feed a shared packing structure: root is drawn separately, nothing else needs to know it
-/// exists.
-/// Longest label worth trying to place for a non-heading content item — long enough to be
-/// recognizable, short enough that `updateLabels`' placer doesn't have to fight a whole paragraph
-/// for room. A heading's own `text` is already short (it's the heading itself); everything else
-/// — a paragraph, a list, a code block — has `text` set to its raw body, which could run to
-/// hundreds of characters and needs cutting down before it's usable as a label at all, the same
-/// way `.md` link text gets truncated elsewhere in this file.
+/// `p.interior.parent` by construction).
+/// Longest label worth trying to place for an interior item — long enough to be recognizable,
+/// short enough that `updateLabels`' placer doesn't have to fight a whole line of prose for room.
+/// A heading's own `text` is usually short already, but nothing stops a note from writing a
+/// paragraph-length one, so it is cut the same way `.md` link text is elsewhere in this file.
 const interior_content_label_max: usize = 48;
 
-/// A short label for any content item, headings included — every content kind needs one now
-/// ("all linkable contexts", not just headings), not only the ones already short enough to use
-/// their raw text directly.
-/// What to write next to an interior item's node: the first line of what it actually says.
+/// A short label for an interior item — its heading text, with the inline markup taken out.
 ///
-/// Headings, tags and embeds carry their own text out of the index. Body blocks — paragraphs,
-/// lists, code, blockquotes, tables — carry **none**: `notes`/`blocks` store a block's kind, line
-/// span and weight, never its prose (see `query.noteContentGraph`, which builds them with
-/// `.text = ""`). So half the nodes in a typical note's interior had no label at all and
-/// `drawLabel` dropped them silently on `label_len == 0`.
-///
-/// The text comes from the file rather than the index. That is the same trade the backlinks pane
-/// already makes (`backlinks.contextFor` reads the source line when it draws a row) and for the
-/// same reason: a snippet per block would be a schema change that grows the index by the size of
-/// the vault's prose, to cache something one `readFileAlloc` gets on demand. This runs once per
-/// interior *build*, not per frame.
-///
-/// `lines` is the note's source split on newlines, or null when it could not be read — in which
-/// case the item is named by kind and size, which is worse but still better than an unlabelled
-/// circle.
-fn interiorItemLabel(
-    arena: std.mem.Allocator,
-    it: content_graph.Item,
-    lines: ?[]const []const u8,
-) []const u8 {
-    // `excerpt.plain` before `clip` in both arms: a heading carries its own inline markup out of
-    // the index (`### The **real** truth`) just as a body line does.
-    if (it.text.len > 0) return excerpt.clip(excerpt.plain(arena, it.text), interior_content_label_max);
-
-    if (lines) |src| {
-        if (excerpt.blockExcerpt(src, it.line)) |text| {
-            return excerpt.clip(excerpt.plain(arena, text), interior_content_label_max);
-        }
-    }
-
-    // No source line to show. Say what the thing is and how big it is; `weight` is a word count for
-    // prose and a line count for code and tables (see `content_graph.Item`).
-    const n = it.weight;
-    const word = if (n == 1) "word" else "words";
-    const line = if (n == 1) "line" else "lines";
-    return switch (it.kind) {
-        .paragraph => std.fmt.allocPrint(arena, "{d} {s}", .{ n, word }) catch "paragraph",
-        .list => std.fmt.allocPrint(arena, "list · {d} {s}", .{ n, word }) catch "list",
-        .code => std.fmt.allocPrint(arena, "code · {d} {s}", .{ n, line }) catch "code",
-        .blockquote => std.fmt.allocPrint(arena, "quote · {d} {s}", .{ n, word }) catch "quote",
-        .table => std.fmt.allocPrint(arena, "table · {d} {s}", .{ n, line }) catch "table",
-        .root, .heading, .tag, .embed => "",
-    };
-}
-
-/// The note's source, split into lines, for `blockExcerpt`. Null when it cannot be read — a note
-/// open in the editor with unsaved changes still reads its on-disk text, same as the backlinks
-/// pane, which is the version the index describes.
-fn noteSourceLines(arena: std.mem.Allocator, st: anytype, rel: []const u8) ?[]const []const u8 {
-    const root = st.vault_root orelse return null;
-    if (rel.len == 0) return null;
-    const abs = std.fs.path.join(arena, &.{ root, rel }) catch return null;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(
-        dvui.io,
-        abs,
-        arena,
-        .limited(Indexer.max_file_bytes),
-    ) catch return null;
-
-    var list: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, bytes, '\n');
-    while (it.next()) |l| list.append(arena, l) catch return null;
-    return list.toOwnedSlice(arena) catch null;
+/// Only headings reach here now (`buildInteriorWorld` keeps nothing else), so the text always
+/// comes out of the index and there is no file to read: a heading carries its own inline markup
+/// (`### The **real** truth`), which `excerpt.plain` reduces to what a reader sees, and `clip`
+/// cuts to a length the label placer can find room for.
+fn interiorItemLabel(arena: std.mem.Allocator, it: content_graph.Item) []const u8 {
+    if (it.text.len == 0) return "";
+    return excerpt.clip(excerpt.plain(arena, it.text), interior_content_label_max);
 }
 
 /// Node size for an interior item.
 ///
 /// Headings are ranked by their own depth — an `h1` is the biggest thing in the document after the
-/// sun, an `h6` barely larger than a paragraph — so the outline reads as an outline from across the
-/// cloud, before any label is legible. `depth` already puts them in rings; this makes the rings
-/// differ in weight as well as radius.
-///
-/// Body items are sized by content weight but capped, deliberately: a long paragraph should read as
-/// more substantial than a one-liner, and never as more structural than the heading it sits under.
-/// Before this they took `weight` raw, so a 400-word paragraph drew larger than every heading in
-/// the note and the outline was inverted.
+/// sun, an `h6` the smallest — so the outline reads as an outline from across the cloud, before any
+/// label is legible. `depth` already puts them in rings; this makes the rings differ in weight as
+/// well as radius. The kinds that are not drawn any more (`buildInteriorWorld` keeps root and
+/// headings) fall to the smallest size rather than being unreachable arms of a switch.
 fn interiorItemDegree(it: content_graph.Item) u32 {
     return switch (it.kind) {
         .root => 64,
         .heading => heading_degree[std.math.clamp(it.level, 1, 6) - 1],
-        .paragraph, .list, .code, .blockquote, .table => @min(it.weight, interior_body_degree_max),
-        .tag, .embed => 1,
+        else => 1,
     };
 }
 
 /// Pseudo-degrees for `h1`…`h6`, fed to `radiusFor` (which is `√degree`-shaped, so the visible
 /// steps are gentler than these numbers look).
 const heading_degree = [6]u32{ 40, 24, 14, 8, 4, 2 };
-/// Ceiling on a body item's size, one step under `h6`.
-const interior_body_degree_max: u32 = 6;
 
 fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     if (st.db == null) return error.NoDb;
@@ -3060,42 +2987,43 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     const cg = try query.noteContentGraph(db, arena, id, p.nodes[idx].title);
     if (cg.items.len == 0) return error.Empty;
 
-    // One read of the note, for the body-block labels the index cannot supply — see
-    // `interiorItemLabel`. Best-effort: a note that cannot be read still builds, just with kind
-    // labels instead of excerpts.
-    const src_lines = noteSourceLines(arena, st, p.nodes[idx].path);
+    // Headings only, root aside. A click on an interior item sends the editor to that item, and a
+    // heading is the only content kind with somewhere stable to be sent: it has an anchor
+    // (`[[Note#Heading]]`, and the same GitHub slug the readers accept), and its own line is
+    // findable again after the text above it moves. A paragraph, list, code block, tag or embed
+    // has neither — clicking one scrolled to a line number that the next edit invalidated, so it
+    // landed in the wrong place often enough to be untrustworthy. Drawing them and then not being
+    // able to go to them is worse than not drawing them: the cloud is an outline now.
+    const keep = try arena.alloc(bool, cg.items.len);
+    for (cg.items, 0..) |it, i| keep[i] = i == 0 or it.kind == .heading;
 
     // Absorb a lone top-level heading into the sun. A document whose only top-level content is
     // one heading — the mechanical "# Title" pattern, where that heading's text just repeats the
     // note's own title — would otherwise draw two nodes carrying the same label sitting almost on
-    // top of each other: the sun, and that heading. When root has exactly one outline-child and
-    // it is a heading, treat it as the document's own entry point instead of a second node: borrow
-    // its line for the sun's "reveal position" and drop it from the content graph. Its own children
-    // keep their items but lose their one edge to it, which needs no special handling below — an
-    // item with no resolved outline-parent just falls back to depth 0, same band as any other
-    // now-parentless top-level heading.
+    // top of each other: the sun, and that heading. When root has exactly one kept outline-child,
+    // treat it as the document's own entry point instead of a second node: borrow its line for the
+    // sun's "reveal position" and drop it too. Its own children keep their items but lose their one
+    // edge to it, which needs no special handling below — an item with no resolved outline-parent
+    // just falls back to depth 0, same band as any other now-parentless top-level heading.
     var sun_line: u32 = 0;
-    var skip: ?u32 = null;
     {
         var root_child: ?u32 = null;
         var root_children: u32 = 0;
         for (cg.edges) |e| {
-            if (e.a != 0) continue;
+            if (e.a != 0 or e.b >= keep.len or !keep[e.b]) continue;
             root_children += 1;
             root_child = e.b;
         }
         if (root_children == 1) if (root_child) |rc| {
-            if (rc < cg.items.len and cg.items[rc].kind == .heading) {
-                skip = rc;
-                sun_line = cg.items[rc].line;
-            }
+            keep[rc] = false;
+            sun_line = cg.items[rc].line;
         };
     }
 
     const remap = try arena.alloc(i32, cg.items.len);
     var out_n: usize = 0;
     for (0..cg.items.len) |i| {
-        if (skip != null and i == skip.?) {
+        if (!keep[i]) {
             remap[i] = -1;
         } else {
             remap[i] = @intCast(out_n);
@@ -3119,26 +3047,11 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     const item_kind = try arena.alloc(content_graph.ItemKind, n);
     for (items, 0..) |it, i| item_kind[i] = it.kind;
 
-    // Outline depth per item — headings use their own ATX level directly; everything else takes
-    // its nearest enclosing heading's level (via the one `.outline` edge every non-root item has)
-    // and sits `interior_content_offset` further out, so a section's body reads as *its* band,
-    // one step beyond the heading that owns it.
-    var parent_level = try arena.alloc(i32, n);
-    @memset(parent_level, -1);
-    for (edges) |e| {
-        if (e.kind != .outline) continue;
-        if (e.b < n) parent_level[e.b] = @intCast(items[e.a].level);
-    }
+    // Outline depth per item: a heading's own ATX level, so `h1`s ring the sun and each nesting
+    // level sits a band further out.
     const depth = try arena.alloc(f32, n);
     depth[0] = 0;
-    for (1..n) |i| {
-        if (items[i].kind == .heading) {
-            depth[i] = @floatFromInt(items[i].level);
-        } else {
-            const pl = if (parent_level[i] >= 0) parent_level[i] else 0;
-            depth[i] = @as(f32, @floatFromInt(pl)) + interior_content_offset;
-        }
-    }
+    for (1..n) |i| depth[i] = @floatFromInt(items[i].level);
 
     // Polar position: angle is this item's rank in document order, swept clockwise starting from
     // north, around the full turn; radius is its depth band, with a deterministic per-item jitter
@@ -3147,29 +3060,15 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
     // `linkSignatures` already uses for a stable per-item value), not the rank used for angle, so
     // it doesn't correlate with position around the ring.
     //
-    // Heading rank and "everything else" rank are counted *separately*, each against its own
-    // total, rather than one shared rank across all items. A document that interleaves one
-    // heading with one paragraph, over and over, still has to give each *class* the full turn —
-    // sharing one rank space only spans the full circle when both classes happen to be counted in
-    // exactly matching proportion throughout the document, which is not guaranteed (and wasn't
-    // happening here: headings clumped into one hemisphere, content into the other, on gauntlet's
-    // giant-0.md). Both classes independently sweeping the full turn is what "headings closer in,
-    // content further out, but both wrap all the way around" actually requires.
-    var heading_total: u32 = 0;
-    var other_total: u32 = 0;
-    for (1..n) |i| {
-        if (items[i].kind == .heading) heading_total += 1 else other_total += 1;
-    }
+    // One rank space, because there is only one class of item left to place. This used to count
+    // headings and body items separately so that each class swept the full turn on its own; with
+    // the body items gone the headings are the whole document order and sweep it outright.
     const local_pos = try arena.alloc(dvui.Point, n);
     local_pos[0] = .{}; // unused — the sun is pinned at `parent`, not placed in this space
     var extent: f32 = 1.0;
-    var heading_rank: u32 = 0;
-    var other_rank: u32 = 0;
+    const total: f32 = @floatFromInt(@max(n - 1, 1));
     for (1..n) |i| {
-        const is_heading = items[i].kind == .heading;
-        const rank: f32 = @floatFromInt(if (is_heading) heading_rank else other_rank);
-        const total: f32 = @floatFromInt(@max(if (is_heading) heading_total else other_total, 1));
-        if (is_heading) heading_rank += 1 else other_rank += 1;
+        const rank: f32 = @floatFromInt(i - 1);
         // `- tau/4` starts rank 0 at north (screen-up); increasing angle from there sweeps
         // clockwise, same convention the rest of this file's local-space math already uses.
         const a = (rank / total) * std.math.tau - std.math.tau / 4.0;
@@ -3225,12 +3124,12 @@ fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
         const world = interior.toWorld(local_pos[i], p.interior.nest, p.interior.parent);
         nodes[i] = .{
             .note_id = it.id,
-            // Line for `revealPosition` on click — every content kind has one now, not just
-            // headings.
+            // Line for `revealPosition` on click — the heading's own line, which is also the
+            // anchor `[[Note#Heading]]` names.
             .line = it.line,
             .is_sun = false,
             .path = p.nodes[idx].path,
-            .title = interiorItemLabel(arena, it, src_lines),
+            .title = interiorItemLabel(arena, it),
             .phantom = false,
             .degree = interiorItemDegree(it),
             .target = world,
@@ -4020,6 +3919,12 @@ pub fn zoomExtentsFor(p: *Panel) void {
     // suppressed. Record the viewport as fitted so `maybeFitCamera` doesn't see "never fitted"
     // next frame and snap on top of the animation.
     p.camera.user_driving = false;
+    // And the pan momentum has to go, for the same reason `focusNode` cancels it: a coasting
+    // fling calls `panScreen` every frame, which re-syncs the targets to wherever the coast has
+    // drifted to — so a recentre pressed while the view was still gliding was overwritten before
+    // it could be chased, and the button appeared to do nothing until the momentum had died.
+    p.fling_x.cancel();
+    p.fling_y.cancel();
     // Still inside an open note → tighten on that cloud (same intent as overview extents).
     // Otherwise frame the vault. Closing the descended note clears `.open` first, so this
     // path becomes the eject-to-overview the open-set handler wants.
@@ -4678,33 +4583,11 @@ fn drawInteriorMarks(p: *Panel, fade: f32) void {
     const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
     const gap_px = p.interior.slot * p.camera.zoom;
 
-    // The sun is the overview ring, grown — so it starts as that ring, exactly.
-    //
-    // Both sizes come from `bubbleScreenRadius`, but from different inputs: the overview node is
-    // `open_screen_r` against `layout_slot * zoom`, the sun is `sun_screen_r` against
-    // `interior.slot * zoom`, each with its own cap and `gap_radius_frac` clamp. Nothing made
-    // those agree at the handover, and the overview copy is `omit`ted the same frame the sun
-    // appears, so whatever they disagreed by was a snap — the ring jumping to a different size
-    // and then growing back to the one it already had.
-    //
-    // Interpolating on `interiorYieldT` rather than on `interior.t` puts the ring's size on the
-    // very curve that fades the overview out, so size and opacity hand over together.
-    const yield_t = interiorYieldT(p);
-    const sun_r0: f32 = if (p.interior.parent_node < p.nodes.len) blk: {
-        // The *overview's* inputs, not the interior's — this is the ring the overview would be
-        // drawing for that node right now if it were not omitted.
-        const o_zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
-        break :blk bubbleScreenRadius(p.nodes[p.interior.parent_node], o_zoom_t, p.layout_slot * p.camera.zoom);
-    } else 0;
-
     const buf = arena.alloc(galaxy.StyledMark, p.interior.nodes.len) catch return;
     for (p.interior.nodes, 0..) |node, i| {
         buf[i] = .{
             .screen = p.camera.worldToScreen(node.pos),
-            .r_px = if (node.is_sun and sun_r0 > 0)
-                std.math.lerp(sun_r0, bubbleScreenRadius(node, zoom_t, gap_px), yield_t)
-            else
-                interiorNodeRadiusPx(p, i, node, zoom_t, gap_px),
+            .r_px = interiorNodeRadiusPx(p, i, node, zoom_t, gap_px),
             .fill = nodeFill(theme, node),
             // The sun is the note you are inside — dashed, so leaving reads differently from
             // stepping between content items.
@@ -5878,13 +5761,39 @@ fn bubbleScreenRadius(n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
     return @max(@min(want, hoverSizeCap(gap_cap, cap, hover)), floor);
 }
 
-/// Drawn / hit radius for an interior item. Headings and body blocks scale by kind, same as
-/// `drawInteriorMarks` — hit-testing against the unscaled rest size missed the disc the
-/// reader was pointing at.
+/// Drawn *and* hit radius for an interior item — one function, because a disc you can see and a
+/// disc you can click have to be the same disc. Items scale by kind; the sun is the overview ring
+/// mid-handover (see `sunScreenRadiusPx`), which is the case that used to disagree: it was drawn
+/// at the overview's size and tested against the interior's own resting size, so through the whole
+/// descent a click on the dashed ring landed outside the sun and did nothing. Zooming on until the
+/// handover finished was what made the two agree again, and the exit start working.
 fn interiorNodeRadiusPx(p: *const Panel, i: usize, n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
+    if (n.is_sun) return sunScreenRadiusPx(p, n, zoom_t, gap_px);
     var r = bubbleScreenRadius(n, zoom_t, gap_px);
     if (i > 0 and i < p.interior.item_kind.len) r *= contentKindRadiusMul(p.interior.item_kind[i]);
     return r;
+}
+
+/// The interior sun's screen radius: the overview ring it grew out of, eased onto its own size.
+///
+/// The sun *is* the overview node's ring, grown. Both sizes come from `bubbleScreenRadius` but
+/// from different inputs — the overview node is `open_screen_r` against `layout_slot * zoom`, the
+/// sun is `sun_screen_r` against `interior.slot * zoom`, each with its own cap and
+/// `gap_radius_frac` clamp — and nothing makes those agree at the handover, while the overview
+/// copy is `omit`ted the same frame the sun appears. Whatever they disagree by would be a snap:
+/// the ring jumping to a different size and then growing back to the one it already had.
+///
+/// Interpolating on `interiorYieldT` rather than on `interior.t` puts the ring's size on the very
+/// curve that fades the overview out, so size and opacity hand over together.
+fn sunScreenRadiusPx(p: *const Panel, n: GraphNode, zoom_t: f32, gap_px: f32) f32 {
+    const own = bubbleScreenRadius(n, zoom_t, gap_px);
+    if (p.interior.parent_node >= p.nodes.len) return own;
+    // The *overview's* inputs, not the interior's — this is the ring the overview would be
+    // drawing for that node right now if it were not omitted.
+    const o_zoom_t = @max(detailRevealT(p.layout_slot, p.camera.zoom), 1);
+    const r0 = bubbleScreenRadius(p.nodes[p.interior.parent_node], o_zoom_t, p.layout_slot * p.camera.zoom);
+    if (!(r0 > 0)) return own;
+    return std.math.lerp(r0, own, interiorYieldT(p));
 }
 
 /// The disc colour notes and coalesced masses share at rest.
@@ -5992,13 +5901,14 @@ fn drawFitButton(p: *Panel, container: *dvui.WidgetData) void {
         icons.tvg.lucide.maximize,
         .{ .stroke_color = icon_color, .fill_color = icon_color },
         .{
-            // `min_size_content.h` must be a real height — IconWidget derives width from it
-            // and clamps up to `min_size_content.w`, so a placeholder height would square
-            // the glyph and `.ratio` would then stretch it.
+            // Height only, and the width left at 0 on purpose: `IconWidget.init` infers the width
+            // from the glyph's own aspect *only* when it is zero. A placeholder 1.0 was taken at
+            // face value, so the icon's min size was 1×32 and `.ratio` scaled that aspect down to
+            // fit — a sliver a fraction of a pixel wide, which is why the button drew empty.
             .expand = .ratio,
             .gravity_x = 0.5,
             .gravity_y = 0.5,
-            .min_size_content = .{ .w = 1.0, .h = size },
+            .min_size_content = .{ .h = size },
         },
     );
 
@@ -6415,7 +6325,11 @@ fn handleInput(p: *Panel, st: anytype) void {
                     if (p.moved_since_press) {
                         released_moved = true;
                     } else if (me.button.pointer() or me.button == .middle) {
-                        if (interiorHasPointer(p)) {
+                        if (interiorSunHit(p, me.p)) {
+                            // The dashed ring is the way out, at any point in the descent — see
+                            // `interiorSunHit`.
+                            exitInterior(p);
+                        } else if (interiorHasPointer(p)) {
                             // Inside a note: sun exits to the vault view; a section scrolls the
                             // editor to that heading.
                             if (hitTestActive(p, me.p)) |ni| {
@@ -6675,6 +6589,7 @@ fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Poi
     // `buildInteriorWorld`), and it is one section's worth of notes, so it is walked outright.
     if (in_interior) {
         for (0..nodes.len) |i| hitTestNode(p, nodes, i, slot, zoom_t, screen, true, &best, &best_d);
+        if (sunRimHit(p, nodes, zoom_t, slot * p.camera.zoom, screen)) |sun| return sun;
         return best;
     }
 
@@ -6694,6 +6609,66 @@ fn hitTestNodes(p: *Panel, nodes: []const GraphNode, slot: f32, screen: dvui.Poi
         hitTestNode(p, nodes, v.index, slot, zoom_t, screen, false, &best, &best_d);
     }
     return best;
+}
+
+/// How far either side of the sun's dashed rim still counts as the rim, in natural px.
+const sun_rim_grab_px: f32 = 12;
+
+/// Did this click land on the interior sun — the dashed ring — whatever the descent has reached?
+///
+/// Asked *before* `interiorHasPointer` routes the click, and that is the point. The ring on screen
+/// is the sun from the moment a cloud exists: `styledMarkFor` omits the overview's own copy of that
+/// node as soon as `interior.nodes` is built, at any `t`. Input, though, only moves to the interior
+/// at `interior_takeover_t`, so through the whole first half of a descent the reader was clicking a
+/// ring that was drawn by the interior and hit-tested against the invisible overview node behind
+/// it — which reads as *open* and so re-entered the note it was already in. Click, nothing;
+/// zoom in a little, click, and now it works. Same ring, same click, two different meanings
+/// depending on a threshold nothing on screen expresses.
+///
+/// Below takeover the whole disc counts, since nothing else in the cloud is taking clicks yet.
+/// Above it, only the rim: the headings own the inside of the disc by then.
+fn interiorSunHit(p: *const Panel, screen: dvui.Point.Physical) bool {
+    if (p.interior.nodes.len == 0) return false;
+    // Only for a descent the reader asked for. A cloud also gets built under a *hand*-driven zoom
+    // (`interiorWant` picks the note being aimed at), and down there the ring is still the note's
+    // own disc as far as the reader is concerned — clicking it has to open the note, not fly away
+    // from it. Once input has moved inside, that ambiguity is gone whatever the framing says.
+    if (p.framing != .interior and !interiorHasPointer(p)) return false;
+    const sun = p.interior.nodes[0];
+    if (!sun.is_sun) return false;
+    const zoom_t = @max(detailRevealT(p.interior.slot, p.camera.zoom), 1);
+    const r = interiorNodeRadiusPx(p, 0, sun, zoom_t, p.interior.slot * p.camera.zoom);
+    const s = p.camera.worldToScreen(sun.pos);
+    const dx = s.x - screen.x;
+    const dy = s.y - screen.y;
+    const d = @sqrt(dx * dx + dy * dy);
+    if (interiorHasPointer(p)) return @abs(d - r) <= sun_rim_grab_px * dpiScale();
+    return d <= r + sun_rim_grab_px * dpiScale();
+}
+
+/// The sun, when the pointer is on its dashed rim — which outranks the nearest-centre answer.
+///
+/// The rim is the way back out of a note, and the sun is drawn *over* the cloud (`on_top` in
+/// `drawInteriorMarks`), so a click on the ring belongs to the sun even where a heading's disc
+/// reaches it. Nearest-centre alone does not say that: a point on the rim is a full sun-radius
+/// from the sun's own centre, so any heading orbiting near the pointer won the click and the
+/// reader got a scroll instead of the way out. Whether that happened depended on where the
+/// headings had landed — they are placed by document order with a per-item jitter — which is
+/// exactly why leaving a note worked on one note, one pose, one click, and not on the next.
+fn sunRimHit(
+    p: *const Panel,
+    nodes: []const GraphNode,
+    zoom_t: f32,
+    gap_px: f32,
+    screen: dvui.Point.Physical,
+) ?usize {
+    if (nodes.len == 0 or !nodes[0].is_sun) return null;
+    const s = p.camera.worldToScreen(nodes[0].pos);
+    const dx = s.x - screen.x;
+    const dy = s.y - screen.y;
+    const d = @sqrt(dx * dx + dy * dy);
+    const r = interiorNodeRadiusPx(p, 0, nodes[0], zoom_t, gap_px);
+    return if (@abs(d - r) <= sun_rim_grab_px * dpiScale()) 0 else null;
 }
 
 /// One node's hit test, against the same radius it is drawn at, keeping the nearest hit.
@@ -6731,6 +6706,9 @@ fn hitTestNode(
 /// interior sun. Focusing the parent note is the reverse of the click that brought you in.
 fn exitInterior(p: *Panel) void {
     p.camera.user_driving = false;
+    // Momentum would re-sync the targets out from under the flight — see `zoomExtentsFor`.
+    p.fling_x.cancel();
+    p.fling_y.cancel();
     const id = p.interior.note_id orelse {
         p.framing = .extents;
         fitToNodes(p, .{ .animate = true });
