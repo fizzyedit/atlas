@@ -1,7 +1,7 @@
 .{
     .id = "atlas",
     .name = "Atlas",
-    .version = "0.0.5",
+    .version = "0.0.6",
     .min_sdk_version = "0.1.52",
     .description = "Wiki-style notes for fizzy: [[wikilinks]], backlinks, and a graph of how your markdown connects.",
     .tags = .{ "notes", "markdown", "wiki" },
