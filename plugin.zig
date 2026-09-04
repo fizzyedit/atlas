@@ -48,6 +48,7 @@ const vtable: sdk.Plugin.VTable = .{
     .needsContinuousRepaint = needsContinuousRepaint,
     .endFrame = endFrame,
     .drawOverlay = vault_sim.drawOverlay,
+    .requestNewDocumentDialog = requestNewDocumentDialog,
 };
 
 var plugin_state: State = .{};
@@ -268,6 +269,59 @@ fn cmdConvertWikilinks(state: *anyopaque) anyerror!void {
 fn zoomGraphToFit(_: *anyopaque) !void {
     sdk.host().setActiveBottomView(graph.view_id);
     graph.zoomExtents();
+}
+
+/// New File → "Atlas": put an empty `.md` note on disk and hand the explorer straight into its
+/// inline rename, so the user types the name onto the row in the tree instead of into a dialog.
+///
+/// There is no dialog of atlas's own here. A note has nothing to configure the way pixi's canvas
+/// dimensions do, and the chooser the user just clicked is already shrinking towards its own
+/// centre — `setExplorerNewFilePath` is what lets fizzy re-aim that close at the row the tree
+/// grows a frame later, so the dialog reads as flying into the thing it created.
+///
+/// Atlas owns no documents (see this file's header), so both the create and the open go through
+/// the workbench service: `.md` stays owned by the text plugin, exactly as for a note made any
+/// other way. Every failure here is a dead end rather than a partial state — nothing is revealed
+/// that was not created.
+fn requestNewDocumentDialog(_: *anyopaque, parent_path: ?[]const u8, _: usize) void {
+    const host = runtime.host();
+    // The folder right-clicked in the explorer, else the project root. A note has to live
+    // somewhere; with no folder open there is no tree to rename it in either.
+    const dir = parent_path orelse host.folder() orelse {
+        dvui.log.err("atlas: New Note needs an open folder", .{});
+        return;
+    };
+    const wb = host.getServiceTyped(sdk.services.workbench.Api) orelse {
+        dvui.log.err("atlas: New Note needs the workbench service", .{});
+        return;
+    };
+
+    const arena = dvui.currentWindow().arena();
+    // "untitled.md", then "untitled-2.md", … — creating a second note must not fail just because
+    // the first is still sitting there under its created name, waiting to be renamed.
+    var name_buf: [32]u8 = undefined;
+    var n: usize = 1;
+    const path = while (n <= 1000) : (n += 1) {
+        const name = if (n == 1)
+            "untitled.md"
+        else
+            std.fmt.bufPrint(&name_buf, "untitled-{d}.md", .{n}) catch return;
+        const candidate = std.fs.path.join(arena, &.{ dir, name }) catch return;
+        std.Io.Dir.accessAbsolute(dvui.io, candidate, .{}) catch break candidate;
+    } else return;
+
+    wb.createFile(path) catch |err| {
+        dvui.log.err("atlas: failed to create note {s}: {any}", .{ path, err });
+        return;
+    };
+    _ = wb.open(path, wb.currentGrouping()) catch |err| {
+        // The note exists and the tree will show it; only the tab is missing. Still worth
+        // revealing below, so this is logged rather than returned on.
+        dvui.log.err("atlas: failed to open note {s}: {any}", .{ path, err });
+    };
+    host.setExplorerNewFilePath(path) catch |err| {
+        dvui.log.err("atlas: failed to reveal note {s}: {any}", .{ path, err });
+    };
 }
 
 comptime {
