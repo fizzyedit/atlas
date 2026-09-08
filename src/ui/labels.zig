@@ -83,7 +83,6 @@ pub const Placement = struct { slot: Slot, rect: Rect };
 /// doesn't wall off a whole quadrant of the panel from labels that never came near the line.
 pub const Segment = struct { a: Point, b: Point };
 
-
 /// A uniform grid over the panel holding, per cell, the link segments that pass through it.
 ///
 /// The placer's collision test is "does this candidate rect cross a drawn link", and it used to

@@ -600,7 +600,6 @@ fn edgeKey(e: Edge) u64 {
     return (@as(u64, e.a) << 32) | @as(u64, e.b);
 }
 
-
 fn coarsenLevel(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -1170,7 +1169,6 @@ test "hasFolders distinguishes a flat vault from a nested one" {
     try testing.expect(hasFolders(&.{ "A.md", "notes/B.md" }));
     try testing.expect(!hasFolders(&.{}));
 }
-
 
 fn totalCount(lad: Ladder) u32 {
     var n: u32 = 0;

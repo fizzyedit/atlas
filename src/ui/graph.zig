@@ -71,8 +71,6 @@ const open_node_r: f32 = 34;
 ///
 /// They are **physical** pixels on a 2x (hidpi) screen, because that is the machine they were
 /// dialled in on and the numbers worth keeping are the ones that were actually looked at.
-
-
 /// Converts a tuned constant to the reader's screen. 1 on a hidpi display, 0.5 on an ordinary one.
 ///
 /// The camera converts world units straight to `Point.Physical`, so a constant compared against,
@@ -141,7 +139,6 @@ const coalesce_grow: f32 = 1.6;
 /// The same for a merged region, which is drawn at the size of the area it covers rather than at
 /// a fixed target size — so it needs far less growth to read as picked out, and much more would
 /// bury the regions around it.
-
 /// Sun grows more than a section bubble — approaching the exit should feel generous.
 const sun_grow_factor: f32 = 1.45;
 /// Screen-space falloff for mouse influence at overview zoom.
@@ -166,7 +163,6 @@ const camera_chase_k: f32 = 7;
 /// Half-width of the focus frame, in lattice slots: one note plus a readable ring around it.
 const focus_context_slots: f32 = 3.5;
 /// How far above the resolve zoom to sit, so the note is comfortably a note and not on the cusp.
-
 const focus_resolve_margin: f32 = 1.15;
 const focus_padding_px: f32 = 56;
 /// On-screen px between lattice neighbours a focus will not zoom *in* past — the close-up
@@ -603,7 +599,6 @@ const LayoutJob = struct {
     /// This solve's positions, adopted by `finishRebuild` for the next rebuild to compare against.
     next_pos: []layout.Vec2 = &.{},
     next_comp: []u32 = &.{},
-
 
     /// Placement inputs, copied from the panel at spawn so the worker never reads live state.
     place_opts: containment.Options = .{},
@@ -1296,7 +1291,6 @@ pub fn shutdown() void {
 /// measurement is wrong; if both track and the view still looks unchanged, it is the camera.
 /// Aspect/reshape readout used while tuning pane packing. Off in normal use — filling a
 /// text HUD and scanning every node for span every frame is pure overhead on the hot path.
-
 /// Per-frame breakdown of where the panel's time goes, shown by `drawDebugHud`.
 ///
 /// The draw pass is a sequence of passes over the same node and edge arrays, and which of them
@@ -1864,7 +1858,6 @@ fn updateHover(p: *Panel) void {
         p.hover_node = hitTestNodes(p, p.nodes, p.layout_slot, mouse);
         p.hover_cluster = if (p.hover_node != null) null else hitTestClusters(p, mouse);
     }
-
 
     const dt = @min(dvui.secondsSinceLastFrame(), 1.0 / 30.0);
     const t_chase = 1.0 - @exp(-pointer_chase_k * dt);
@@ -3277,11 +3270,7 @@ fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
         n.target_radius = radiusFor(n.degree, false, n.phantom);
     }
     p.open_notes.clearRetainingCapacity();
-    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse {
-        p.open_hash = open_hash;
-        return;
-    };
-    const n_open = wb.openCount();
+    const n_open = sdk.host().openDocCount();
     if (n_open > 0) {
         // One pass to index by path, rather than a full scan of the vault per open tab. At 286,546
         // notes the nested version was a string compare against every node for each tab, on the
@@ -3298,7 +3287,7 @@ fn applyOpenSet(p: *Panel, vault: []const u8, open_hash: u64) void {
         var rel_buf: [query.max_rel_path]u8 = undefined;
         var i: usize = 0;
         while (i < n_open) : (i += 1) {
-            const abs = wb.openPathAt(i) orelse continue;
+            const abs = openPathAt(i) orelse continue;
             if (!query.isMarkdownPath(abs)) continue;
             const rel = query.vaultRelative(vault, abs, &rel_buf) orelse continue;
             const gi = by_path.get(rel) orelse continue;
@@ -3598,12 +3587,11 @@ fn followAnchorKeepZoom(p: *Panel, before: dvui.Point, after: dvui.Point) void {
 
 fn hashOpenNotes(vault: []const u8) u64 {
     var h: u64 = 14695981039346656037;
-    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return 0;
-    const n = wb.openCount();
+    const n = sdk.host().openDocCount();
     var rel_buf: [query.max_rel_path]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const abs = wb.openPathAt(i) orelse continue;
+        const abs = openPathAt(i) orelse continue;
         if (!query.isMarkdownPath(abs)) continue;
         const rel = query.vaultRelative(vault, abs, &rel_buf) orelse continue;
         for (rel) |c| {
@@ -4395,8 +4383,8 @@ fn focusNodeIndex(p: *Panel) ?u32 {
     } else if (!p.synthetic) {
         // Only the workbench knows the difference between "between tabs" and "no tabs". Absent the
         // service there is no way to tell, so the hold stands rather than guessing.
-        if (sdk.host().getServiceTyped(sdk.services.workbench.Api)) |wb| {
-            if (wb.openCount() == 0) p.focus_node = fold.invalid;
+        if (sdk.host().getServiceTyped(sdk.services.workbench.Api) != null) {
+            if (sdk.host().openDocCount() == 0) p.focus_node = fold.invalid;
         }
     }
     if (p.focus_node == fold.invalid) return null;
@@ -5448,7 +5436,7 @@ fn renderTextPlated(
         .w = w,
         .h = h,
     };
-    box.fill(.all(h * 0.5), .{ .color = plate.opacity(eased), .fade = 1 });
+    box.fill(.all(h * 0.5), .{ .color = .{ .color = plate.opacity(eased) }, .fade = 1 });
 
     dvui.renderText(.{
         .font = font,
@@ -5875,8 +5863,8 @@ fn drawFitButton(p: *Panel, container: *dvui.WidgetData) void {
         .min_size_content = .{ .w = size, .h = size },
         .background = true,
         .corners = .round(btn_radius),
-        .color_fill = fill,
-        .color_fill_hover = fill.lighten(if (theme.dark) 10.0 else -10.0),
+        .color_fill = .{ .color = fill },
+        .color_fill_hover = .{ .color = fill.lighten(if (theme.dark) 10.0 else -10.0) },
         .color_border = .transparent,
         // Pad on the button, not the icon: a uniform pad on the icon forces its content
         // rect square and skews non-square glyphs under `expand = .ratio`.
@@ -5899,7 +5887,7 @@ fn drawFitButton(p: *Panel, container: *dvui.WidgetData) void {
         @src(),
         "zoom graph to fit",
         icons.tvg.lucide.maximize,
-        .{ .stroke_color = icon_color, .fill_color = icon_color },
+        .{ .stroke_color = .{ .color = icon_color }, .fill_color = .{ .color = icon_color } },
         .{
             // Height only, and the width left at 0 on purpose: `IconWidget.init` infers the width
             // from the glyph's own aspect *only* when it is zero. A placeholder 1.0 was taken at
@@ -5959,18 +5947,17 @@ fn logFrameProfile(p: *Panel) void {
             "| edges {d} nodes {d} clusters {d} names {d} " ++
             "|| marks {d} links {d} notes {d} clusters {d} pathed {d} zoom {d:.4}",
         .{
-            us(fp.total()),          us(fp.rebuild_ns),
-            us(fp.misc_ns),          us(fp.bubbles_ns),
-            us(fp.hover_ns),         us(fp.labels_ns),
-            us(fp.labels_seg_ns),    us(fp.labels_place_ns),
-            us(fp.world_step_ns),    us(fp.world_sync_ns),
-            us(fp.world_lift_ns),    us(fp.draw_edges_ns),
-            us(fp.draw_nodes_ns),    us(fp.draw_clusters_ns),
-            us(fp.draw_labels_ns),
-            if (p.world_state) |*w| w.marks.items.len else 0,
-            if (p.world_state) |*w| w.links.items.len else 0,
-            fp.nodes_drawn,          fp.clusters_drawn,
-            fp.nodes_pathed,         p.camera.zoom,
+            us(fp.total()),                                   us(fp.rebuild_ns),
+            us(fp.misc_ns),                                   us(fp.bubbles_ns),
+            us(fp.hover_ns),                                  us(fp.labels_ns),
+            us(fp.labels_seg_ns),                             us(fp.labels_place_ns),
+            us(fp.world_step_ns),                             us(fp.world_sync_ns),
+            us(fp.world_lift_ns),                             us(fp.draw_edges_ns),
+            us(fp.draw_nodes_ns),                             us(fp.draw_clusters_ns),
+            us(fp.draw_labels_ns),                            if (p.world_state) |*w| w.marks.items.len else 0,
+            if (p.world_state) |*w| w.links.items.len else 0, fp.nodes_drawn,
+            fp.clusters_drawn,                                fp.nodes_pathed,
+            p.camera.zoom,
         },
     );
 }
@@ -6110,13 +6097,13 @@ fn drawDebugHud(p: *Panel) void {
             "{s}\n" ++
             "awake: {s}",
         .{
-            vp.w,                             vp.h,
-            if (vp.h > 0) vp.w / vp.h else 0, p.aspect_smooth,
-            p.layout_aspect,                  p.nodes.len,
-            p.edges.len,                      p.layout_slot,
-            p.camera.zoom,                    span,
-            p.island_count,                   @tagName(p.framing),
-            p.interior.t,                     focus,
+            vp.w,                                      vp.h,
+            if (vp.h > 0) vp.w / vp.h else 0,          p.aspect_smooth,
+            p.layout_aspect,                           p.nodes.len,
+            p.edges.len,                               p.layout_slot,
+            p.camera.zoom,                             span,
+            p.island_count,                            @tagName(p.framing),
+            p.interior.t,                              focus,
             if (awake.len == 0) "(asleep)" else awake,
         },
     ) catch return;
@@ -6162,7 +6149,7 @@ fn drawDebugHud(p: *Panel) void {
         .w = vp.w - 16 * scale,
         .h = 146 * scale,
     };
-    rect.fill(.{}, .{ .color = dvui.Color.black.opacity(0.55), .fade = 1 });
+    rect.fill(.{}, .{ .color = .{ .color = dvui.Color.black.opacity(0.55) }, .fade = 1 });
     dvui.renderText(.{
         .font = dvui.Font.theme(.body).larger(-2),
         .text = text,
@@ -6187,7 +6174,7 @@ fn drawBuildingMapSpinner(note_count: u32) void {
     dvui.spinner(@src(), .{
         .gravity_x = 0.5,
         .min_size_content = .{ .w = 28, .h = 28 },
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
     });
 
     var buf: [64]u8 = undefined;
@@ -6197,7 +6184,7 @@ fn drawBuildingMapSpinner(note_count: u32) void {
         "Building map…";
     dvui.labelNoFmt(@src(), msg, .{}, .{
         .font = dvui.Font.theme(.body).larger(-1),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
         .gravity_x = 0.5,
     });
 }
@@ -6214,7 +6201,7 @@ fn drawLayoutSpinner(note_count: u32, scan_total: u32, phase: Indexer.Phase) voi
     dvui.spinner(@src(), .{
         .gravity_x = 0.5,
         .min_size_content = .{ .w = 28, .h = 28 },
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
     });
 
     var buf: [64]u8 = undefined;
@@ -6239,7 +6226,7 @@ fn drawLayoutSpinner(note_count: u32, scan_total: u32, phase: Indexer.Phase) voi
         "Building…";
     dvui.labelNoFmt(@src(), msg, .{}, .{
         .font = dvui.Font.theme(.body).larger(-1),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
         .gravity_x = 0.5,
         .margin = .{ .y = 8 },
     });
@@ -6255,7 +6242,7 @@ fn drawCenteredHint(msg: []const u8) void {
     defer box.deinit();
     dvui.labelNoFmt(@src(), msg, .{}, .{
         .font = dvui.Font.theme(.body).larger(-1),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
         .gravity_x = 0.5,
     });
 }
@@ -6267,9 +6254,9 @@ fn handleInput(p: *Panel, st: anytype) void {
     const scheme = sdk.host().panZoomScheme();
 
     const suppressed = if (p.dialog_canvas)
-        core.dvui.dialogCanvasPointerInputSuppressed()
+        core.dialogs.dialogCanvasPointerInputSuppressed()
     else
-        core.dvui.canvasPointerInputSuppressed();
+        core.dialogs.canvasPointerInputSuppressed();
     if (suppressed) {
         if (dvui.captured(id)) {
             for (dvui.events()) |*e| {
@@ -6753,9 +6740,8 @@ fn revealInteriorSection(p: *Panel, st: anytype, idx: usize) void {
     // Generated notes have no backing file — nothing to reveal.
     if (p.synthetic or n.path.len == 0) return;
     const root = st.vault_root orelse return;
-    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
     const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, n.path }) catch return;
-    _ = wb.revealPosition(abs, n.line, 0, false) catch |err| {
+    _ = sdk.host().revealPosition(abs, n.line, 0, false) catch |err| {
         dvui.log.err("atlas: revealPosition {s}:{d}: {any}", .{ abs, n.line, err });
     };
     // The markdown preview pane is created on a later frame than the raw editor. Host
@@ -6775,12 +6761,8 @@ fn queuePreviewReveal(p: *Panel, abs: []const u8, line: u32) void {
 
 fn tickPendingReveal(p: *Panel) void {
     if (p.reveal_frames == 0 or p.reveal_path_len == 0) return;
-    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse {
-        p.reveal_frames = 0;
-        return;
-    };
     const abs = p.reveal_path_buf[0..p.reveal_path_len];
-    _ = wb.revealPosition(abs, p.reveal_line, 0, false) catch {};
+    _ = sdk.host().revealPosition(abs, p.reveal_line, 0, false) catch {};
     p.reveal_frames -= 1;
     if (p.reveal_frames > 0) dvui.refresh(null, @src(), null);
 }
@@ -6807,7 +6789,8 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
             break :blk n.title;
         };
         const path = std.fmt.allocPrint(dvui.currentWindow().arena(), "{s}/{s}.md", .{ root, stem }) catch return;
-        wb.createFile(path) catch |err| {
+        const files_api = sdk.host().getServiceTyped(sdk.services.files.Api) orelse return;
+        files_api.createFile(path) catch |err| {
             dvui.log.err("atlas: createFile {s}: {any}", .{ path, err });
             return;
         };
@@ -6820,18 +6803,18 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
             var rel_buf: [query.max_rel_path]u8 = undefined;
             if (query.vaultRelative(root, path, &rel_buf)) |rel| st.indexer.enqueue(rel);
         }
-        _ = wb.revealPosition(path, 0, 0, open_side) catch {};
+        _ = sdk.host().revealPosition(path, 0, 0, open_side) catch {};
         return;
     }
 
     const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, n.path }) catch return;
     if (open_side) {
         const g = wb.newGrouping();
-        _ = wb.open(abs, g) catch |err| {
+        _ = sdk.host().openFilePath(abs, g) catch |err| {
             dvui.log.err("atlas: open {s}: {any}", .{ abs, err });
         };
     } else {
-        _ = wb.revealPosition(abs, 0, 0, false) catch |err| {
+        _ = sdk.host().revealPosition(abs, 0, 0, false) catch |err| {
             dvui.log.err("atlas: revealPosition {s}: {any}", .{ abs, err });
         };
     }
@@ -7052,7 +7035,6 @@ fn envFlag(comptime name: []const u8, cache: *?bool) bool {
     return v;
 }
 
-
 /// `ATLAS_HUD=1` shows the per-phase frame breakdown. It is the only way to tell a slow *draw*
 /// from a slow *decision* while the app is running, and the harness cannot see the draw path at
 /// all — `bench --world --zoom` drives `World` directly, with no panel and no dvui.
@@ -7061,4 +7043,10 @@ fn hudEnabled() bool {
         var cached: ?bool = null;
     };
     return envFlag("ATLAS_HUD", &S.cached);
+}
+
+/// The absolute path of the `i`th open document, whoever owns it.
+fn openPathAt(i: usize) ?[]const u8 {
+    const doc = sdk.host().docByIndex(i) orelse return null;
+    return doc.owner.documentPath(doc);
 }

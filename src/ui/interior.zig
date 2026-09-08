@@ -131,7 +131,6 @@ pub fn toWorld(local: dvui.Point, n: Nest, parent: dvui.Point) dvui.Point {
     return .{ .x = parent.x + local.x * n.scale, .y = parent.y + local.y * n.scale };
 }
 
-
 /// Share of the panel's short side the interior's own spread has to cover before it starts to
 /// appear, and before it has fully taken over.
 ///
@@ -276,9 +275,6 @@ test "descent is monotonic in zoom" {
     }
     try testing.expectApproxEqAbs(@as(f32, 1), prev, 1e-4);
 }
-
-
-
 
 test "an interior stays inside its own note's berth" {
     // If a cloud overflowed its berth it would tangle with the neighbouring notes' nodes at

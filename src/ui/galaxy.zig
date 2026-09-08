@@ -246,9 +246,9 @@ pub const PreparedMarks = struct {
             // dashed ring of every hovered mass: pointing at one changed what kind of thing it
             // looked like.
             if (d.dashed_rim) {
-                strokeCircleDashed(d.c, d.r, .{ .thickness = thickness, .color = d.rim });
+                strokeCircleDashed(d.c, d.r, .{ .thickness = thickness, .color = .{ .color = d.rim } });
             } else {
-                strokeCircle(d.c, d.r, .{ .thickness = thickness, .color = d.rim });
+                strokeCircle(d.c, d.r, .{ .thickness = thickness, .color = .{ .color = d.rim } });
             }
         }
     }
@@ -360,7 +360,7 @@ fn fillCircle(center: dvui.Point.Physical, radius: f32, col: dvui.Color) void {
         pt.* = .{ .x = center.x + @cos(a) * radius, .y = center.y + @sin(a) * radius };
     }
     const path: dvui.Path = .{ .points = pts };
-    path.fillConvex(.{ .color = col });
+    path.fillConvex(.{ .color = .{ .color = col } });
 }
 
 fn strokeCircle(center: dvui.Point.Physical, radius: f32, stroke: dvui.Path.StrokeOptions) void {

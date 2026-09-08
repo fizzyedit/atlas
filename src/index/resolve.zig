@@ -752,10 +752,10 @@ test "the index gives byte-identical answers to the linear scan" {
     defer index.deinit();
 
     const targets = [_][]const u8{
-        "Setup",       "setup",          "SETUP",     "Journal",
-        "Daily",       "notes/Daily",    "a/Setup",   "a/b/setup",
-        "./Setup",     "../Setup",       "Zed.md",    "Missing",
-        "notes/Daily.md", "b/Setup",     "",          "Other",
+        "Setup",          "setup",       "SETUP",   "Journal",
+        "Daily",          "notes/Daily", "a/Setup", "a/b/setup",
+        "./Setup",        "../Setup",    "Zed.md",  "Missing",
+        "notes/Daily.md", "b/Setup",     "",        "Other",
     };
     const sources = [_][]const u8{ "", "a/note.md", "a/b/note.md", "notes/x.md" };
 

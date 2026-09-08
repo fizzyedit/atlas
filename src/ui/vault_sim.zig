@@ -412,7 +412,7 @@ pub const Sim = struct {
             .margin = .{ .x = 8, .y = 8, .w = 8, .h = 8 },
             .padding = dvui.Rect.all(8),
             .background = true,
-            .color_fill = dvui.themeGet().color(.content, .fill),
+            .color_fill = .{ .color = dvui.themeGet().color(.content, .fill) },
             .corners = .round(6),
         });
         defer box.deinit();
@@ -476,7 +476,7 @@ pub const Sim = struct {
         if (self.job != null) {
             dvui.labelNoFmt(@src(), "Regenerating…", .{}, .{
                 .margin = .{ .y = 12 },
-                .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+                .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
             });
         } else if (self.applied_valid) {
             const shown = blk: {
@@ -487,7 +487,7 @@ pub const Sim = struct {
             };
             dvui.label(@src(), "Showing: {s} · {d}", .{ shown, self.applied.n }, .{
                 .margin = .{ .y = 12 },
-                .color_text = dvui.themeGet().color(.content, .text).opacity(0.55),
+                .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.55) },
             });
         }
 
@@ -547,7 +547,7 @@ pub const Sim = struct {
     /// width; keep them inside `readout_cols` or they will be clipped rather than resize anything.
     fn readout(src: std.builtin.SourceLocation, comptime fmt: []const u8, args: anytype) void {
         const opts: dvui.Options = .{
-            .color_text = dvui.themeGet().color(.content, .text).opacity(0.55),
+            .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.55) },
             .font = dvui.Font.theme(.mono),
         };
         dvui.label(src, fmt, args, opts.min_sizeM(readout_cols, 1).max_sizeM(readout_cols, 1));
@@ -588,7 +588,7 @@ pub const Sim = struct {
                 .interval = k[4],
             }, .{ .expand = .horizontal, .margin = .{ .y = 4 }, .id_extra = i })) changed = true;
             dvui.labelNoFmt(@src(), k[5], .{}, .{
-                .color_text = dim,
+                .color_text = .{ .color = dim },
                 .margin = .{ .h = 6 },
                 .id_extra = i,
             });
@@ -596,7 +596,7 @@ pub const Sim = struct {
 
         dvui.label(@src(), "no-overlap at spread ≥ {d:.3}", .{
             containment.minRadiusExp(self.place.fill),
-        }, .{ .color_text = dim });
+        }, .{ .color_text = .{ .color = dim } });
 
         if (changed) {
             self.panel.place_opts = self.place;
@@ -614,7 +614,7 @@ pub const Sim = struct {
         var box = dvui.box(@src(), .{ .dir = .vertical }, .{
             .expand = .both,
             .background = true,
-            .color_fill = dvui.themeGet().color(.window, .fill),
+            .color_fill = .{ .color = dvui.themeGet().color(.window, .fill) },
             .margin = .{ .y = 8, .w = 8, .h = 8 },
             .corners = .round(6),
         });
@@ -641,7 +641,7 @@ pub const Sim = struct {
                 pts[i] = .{ .x = scr.x + @cos(a) * r_px, .y = scr.y + @sin(a) * r_px };
             }
             var path: dvui.Path = .{ .points = pts[0 .. n_pts + 1] };
-            path.stroke(.{ .color = col, .thickness = 1 });
+            path.stroke(.{ .color = .{ .color = col }, .thickness = 1 });
         }
     }
 };
@@ -706,15 +706,15 @@ pub fn drawOverlay(_: *anyopaque) !void {
     if (!s.open) return;
     s.tick();
 
-    // Same chrome every other fizzy dialog uses (`core.dvui.dialogWindow`'s own opts) — rounded
+    // Same chrome every other fizzy dialog uses (`core.dialogs.dialogWindow`'s own opts) — rounded
     // corners, no border, a soft drop shadow — rather than a bare dvui.floatingWindow, which reads
     // as a foreign widget next to the rest of the app's dialogs and tool windows.
-    var float = core.dvui.floatingWindow(@src(), .{
+    var float = core.widgets.floatingWindow(@src(), .{
         .rect = &s.win_rect,
         .open_flag = &s.open,
         .window_avoid = .nudge_once,
     }, .{
-        .color_fill = dvui.themeGet().color(.content, .fill).opacity(0.85),
+        .color_fill = .{ .color = dvui.themeGet().color(.content, .fill).opacity(0.85) },
         .corners = .round(10),
         .border = .all(0),
         .box_shadow = .{ .color = .black, .alpha = 0.35, .fade = 10, .corners = .round(10) },
@@ -724,7 +724,7 @@ pub fn drawOverlay(_: *anyopaque) !void {
     // Narrow the window-drag hit target to the header. Without this, FloatingWindowWidget
     // keeps drag_area = the whole window → move cursor everywhere, and presses become
     // window drags instead of sidebar edits / canvas pan-zoom.
-    float.dragAreaSet(core.dvui.windowHeader("Atlas: Vault Simulator", "", &s.open, .none));
+    float.dragAreaSet(core.dialogs.windowHeader("Atlas: Vault Simulator", "", &s.open, .none));
 
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .both });
     defer row.deinit();

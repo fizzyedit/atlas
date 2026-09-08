@@ -129,8 +129,8 @@ pub fn printHeader() void {
     std.debug.print(
         "{s:<14}{s:>8}{s:>9}{s:>9}{s:>8}{s:>6}{s:>7}{s:>6}{s:>6}{s:>6}{s:>6}{s:>6}{s:>8}{s:>8}{s:>8}{s:>11}  {s}\n",
         .{
-            "shape", "n", "e", "solve", "spread", "xing", "cocite", "r0", "bimod",
-            "ovlp",  "penet", "leaf", "hwy", "d-p50", "d-p99", "graph", "communities",
+            "shape", "n",     "e",    "solve", "spread", "xing",  "cocite", "r0",          "bimod",
+            "ovlp",  "penet", "leaf", "hwy",   "d-p50",  "d-p99", "graph",  "communities",
         },
     );
     std.debug.print("{s}\n", .{"-" ** 148});

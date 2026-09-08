@@ -37,7 +37,7 @@ const log = std.log.scoped(.atlas);
 /// but a rebuild frame on a large vault outlives *many* commits (a full scan publishes every
 /// 200 files), so the ring wrapped and the arena backing the strings the layout was walking got
 /// freed underneath it. Counts alone are pointer-free; see `counts`.
-    pub const SnapNode = struct {
+pub const SnapNode = struct {
     id: i64,
     path: []const u8,
     title: []const u8,
@@ -1466,12 +1466,12 @@ fn logTimings(self: *const Indexer) void {
             "(stat {d:.0}  read {d:.0}  parse {d:.0}  db {d:.0})  drop {d:.0}ms  " ++
             "relink {d:.0}ms  publish {d:.0}ms",
         .{
-            t.files_read,   t.files_skipped,
+            t.files_read,     t.files_skipped,
             ms(t.prepass_ns), ms(t.walk_ns),
-            ms(t.stat_ns),  ms(t.read_ns),
-            ms(t.parse_ns), ms(t.write_ns),
-            ms(t.drop_ns),
-            ms(t.relink_ns), ms(t.publish_ns),
+            ms(t.stat_ns),    ms(t.read_ns),
+            ms(t.parse_ns),   ms(t.write_ns),
+            ms(t.drop_ns),    ms(t.relink_ns),
+            ms(t.publish_ns),
         },
     );
 }

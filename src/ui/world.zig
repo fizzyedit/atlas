@@ -689,7 +689,6 @@ pub const World = struct {
         return .{ .centre = self.quant_centre, .half = self.quant_half };
     }
 
-
     /// `fold_opts.cancel`, when set, makes this abandonable — see `fold.Options.cancel`. The
     /// checks between phases below matter as much as the one inside the coarsening loop: the web
     /// build and the placement are each a large fraction of the total.
@@ -1392,7 +1391,6 @@ pub const World = struct {
         if (m.of >= self.marks.items.len) return null;
         return m.of;
     }
-
 
     /// The cut cell covering `cell`: the first cell on the root→`cell` path that is not open this
     /// frame. Null when every cell on that path is open, which means the cut is strictly *below*

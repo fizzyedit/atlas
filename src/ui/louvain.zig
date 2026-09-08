@@ -808,4 +808,3 @@ test "Leiden refine still separates two cliques" {
     for (9..16) |i| try testing.expectEqual(finest[8], finest[i]);
     try testing.expect(finest[0] != finest[8]);
 }
-

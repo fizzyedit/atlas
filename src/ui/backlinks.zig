@@ -209,7 +209,7 @@ const row_corner_radius: f32 = 6;
 /// one line of the row font. Taking the max means neither is squeezed, and it is applied as both
 /// the minimum *and* the maximum, so no child can push a row past it — see `rowShell`.
 fn rowContentHeight() f32 {
-    return @max(rowFont().textHeight(), core.dvui.treeRowGlyphSize().h);
+    return @max(rowFont().textHeight(), core.widgets.treeRowGlyphSize().h);
 }
 
 fn rowFont() dvui.Font {
@@ -331,8 +331,8 @@ fn rowShell(bw: *dvui.ButtonWidget, id_extra: usize, indent: f32, height: f32) v
         .corners = dvui.CornerRect.all(row_corner_radius),
         .background = true,
         .color_fill = .transparent,
-        .color_fill_hover = theme.color(.control, .fill).opacity(0.5),
-        .color_fill_press = theme.color(.control, .fill).opacity(0.9),
+        .color_fill_hover = .{ .color = theme.color(.control, .fill).opacity(0.5) },
+        .color_fill_press = .{ .color = theme.color(.control, .fill).opacity(0.9) },
     });
     bw.processHover();
     bw.drawBackground();
@@ -407,7 +407,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     if (st.vault_root == null or st.db == null) {
         dvui.labelNoFmt(@src(), "Open a folder to index your notes.", .{}, .{
             .font = dvui.Font.theme(.body).larger(-1),
-            .color_text = dvui.themeGet().color(.content, .text).opacity(0.6),
+            .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.6) },
         });
         return;
     }
@@ -416,7 +416,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     const active_rel = activeNoteRel(st.vault_root.?, &active_rel_buf) orelse {
         dvui.labelNoFmt(@src(), "Open a markdown note to see its backlinks.", .{}, .{
             .font = dvui.Font.theme(.body).larger(-1),
-            .color_text = dvui.themeGet().color(.content, .text).opacity(0.6),
+            .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.6) },
         });
         drawFooter(st);
         return;
@@ -427,7 +427,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
 
     dvui.labelNoFmt(@src(), displayTitle(active_rel), .{}, .{
         .font = dvui.Font.theme(.body).larger(-1).withWeight(.bold),
-        .color_text = dvui.themeGet().color(.content, .text),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text) },
     });
 
     var count_buf: [64]u8 = undefined;
@@ -437,7 +437,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     }) catch "";
     dvui.labelNoFmt(@src(), count_label, .{}, .{
         .font = dvui.Font.theme(.body).larger(-1),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.55),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.55) },
     });
 
     const filter_entry = dvui.textEntry(@src(), .{
@@ -453,7 +453,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     if (c.links.len == 0) {
         dvui.labelNoFmt(@src(), "No notes link here yet.", .{}, .{
             .font = dvui.Font.theme(.body).larger(-1),
-            .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+            .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
         });
         drawFooter(st);
         return;
@@ -464,7 +464,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     if (rows.len == 0) {
         dvui.labelNoFmt(@src(), "No matches.", .{}, .{
             .font = dvui.Font.theme(.body).larger(-1),
-            .color_text = dvui.themeGet().color(.content, .text).opacity(0.5),
+            .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.5) },
         });
         drawContextLimitNote(c);
         drawFooter(st);
@@ -617,7 +617,7 @@ fn drawContextLimitNote(c: *const Cache) void {
     ) catch return;
     dvui.labelNoFmt(@src(), msg, .{}, .{
         .font = dvui.Font.theme(.body).larger(-2),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.45),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.45) },
     });
 }
 
@@ -817,14 +817,14 @@ fn drawGroupHeader(bl: query.Backlink, count: usize, id_extra: usize, height: f3
     // tofu — and picking a glyph the font happens to have would still drift from the file tree's
     // caret the moment either changed. This is the same call the workbench makes.
     const caret_color = dvui.themeGet().color(.content, .text).opacity(0.55);
-    const caret = core.dvui.treeRowGlyph(@src(), .{ .id_extra = id_extra, .gravity_y = 0.5 });
+    const caret = core.widgets.treeRowGlyph(@src(), .{ .id_extra = id_extra, .gravity_y = 0.5 });
     const caret_rs = caret.data().borderRectScale().r;
     _ = dvui.icon(
         @src(),
         "BacklinkGroupCaret",
         if (is_collapsed) icons.tvg.entypo.@"right-open" else icons.tvg.entypo.@"down-open",
-        .{ .fill_color = caret_color, .stroke_color = caret_color },
-        core.dvui.treeRowIconOptions(.{ .id_extra = id_extra }),
+        .{ .fill_color = .{ .color = caret_color }, .stroke_color = .{ .color = caret_color } },
+        core.widgets.treeRowIconOptions(.{ .id_extra = id_extra }),
     );
     caret.deinit();
 
@@ -843,15 +843,15 @@ fn drawGroupHeader(bl: query.Backlink, count: usize, id_extra: usize, height: f3
         .background = false,
         .font = rowFont().withWeight(.bold),
         // The caret sits to the left of this label inside the row, so it is not text width.
-        .max_size_content = rowTextMax(core.dvui.treeRowGlyphSize().w),
+        .max_size_content = rowTextMax(core.widgets.treeRowGlyphSize().w),
         .id_extra = id_extra,
     });
     // Scored `plain = false` to match `groupMatches`, which weights the path's basename — and the
     // title *is* the basename for a note with no front-matter title.
-    core.dvui.addHighlightedText(&label, bl.title, q, false, title_color);
+    core.draw.addHighlightedText(&label, bl.title, q, false, title_color);
     var count_buf: [24]u8 = undefined;
     const suffix = std.fmt.bufPrint(&count_buf, "  ({d})", .{count}) catch "";
-    label.addText(suffix, .{ .color_text = title_color });
+    label.addText(suffix, .{ .color_text = .{ .color = title_color } });
     label.deinit();
 
     for (dvui.events()) |*e| {
@@ -891,13 +891,12 @@ fn drawGroupHeader(bl: query.Backlink, count: usize, id_extra: usize, height: f3
 fn revealBacklink(st: anytype, bl: query.Backlink, open_side: bool) void {
     const root = st.vault_root orelse return;
     const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, bl.path }) catch return;
-    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
-    _ = wb.revealPosition(abs, bl.line, bl.col, open_side) catch |err| {
+    _ = sdk.host().revealPosition(abs, bl.line, bl.col, open_side) catch |err| {
         dvui.log.err("atlas: revealPosition {s}: {any}", .{ abs, err });
     };
 }
 
-/// One run of a context line: `core.dvui.addHighlightedText` with the font carried per run, so a
+/// One run of a context line: `core.draw.addHighlightedText` with the font carried per run, so a
 /// link's name can be bold while the prose around it is not. The helper takes only a colour — the
 /// font there comes from the widget — and a run of a different weight is the whole point here.
 ///
@@ -912,14 +911,14 @@ fn addRun(
     font: dvui.Font,
 ) void {
     if (s.len == 0) return;
-    const plain: dvui.Options = .{ .font = font, .color_text = plain_color };
+    const plain: dvui.Options = .{ .font = font, .color_text = .{ .color = plain_color } };
     if (q.isEmpty()) return tl.addText(s, plain);
 
     var buf: [fuzzy.highlight_buf_len]usize = undefined;
     const hits = fuzzy.highlight(s, q, &buf, .{ .plain = true });
     if (hits.len == 0) return tl.addText(s, plain);
 
-    const matched: dvui.Options = .{ .font = font, .color_text = dvui.themeGet().color(.highlight, .fill) };
+    const matched: dvui.Options = .{ .font = font, .color_text = .{ .color = dvui.themeGet().color(.highlight, .fill) } };
     var i: usize = 0;
     var h: usize = 0;
     while (i < s.len) {
@@ -1099,7 +1098,7 @@ fn drawFooter(st: anytype) void {
 
     dvui.labelNoFmt(@src(), text, .{}, .{
         .font = dvui.Font.theme(.body).larger(-2),
-        .color_text = dvui.themeGet().color(.content, .text).opacity(0.4),
+        .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.4) },
         .margin = .{ .y = 10 },
     });
 }

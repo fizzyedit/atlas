@@ -153,7 +153,6 @@ const drift_frac: f32 = 0.12;
 /// the other still capped the input is indistinguishable from not having fixed it.
 pub const aspect_limit: f32 = 8.0;
 
-
 pub const Edge = struct { a: usize, b: usize };
 
 /// Layout lattice spacing for a vault of `n` notes — see `hex.layoutSpacingFor`.
@@ -596,7 +595,6 @@ pub fn targets(
             pos[i].x += fx;
             pos[i].y += fy;
         }
-
     }
 
     if (opts.profile) |pr| {
@@ -2685,7 +2683,7 @@ test "same-folder notes huddle closer than cross-folder peers" {
     var deg: [n]u32 = .{0} ** n;
     var no_edges: [0]Edge = .{};
     const paths = [_][]const u8{
-        "proj/a.md", "proj/b.md", "proj/c.md",
+        "proj/a.md",  "proj/b.md",  "proj/c.md",
         "other/x.md", "other/y.md", "other/z.md",
     };
     var seeds: [n]?dvui.Point = .{null} ** n;
@@ -2803,7 +2801,6 @@ test "a newly linked pair is parked near itself, not out past the vault" {
     try testing.expect(@sqrt(mid_x * mid_x + mid_y * mid_y) <= far);
 }
 
-
 test "a triangle inside a cluster does not snap into a straight line" {
     // The report this pins: three notes linking to one another, drawn as three in a row with the
     // middle one sitting on the edge joining the other two — every connection hidden. The force
@@ -2874,11 +2871,6 @@ test "countOccluded sees a node sitting on a link, and only then" {
         countOccluded(&clear, &pos, &cells, &occupied, spacing, spacing * occlude_frac),
     );
 }
-
-
-
-
-
 
 test "a group's links stay near the tightest the lattice allows" {
     // Bounds on how long a group's own connections come out, measured in snap cells. They are

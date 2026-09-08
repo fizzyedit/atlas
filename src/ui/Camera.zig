@@ -177,7 +177,6 @@ pub fn poseForBounds(self: *const Camera, bounds: dvui.Rect, padding: f32) Pose 
 /// Snap `center`/`zoom` so `bounds` (world AABB) fills the viewport with `padding` screen pixels.
 /// Abandon any arc. Called wherever the user takes the camera by hand — a drag or a wheel mid-
 /// flight must win immediately, not fight a path it cannot see.
-
 pub fn fitBounds(self: *Camera, bounds: dvui.Rect, padding: f32) void {
     const pose = self.poseForBounds(bounds, padding);
     self.zoom = pose.zoom;

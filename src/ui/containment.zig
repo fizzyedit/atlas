@@ -954,7 +954,6 @@ pub const Field = struct {
         if (parent != fold.invalid) sibs = @max(1, lad.cells[parent].child_count);
         return base * swell * self.siblingPushScale(sibs);
     }
-
 };
 
 pub fn init(

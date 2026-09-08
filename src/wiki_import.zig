@@ -525,9 +525,8 @@ pub fn main(init: std.process.Init) !void {
         \\  content       {d:.1} MB
         \\
     , .{
-        written,      out_dir.?,
-        stats.links,  stats.dropped_links,
-        stats.collisions,
-        @as(f64, @floatFromInt(stats.bytes)) / (1 << 20),
+        written,          out_dir.?,
+        stats.links,      stats.dropped_links,
+        stats.collisions, @as(f64, @floatFromInt(stats.bytes)) / (1 << 20),
     });
 }

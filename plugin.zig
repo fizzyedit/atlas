@@ -95,6 +95,16 @@ fn formatMarkdown(state: *anyopaque, ext: []const u8, path: []const u8, bytes: [
     };
 }
 
+fn drawBacklinks(ctx: ?*anyopaque) anyerror!dvui.App.Result {
+    try backlinks.draw(ctx);
+    return .ok;
+}
+
+fn drawGraph(ctx: ?*anyopaque) anyerror!dvui.App.Result {
+    try graph.draw(ctx);
+    return .ok;
+}
+
 pub fn register(host: *sdk.Host) !void {
     plugin_state.init(host.allocator);
     plugin.state = @ptrCast(&plugin_state);
@@ -104,21 +114,23 @@ pub fn register(host: *sdk.Host) !void {
     plugin_state.loadSettings(host);
     try plugin_state.registerSettings(host, &plugin);
     try host.registerLanguageSupport(language_support);
-    try host.registerSidebarView(.{
+    try host.registerSurface(.{
         .id = backlinks.view_id,
         .owner = &plugin,
-        .icon = icons.tvg.lucide.@"git-fork",
+        .icon = .{ .tvg = icons.tvg.lucide.@"git-fork" },
         .title = "Backlinks",
-        .draw = backlinks.draw,
+        .keywords = sdk.keywords.ide.sidebar,
+        .draw = drawBacklinks,
     });
-    try host.registerBottom(.{
+    try host.registerSurface(.{
         .id = graph.view_id,
         .owner = &plugin,
         .title = "Atlas",
+        .keywords = sdk.keywords.ide.panel,
         .persistent = true,
-        .draw = graph.draw,
+        .draw = drawGraph,
     });
-    try host.registerService(sdk.services.wikilink.Api.service_name, &wikilink_api, &plugin);
+    try host.registerService(sdk.services.wikilink.Api, &wikilink_api, &plugin);
     try host.registerCommand(.{
         .id = "atlas.rebuildIndex",
         .owner = &plugin,
@@ -139,7 +151,7 @@ pub fn register(host: *sdk.Host) !void {
         .owner = &plugin,
         .title = "Atlas: Zoom Graph to Fit",
         .run = zoomGraphToFit,
-        .icon = icons.tvg.lucide.@"maximize",
+        .icon = icons.tvg.lucide.maximize,
     });
     try host.registerCommand(.{
         .id = "atlas.convertWikilinks",
@@ -147,14 +159,14 @@ pub fn register(host: *sdk.Host) !void {
         .title = "Atlas: Convert Wikilinks to Markdown Links",
         .run = cmdConvertWikilinks,
         .isEnabled = cmdConvertWikilinksEnabled,
-        .icon = icons.tvg.lucide.@"link",
+        .icon = icons.tvg.lucide.link,
     });
     try host.registerCommand(.{
         .id = "atlas.openVaultSimulator",
         .owner = &plugin,
         .title = "Atlas: Vault Simulator",
         .run = openVaultSimulator,
-        .icon = icons.tvg.lucide.@"orbit",
+        .icon = icons.tvg.lucide.orbit,
     });
 
     // A folder may already be open when a plugin is loaded mid-session (install, or re-enable
@@ -220,7 +232,8 @@ fn needsContinuousRepaint(_: *anyopaque) bool {
     // `sdk.refresh()` from the worker.
     // Active-tab + recently-painted gates live inside `wantsRepaint` (via `drawn_recently`).
     // Asking while another bottom tab is showing is still a cheap false.
-    if (!sdk.host().isActiveBottomView(graph.view_id)) return false;
+    const chosen = sdk.host().selectionFor(sdk.keywords.ide.panel) orelse return false;
+    if (!std.mem.eql(u8, chosen, graph.view_id)) return false;
     return graph.wantsRepaint();
 }
 
@@ -240,9 +253,8 @@ fn rebuildIndexEnabled(state: *anyopaque) bool {
 }
 
 fn openGraph(_: *anyopaque) !void {
-    sdk.host().setActiveBottomView(graph.view_id);
+    sdk.host().setSelectionFor(sdk.keywords.ide.panel, graph.view_id);
 }
-
 
 fn cmdConvertWikilinksEnabled(state: *anyopaque) bool {
     const st: *State = @ptrCast(@alignCast(state));
@@ -267,7 +279,7 @@ fn cmdConvertWikilinks(state: *anyopaque) anyerror!void {
 /// Recentre the graph on the whole vault. The only way to trigger a refit now that clicking
 /// a node deliberately leaves the camera alone.
 fn zoomGraphToFit(_: *anyopaque) !void {
-    sdk.host().setActiveBottomView(graph.view_id);
+    sdk.host().setSelectionFor(sdk.keywords.ide.panel, graph.view_id);
     graph.zoomExtents();
 }
 
@@ -310,11 +322,11 @@ fn requestNewDocumentDialog(_: *anyopaque, parent_path: ?[]const u8, _: usize) v
         std.Io.Dir.accessAbsolute(dvui.io, candidate, .{}) catch break candidate;
     } else return;
 
-    wb.createFile(path) catch |err| {
+    (sdk.host().getServiceTyped(sdk.services.files.Api) orelse return).createFile(path) catch |err| {
         dvui.log.err("atlas: failed to create note {s}: {any}", .{ path, err });
         return;
     };
-    _ = wb.open(path, wb.currentGrouping()) catch |err| {
+    _ = sdk.host().openFilePath(path, wb.currentGrouping()) catch |err| {
         // The note exists and the tree will show it; only the tab is missing. Still worth
         // revealing below, so this is logged rather than returned on.
         dvui.log.err("atlas: failed to open note {s}: {any}", .{ path, err });

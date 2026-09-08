@@ -700,7 +700,9 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
         // Density profile of the giant component on its own, so the drawer and the packing
         // cannot flatter or distort it.
         var big: u32 = 0;
-        for (cnt, 0..) |k, c| if (k > cnt[big]) { big = @intCast(c); };
+        for (cnt, 0..) |k, c| if (k > cnt[big]) {
+            big = @intCast(c);
+        };
         {
             var hist: [8]u32 = @splat(0);
             var tot: u32 = 0;
@@ -848,10 +850,10 @@ fn worldSweep(gpa: std.mem.Allocator, io: std.Io, n: usize, edges: []const fold.
     }
     try layoutReport(gpa, io, &w, edges, paths, label);
     std.debug.print("  {s:>9}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>7}  {s:>6} {s:>8} {s:>6} {s:>6} {s:>6}  {s:>7} {s:>7} {s:>7} {s:>7} {s:>8}\n", .{
-        "zoom",  "marks",  "notes",   "masses",  "links",   "drawn",
-        "bound", "cand", "chwy%", "hwy%", "mute%", "clr ms", "topo ms", "pres ms", "lift ms", "frame ms",
+        "zoom",    "marks",   "notes",   "masses",   "links", "drawn",
+        "bound",   "cand",    "chwy%",   "hwy%",     "mute%", "clr ms",
+        "topo ms", "pres ms", "lift ms", "frame ms",
     });
-
 
     var zoom = z_fit;
     var stepn: usize = 0;
@@ -1129,9 +1131,9 @@ fn linkSpreadReport(
             std.debug.print(
                 "       deg {s:>9}   n {d:>6}  ({d:>4.1}% of links)   mean {d:.3}r   crossing {d:.1}%\n",
                 .{
-                    name,                    b_n[bi],
-                    bn * 100.0 / @as(f64, @floatFromInt(lens.items.len)),
-                    b_sum[bi] / bn / ext,    @as(f64, @floatFromInt(b_far[bi])) * 100.0 / bn,
+                    name,                                                 b_n[bi],
+                    bn * 100.0 / @as(f64, @floatFromInt(lens.items.len)), b_sum[bi] / bn / ext,
+                    @as(f64, @floatFromInt(b_far[bi])) * 100.0 / bn,
                 },
             );
             lo = c +| 1; // the last cut is `maxInt`, and there is no bucket after it to name
@@ -1781,8 +1783,7 @@ fn zoomProbe(
         "  frame budget {d:.2} ms ({d} fps)\n" ++
             "  {s:>4}  {s:>8} {s:>8} {s:>8} {s:>6}   {s:>7} {s:>7} {s:>9}   " ++
             "{s:>8} {s:>8} {s:>9} {s:>8} {s:>8}\n",
-        .{ frame_budget_ms, target_fps, "lap",   "mean ms", "p95 ms", "max ms", "over", "marks", "links", "line Mpx",
-            "rebuilt", "scan ms",  "build ms", "sort ms", "fade ms" },
+        .{ frame_budget_ms, target_fps, "lap", "mean ms", "p95 ms", "max ms", "over", "marks", "links", "line Mpx", "rebuilt", "scan ms", "build ms", "sort ms", "fade ms" },
     );
 
     world_mod.prof = .{};
@@ -2022,15 +2023,21 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
             "         worst frame {d:.2} ms: topo {d:.2}  present {d:.2}  scan {d:.2}  build {d:.2}  sort {d:.2}  fade {d:.2}  lifted {d}  cut {d}  marks {d}\n",
         .{
             if (px_per_frame == 0) "park" else "pan ",
-            sum / @as(f64, frames), sorted[frames / 2], sorted[frames * 95 / 100], sorted[frames - 1],
-            pr.recomputes,          pr.calls,
+            sum / @as(f64, frames),
+            sorted[frames / 2],
+            sorted[frames * 95 / 100],
+            sorted[frames - 1],
+            pr.recomputes,
+            pr.calls,
             churn * 100,
             link_churn * 100,
             n_min,
             n_max,
-            per(step_ns),           per(pr.focus_ns),
+            per(step_ns),
+            per(pr.focus_ns),
             per(pr.scan_ns),
-            per(pr.build_ns),       per(pr.sort_ns),
+            per(pr.build_ns),
+            per(pr.sort_ns),
             per(pr.fade_ns),
             w.links.items.len,
             samples[worst],
@@ -2062,10 +2069,9 @@ fn panProbe(io: std.Io, w: *world_mod.World, view: world_mod.View, params: world
             "         worst f{d:<3} {d:.2} ms = topo {d:.2} pres {d:.2} scan {d:.2} build {d:.2} sort {d:.2} fade {d:.2}" ++
                 "   churn {d:.0}%  cut {d}  marks {d}  lifted {d}  scanned {d}\n",
             .{
-                i,                 samples[i],       detail[i].topo,  detail[i].pres,
-                detail[i].scan,    detail[i].build,  detail[i].sort,  detail[i].fade,
-                detail[i].churn * 100,
-                detail[i].cut,     detail[i].marks,  detail[i].lifted,
+                i,                     samples[i],      detail[i].topo,  detail[i].pres,
+                detail[i].scan,        detail[i].build, detail[i].sort,  detail[i].fade,
+                detail[i].churn * 100, detail[i].cut,   detail[i].marks, detail[i].lifted,
                 detail[i].scanned,
             },
         );
@@ -2254,7 +2260,7 @@ fn printStabilityHeader() void {
     std.debug.print(
         "{s:<22}{s:>8}{s:>9}{s:>8}{s:>8}{s:>7}{s:>22}{s:>22}{s:>8}{s:>8}\n",
         .{
-            "shape", "n", "e", "comm-f", "comm-r", "trials",
+            "shape",            "n",                  "e",     "comm-f",  "comm-r", "trials",
             "fine p50/p90/max", "region p50/p90/max", "fine%", "region%",
         },
     );
@@ -2672,12 +2678,18 @@ fn layoutEditTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !v
         edit_fr,
         edit_fr_n,
         edit_world_ms,
-        stageMs(cold_stages, .normalise),  stageMs(edit_stages, .normalise),
-        stageMs(cold_stages, .components), stageMs(edit_stages, .components),
-        stageMs(cold_stages, .cluster),    stageMs(edit_stages, .cluster),
-        stageMs(cold_stages, .interiors),  stageMs(edit_stages, .interiors),
-        stageMs(cold_stages, .frames),     stageMs(edit_stages, .frames),
-        stageMs(cold_stages, .pack),       stageMs(edit_stages, .pack),
+        stageMs(cold_stages, .normalise),
+        stageMs(edit_stages, .normalise),
+        stageMs(cold_stages, .components),
+        stageMs(edit_stages, .components),
+        stageMs(cold_stages, .cluster),
+        stageMs(edit_stages, .cluster),
+        stageMs(cold_stages, .interiors),
+        stageMs(edit_stages, .interiors),
+        stageMs(cold_stages, .frames),
+        stageMs(edit_stages, .frames),
+        stageMs(cold_stages, .pack),
+        stageMs(edit_stages, .pack),
     });
 
     std.debug.print(
@@ -2716,15 +2728,29 @@ fn layoutEditTarget(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) !v
         \\
     , .{
         @as(f64, cold.spacing) * 4,
-        comp_before, comp_after,
-        disp.shift_x, disp.shift_y,
-        disp.raw_med, disp.raw_p99, disp.raw_max,
-        disp.aligned_med, disp.aligned_p99, disp.aligned_max,
-        disp.moved, n,
+        comp_before,
+        comp_after,
+        disp.shift_x,
+        disp.shift_y,
+        disp.raw_med,
+        disp.raw_p99,
+        disp.raw_max,
+        disp.aligned_med,
+        disp.aligned_p99,
+        disp.aligned_max,
+        disp.moved,
+        n,
         disp.scale,
-        disp.fit_med, disp.fit_p99, disp.fit_max, disp.fit_moved,
-        disp.home_changed, disp.inner_changed, disp.replaced,
-        edit_miss_discs, edit_miss_max, edit_miss_depth,
+        disp.fit_med,
+        disp.fit_p99,
+        disp.fit_max,
+        disp.fit_moved,
+        disp.home_changed,
+        disp.inner_changed,
+        disp.replaced,
+        edit_miss_discs,
+        edit_miss_max,
+        edit_miss_depth,
     });
 }
 
@@ -3355,4 +3381,3 @@ fn collect(
         }
     }
 }
-

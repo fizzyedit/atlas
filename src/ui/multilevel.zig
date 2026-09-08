@@ -1077,7 +1077,6 @@ fn pairForceOn(pos: []const dvui.Point, force: []dvui.Point, mass: []const f32, 
     force[i].y += (dy / d) * mag;
 }
 
-
 fn seedCloud(pos: []dvui.Point) void {
     // A disc of jitter, not a golden-angle spiral. The spiral was a compact seed that the force
     // solve never fully forgot on trees and chains — those graphs have too few cycles to pull

@@ -519,6 +519,95 @@ fn redistributeOrphans(
         if (owner[c] == std.math.maxInt(u32)) owner[c] = @intCast(i);
     }
 
+    // A cell being empty of *notes* does not make it empty. The gaps inside a group are threaded
+    // with the links between its members, and a link is drawn all the way across whatever space it
+    // spans — so the emptiest, most central cells, the ones this function prefers, are exactly the
+    // ones a long link runs through. Dropping a note there sits it on a line it has nothing to do
+    // with, which reads as a relationship. Rare in a 284k vault where the ocean is small compared
+    // with the mass; the normal case in a vault of seventeen notes, where the map is mostly air.
+    //
+    // So the links are rasterised into a mask and each candidate is ranked by how much room it has
+    // around it. Ranked and not filtered: a map can be threaded with links everywhere its dust
+    // could go, and it still has to place the dust somewhere.
+    //
+    // The mask is finer than the occupancy grid, which is sized by the *map* and is one note pitch
+    // per cell at best — too coarse to tell "beside the link" from "on it". It is subdivided until
+    // a mask cell is about half a note radius, where "the line clips this cell" and "the note would
+    // sit on the line" mean nearly the same thing, and no finer: the extra cells are paid for in
+    // the walk along every link. A flat cell budget bounds it as well, so a big grid stays big
+    // rather than becoming a huge one.
+    const mask_cells_max: usize = 1 << 22;
+    const sub_want: usize = @intFromFloat(std.math.clamp(@floor(2 * cell / @max(opts.note_r, 1e-3)), 1, 8));
+    var sub: usize = 1;
+    while (sub < sub_want and w * h * (sub + 1) * (sub + 1) <= mask_cells_max) sub += 1;
+    const mw = w * sub;
+    const mh = h * sub;
+    const mcell = cell / @as(f32, @floatFromInt(sub));
+    // Rank saturates once a candidate is a note's width clear of every link; past that, the
+    // centre-first order decides.
+    const air_max: u8 = @intFromFloat(std.math.clamp(@ceil(2 * opts.note_r / mcell), 1, 64));
+
+    // What the mask costs is one grid write per half cell of link, and on a vault whose links
+    // between them span millions of cells that is seconds of cache misses for a refinement worth
+    // milliseconds. Estimated first (Manhattan, so an over-estimate, and no square roots) and
+    // skipped wholesale when it comes out too dear — the dust then falls back to centre-first
+    // order, which is what it did before this existed. The vaults that lose the ranking are the
+    // ones whose map is mostly mass rather than air, where the gaps are small and every candidate
+    // is beside a link anyway.
+    const mask_steps_max: f32 = 4 << 20;
+    var est: f32 = 0;
+    for (links) |e| {
+        if (e.a >= n or e.b >= n or dust[e.a] or dust[e.b]) continue;
+        est += (@abs(out.pos[e.b].x - out.pos[e.a].x) + @abs(out.pos[e.b].y - out.pos[e.a].y)) / mcell;
+        if (est > mask_steps_max) break;
+    }
+
+    const air = try arena.alloc(u8, mw * mh);
+    defer arena.free(air);
+    @memset(air, air_max);
+    for (if (est > mask_steps_max) links[0..0] else links) |e| {
+        if (e.a >= n or e.b >= n or dust[e.a] or dust[e.b]) continue;
+        const pa = out.pos[e.a];
+        const pb = out.pos[e.b];
+        const dx = pb.x - pa.x;
+        const dy = pb.y - pa.y;
+        const len = @sqrt(dx * dx + dy * dy);
+        // Only the part of the link that crosses open ground. The stub at each end is under its
+        // own note, and dust *beside a note* is the whole point of the shore — it is a link that
+        // arrives from somewhere else that must not be sat on. A link with no span outside its two
+        // endpoints is two notes side by side and has nothing to protect.
+        const trim = opts.note_r;
+        if (!(len > 2 * trim)) continue;
+        const t0 = trim / len;
+        const span_t = 1 - 2 * t0;
+        const steps: usize = @intFromFloat(@min(span_t * len / (mcell * 0.5) + 1, 4 * grid_side_max));
+        for (0..steps + 1) |k| {
+            const t = t0 + span_t * @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(steps));
+            air[cellOf(.{ .x = pa.x + dx * t, .y = pa.y + dy * t }, lo, mcell, mw, mh)] = 0;
+        }
+    }
+    // Manhattan distance to the nearest link, clamped: two sweeps, both directions.
+    for (0..mh) |cy| {
+        for (0..mw) |cx| {
+            const c = cy * mw + cx;
+            if (cx > 0) air[c] = @min(air[c], air[c - 1] + 1);
+            if (cy > 0) air[c] = @min(air[c], air[c - mw] + 1);
+        }
+    }
+    {
+        var cy = mh;
+        while (cy > 0) {
+            cy -= 1;
+            var cx = mw;
+            while (cx > 0) {
+                cx -= 1;
+                const c = cy * mw + cx;
+                if (cx + 1 < mw) air[c] = @min(air[c], air[c + 1] + 1);
+                if (cy + 1 < mh) air[c] = @min(air[c], air[c + mw] + 1);
+            }
+        }
+    }
+
     // Free cells with an occupied neighbour: the ocean at the edge of a group.
     var shore: std.ArrayListUnmanaged(u32) = .empty;
     defer shore.deinit(arena);
@@ -566,21 +655,52 @@ fn redistributeOrphans(
         cell: f32,
         w: usize,
         mid: Vec2,
+        air: []const u8,
+        mw: usize,
+        mh: usize,
+        mcell: f32,
         fn closer(ctx: @This(), a: u32, b: u32) bool {
+            // Room from the links first, and only then innermost first: a spot with a link through
+            // it is a last resort, however well placed it is.
+            const aa = ctx.airAt(a);
+            const ab = ctx.airAt(b);
+            if (aa != ab) return aa > ab;
             return ctx.d2(a) < ctx.d2(b);
         }
-        fn d2(ctx: @This(), c: u32) f32 {
+        /// Room around the point the note would actually be put at, which is the cell's low corner.
+        fn airAt(ctx: @This(), c: u32) u8 {
+            const p = ctx.pointOf(c);
+            const m = cellOf(p, ctx.lo, ctx.mcell, ctx.mw, ctx.mh);
+            return @min(@min(ctx.air[m], ctx.air[m - 1]), @min(ctx.air[m - ctx.mw], ctx.air[m - ctx.mw - 1]));
+        }
+        fn pointOf(ctx: @This(), c: u32) Vec2 {
             const cx = @as(f32, @floatFromInt(c % ctx.w)) - 1;
             const cy = @as(f32, @floatFromInt(c / ctx.w)) - 1;
-            const x = ctx.lo.x + cx * ctx.cell - ctx.mid.x;
-            const y = ctx.lo.y + cy * ctx.cell - ctx.mid.y;
+            return .{ .x = ctx.lo.x + cx * ctx.cell, .y = ctx.lo.y + cy * ctx.cell };
+        }
+        fn d2(ctx: @This(), c: u32) f32 {
+            const p = ctx.pointOf(c);
+            const x = p.x - ctx.mid.x;
+            const y = p.y - ctx.mid.y;
             return x * x + y * y;
         }
     };
-    std.mem.sort(u32, shore.items, Sorter{ .lo = lo, .cell = cell, .w = w, .mid = mid }, Sorter.closer);
+    const sorter: Sorter = .{ .lo = lo, .cell = cell, .w = w, .mid = mid, .air = air, .mw = mw, .mh = mh, .mcell = mcell };
+    std.mem.sort(u32, shore.items, sorter, Sorter.closer);
     // Draw from the innermost band rather than the first `n_groups` outright, so the dust is spread
     // through the interior instead of packed into one hole at the centre.
-    const usable = @min(shore.items.len, n_groups * 4);
+    //
+    // Spreading is over the gaps that are *clear of links* whenever there are enough of them — they
+    // sort first, so they are a prefix. Spreading over the whole band instead reaches past them and
+    // parks the last few groups on a line while clear cells sit unused, which is the same bug the
+    // ranking is there to fix.
+    var clear_n: usize = 0;
+    while (clear_n < shore.items.len and sorter.airAt(shore.items[clear_n]) >= air_max) clear_n += 1;
+    // And when there are not enough clear gaps, spreading is what has to give: take the best
+    // `n_groups` cells the ranking found rather than fanning out across the whole band into
+    // whatever is left.
+    const band = if (clear_n >= n_groups) clear_n else n_groups;
+    const usable = @min(band, n_groups * 4);
 
     // Spread across the whole shore rather than filling it from one corner, so the orphans dust the
     // map evenly instead of banking up along one side of it.
@@ -841,7 +961,6 @@ fn splitOversized(
     }
     n_comm_io.* = n_comm;
 }
-
 
 /// Place one connected component as packed Louvain regions with every note on its region centre.
 ///
@@ -1795,71 +1914,71 @@ const InteriorCtx = struct {
         var sub_pos: std.ArrayListUnmanaged(dvui.Point) = .empty;
         defer sub_pos.deinit(wa);
 
-for (lo..hi) |c| {
-    if (opts.cancel) |k| if (k.load(.monotonic)) return error.Canceled;
-    const k = count[c];
-    const mem = member[start[c]..start[c + 1]];
+        for (lo..hi) |c| {
+            if (opts.cancel) |k| if (k.load(.monotonic)) return error.Canceled;
+            const k = count[c];
+            const mem = member[start[c]..start[c + 1]];
 
-    // Frame identity is membership; interior reuse is the induced subgraph. An internal
-    // link leaves the members in place (parent frame can still hit) and still changes
-    // the interior a cold open would solve.
-    const sig = membershipHash(self, mem);
-    self.sig[c] = sig;
-    const edges = sub_edges[e_start[c]..e_start[c + 1]];
-    const sub = subgraphHash(self, sig, mem, edges);
-    for (mem) |li| home[notes[li]] = sub;
-    if (k <= 1) continue;
+            // Frame identity is membership; interior reuse is the induced subgraph. An internal
+            // link leaves the members in place (parent frame can still hit) and still changes
+            // the interior a cold open would solve.
+            const sig = membershipHash(self, mem);
+            self.sig[c] = sig;
+            const edges = sub_edges[e_start[c]..e_start[c + 1]];
+            const sub = subgraphHash(self, sig, mem, edges);
+            for (mem) |li| home[notes[li]] = sub;
+            if (k <= 1) continue;
 
-    // Already solved, in a previous solve, from exactly this subgraph. An interior is a pure
-    // function of that subgraph, so the answer cannot have changed — see `Options.reuse`.
-    if (self.reuseInto(sub, mem, &radius[c])) {
-        _ = self.reused.fetchAdd(1, .monotonic);
-        continue;
-    }
+            // Already solved, in a previous solve, from exactly this subgraph. An interior is a pure
+            // function of that subgraph, so the answer cannot have changed — see `Options.reuse`.
+            if (self.reuseInto(sub, mem, &radius[c])) {
+                _ = self.reused.fetchAdd(1, .monotonic);
+                continue;
+            }
 
-    try sub_pos.resize(wa, k);
-    var sub_opts = opts.iters;
-    sub_opts.cancel = opts.cancel;
-    try multilevel.solve(wa, k, sub_edges[e_start[c]..e_start[c + 1]], sub_pos.items, sub_opts);
+            try sub_pos.resize(wa, k);
+            var sub_opts = opts.iters;
+            sub_opts.cancel = opts.cancel;
+            try multilevel.solve(wa, k, sub_edges[e_start[c]..e_start[c + 1]], sub_pos.items, sub_opts);
 
-    var cx: f64 = 0;
-    var cy: f64 = 0;
-    for (sub_pos.items) |p| {
-        cx += p.x;
-        cy += p.y;
-    }
-    const invk = 1.0 / @as(f64, @floatFromInt(k));
-    const ctr: Vec2 = .{ .x = @floatCast(cx * invk), .y = @floatCast(cy * invk) };
+            var cx: f64 = 0;
+            var cy: f64 = 0;
+            for (sub_pos.items) |p| {
+                cx += p.x;
+                cy += p.y;
+            }
+            const invk = 1.0 / @as(f64, @floatFromInt(k));
+            const ctr: Vec2 = .{ .x = @floatCast(cx * invk), .y = @floatCast(cy * invk) };
 
-    // Unit space to world, against this territory's own *nearest* neighbours. Mean edge
-    // length is the wrong ruler: in a clique every pair is an edge, so the mean is the
-    // diameter, the scale comes out tiny and 80 notes land on top of each other. Taking each
-    // note's shortest link and the median of those measures the thing `spacing` is calibrated
-    // against — how far apart two adjacent discs actually sit.
-    const med = nearestNeighbourMedian(wa, sub_pos.items) catch 0;
-    if (!(med > 1e-6)) {
-        // Nothing to solve from, and this is common rather than exotic: `addOrphanDrawer` hangs
-        // every unlinked note off one hub, so the clustering hands back territories of spokes that
-        // are adjacent to nothing inside them. A force solve of an edgeless graph is a pile at the
-        // origin, so the arrangement has to be invented — see `scatterDisc` for what shape is
-        // honest about that, and which shape is not.
-        scatterDisc(wa, inner, notes, mem, pitch, opts.note_r, &radius[c]);
-        continue;
-    }
-    const s: f32 = pitch / med;
+            // Unit space to world, against this territory's own *nearest* neighbours. Mean edge
+            // length is the wrong ruler: in a clique every pair is an edge, so the mean is the
+            // diameter, the scale comes out tiny and 80 notes land on top of each other. Taking each
+            // note's shortest link and the median of those measures the thing `spacing` is calibrated
+            // against — how far apart two adjacent discs actually sit.
+            const med = nearestNeighbourMedian(wa, sub_pos.items) catch 0;
+            if (!(med > 1e-6)) {
+                // Nothing to solve from, and this is common rather than exotic: `addOrphanDrawer` hangs
+                // every unlinked note off one hub, so the clustering hands back territories of spokes that
+                // are adjacent to nothing inside them. A force solve of an edgeless graph is a pile at the
+                // origin, so the arrangement has to be invented — see `scatterDisc` for what shape is
+                // honest about that, and which shape is not.
+                scatterDisc(wa, inner, notes, mem, pitch, opts.note_r, &radius[c]);
+                continue;
+            }
+            const s: f32 = pitch / med;
 
-    var rmax: f32 = 0;
-    for (mem, sub_pos.items) |li, p| {
-        const note = notes[li];
-        const q: Vec2 = .{
-            .x = @as(f32, @floatCast(p.x - ctr.x)) * s,
-            .y = @as(f32, @floatCast(p.y - ctr.y)) * s,
-        };
-        inner[note] = q;
-        rmax = @max(rmax, @sqrt(q.x * q.x + q.y * q.y));
-    }
-    radius[c] = rmax + opts.note_r;
-}
+            var rmax: f32 = 0;
+            for (mem, sub_pos.items) |li, p| {
+                const note = notes[li];
+                const q: Vec2 = .{
+                    .x = @as(f32, @floatCast(p.x - ctr.x)) * s,
+                    .y = @as(f32, @floatCast(p.y - ctr.y)) * s,
+                };
+                inner[note] = q;
+                rmax = @max(rmax, @sqrt(q.x * q.x + q.y * q.y));
+            }
+            radius[c] = rmax + opts.note_r;
+        }
     }
 };
 
@@ -2066,7 +2185,6 @@ fn frameGaps(
 /// edge between them, so any single neighbour holds a share of it. Tuned on `grid` and `chain`
 /// closing while `two cliques become two territories that do not overlap` keeps its ocean.
 const border_coupling: f32 = 0.5;
-
 
 fn packDiscsCloud(arena: std.mem.Allocator, centres: []Vec2, radius: []const f32, ocean: f32) void {
     const n = centres.len;
@@ -3239,4 +3357,51 @@ test "a memo from a different note set is refused rather than misapplied" {
     });
     defer second.deinit(gpa);
     try testing.expectEqual(@as(u32, 0), reused_interiors);
+}
+
+/// Distance from `p` to the segment `a`-`b`. Test scaffolding for the orphan-clearance checks.
+fn pointSegmentDistance(p: Vec2, a: Vec2, b: Vec2) f32 {
+    const vx = b.x - a.x;
+    const vy = b.y - a.y;
+    const len2 = vx * vx + vy * vy;
+    const t = if (len2 < 1e-9) 0 else std.math.clamp(((p.x - a.x) * vx + (p.y - a.y) * vy) / len2, 0, 1);
+    const dx = p.x - (a.x + vx * t);
+    const dy = p.y - (a.y + vy * t);
+    return @sqrt(dx * dx + dy * dy);
+}
+
+test "a dusted orphan does not land on a link" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The shape of a personal vault: one small huddle of notes that link to each other, a couple
+    // of chains trailing off it, and some notes that link to nothing. Sparse, so the map is mostly
+    // air — which is the case where a link crosses the gap that dust wants.
+    const n: u32 = 15;
+    var edges: std.ArrayListUnmanaged(Edge) = .empty;
+    const hub: [10][2]u32 = .{
+        .{ 0, 1 }, .{ 0, 2 }, .{ 0, 3 }, .{ 1, 2 }, .{ 1, 3 },
+        .{ 2, 3 }, .{ 0, 4 }, .{ 4, 5 }, .{ 5, 6 }, .{ 2, 7 },
+    };
+    for (hub) |e| try edges.append(arena, .{ .a = e[0], .b = e[1] });
+    // Two notes hanging a long way off the huddle, so their links cross open ground.
+    try edges.append(arena, .{ .a = 6, .b = 8 });
+    try edges.append(arena, .{ .a = 7, .b = 9 });
+    const paths = try arena.alloc([]const u8, n);
+    for (paths, 0..) |*p, i| p.* = try std.fmt.allocPrint(arena, "dir{d}/n{d}.md", .{ i % 2, i });
+
+    const note_r: f32 = 4;
+    var res = try solve(testing.allocator, n, edges.items, paths, .{ .note_r = note_r });
+    defer res.deinit(testing.allocator);
+
+    for (10..n) |i| {
+        var nearest: f32 = std.math.floatMax(f32);
+        for (edges.items) |e| {
+            nearest = @min(nearest, pointSegmentDistance(res.pos[i], res.pos[e.a], res.pos[e.b]));
+        }
+        // A note drawn at `note_r` sitting on a line reads as a node *on* that edge. One radius
+        // of air is the least that keeps the two legible as separate things.
+        try testing.expect(nearest > note_r);
+    }
 }
