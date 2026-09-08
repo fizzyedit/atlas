@@ -67,6 +67,9 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "atlas-resolve-tests", "src/index/resolve.zig" },
         .{ "atlas-schema-tests", "src/index/schema.zig" },
+        // The in-memory index store: notes, derived rows, links, media, sorted views. No dvui,
+        // no filesystem, no SQLite.
+        .{ "atlas-index-tests", "src/index/Index.zig" },
         .{ "atlas-relpath-tests", "src/index/relpath.zig" },
         .{ "atlas-wikilink-context-tests", "src/service/wikilink_context.zig" },
         .{ "atlas-proximity-tests", "src/ui/proximity.zig" },

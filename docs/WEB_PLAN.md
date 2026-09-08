@@ -1,0 +1,182 @@
+# Atlas on the web
+
+Goal: the fizzy web build bundles two plugins, **drive** and **atlas**, so that signing in to
+Google Drive and opening a vault folder shows the note graph in the browser, with edits
+landing in the cloud. Same source on native, where the vault may be on disk or on Drive.
+
+This is a rebuild of atlas's index layer, not a port: the parts that block the web are the
+parts that were written for one machine with a disk and threads, and every one of them is also
+what stops a vault on Drive from working natively today.
+
+## What blocks, found by reading
+
+| Where | What | Web | Drive on native |
+|---|---|---|---|
+| `src/index/Db.zig`, `schema.zig`, `query.zig`, most of `Indexer.zig` | SQLite (C amalgamation, file-backed, ~90 call sites) | no libc on `wasm32-freestanding`; no file | works, but it is a disk cache of a disk |
+| `Indexer.walk/countMarkdown/probeFile/flushReads`, `Watcher.tick`, `plugin.zig:322` | `std.Io.Dir` reads, stats, walks | no filesystem | reads the disk, not the mount |
+| `cache_dir.zig` | per-vault cache folder from `$HOME`/env | none | fine |
+| `Indexer.worker` | a `std.Thread` + `Io.Mutex/Condition`, `runFullScan` blocking for the whole vault | no threads | fine |
+| `Indexer.markNs`, `Watcher.tick` | `std.Io.Clock.boot.now(dvui.io)` | `dvui.io` is `std.Io.failing` on web | fine |
+| `batch2d`, the graph renderer | render targets, `u16` vertex indices | targets drew icons soft on the web backend (see fizzy `core/gfx/icon.zig`); indices already chunked | — |
+
+Nothing in `src/ui/**`, `resolve.zig`, `Scanner.scan` (parse) or `content_graph.zig` touches
+any of this: the parser and the graph are pure over bytes and snapshots. That is the boundary
+the rebuild keeps.
+
+## On `std.Io`: what it gives us and what it does not
+
+The pitch is right for **I/O**: code written against `std.Io` (files, clocks, sleeps, mutexes)
+runs unchanged under a threaded `Io` on native and a single-threaded one elsewhere — atlas's
+tests already drive the indexer with their own `Io`. It is **not** a way to get background work
+on the web:
+
+- `Io.Threaded` in single-threaded mode runs `io.async(f)` **inline, to completion**, at the
+  call site; `io.concurrent` returns `error.ConcurrencyUnavailable`. There is no yield. A full
+  scan wrapped in `io.async` would still run inside one frame and hang the tab.
+- The evented `Io` implementations (`std.Io.Evented`, `fiber.zig`) switch stacks, which needs
+  `x86_64`/`aarch64`/`riscv64` — not wasm.
+- wasm threads exist (atomics + `SharedArrayBuffer`) but need COOP/COEP headers on the site,
+  a threads-enabled wasm build and a dvui web backend that tolerates it. Not this pass.
+
+So the single implementation we can write is one that **does bounded work per call and keeps
+its own state between calls** — a state machine, not a blocking loop. Given that shape, the
+same code runs two ways:
+
+- **native**: a worker thread (`io.concurrent`, or the existing `std.Thread`) calls
+  `step()` in a tight loop until done; file completions from `core.LocalFs` arrive inline, so
+  it is exactly as fast as today's loop;
+- **web**: fizzy's frame pump calls `step()` with a time budget (say 4 ms) each frame; file
+  completions come from the Drive mount's transport as they land.
+
+That is a small library, not a big one, and it belongs in fizzy's `core` so drive, atlas and
+anything else share it:
+
+```zig
+// core/work.zig (proposed)
+pub const Task = struct {
+    ctx: *anyopaque,
+    /// Do up to `budget_ns` of work (0 = as much as is ready); say whether more remains.
+    step: *const fn (ctx: *anyopaque, io: std.Io, budget_ns: u64) Status,
+    cancel: *const fn (ctx: *anyopaque) void,
+    pub const Status = enum { more, waiting, done };
+};
+pub const Runner = struct {
+    /// Native: runs `task` on a worker until `done`, waking the host on progress.
+    /// Web: registers `task` to be stepped from the host's per-frame pump.
+    pub fn start(io: std.Io, task: Task, wake: *const fn () void) !void;
+    pub fn pump(budget_ns: u64) void; // web only; no-op on native
+};
+```
+
+`waiting` is the state a task is in when it has asked the mount for bytes and nothing is ready
+— the runner then sleeps on the transport's wake (native) or returns until next frame (web).
+Everything the Drive client does today (`drive.Client.Job`) is already this shape; `core.vfs`
+is completion-based for exactly this reason.
+
+## The index store: SQLite or not
+
+Two options.
+
+**A. SQLite to wasm.** Build the amalgamation for `wasm32-freestanding` with
+`SQLITE_OS_OTHER=1`, `SQLITE_THREADSAFE=0`, `SQLITE_OMIT_WAL`, an in-memory VFS
+(`SQLITE_ENABLE_MEMDB` + a stub `sqlite3_os_init`), and supply the libc surface it needs
+(`memcpy/strlen/qsort/snprintf/localtime…`) ourselves or from wasi-libc with the WASI imports
+shimmed in JS. Keeps all 90 call sites. Unknown-sized rabbit hole; every build-graph problem it
+creates is permanent.
+
+**B. An in-memory index in Zig.** The schema is seven plain tables — notes, aliases, headings,
+links, tags, blocks, media — with lookups by path, folded stem, note id and link endpoint. That
+is a struct of `ArrayList`s and `HashMap`s, and the queries `query.zig` and `Indexer.zig` run
+against it are lookups and joins over those keys, not SQL that needs a planner. The snapshot
+the graph draws from (`SnapNode`/`SnapEdge`) is then a view over the index, not a query that
+copies it. Persistence, which SQLite gave for free, becomes a serialized index file:
+
+- **native**: the same cache folder, one file, written after a publish; loading it skips the
+  scan for unchanged files exactly as the mtime/size/hash rows do today;
+- **Drive / web**: the same file *in the vault* (`.atlas/index`), so the web build loads a
+  prebuilt index in one read and reconciles against `changes.list` instead of reading every
+  note on every visit. This is the single biggest performance lever for a cloud vault, and
+  SQLite could never have given it.
+
+Recommendation: **B**, measured first. `Indexer.Timings` already separates `write_ns` and
+`publish_ns` from `read/parse`; a run over the real vault says what SQLite costs today, and
+the `db_test.zig` suite (773 lines) is the acceptance test the new store has to pass.
+
+## Step 0 — measured (2026-09-21, ReleaseFast, `zig build bench -- --index`)
+
+| vault | notes / links | cold total | of which SQLite | parse | read+stat |
+|---|---|---|---|---|---|
+| foxnne's Vault (Drive-synced folder) | 16 / 38 | 0.00 s | — | — | — |
+| gauntlet `tree` | 1 365 / 1 364 | 0.11 s | 0.01 s | 0.00 s | 0.08 s |
+| simplewiki | 283 892 / 3 351 076 | **45.1 s** | **~31.7 s** (db 6.8 + relink 24.9) | 0.9 s | 8.2 s |
+
+Warm open of simplewiki: 2.9 s (2.0 s of it `stat`); one edit at steady state: 1.2 ms.
+
+So on the scale case SQLite is 70 % of a cold index and the parse is 2 %: the relink pass
+alone (rewriting `links.dst_id` row by row) costs 27× the parse. An in-memory index makes the
+relink a pass over an adjacency list and the note writes a hash-map upsert; the cold floor
+becomes read + parse, ~9 s here and mostly the disk. Option B, confirmed.
+
+The store's operation set, from every statement in `Db.zig`, `Indexer.zig`, `query.zig`:
+
+| group | operations |
+|---|---|
+| notes | get by path (real only) → id/mtime/size/hash; get phantom by folded stem; insert real / insert phantom; update fields; promote phantom to real; touch (mtime, size); retire real to phantom (keeping inbound links) or delete; merge duplicate phantoms; count real / phantom; iterate real (path, stem, id); iterate phantoms (id, stem, title) |
+| per-note children | replace all aliases / headings / tags / blocks of a note; read headings (by line; by folded text → line), tags, blocks of a note |
+| links | replace a note's outbound links; iterate outbound (dst, raw, heading, alias, kind, line, col); inbound existence / backlinks (src path, title, stem, line, col, raw, alias) for a dst; iterate all (src, dst); count all / non-self; re-target every link of a dst (merge); relink: iterate unresolved-or-all with src path, set dst + ambiguous |
+| media | upsert by path (stem, folded stem/name); iterate all; delete by id; prefix scan on folded name / stem (completion) |
+| resolve inputs | all real (path, stem) + all aliases (path, stem, alias) → `resolve.Candidate` list; same for media |
+| completion | prefix scans on notes (folded stem) and aliases (folded alias) with a limit; headings of a note by prefix |
+| bookkeeping | meta (schema version, vault stamp); orphan-phantom purge (phantom with no inbound) |
+
+Every one of these is a hash-map lookup, an adjacency-list walk or a sorted-prefix scan
+(folded stems/aliases/media names kept in sorted arrays for the completion scans). Readers on
+the UI thread take a short mutex; the graph reads snapshots, as now.
+
+## Steps, each with a gate
+
+0. **Measure.** Full scan of the vault with timings logged; count the `Db` API surface
+   actually used (`Indexer` 38, `Db` 32, `query` 18 statement sites). Output: the list of
+   index operations the store must provide. *Gate: a table in this doc.*
+1. **`core.work`** (fizzy). `Task`/`Runner` as above, native runner on `io.concurrent`, web
+   runner on the frame pump, with a test that runs one task both ways to the same result.
+   *Gate: `zig build test` + `check-web`.*
+2. **Vault access through `core.vfs`** (atlas). `walk`, `countMarkdown`, `probeFile`,
+   `flushReads` and `Watcher.tick` read through `host.files`/the mount — `listDir`, `stat`,
+   `readFile` — never `std.Io.Dir`. A concurrency window of reads in flight (8–16) so a Drive
+   vault is bounded by bandwidth, not round trips. `Watcher` keeps `onPathsChanged` for the
+   disk and takes the mount's listing invalidations (the Drive change feed) for the cloud.
+   *Gate: a vault on Drive indexes natively, same graph as from disk.*
+3. **`Index` replaces `Db`** (atlas). One struct, the operations from step 0, `query.zig`
+   rewritten over it, `db_test.zig` ported. Persistence file (versioned, little-endian, a
+   header with vault stamp + generation). *Gate: db tests pass; scan timings no worse.*
+4. **Indexer as a `Task`** (atlas). `runFullScan` becomes phases with explicit state
+   (`count → walk → read → parse → write → drop-missing → relink → publish`), each phase a
+   loop that returns when out of budget or waiting on bytes. The worker thread is deleted;
+   `Runner` drives it. Progress and `busy` unchanged. *Gate: native scan speed unchanged;
+   the web build indexes a small vault without a dropped frame over 16 ms.*
+5. **Web bundle** (fizzy). `web_plugin_dirs = { zig-drive, atlas }`; `dvui.io` on web gets a
+   clock (`Io.Threaded.global_single_threaded` is enough for clocks and mutexes); check the
+   graph's render targets on the web backend (the icon-target softness suggests a real
+   backend difference to find, not to route around). *Gate: `zig build web`, graph draws.*
+6. **End to end.** Sign in → Open Drive Folder → vault indexes from `.atlas/index` + changes
+   → open a note, edit, ⌘S → link appears in the graph → reload the page → index loads in one
+   read. *Gate: this sequence, timed.*
+
+## Performance, specifically
+
+- The parse (`Scanner.scan`) is the floor and stays where it is; everything else is arranged
+  so the scan is parse-bound: reads pipelined (step 2), writes to memory (step 3), no SQL
+  round trip per note.
+- On the web, work is budgeted per frame; a 10k-note vault at ~50 µs/parse is ~0.5 s of parse
+  spread over frames, plus reads — which the prebuilt `.atlas/index` makes zero for unchanged
+  notes.
+- Memory: a wasm module has one linear memory; the index for a large vault is a few tens of
+  MB of strings and edges, fine. Two snapshots (the ring) stay; the index itself is not copied
+  into them.
+
+## Out of scope for this pass
+
+wasm threads; SQLite on wasm; a Drive-side search API (the index is local by design);
+IndexedDB persistence for a vault that has no `.atlas/index` yet (first visit reads the vault,
+then writes the file *to Drive*, so the second visit is fast everywhere).
