@@ -263,6 +263,31 @@ estimate is 2–3 weeks. Then the web build ships exactly the built-ins native d
 and atlas arrive from the store like everywhere else. Nothing in the index work above
 changes for it: a side module is the dylib model with table indices for function pointers.
 
+### Step 7 — first milestones landed (same day)
+
+- `fizzy.plugin.create` for `-Dtarget=wasm32-freestanding` emits a side module (PIC, no
+  entry, undefined symbols as `env` imports; dvui's proxy backend with libc/freetype/stb/
+  tree-sitter off). `zig build -Dtarget=wasm32-freestanding` in drive or atlas → `zig-out/<id>.wasm`
+  (drive 0.6 MB ReleaseSmall, atlas 12.6 MB Debug).
+- The web host imports the page's growable function table and exports what a side module
+  links against; `web/index.html`'s `loadPlugin` fetches, reads `dylink.0`, carves the data
+  segment out of the host heap, grows the table, instantiates against the host's exports (the
+  `fizzy` JS shims bound per instance, since a plugin exports its own callbacks), applies
+  relocations and hands one table index per entry point to `app/store/PluginLoader_web.zig`,
+  which runs the desktop loader's sequence unchanged.
+- Verified in the browser: `?plugin=drive&plugin=atlas` on a web build with **no** statically
+  bundled third-party plugins loads both — the account glyph, the ATLAS panel and the
+  backlinks icon appear, no console errors. `web_plugin_dirs` is empty now.
+- The store: `hostKey()` is `web-wasm32` on wasm; install goes through
+  `PluginManager.installFromUrl` → `Editor.loadWebPlugin` straight from the release URL;
+  `plugin-build-action` has the seventh, best-effort target (uncommitted in that checkout).
+
+Still open in step 7: a plugin's *own* drawing through the render bridge is unexercised in the
+browser (drive and atlas draw little of their own until a vault is open); the enabled/installed
+set persists nowhere on the web yet (`localStorage`); the web host must ship the store's
+optimize class (ReleaseFast) for fingerprints to match release builds; CORS on GitHub release
+assets is assumed, not yet tried.
+
 ## A further step: plugins as their own web apps
 
 Two things fizzy already has make this cheap: a plugin bundles into an app through
