@@ -1123,11 +1123,12 @@ pub fn relinkChunk(self: *Indexer, cursor: *i64, done: *u32, made_phantom: *bool
 /// Resolve every link of `src`. Index locked by the caller.
 fn relinkOne(self: *Indexer, index: *Index, src: i64, cache: *ResolveCache, buf: []u8, made_phantom: *bool) !void {
     _ = self;
-    const n = index.live(src) orelse return;
-    // Backwards, so removing a non-note target keeps the indices ahead of it valid.
-    var i: usize = n.links.len;
+    // Backwards, so removing a non-note target keeps the indices ahead of it valid. The note is
+    // fetched per link: creating a phantom appends to the note array, which can move it.
+    var i: usize = (index.live(src) orelse return).links.len;
     while (i > 0) {
         i -= 1;
+        const n = index.live(src) orelse return;
         const l = n.links[i];
         // Drop edges that never should have been notes (e.g. `[x](foo.zig)` from older scans).
         if (!resolve.isNoteLikeTarget(l.raw)) {
@@ -2345,4 +2346,56 @@ test "deleting an unlinked note removes its row" {
         @as(usize, 0),
         @as(usize, v.index.real_count + v.index.phantom_count),
     );
+}
+
+// A vault on a mount, indexed the way the web build and a cloud drive do it: the source does
+// not pump itself, the host pumps it once a frame and then steps the task within a budget.
+// `vfs.Mem` stands in for the mount (its completions land on `pump`, like a drive's).
+test "a mounted vault is indexed from the frame, a budget at a time" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+    // The runner's clock and lock come from the host's `Io`; headless, that is the test's.
+    dvui.io = v.threaded.io();
+
+    var mem = try core.vfs.Mem.init(gpa);
+    defer mem.deinit();
+    try mem.putDir("/notes");
+    try mem.put("/notes/Alpha.md", "# Alpha\n\nsee [[Beta]] and [[Nowhere]]\n");
+    try mem.put("/notes/Beta.md", "# Beta\n\nback to [[Alpha]]\n");
+    try mem.put("/diagram.png", "");
+
+    try v.indexer.start(&v.index, "mem://box", .{ .fs = mem.fs(), .root = "/", .pump_self = false });
+    // Frames: the host pumps the mount, then gives the task its slice.
+    var frames: usize = 0;
+    while (frames < 10_000) : (frames += 1) {
+        mem.fs().pump();
+        v.indexer.pump(1 * std.time.ns_per_ms);
+        if (v.indexer.counts().complete) break;
+    }
+    const c = v.indexer.counts();
+    try testing.expect(c.complete);
+    try testing.expectEqual(@as(u32, 2), c.note_count);
+    try testing.expectEqual(@as(u32, 1), c.phantom_count); // Nowhere
+    try testing.expectEqual(@as(usize, 3), try v.realEdgeCount());
+    try testing.expectEqual(@as(u32, 1), v.index.media_count);
+    try testing.expect(frames > 1); // it took more than one frame, i.e. it yielded
+
+    // A save arrives as a queued path: the scoped scan runs from the frame too. Written the way
+    // a save is — through the filesystem, landing on a pump.
+    const Done = struct {
+        fn f(_: ?*anyopaque, _: core.vfs.Error!void) void {}
+    };
+    _ = try mem.fs().writeFile("/notes/Beta.md", "# Beta\n\nno links now\n", .{}, Done.f, null);
+    mem.fs().pump();
+    v.indexer.enqueue("notes/Beta.md");
+    frames = 0;
+    while (frames < 10_000) : (frames += 1) {
+        mem.fs().pump();
+        v.indexer.pump(1 * std.time.ns_per_ms);
+        if (try v.realEdgeCount() == 2) break;
+    }
+    try testing.expectEqual(@as(usize, 2), try v.realEdgeCount());
+    v.indexer.stop();
+    v.indexer.index = &v.index;
 }
