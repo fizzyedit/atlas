@@ -6,8 +6,8 @@
 //! Fully independent of `State`/the real bottom panel. `SimState` is a `State`-lookalike built
 //! the same way `State.init` builds the real one — its own `Indexer`, `generation`, `busy` — so it
 //! satisfies exactly the same duck-typed surface `graph.drawPanel`/`rebuildIfNeeded`/
-//! `buildInteriorWorld` read off `*State` (`db`, `generation`, `indexer`, `indexer_ready`,
-//! `vault_root`, `hasGraphSource()`), never given a `db`. `SimSpec`'s fields are the "independent
+//! `buildInteriorWorld` read off `*State` (`index`, `generation`, `indexer`, `indexer_ready`,
+//! `vault_root`, `hasGraphSource()`), never given an `index`. `SimSpec`'s fields are the "independent
 //! settings just at runtime" this window's sidebar widgets read and write directly — no
 //! `sdk.settings.Value`, no persistence, nothing shared with the real bottom panel's own state.
 const std = @import("std");
@@ -15,7 +15,7 @@ const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
 const core = @import("core");
 
-const Db = @import("../index/Db.zig");
+const Index = @import("../index/Index.zig");
 const Indexer = @import("../index/Indexer.zig");
 const vault_synth = @import("vault_synth.zig");
 const graph = @import("graph.zig");
@@ -54,7 +54,7 @@ pub fn quantizeNotes(raw: f32) usize {
 }
 
 /// The minimal `State`-lookalike `graph.drawPanel` and friends need — see the file doc comment.
-/// Never given a `db`: `buildInteriorWorld`'s `if (st.db == null) return error.NoDb` means a
+/// Never given an `index`: `buildInteriorWorld`'s `if (st.index == null) return error.NoIndex` means a
 /// synthetic note's interior doesn't build in this pass (`vault_synth.synthContentGraph` already
 /// exists and is the natural follow-up wiring for that — left out here to keep this change scoped
 /// to the vault-shape/scale simulator that was actually asked for).
@@ -63,7 +63,7 @@ pub const SimState = struct {
     generation: std.atomic.Value(u64) = .init(0),
     indexer: Indexer = undefined,
     indexer_ready: bool = false,
-    db: ?Db = null,
+    index: ?Index = null,
     vault_root: ?[]const u8 = "synth://atlas-simulator",
     /// Packed world positions from `vault_synth`, parallel to note ids `1..N` (so graph index
     /// `i` after the id-sort). Owned; freed on replace and on `deinit`.

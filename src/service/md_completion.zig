@@ -31,7 +31,7 @@ const sdk = @import("fizzy_sdk");
 
 const State = @import("../State.zig");
 const query = @import("../index/query.zig");
-const Db = @import("../index/Db.zig");
+const Index = @import("../index/Index.zig");
 const resolve = @import("../index/resolve.zig");
 const relpath = @import("../index/relpath.zig");
 const wikilink_context = @import("wikilink_context.zig");
@@ -64,7 +64,7 @@ pub fn completion(
     if (!isMarkdownExt(ext)) return null;
     const st: *State = @ptrCast(@alignCast(state));
     const root = st.vault_root orelse return null;
-    const db = if (st.db) |*d| d else return null;
+    const db = if (st.index) |*d| d else return null;
 
     const ctx = wikilink_context.find(bytes, byte_offset) orelse return null;
 
@@ -98,7 +98,7 @@ pub fn completion(
 fn headingItems(
     st: *State,
     a: std.mem.Allocator,
-    db: *Db,
+    db: *Index,
     ctx: wikilink_context.Context,
     heading_prefix: []const u8,
     src_rel: []const u8,

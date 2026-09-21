@@ -358,14 +358,18 @@ pub fn setDerived(self: *Index, id: i64, d: Derived) !void {
     self.touched();
 }
 
-/// What a parse produced, in the parser's own types (borrowed; copied in).
+/// What a parse produced (borrowed; copied in). Named element types so a caller can build
+/// them from its own parser's rows.
 pub const Derived = struct {
     aliases: []const []const u8 = &.{},
-    headings: []const struct { text: []const u8, level: u8, line: u32 } = &.{},
-    tags: []const struct { tag: []const u8, line: u32 } = &.{},
-    blocks: []const struct { kind: schema.BlockKind, line_start: u32, line_end: u32, weight: u32 } = &.{},
-    links: []const struct { raw: []const u8, heading: []const u8 = "", alias: []const u8 = "", kind: schema.LinkKind, line: u32, col: u32 } = &.{},
+    headings: []const HeadingIn = &.{},
+    tags: []const TagIn = &.{},
+    blocks: []const Block = &.{},
+    links: []const LinkIn = &.{},
 };
+pub const HeadingIn = struct { text: []const u8, level: u8, line: u32 };
+pub const TagIn = struct { tag: []const u8, line: u32 };
+pub const LinkIn = struct { raw: []const u8, heading: []const u8 = "", alias: []const u8 = "", kind: schema.LinkKind, line: u32, col: u32 };
 
 /// Point link `index` of `src` at `dst` (with the resolver's ambiguity verdict).
 pub fn setLinkDst(self: *Index, src: i64, index: usize, dst: i64, ambiguous: bool) !void {

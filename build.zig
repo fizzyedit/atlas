@@ -13,16 +13,6 @@ pub fn build(b: *std.Build) void {
         plugin.module.addImport("icons", dep.module("icons"));
     }
 
-    // FTS5 is compiled in now, before anything uses it: turning it on later would mean
-    // re-pinning and re-verifying the C build for all six release targets, and full-text search
-    // over note bodies is the obvious way to make "unlinked mentions" cheap.
-    const sqlite = b.dependency("sqlite", .{
-        .target = target,
-        .optimize = optimize,
-        .fts5 = true,
-    });
-    plugin.module.addImport("sqlite", sqlite.module("sqlite"));
-
     const fizzy_dep = b.dependency("fizzy", .{ .target = target, .optimize = optimize });
     const batch2d_mod = b.createModule(.{
         .root_source_file = b.path("src/batch2d/root.zig"),
@@ -73,7 +63,6 @@ pub fn build(b: *std.Build) void {
         .{ "atlas-relpath-tests", "src/index/relpath.zig" },
         .{ "atlas-wikilink-context-tests", "src/service/wikilink_context.zig" },
         .{ "atlas-proximity-tests", "src/ui/proximity.zig" },
-        .{ "atlas-cache-dir-tests", "src/index/cache_dir.zig" },
         // `--stats` bench mode: degree/component/hub-fragility/coarsening-ladder/folder-
         // correlation math over plain `Edge` pairs — no dvui, no filesystem.
         .{ "atlas-bench-stats-tests", "src/bench_stats.zig" },
@@ -144,33 +133,31 @@ pub fn build(b: *std.Build) void {
     scanner_tests.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
     test_step.dependOn(&b.addRunArtifact(scanner_tests).step);
 
-    // The schema against real sqlite — that the DDL executes, that a reopen is a no-op, and
-    // that a wrong version is discarded rather than half-used. Structural checks in
-    // `schema.zig` can't answer any of those; only sqlite can.
-    const db_tests = b.addTest(.{
-        .name = "atlas-db-tests",
+    // The read side over the in-memory index: the interior content graph, the completers,
+    // heading lookup and backlinks.
+    const query_tests = b.addTest(.{
+        .name = "atlas-query-tests",
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
-            .root_source_file = b.path("src/index/db_test.zig"),
+            .root_source_file = b.path("src/index/query_test.zig"),
         }),
     });
-    db_tests.root_module.addImport("sqlite", sqlite.module("sqlite"));
-    // query.zig (reached via db_test.zig's relative import) needs `content_graph` by name — see
+    // query.zig (reached via query_test.zig's relative import) needs `content_graph` by name — see
     // the comment on that import in query.zig. A distinct Module object from `content_graph_mod`
     // above and from the vault-synth test's own copy: sharing one Module across independent
     // artifacts' import tables is what triggered the double-attachment error in the first place.
-    const cg_for_db_test = b.createModule(.{
+    const cg_for_query_test = b.createModule(.{
         .root_source_file = b.path("src/index/content_graph.zig"),
         .target = target,
         .optimize = optimize,
     });
-    db_tests.root_module.addImport("content_graph", cg_for_db_test);
-    test_step.dependOn(&b.addRunArtifact(db_tests).step);
+    query_tests.root_module.addImport("content_graph", cg_for_query_test);
+    test_step.dependOn(&b.addRunArtifact(query_tests).step);
 
     // The incremental write path end to end: scan a buffer, write the rows, relink. Everything
     // the graph draws comes out of `links`, and "does removing a wikilink remove the row" is a
-    // question only the real Indexer against real sqlite can answer.
+    // question only the real Indexer against the real store can answer.
     const indexer_tests = b.addTest(.{
         .name = "atlas-indexer-tests",
         .root_module = b.createModule(.{
@@ -179,7 +166,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/index/Indexer.zig"),
         }),
     });
-    indexer_tests.root_module.addImport("sqlite", sqlite.module("sqlite"));
     indexer_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
     indexer_tests.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
     test_step.dependOn(&b.addRunArtifact(indexer_tests).step);
@@ -255,8 +241,7 @@ pub fn build(b: *std.Build) void {
         bench.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
         // `--index` drives the real `Indexer` against a real database, which is the only way to
         // time the scan the rest of this harness skips.
-        bench.root_module.addImport("sqlite", sqlite.module("sqlite"));
-        // A distinct module object from `content_graph_mod`/`cg_for_db_test` above, deliberately —
+        // A distinct module object from `content_graph_mod`/`cg_for_query_test` above, deliberately —
         // same reasoning: sharing one `Module` object across independent build artifacts is the
         // other half of the "file exists in modules X and Y" bug class this file already works
         // around once.

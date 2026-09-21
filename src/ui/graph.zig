@@ -2971,8 +2971,8 @@ fn interiorItemDegree(it: content_graph.Item) u32 {
 const heading_degree = [6]u32{ 40, 24, 14, 8, 4, 2 };
 
 fn buildInteriorWorld(p: *Panel, st: anytype, id: i64, gen: u64) !void {
-    if (st.db == null) return error.NoDb;
-    const db = &st.db.?;
+    if (st.index == null) return error.NoIndex;
+    const db = &st.index.?;
     _ = p.interior.arena.reset(.retain_capacity);
     const arena = p.interior.arena.allocator();
 

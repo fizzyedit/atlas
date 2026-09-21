@@ -133,6 +133,25 @@ Every one of these is a hash-map lookup, an adjacency-list walk or a sorted-pref
 (folded stems/aliases/media names kept in sorted arrays for the completion scans). Readers on
 the UI thread take a short mutex; the graph reads snapshots, as now.
 
+### Step 3 — landed (same day)
+
+`Index.zig` replaces `Db.zig`/`schema.zig`'s DDL/`cache_dir.zig`; SQLite is out of the build.
+Same vault, same machine, ReleaseFast, identical counts (283 892 notes, 3 351 076 links,
+2 656 phantoms):
+
+| | before (SQLite) | after (`Index`) |
+|---|---|---|
+| cold build | 45.1 s | **10.8 s** — read 3.9 + stat 2.6 + parse 0.9 + write 0.2 + relink 2.3 |
+| warm re-scan (nothing changed) | 2.9 s | 1.5 s |
+| one edit, steady state | 1.2 ms | 1.1 ms |
+| peak RSS during the bench | — | 1.33 GB |
+
+The floor is now the disk (stat + read = 6.4 s of 10.8), which is what step 2's pipelined
+reads and the `.atlas/index` file are for. The RSS is the scale case's price and has an
+obvious lever left unpulled: `Index.Link` is 88 bytes with three slices for strings that
+average a few bytes; packing them as offsets into the note's `derived` blob would take it
+under 40. Not done until a vault needs it.
+
 ## Steps, each with a gate
 
 0. **Measure.** Full scan of the vault with timings logged; count the `Db` API surface

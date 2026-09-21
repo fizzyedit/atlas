@@ -404,7 +404,7 @@ pub fn draw(_: ?*anyopaque) anyerror!void {
     defer box.deinit();
     measureRowTextWidth(box);
 
-    if (st.vault_root == null or st.db == null) {
+    if (st.vault_root == null or st.index == null) {
         dvui.labelNoFmt(@src(), "Open a folder to index your notes.", .{}, .{
             .font = dvui.Font.theme(.body).larger(-1),
             .color_text = .{ .color = dvui.themeGet().color(.content, .text).opacity(0.6) },
@@ -1036,7 +1036,7 @@ fn refreshCache(c: *Cache, st: anytype, active_rel: []const u8) !void {
     c.gen = gen;
     c.dirty_n = dirty_n;
 
-    const db_links = try query.backlinksFor(&st.db.?, arena, active_rel);
+    const db_links = try query.backlinksFor(&st.index.?, arena, active_rel);
     const dirty_extra = try st.dirtyBacklinks(arena, active_rel, db_links);
     if (dirty_extra.len == 0) {
         c.links = db_links;

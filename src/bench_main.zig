@@ -28,7 +28,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
-const Db = @import("index/Db.zig");
+const Index = @import("index/Index.zig");
 const Indexer = @import("index/Indexer.zig");
 const Scanner = @import("index/Scanner.zig");
 const resolve = @import("index/resolve.zig");
@@ -425,27 +425,25 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     var gpa_copy = gpa;
     sdk.installRuntime(&gpa_copy, &host, null);
 
-    // Under the build cache rather than the vault: the index is derived data, it can be
-    // gigabytes, and putting it next to the notes is exactly what `Db`'s file comment forbids.
-    const cache_dir = ".zig-cache/atlas-index-bench";
-    if (!index_warm) std.Io.Dir.cwd().deleteTree(io, cache_dir) catch {};
-
-    var db = try Db.openIn(gpa, io, cache_dir, dir);
-    defer db.close(gpa);
+    // In memory; a "warm" run is a second full scan over the index the first one built, which
+    // is what a re-open costs once the index file (WEB_PLAN step 3) loads it.
+    var index = Index.init(gpa, io);
+    defer index.deinit();
 
     var busy: std.atomic.Value(bool) = .init(false);
     var generation: std.atomic.Value(u64) = .init(0);
     var indexer = Indexer.init(gpa, &busy, &generation);
     defer indexer.deinit();
-    indexer.db = &db;
+    indexer.index = &index;
     indexer.vault_root = dir;
 
+    if (index_warm) try indexer.runFullScan(io, .always);
     const t0 = std.Io.Clock.boot.now(io).nanoseconds;
     try indexer.runFullScan(io, .always);
     const total_ns = std.Io.Clock.boot.now(io).nanoseconds - t0;
 
     if (index_edit) {
-        try timeOneEdit(gpa, io, &db, &indexer);
+        try timeOneEdit(gpa, io, &index, &indexer);
         return;
     }
 
@@ -460,7 +458,7 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
         \\{s}{s}
         \\  notes {d}  links {d}  phantoms {d}   ({d} files read, {d} unchanged)
         \\  prepass   {d:>7.2}s
-        \\  walk      {d:>7.2}s   stat {d:.2}s  read {d:.2}s  parse {d:.2}s  db {d:.2}s
+        \\  walk      {d:>7.2}s   stat {d:.2}s  read {d:.2}s  parse {d:.2}s  write {d:.2}s
         \\  drop      {d:>7.2}s
         \\  relink    {d:>7.2}s
         \\  publish   {d:>7.2}s
@@ -490,16 +488,20 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
 /// Time the three steps a single edited buffer costs: writing the note's rows, resolving links,
 /// and republishing the snapshot. This is the interactive path — `documentContentChanged` fires on
 /// a typing lull, and everything it triggers happens before the graph can show the edit.
-fn timeOneEdit(gpa: std.mem.Allocator, io: std.Io, db: *Db, indexer: *Indexer) !void {
+fn timeOneEdit(gpa: std.mem.Allocator, io: std.Io, index: *Index, indexer: *Indexer) !void {
     // A real note, edited the way a reader edits one: same file, different body. The content must
     // actually differ or `indexBuffer` short-circuits on the hash and measures nothing.
-    var stmt = try db.conn.prepare("SELECT path FROM notes WHERE phantom = 0 ORDER BY id LIMIT 1");
-    defer stmt.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const row = (try stmt.oneAlloc([]const u8, arena.allocator(), .{}, .{})) orelse {
-        std.debug.print("no notes to edit\n", .{});
-        return;
+    const row = blk: {
+        index.lock();
+        defer index.unlock();
+        var it = index.iterate(false);
+        const first = it.next() orelse {
+            std.debug.print("no notes to edit\n", .{});
+            return;
+        };
+        break :blk try arena.allocator().dupe(u8, first.path);
     };
 
     var buf: [256]u8 = undefined;

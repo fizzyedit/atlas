@@ -1,12 +1,12 @@
-//! Read-side helpers over the index DB, plus the shared path helpers (`vaultRelative`,
+//! Read-side helpers over the in-memory `Index`, plus the shared path helpers (`vaultRelative`,
 //! `isMarkdownPath`, `stemOf`, `foldInto`) used by the indexer, watcher, and services.
 //!
-//! All of the SELECTs are UI-thread / caller-thread. The indexer is the only writer; WAL +
-//! sqlite's Serialized threading mode make concurrent reads safe against in-flight commits.
+//! Every reader here is UI-thread / caller-thread and takes the index lock for the length of
+//! one function, copying what it returns into the caller's arena — nothing handed back points
+//! into the index. The indexer is the only writer.
 const std = @import("std");
 const builtin = @import("builtin");
-const sqlite = @import("sqlite");
-const Db = @import("Db.zig");
+const Index = @import("Index.zig");
 const resolve = @import("resolve.zig");
 const relpath = @import("relpath.zig");
 const schema = @import("schema.zig");
@@ -38,142 +38,93 @@ pub const Backlink = struct {
     context: []const u8 = "",
 };
 
-/// Load every real note (+ one Candidate per alias) for `resolve.resolve`, over the UI thread's
-/// read connection.
+/// Load every real note (+ one Candidate per alias) for `resolve.resolve`.
 ///
-/// Prefer *not* calling this on a hot UI path: on a 286,547-note vault it is a multi-second walk
-/// of every note and alias. The indexer builds the same list on its worker as part of publishing
-/// and hands it over (`Indexer.takeCandidates`); this remains the fallback for callers with no
+/// Prefer *not* calling this on a hot UI path: on a 286,547-note vault it is a walk of every
+/// note and alias. The indexer builds the same list on its worker as part of publishing and
+/// hands it over (`Indexer.takeCandidates`); this remains the fallback for callers with no
 /// indexer behind them (tests, a synthetic vault, a publish that never happened).
-pub fn loadCandidates(db: *Db, arena: std.mem.Allocator) ![]resolve.Candidate {
-    return loadCandidatesOn(db.reader(), arena);
-}
-
-/// `loadCandidates` against an explicit connection, so the indexer's worker can build the list on
-/// the *writer* handle it already owns. It must not touch `Db.reader()`: that connection is opened
-/// lazily on first use, and two threads racing that one null check is a data race on `Db` itself,
-/// whatever SQLite's own threading mode guarantees about the handles.
-pub fn loadCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]resolve.Candidate {
+pub fn loadCandidates(index: *Index, arena: std.mem.Allocator) ![]resolve.Candidate {
+    index.lock();
+    defer index.unlock();
     var list: std.ArrayList(resolve.Candidate) = .empty;
-    // Reserve up front: growing an empty list to that length reallocates and copies it a couple of
-    // dozen times on the way, and one count is far cheaper than the copies.
-    if (conn.one(usize, "SELECT count(*) FROM notes WHERE phantom = 0", .{}, .{}) catch null) |n| {
-        try list.ensureTotalCapacity(arena, n);
-    }
-
-    {
-        var stmt = try conn.prepare("SELECT path, stem FROM notes WHERE phantom = 0");
-        defer stmt.deinit();
-        var iter = try stmt.iterator(struct { path: []const u8, stem: []const u8 }, .{});
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try list.append(arena, .{ .path = row.path, .stem = row.stem });
-        }
-    }
-    {
-        var stmt = try conn.prepare(
-            \\SELECT n.path, n.stem, a.alias
-            \\FROM aliases a JOIN notes n ON n.id = a.note_id
-            \\WHERE n.phantom = 0
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(struct { path: []const u8, stem: []const u8, alias: []const u8 }, .{});
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try list.append(arena, .{ .path = row.path, .stem = row.stem, .alias = row.alias });
-        }
+    try list.ensureTotalCapacity(arena, index.real_count);
+    var it = index.iterate(false);
+    while (it.next()) |n| {
+        const path = try arena.dupe(u8, n.path);
+        const stem = try arena.dupe(u8, n.stem);
+        try list.append(arena, .{ .path = path, .stem = stem });
+        for (n.aliases) |al| try list.append(arena, .{ .path = path, .stem = stem, .alias = try arena.dupe(u8, al.alias) });
     }
     return list.toOwnedSlice(arena);
 }
 
-/// Prepares its own statement every call, on purpose.
-///
-/// This is a **UI-thread** helper (`backlinksFor` and friends run it during a frame) while the
-/// indexer's worker is writing on the same connection. `Db.cached()` hands out one shared set of
-/// `sqlite3_stmt`s, and two threads resetting and stepping the same statement is undefined
-/// behaviour — not a race that shows up under load, one that corrupts whenever it interleaves.
-/// The indexer has `cachedNoteId` for the hot relink path, which is worker-only.
-pub fn noteIdForPath(db: *Db, path: []const u8) !?i64 {
-    return db.reader().one(i64, "SELECT id FROM notes WHERE path = ? AND phantom = 0", .{}, .{path});
+pub fn noteIdForPath(index: *Index, path: []const u8) !?i64 {
+    index.lock();
+    defer index.unlock();
+    return index.idByPath(path);
 }
 
-pub fn noteTitle(db: *Db, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const row = try db.reader().oneAlloc(
-        struct { title: []const u8, stem: []const u8 },
-        arena,
-        "SELECT title, stem FROM notes WHERE path = ? AND phantom = 0",
-        .{},
-        .{path},
-    ) orelse return "";
-    if (row.title.len > 0) return row.title;
-    return row.stem;
+pub fn noteTitle(index: *Index, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    index.lock();
+    defer index.unlock();
+    const n = index.byPath(path) orelse return "";
+    return arena.dupe(u8, n.shownTitle());
 }
 
 /// 0-based line of a heading in `path`, or 0 when missing (not an error).
-pub fn headingLine(db: *Db, path: []const u8, heading: []const u8) !u32 {
+pub fn headingLine(index: *Index, path: []const u8, heading: []const u8) !u32 {
     if (heading.len == 0) return 0;
-    const id = (try noteIdForPath(db, path)) orelse return 0;
     var fold_buf: [512]u8 = undefined;
     if (heading.len > fold_buf.len) return 0;
     const folded = foldInto(&fold_buf, heading);
-    if (try db.reader().one(
-        i64,
-        "SELECT line FROM headings WHERE note_id = ? AND text_fold = ? LIMIT 1",
-        .{},
-        .{ id, folded },
-    )) |line| return @intCast(@max(line, 0));
-
+    index.lock();
+    defer index.unlock();
+    const n = index.byPath(path) orelse return 0;
+    for (n.headings) |h| if (std.mem.eql(u8, h.text_fold, folded)) return h.line;
     // Not the heading as written — try it as a slug (`#habitat-and-range`), the form a portable
     // markdown link into a section carries. One pass over this note's headings, only on the miss.
-    var stmt = try db.reader().prepare("SELECT text, line FROM headings WHERE note_id = ? ORDER BY line");
-    defer stmt.deinit();
-    var iter = try stmt.iterator(struct { text: []const u8, line: i64 }, .{id});
-    var row_buf: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&row_buf);
-    while (true) {
-        fba.reset();
-        const row = (iter.nextAlloc(fba.allocator(), .{}) catch break) orelse break;
+    for (n.headings) |h| {
         var text_fold: [512]u8 = undefined;
-        if (row.text.len > text_fold.len) continue;
-        if (headingMatches(row.text, folded, &text_fold)) return @intCast(@max(row.line, 0));
+        if (h.text.len > text_fold.len) continue;
+        if (headingMatches(h.text, folded, &text_fold)) return h.line;
     }
     return 0;
 }
 
 /// Inbound edges for `dst_path`, ordered by source path then line — ready to group in the UI.
-pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]Backlink {
-    const id = (try noteIdForPath(db, dst_path)) orelse return &.{};
-    var stmt = try db.reader().prepare(
-        \\SELECT n.path, n.title, n.stem, l.line, l.col, l.raw, l.alias
-        \\FROM links l
-        \\JOIN notes n ON n.id = l.src_id
-        \\WHERE l.dst_id = ? AND n.phantom = 0
-        \\ORDER BY n.path, l.line, l.col
-    );
-    defer stmt.deinit();
-
+pub fn backlinksFor(index: *Index, arena: std.mem.Allocator, dst_path: []const u8) ![]Backlink {
+    index.lock();
+    defer index.unlock();
+    const dst = index.byPath(dst_path) orelse return &.{};
     var list: std.ArrayList(Backlink) = .empty;
-    var iter = try stmt.iterator(struct {
-        path: []const u8,
-        title: []const u8,
-        stem: []const u8,
-        line: i64,
-        col: i64,
-        raw: []const u8,
-        alias: []const u8,
-    }, .{id});
-    while (true) {
-        const row = (try iter.nextAlloc(arena, .{})) orelse break;
-        const title = if (row.title.len > 0) row.title else row.stem;
-        try list.append(arena, .{
-            .path = row.path,
-            .title = title,
-            .line = @intCast(row.line),
-            .col = @intCast(row.col),
-            .raw = row.raw,
-            .alias = row.alias,
-        });
+    var srcs = dst.inbound.keyIterator();
+    while (srcs.next()) |src_id| {
+        const src = index.live(src_id.*) orelse continue;
+        if (src.phantom) continue;
+        const path = try arena.dupe(u8, src.path);
+        const title = try arena.dupe(u8, src.shownTitle());
+        for (src.links) |l| {
+            if (l.dst_id != dst.id) continue;
+            try list.append(arena, .{
+                .path = path,
+                .title = title,
+                .line = l.line,
+                .col = l.col,
+                .raw = try arena.dupe(u8, l.raw),
+                .alias = try arena.dupe(u8, l.alias),
+            });
+        }
     }
+    std.mem.sort(Backlink, list.items, {}, struct {
+        fn lessThan(_: void, a: Backlink, b: Backlink) bool {
+            return switch (std.mem.order(u8, a.path, b.path)) {
+                .lt => true,
+                .gt => false,
+                .eq => if (a.line != b.line) a.line < b.line else a.col < b.col,
+            };
+        }
+    }.lessThan);
     return list.toOwnedSlice(arena);
 }
 
@@ -192,7 +143,7 @@ pub fn backlinksFor(db: *Db, arena: std.mem.Allocator, dst_path: []const u8) ![]
 /// the thing the outline hangs off when a document opens at `###` and never has an `#`, or has
 /// content before its first heading.
 pub fn noteContentGraph(
-    db: *Db,
+    index: *Index,
     arena: std.mem.Allocator,
     note_id: i64,
     title: []const u8,
@@ -200,88 +151,56 @@ pub fn noteContentGraph(
     var items: std.ArrayList(content_graph.Item) = .empty;
     try items.append(arena, .{ .id = 0, .kind = .root, .level = 0, .line = 0, .text = title, .weight = 1 });
 
-    // -- headings, exactly as before: identity survives edits that only move lines ----------
+    // Everything this note's interior is built from, copied out under the lock — the rest of
+    // this function is pure over the copies.
     const HeadingRow = struct { line: u32, level: u32 };
     var heading_rows: std.ArrayList(HeadingRow) = .empty;
+    const BlockRow = struct { kind: i64, line_start: i64, line_end: i64, weight: i64 };
+    var block_rows: std.ArrayList(BlockRow) = .empty;
+    const TagRow = struct { tag: []const u8, line: i64 };
+    var tag_rows: std.ArrayList(TagRow) = .empty;
+    const EmbedRow = struct { raw: []const u8, alias: []const u8, line: i64 };
+    var embed_rows: std.ArrayList(EmbedRow) = .empty;
+    const SelfLink = struct { line: i64, heading: []const u8 };
+    var self_links: std.ArrayList(SelfLink) = .empty;
     {
-        var stmt = try db.reader().prepare(
-            \\SELECT text, text_fold, level, line FROM headings
-            \\WHERE note_id = ? ORDER BY line
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(
-            struct { text: []const u8, text_fold: []const u8, level: i64, line: i64 },
-            .{note_id},
-        );
+        index.lock();
+        defer index.unlock();
+        const n = index.live(note_id) orelse return .{ .items = try items.toOwnedSlice(arena), .edges = &.{} };
+
+        // -- headings: identity survives edits that only move lines ----------------------
         // Folded text of each heading added so far, so a repeated heading can be given a
         // different occurrence number and so a different id.
         var folds: std.ArrayList([]const u8) = .empty;
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
+        for (n.headings) |h| {
             var seen: u32 = 0;
             for (folds.items) |f| {
-                if (std.mem.eql(u8, f, row.text_fold)) seen += 1;
+                if (std.mem.eql(u8, f, h.text_fold)) seen += 1;
             }
-            try folds.append(arena, row.text_fold);
-            const level: u32 = @intCast(std.math.clamp(row.level, 1, 6));
-            const line: u32 = @intCast(@max(row.line, 0));
+            const text_fold = try arena.dupe(u8, h.text_fold);
+            try folds.append(arena, text_fold);
+            const level: u32 = @intCast(std.math.clamp(h.level, 1, 6));
             try items.append(arena, .{
-                .id = sectionId(row.text_fold, seen),
+                .id = sectionId(text_fold, seen),
                 .kind = .heading,
                 .level = level,
-                .line = line,
-                .text = row.text,
+                .line = h.line,
+                .text = try arena.dupe(u8, h.text),
                 .weight = 1,
             });
-            try heading_rows.append(arena, .{ .line = line, .level = level });
+            try heading_rows.append(arena, .{ .line = h.line, .level = level });
+        }
+        for (n.blocks) |b| try block_rows.append(arena, .{ .kind = @intFromEnum(b.kind), .line_start = b.line_start, .line_end = b.line_end, .weight = b.weight });
+        for (n.tags) |t| try tag_rows.append(arena, .{ .tag = try arena.dupe(u8, t.tag), .line = t.line });
+        // Embeds are kept apart from the same-note cross-reference edges below rather than
+        // merged into them.
+        for (n.links) |l| {
+            if (l.kind == .embed) try embed_rows.append(arena, .{ .raw = try arena.dupe(u8, l.raw), .alias = try arena.dupe(u8, l.alias), .line = l.line });
+            // Only a self-link (dst == this note) has both ends inside this graph.
+            if (l.dst_id == note_id and l.heading.len != 0) try self_links.append(arena, .{ .line = l.line, .heading = try arena.dupe(u8, l.heading) });
         }
     }
     const heading_count = heading_rows.items.len;
-
-    // -- body blocks --------------------------------------------------------------------
-    const BlockRow = struct { kind: i64, line_start: i64, line_end: i64, weight: i64 };
-    var block_rows: std.ArrayList(BlockRow) = .empty;
-    {
-        var stmt = try db.reader().prepare(
-            \\SELECT kind, line_start, line_end, weight FROM blocks
-            \\WHERE note_id = ? ORDER BY line_start
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(BlockRow, .{note_id});
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try block_rows.append(arena, row);
-        }
-    }
-
-    // -- tags: captured since day one, consumed here for the first time -------------------
-    const TagRow = struct { tag: []const u8, line: i64 };
-    var tag_rows: std.ArrayList(TagRow) = .empty;
-    {
-        var stmt = try db.reader().prepare("SELECT tag, line FROM tags WHERE note_id = ? ORDER BY line");
-        defer stmt.deinit();
-        var iter = try stmt.iterator(TagRow, .{note_id});
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try tag_rows.append(arena, row);
-        }
-    }
-
-    // -- embeds: links of kind `.embed`, kept apart from the same-note cross-reference edges
-    // below rather than merged into them.
-    const EmbedRow = struct { raw: []const u8, alias: []const u8, line: i64 };
-    var embed_rows: std.ArrayList(EmbedRow) = .empty;
-    {
-        var stmt = try db.reader().prepare(
-            \\SELECT raw, alias, line FROM links WHERE src_id = ? AND kind = ? ORDER BY line
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(EmbedRow, .{ note_id, @intFromEnum(schema.LinkKind.embed) });
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            try embed_rows.append(arena, row);
-        }
-    }
 
     // -- merge everything by line, and attach each non-heading item to whichever heading was
     // last seen in that walk (the root, until the first heading). A single forward pass over
@@ -376,22 +295,12 @@ pub fn noteContentGraph(
     };
 
     // Same-note wikilinks: an explicit `[[This Note#Heading]]` connects two of this note's own
-    // headings. Only a self-link (dst_id == note_id) has both ends inside this graph.
-    {
-        var stmt = try db.reader().prepare(
-            \\SELECT line, heading FROM links
-            \\WHERE src_id = ? AND dst_id = ? AND heading <> ''
-            \\ORDER BY line
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(struct { line: i64, heading: []const u8 }, .{ note_id, note_id });
-        while (true) {
-            const row = (try iter.nextAlloc(arena, .{})) orelse break;
-            const from = sectionAtLine(items.items[0 .. 1 + heading_count], @max(row.line, 0));
-            const to = sectionByHeading(items.items[0 .. 1 + heading_count], row.heading) orelse continue;
-            if (to == from) continue;
-            try edges.append(arena, .{ .a = @intCast(from), .b = @intCast(to), .kind = .link });
-        }
+    // headings.
+    for (self_links.items) |row| {
+        const from = sectionAtLine(items.items[0 .. 1 + heading_count], @max(row.line, 0));
+        const to = sectionByHeading(items.items[0 .. 1 + heading_count], row.heading) orelse continue;
+        if (to == from) continue;
+        try edges.append(arena, .{ .a = @intCast(from), .b = @intCast(to), .kind = .link });
     }
 
     return .{
@@ -532,7 +441,7 @@ pub const max_prefix: usize = 512;
 /// what someone typing a prefix expects: `Ab Anar` next to `AB Aurigae`, not two runs split by
 /// capitalisation.
 pub fn complete(
-    db: *Db,
+    index: *Index,
     arena: std.mem.Allocator,
     prefix: []const u8,
     limit: usize,
@@ -541,102 +450,40 @@ pub fn complete(
     var fold_buf: [max_prefix]u8 = undefined;
     if (prefix.len > fold_buf.len) return &.{};
     const lo = foldInto(&fold_buf, prefix);
-    var end_buf: [max_prefix]u8 = undefined;
-    const hi: ?[]const u8 = if (lo.len == 0) null else prefixEnd(&end_buf, lo);
 
+    index.lock();
+    defer index.unlock();
+    try index.ensureSorted();
     var list: std.ArrayList(CompleteRow) = .empty;
 
-    const Note = struct { stem: []const u8, path: []const u8, title: []const u8 };
-    {
-        // Two spellings of the same seek: bounded when the prefix has a successor, open-ended
-        // when it doesn't (empty prefix, or the 0xFF edge). Both are `SEARCH … USING INDEX
-        // notes_stem_fold`; splitting them keeps the range constraint literal rather than
-        // hiding it behind an `IS NULL` the optimizer would have to see through.
-        const n: i64 = @intCast(limit);
-        if (hi) |h| {
-            var stmt = try db.reader().prepare(
-                \\SELECT stem, path, title FROM notes
-                \\WHERE phantom = 0 AND stem_fold >= ? AND stem_fold < ?
-                \\ORDER BY stem_fold LIMIT ?
-            );
-            defer stmt.deinit();
-            var iter = try stmt.iterator(Note, .{ lo, h, n });
-            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
-                .target = row.stem,
-                .path = row.path,
-                .title = if (row.title.len > 0) row.title else row.stem,
-            });
-        } else {
-            var stmt = try db.reader().prepare(
-                \\SELECT stem, path, title FROM notes
-                \\WHERE phantom = 0 AND stem_fold >= ?
-                \\ORDER BY stem_fold LIMIT ?
-            );
-            defer stmt.deinit();
-            var iter = try stmt.iterator(Note, .{ lo, n });
-            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
-                .target = row.stem,
-                .path = row.path,
-                .title = if (row.title.len > 0) row.title else row.stem,
-            });
+    const Keys = struct {
+        fn stem(i: *Index, id: i64) []const u8 {
+            return i.note(id).?.stem_fold;
         }
+        fn alias(i: *Index, r: Index.AliasRef) []const u8 {
+            return i.aliasFold(r);
+        }
+    };
+    // A seek into the sorted view, then rows while they still start with the prefix.
+    const stems = index.stems_sorted.items;
+    var at = Index.lowerBound(i64, stems, index, Keys.stem, lo);
+    while (at < stems.len and list.items.len < limit) : (at += 1) {
+        const n = index.note(stems[at]).?;
+        if (!std.mem.startsWith(u8, n.stem_fold, lo)) break;
+        try list.append(arena, .{ .target = try arena.dupe(u8, n.stem), .path = try arena.dupe(u8, n.path), .title = try arena.dupe(u8, n.shownTitle()) });
     }
     if (list.items.len < limit) {
-        const Alias = struct { alias: []const u8, path: []const u8, title: []const u8, stem: []const u8 };
-        const remain: i64 = @intCast(limit - list.items.len);
-        if (hi) |h| {
-            var stmt = try db.reader().prepare(
-                \\SELECT a.alias, n.path, n.title, n.stem FROM aliases a
-                \\JOIN notes n ON n.id = a.note_id
-                \\WHERE a.alias_fold >= ? AND a.alias_fold < ? AND n.phantom = 0
-                \\ORDER BY a.alias_fold LIMIT ?
-            );
-            defer stmt.deinit();
-            var iter = try stmt.iterator(Alias, .{ lo, h, remain });
-            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
-                .target = row.alias,
-                .path = row.path,
-                .title = if (row.title.len > 0) row.title else row.stem,
-            });
-        } else {
-            var stmt = try db.reader().prepare(
-                \\SELECT a.alias, n.path, n.title, n.stem FROM aliases a
-                \\JOIN notes n ON n.id = a.note_id
-                \\WHERE a.alias_fold >= ? AND n.phantom = 0
-                \\ORDER BY a.alias_fold LIMIT ?
-            );
-            defer stmt.deinit();
-            var iter = try stmt.iterator(Alias, .{ lo, remain });
-            while (try iter.nextAlloc(arena, .{})) |row| try list.append(arena, .{
-                .target = row.alias,
-                .path = row.path,
-                .title = if (row.title.len > 0) row.title else row.stem,
-            });
+        const aliases = index.aliases_sorted.items;
+        var ai = Index.lowerBound(Index.AliasRef, aliases, index, Keys.alias, lo);
+        while (ai < aliases.len and list.items.len < limit) : (ai += 1) {
+            const r = aliases[ai];
+            const n = index.note(r.note_id).?;
+            const al = n.aliases[r.index];
+            if (!std.mem.startsWith(u8, al.alias_fold, lo)) break;
+            try list.append(arena, .{ .target = try arena.dupe(u8, al.alias), .path = try arena.dupe(u8, n.path), .title = try arena.dupe(u8, n.shownTitle()) });
         }
     }
     return list.toOwnedSlice(arena);
-}
-
-/// Drop phantoms nothing links to any more.
-///
-/// A phantom only exists to stand in for "a link points here but the file doesn't exist", so
-/// once its last inbound link is gone it has no reason to. Nothing else deletes them: writing
-/// a note replaces its links wholesale, which silently orphans whatever phantoms the old ones
-/// had materialized, and the non-note purge only rejects targets that aren't note-like at all.
-/// So editing `[[test]]` into `[[testi]]` left a permanent `test` node behind — every
-/// intermediate state of a link you typed became its own floating node in the graph, and
-/// clicking one offered to create a file for a link that no longer existed.
-///
-/// `NOT EXISTS` rather than `NOT IN` only as insurance: `links.dst_id` is `NOT NULL` today, so
-/// both forms behave identically, but `NOT IN` would silently match nothing (purging none of
-/// them) if that constraint were ever relaxed.
-/// The one writer in this file, so `db.conn` rather than `db.reader()` — the read-only handle
-/// would reject it. Called from the indexer's worker at the end of a relink.
-pub fn purgeOrphanPhantoms(db: *Db) !void {
-    try db.conn.exec(
-        \\DELETE FROM notes WHERE phantom = 1
-        \\  AND NOT EXISTS (SELECT 1 FROM links WHERE links.dst_id = notes.id)
-    , .{}, .{});
 }
 
 /// Longest vault-relative path the index carries. Matches `resolve.max_path_len`: a path longer
@@ -744,7 +591,7 @@ pub const HeadingHit = struct {
 /// — the whole set costs one indexed seek on `headings_note` — and that buys a substring match,
 /// which is what finds "Habitat and range" from "range".
 pub fn completeHeadings(
-    db: *Db,
+    index: *Index,
     arena: std.mem.Allocator,
     note_path: []const u8,
     prefix: []const u8,
@@ -755,26 +602,17 @@ pub fn completeHeadings(
     if (prefix.len > fold_buf.len) return &.{};
     const want = foldInto(&fold_buf, prefix);
 
-    const id = (try noteIdForPath(db, note_path)) orelse return &.{};
-    var stmt = try db.reader().prepare(
-        "SELECT text, text_fold, level, line FROM headings WHERE note_id = ? ORDER BY line",
-    );
-    defer stmt.deinit();
-
+    index.lock();
+    defer index.unlock();
+    const n = index.byPath(note_path) orelse return &.{};
     var list: std.ArrayList(HeadingHit) = .empty;
-    var iter = try stmt.iterator(struct {
-        text: []const u8,
-        text_fold: []const u8,
-        level: i64,
-        line: i64,
-    }, .{id});
-    while (try iter.nextAlloc(arena, .{})) |row| {
+    for (n.headings) |h| {
         if (list.items.len >= limit) break;
-        if (want.len > 0 and std.mem.indexOf(u8, row.text_fold, want) == null) continue;
+        if (want.len > 0 and std.mem.indexOf(u8, h.text_fold, want) == null) continue;
         try list.append(arena, .{
-            .text = row.text,
-            .level = @intCast(@max(row.level, 1)),
-            .line = @intCast(@max(row.line, 0)),
+            .text = try arena.dupe(u8, h.text),
+            .level = @max(h.level, 1),
+            .line = h.line,
         });
     }
     return list.toOwnedSlice(arena);
@@ -782,42 +620,48 @@ pub fn completeHeadings(
 
 /// Media rows whose name starts with `prefix` (folded), for `![[…]]` completion. Ordered by
 /// name so the list is stable between keystrokes.
-pub fn completeMedia(db: *Db, arena: std.mem.Allocator, prefix: []const u8, limit: usize) ![]CompleteRow {
+pub fn completeMedia(index: *Index, arena: std.mem.Allocator, prefix: []const u8, limit: usize) ![]CompleteRow {
     if (limit == 0) return &.{};
     var fold_buf: [max_prefix]u8 = undefined;
     if (prefix.len > fold_buf.len) return &.{};
     const lo = foldInto(&fold_buf, prefix);
-    var end_buf: [max_prefix]u8 = undefined;
-    const hi: ?[]const u8 = if (lo.len == 0) null else prefixEnd(&end_buf, lo);
 
-    // `name_fold LIKE ? OR stem_fold LIKE ?` could use neither index — the LIKE for the reason
-    // in `prefixEnd`, and the `OR` because one scan cannot satisfy two columns. Two index seeks
-    // unioned can: `UNION` (not `UNION ALL`) also does the dedupe a file matching on both its
-    // name and its stem needs. Each arm still sorts, but over the rows the prefix already
-    // narrowed it to rather than over every media row in the vault.
-    const Row = struct { path: []const u8, name_fold: []const u8 };
+    index.lock();
+    defer index.unlock();
+    try index.ensureSorted();
+    // Two seeks — by folded name and by folded stem — unioned: a file matching on both its name
+    // and its stem appears once. Ordered by name so the list is stable between keystrokes.
+    const Keys = struct {
+        fn name(i: *Index, id: i64) []const u8 {
+            return i.media.items[@intCast(id - 1)].name_fold;
+        }
+        fn stem(i: *Index, id: i64) []const u8 {
+            return i.media.items[@intCast(id - 1)].stem_fold;
+        }
+    };
+    var hits: std.AutoArrayHashMapUnmanaged(i64, void) = .empty;
+    const by_name = index.media_by_name_sorted.items;
+    var at = Index.lowerBound(i64, by_name, index, Keys.name, lo);
+    while (at < by_name.len) : (at += 1) {
+        if (!std.mem.startsWith(u8, Keys.name(index, by_name[at]), lo)) break;
+        try hits.put(arena, by_name[at], {});
+    }
+    const by_stem = index.media_by_stem_sorted.items;
+    at = Index.lowerBound(i64, by_stem, index, Keys.stem, lo);
+    while (at < by_stem.len) : (at += 1) {
+        if (!std.mem.startsWith(u8, Keys.stem(index, by_stem[at]), lo)) break;
+        try hits.put(arena, by_stem[at], {});
+    }
+    const ids = hits.keys();
+    std.mem.sort(i64, ids, index, struct {
+        fn lessThan(i: *Index, a: i64, b: i64) bool {
+            return std.mem.lessThan(u8, Keys.name(i, a), Keys.name(i, b));
+        }
+    }.lessThan);
     var list: std.ArrayList(CompleteRow) = .empty;
-    const n: i64 = @intCast(limit);
-    if (hi) |h| {
-        var stmt = try db.reader().prepare(
-            \\SELECT path, name_fold FROM media WHERE name_fold >= ? AND name_fold < ?
-            \\UNION
-            \\SELECT path, name_fold FROM media WHERE stem_fold >= ? AND stem_fold < ?
-            \\ORDER BY 2 LIMIT ?
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(Row, .{ lo, h, lo, h, n });
-        while (try iter.nextAlloc(arena, .{})) |row| try appendMedia(arena, &list, row.path);
-    } else {
-        var stmt = try db.reader().prepare(
-            \\SELECT path, name_fold FROM media WHERE name_fold >= ?
-            \\UNION
-            \\SELECT path, name_fold FROM media WHERE stem_fold >= ?
-            \\ORDER BY 2 LIMIT ?
-        );
-        defer stmt.deinit();
-        var iter = try stmt.iterator(Row, .{ lo, lo, n });
-        while (try iter.nextAlloc(arena, .{})) |row| try appendMedia(arena, &list, row.path);
+    for (ids) |id| {
+        if (list.items.len >= limit) break;
+        try appendMedia(arena, &list, try arena.dupe(u8, index.media.items[@intCast(id - 1)].path));
     }
     return list.toOwnedSlice(arena);
 }
@@ -832,28 +676,19 @@ fn appendMedia(arena: std.mem.Allocator, list: *std.ArrayList(CompleteRow), path
 /// Media files as resolution candidates. Kept a separate list from `loadCandidates` rather
 /// than merged with a kind flag: an embed resolves against media and a plain wikilink against
 /// notes, so two lists means no precedence rule to get wrong (and `[[Target]]` can never
-/// silently land on `Target.png` instead of `Target.md`).
-pub fn loadMediaCandidates(db: *Db, arena: std.mem.Allocator) ![]resolve.Candidate {
-    return loadMediaCandidatesOn(db.reader(), arena);
-}
-
-/// `loadMediaCandidates` against an explicit connection — see `loadCandidatesOn`.
-pub fn loadMediaCandidatesOn(conn: *sqlite.Db, arena: std.mem.Allocator) ![]resolve.Candidate {
+/// silently land on `Target.png` instead of `Target.md`). Two rows per file, one per spelling —
+/// both `![[diagram]]` and `![[diagram.png]]` should find the image.
+pub fn loadMediaCandidates(index: *Index, arena: std.mem.Allocator) ![]resolve.Candidate {
+    index.lock();
+    defer index.unlock();
     var list: std.ArrayList(resolve.Candidate) = .empty;
-    var stmt = try conn.prepare("SELECT path, stem FROM media");
-    defer stmt.deinit();
-    var iter = try stmt.iterator(struct { path: []const u8, stem: []const u8 }, .{});
-    while (true) {
-        const row = (try iter.nextAlloc(arena, .{})) orelse break;
-        // Two rows per file, one per spelling — the same shape aliases use for notes. A
-        // resolver pass matches `Candidate.stem`, and both `![[diagram]]` and
-        // `![[diagram.png]]` should find the image (unlike a note, the extension is not
-        // stripped from a media target, so the bare stem would never match on its own).
-        try list.append(arena, .{ .path = row.path, .stem = row.stem });
-        const name = std.fs.path.basenamePosix(row.path);
-        if (!std.mem.eql(u8, name, row.stem)) {
-            try list.append(arena, .{ .path = row.path, .stem = name });
-        }
+    var it = index.iterateMedia();
+    while (it.next()) |m| {
+        const path = try arena.dupe(u8, m.path);
+        const stem = try arena.dupe(u8, m.stem);
+        try list.append(arena, .{ .path = path, .stem = stem });
+        const name = std.fs.path.basenamePosix(path);
+        if (!std.mem.eql(u8, name, stem)) try list.append(arena, .{ .path = path, .stem = name });
     }
     return list.toOwnedSlice(arena);
 }

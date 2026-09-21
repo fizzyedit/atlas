@@ -2,7 +2,7 @@
 //! `[[Note]]` mean*.
 //!
 //! Called from the UI thread inside the markdown renderer's draw, so nothing here may block
-//! on I/O beyond a sqlite SELECT (WAL + Serialized keeps that cheap against the indexer).
+//! on I/O at all: the index is in memory, and a query takes its lock for a moment.
 //! Callers memoize against `generation`, so the steady-state cost is a hash lookup on their
 //! side and a candidate-list reuse on ours.
 const std = @import("std");
@@ -29,7 +29,7 @@ fn resolveFn(
 ) anyerror!Api.Resolution {
     const st: *State = @ptrCast(@alignCast(ctx));
     const root = st.vault_root orelse return .{ .status = .unresolved };
-    if (st.db == null) return .{ .status = .unresolved };
+    if (st.index == null) return .{ .status = .unresolved };
 
     // First open: the walk hasn't committed anything yet. Prefer "not sure" over a flash of red.
     if (st.busy.load(.acquire) and st.indexer.counts().note_count == 0) {
@@ -52,11 +52,11 @@ fn resolveFn(
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const title_src = query.noteTitle(&st.db.?, arena.allocator(), rel) catch "";
+    const title_src = query.noteTitle(&st.index.?, arena.allocator(), rel) catch "";
     const title = try gpa.dupe(u8, if (title_src.len > 0) title_src else query.stemOf(rel));
 
     const line: u32 = if (heading.len > 0)
-        (query.headingLine(&st.db.?, rel, heading) catch 0)
+        (query.headingLine(&st.index.?, rel, heading) catch 0)
     else
         0;
 
@@ -83,7 +83,7 @@ fn complete(
     _ = source_path;
     const st: *State = @ptrCast(@alignCast(ctx));
     const root = st.vault_root orelse return &.{};
-    const db = if (st.db) |*d| d else return &.{};
+    const db = if (st.index) |*d| d else return &.{};
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

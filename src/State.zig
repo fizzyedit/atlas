@@ -11,10 +11,9 @@ const std = @import("std");
 const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
 
-const Db = @import("index/Db.zig");
+const Index = @import("index/Index.zig");
 const Indexer = @import("index/Indexer.zig");
 const Watcher = @import("index/Watcher.zig");
-const cache_dir = @import("index/cache_dir.zig");
 const query = @import("index/query.zig");
 const resolve = @import("index/resolve.zig");
 const Scanner = @import("index/Scanner.zig");
@@ -40,7 +39,8 @@ vault_root: ?[]u8 = null,
 /// The index for `vault_root`. Null when no folder is open, or when the index could not be
 /// opened at all — atlas degrades to "resolves nothing" rather than refusing to load, since a
 /// broken cache directory shouldn't cost the user their editor.
-db: ?Db = null,
+/// The vault's index, in memory. Null until a vault is open.
+index: ?Index = null,
 
 /// Background walker/writer. Lives for the life of the State; `start`/`stop` track the vault.
 indexer: Indexer = undefined,
@@ -127,7 +127,7 @@ pub fn openVault(self: *State, gpa: std.mem.Allocator, root: []const u8) !void {
     // reader would expect to retry. Deliberately re-reading a vault that opened fine is what the
     // "rebuild index" command is for.
     if (self.vault_root) |current| {
-        if (self.db != null and std.mem.eql(u8, current, root)) return;
+        if (self.index != null and std.mem.eql(u8, current, root)) return;
     }
     self.closeVault(gpa);
     self.vault_root = try gpa.dupe(u8, root);
@@ -136,14 +136,11 @@ pub fn openVault(self: *State, gpa: std.mem.Allocator, root: []const u8) !void {
         self.vault_root = null;
     }
 
-    self.db = openIndex(gpa, root) catch |err| blk: {
-        std.log.scoped(.atlas).err("could not open index for {s}: {s}", .{ root, @errorName(err) });
-        break :blk null;
-    };
+    self.index = Index.init(gpa, dvui.io);
 
-    if (self.db) |*db| {
+    if (self.index) |*index| {
         if (self.indexer_ready) {
-            self.indexer.start(db, self.vault_root.?) catch |err| {
+            self.indexer.start(index, self.vault_root.?) catch |err| {
                 std.log.scoped(.atlas).err("could not start indexer: {s}", .{@errorName(err)});
             };
         }
@@ -151,21 +148,12 @@ pub fn openVault(self: *State, gpa: std.mem.Allocator, root: []const u8) !void {
     }
 }
 
-fn openIndex(gpa: std.mem.Allocator, root: []const u8) !Db {
-    const dir = try cache_dir.forVault(gpa, root);
-    defer gpa.free(dir);
-    // Opening the cache file is a one-shot FS op; a private threaded Io keeps State free of
-    // dvui so the rest of the index stack stays headless-testable.
-    var threaded = std.Io.Threaded.init_single_threaded;
-    return Db.openIn(gpa, threaded.io(), dir, root);
-}
-
 pub fn closeVault(self: *State, gpa: std.mem.Allocator) void {
     if (self.watcher_ready) self.watcher.clear();
-    // Join first — the worker holds `db` and must finish before we close it.
+    // Join first — the worker holds `index` and must finish before we free it.
     if (self.indexer_ready) self.indexer.stop();
-    if (self.db) |*db| db.close(gpa);
-    self.db = null;
+    if (self.index) |*index| index.deinit();
+    self.index = null;
     if (self.vault_root) |r| gpa.free(r);
     self.vault_root = null;
     self.invalidateCandidates();
@@ -177,7 +165,7 @@ pub fn closeVault(self: *State, gpa: std.mem.Allocator) void {
 
 /// True when the graph panel has something to draw.
 pub fn hasGraphSource(self: *const State) bool {
-    return self.vault_root != null and self.db != null;
+    return self.vault_root != null and self.index != null;
 }
 
 pub fn tickWatcher(self: *State) void {
@@ -233,14 +221,14 @@ pub fn folderPathsChanged(self: *State, changes: sdk.Plugin.PathChanges) void {
 }
 
 pub fn hasVault(self: *const State) bool {
-    return self.vault_root != null and self.db != null;
+    return self.vault_root != null and self.index != null;
 }
 
 pub fn rebuildIndex(self: *State) void {
-    if (!self.indexer_ready or self.db == null) return;
+    if (!self.indexer_ready or self.index == null) return;
     if (self.indexer.thread == null) {
         if (self.vault_root) |root| {
-            self.indexer.start(&self.db.?, root) catch return;
+            self.indexer.start(&self.index.?, root) catch return;
             return;
         }
     }
@@ -308,14 +296,14 @@ pub fn ensureCandidates(self: *State) ![]const resolve.Candidate {
     // Fallback. Nothing published candidates for this generation and none is coming: no vault
     // indexer (headless tests, a synthetic vault), a publish whose candidate build failed, or a
     // generation bumped by something other than `commitAndPublish`.
-    const db = if (self.db) |*d| d else {
+    const index = if (self.index) |*d| d else {
         self.releaseCandidates();
         self.cand_gen = gen;
         return &.{};
     };
     self.releaseCandidates();
-    self.candidates = try query.loadCandidates(db, self.cand_arena.allocator());
-    self.media_candidates = try query.loadMediaCandidates(db, self.cand_arena.allocator());
+    self.candidates = try query.loadCandidates(index, self.cand_arena.allocator());
+    self.media_candidates = try query.loadMediaCandidates(index, self.cand_arena.allocator());
     // Built here too, not just on the worker: this path is rare, but the callers below are the
     // per-link ones, and "rare" is no reason to hand them a linear scan of the whole vault.
     self.cand_index = resolve.Index.init(self.cand_arena.child_allocator, self.candidates) catch null;
