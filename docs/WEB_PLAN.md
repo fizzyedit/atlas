@@ -298,10 +298,21 @@ Later the same day:
 - A frame-driven scan kept parking: the app only renders when asked, so the indexer asks for
   a frame while it has work; and an immediate backend's answers are drained within the step.
 
+- Settings, recents and keybinds persist on the web: `core.fs.read/write/remove` is the
+  app's small-file seam on both targets (localStorage keyed by path), the wasm gates around
+  them are gone, and recents save as they change (a tab is closed, never quit).
+
 Still open in step 7: CORS on GitHub release assets is assumed, not yet tried (the registry
 has no `web-wasm32` builds yet — the action gained the target, uncommitted); the host must
-ship the store's optimize class; settings/recents on the web (`localStorage` behind the
-settings file API); the layout solve runs inline on the web.
+ship the store's optimize class; `layout.zon`/`window.zon` still go through the native
+backend; the layout solve runs inline on the web — stepping it means restructuring
+`layout.solve`'s fold/Louvain/containment pipeline, a separate piece of work.
+
+**Local test loop** (until the registry serves web builds): in a plugin checkout
+`zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall` → `zig-out/<id>.wasm`; in
+fizzy `zig build web -Doptimize=ReleaseSmall`, copy the wasm to `zig-out/web/plugins/<id>/`,
+serve `zig-out/web`, open `/?plugin=<id>&open=<url of a zip>`. The page remembers what it
+loaded (`localStorage` `fizzy.web_plugins`).
 
 ## A further step: plugins as their own web apps
 
