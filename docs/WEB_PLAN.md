@@ -237,6 +237,32 @@ edits only from the 2-minute sweep. Both are host follow-ups.
   `app/settings` file API (a JS shim like `fizzy_web_request`), per origin, so each plugin's
   settings persist across visits without a server. Same for `recents.zon`; `layout.zon` too.
 
+### Step 5 — landed
+
+The web build links atlas (`web_plugin_dirs` names the modules atlas's own `build.zig` adds:
+`batch2d`, `content_graph`, the `threads` shim). What wasm needed of atlas: a `std.Thread`
+stand-in whose `spawn` refuses (every site already had the inline fallback), a plain
+generation counter (wasm32 atomics stop at 32 bits), the frame's clock instead of the host
+`Io`'s, no environment, no disk poll in the watcher, and the backlinks pane reading a source
+line through the host's filesystem. The end-to-end mount path is a headless test now
+(`Indexer.zig`, "a mounted vault is indexed from the frame"): a `vfs.Mem` mount pumped by
+"the host", the task stepped a millisecond at a time, a save as a queued path.
+
+Open: the layout solve runs inline on the web (it was a thread); a large vault will hitch
+once per rebuild there until it is a `Task` too.
+
+## Step 7: the store loads plugins on the web (no static list)
+
+The static `web_plugin_dirs` list is the interim the review called step 1 (§2.4 of
+`fizzy/docs/REVIEW_2026-09.md`). What the user actually wants is its step 2: a plugin built
+as a wasm **side module** (`-dynamic -fPIC`, `dylink.0`), the web host built with
+`--import-table` + exported `__stack_pointer`, a ~200-line JS loader that fetches, relocates
+and registers it, a `WebDynLib` behind the existing `PluginLoader.loadAndRegister` sequence,
+and `web-wasm32` as a store target. The mechanism was demonstrated under node; the review's
+estimate is 2–3 weeks. Then the web build ships exactly the built-ins native does, and drive
+and atlas arrive from the store like everywhere else. Nothing in the index work above
+changes for it: a side module is the dylib model with table indices for function pointers.
+
 ## A further step: plugins as their own web apps
 
 Two things fizzy already has make this cheap: a plugin bundles into an app through
