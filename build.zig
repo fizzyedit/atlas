@@ -168,6 +168,7 @@ pub fn build(b: *std.Build) void {
     });
     indexer_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
     indexer_tests.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
+    indexer_tests.root_module.addImport("core", fizzy_dep.module("core"));
     test_step.dependOn(&b.addRunArtifact(indexer_tests).step);
 
     // Graph camera + radial layout: pure math over `dvui.Point`/`Rect`, no window needed.
@@ -239,6 +240,7 @@ pub fn build(b: *std.Build) void {
         // an immediate "file exists in modules 'resolve' and 'Scanner'".
         bench.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         bench.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
+        bench.root_module.addImport("core", fizzy_dep.module("core"));
         // `--index` drives the real `Indexer` against a real database, which is the only way to
         // time the scan the rest of this harness skips.
         // A distinct module object from `content_graph_mod`/`cg_for_query_test` above, deliberately —

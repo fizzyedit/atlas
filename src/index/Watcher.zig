@@ -40,6 +40,9 @@ pub const sweep_ns: i96 = 15 * std.time.ns_per_s;
 /// enough to bound how wrong the graph can get if the platform's watcher stops delivering
 /// without saying so.
 pub const watched_sweep_ns: i96 = 5 * std.time.ns_per_min;
+/// A vault on a mount: every sweep is a listing round trip per folder, so rarely — the mount's
+/// own change feed keeps the explorer fresh in between.
+pub const mount_sweep_ns: i96 = 2 * std.time.ns_per_min;
 
 indexer: *Indexer,
 vault_root: []const u8 = "",
@@ -75,10 +78,14 @@ pub fn clear(self: *Watcher) void {
 /// Call from the UI thread's `endFrame`. Cheap when the interval hasn't elapsed.
 pub fn tick(self: *Watcher) void {
     if (self.vault_root.len == 0) return;
-    const now = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    const now: i96 = Indexer.nowNs();
 
     const host = sdk.host();
-    const interval: i96 = if (host.folderWatchActive()) watched_sweep_ns else sweep_ns;
+    // A vault on a mount has no disk to poll and no host watcher; its listings say when a
+    // file changed, so the sweep is the whole mechanism — at a pace a round trip per folder
+    // can afford. Per-path change events for mounts are a host follow-up (WEB_PLAN).
+    const mounted = if (host.files) |files| files.isMounted(self.vault_root) else false;
+    const interval: i96 = if (mounted) mount_sweep_ns else if (host.folderWatchActive()) watched_sweep_ns else sweep_ns;
     if (self.last_sweep_ns == 0) {
         // Opening the vault already queued a full scan — start the clock rather than asking
         // for a second walk on the very next frame.
@@ -88,6 +95,7 @@ pub fn tick(self: *Watcher) void {
         self.indexer.requestSweep();
     }
 
+    if (mounted) return;
     if (self.last_poll_ns != 0 and now - self.last_poll_ns < poll_ns) return;
     self.last_poll_ns = now;
 

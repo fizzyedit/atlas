@@ -10,6 +10,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
+const core = @import("core");
 
 const Index = @import("index/Index.zig");
 const Indexer = @import("index/Indexer.zig");
@@ -41,6 +42,10 @@ vault_root: ?[]u8 = null,
 /// broken cache directory shouldn't cost the user their editor.
 /// The vault's index, in memory. Null until a vault is open.
 index: ?Index = null,
+/// The disk behind a vault that lives on this machine, the indexer's own — its reads overlap
+/// on the host's `Io` pool and its completions land on the indexer's thread, never the
+/// host's. Null for a vault on a mount, which reads through the host's own filesystem.
+local: ?core.LocalFs = null,
 
 /// Background walker/writer. Lives for the life of the State; `start`/`stop` track the vault.
 indexer: Indexer = undefined,
@@ -140,12 +145,32 @@ pub fn openVault(self: *State, gpa: std.mem.Allocator, root: []const u8) !void {
 
     if (self.index) |*index| {
         if (self.indexer_ready) {
-            self.indexer.start(index, self.vault_root.?) catch |err| {
+            self.indexer.start(index, self.vault_root.?, self.sourceFor(gpa, self.vault_root.?)) catch |err| {
                 std.log.scoped(.atlas).err("could not start indexer: {s}", .{@errorName(err)});
             };
         }
         if (self.watcher_ready) self.watcher.setVault(self.vault_root.?);
     }
+}
+
+/// Where the vault's bytes come from: a mount's filesystem when the root is on one (the host
+/// pumps it; the indexer runs from the frame), else this machine's disk through an indexer-
+/// owned `LocalFs` (the indexer runs on its own thread and pumps it itself).
+fn sourceFor(self: *State, gpa: std.mem.Allocator, root: []const u8) Indexer.Source {
+    if (sdk.host().files) |files| {
+        if (files.isMounted(root)) {
+            const r = files.resolve(root);
+            return .{ .fs = r.fs, .root = r.rel, .pump_self = false };
+        }
+    }
+    if (self.local == null) self.local = core.LocalFs.init(gpa, dvui.io);
+    return .{ .fs = self.local.?.fs(), .root = root, .pump_self = true };
+}
+
+/// Once a frame: a task run from the frame (a mount, the web) gets its budget here.
+pub fn pumpIndexer(self: *State) void {
+    if (!self.indexer_ready) return;
+    self.indexer.pump(4 * std.time.ns_per_ms);
 }
 
 pub fn closeVault(self: *State, gpa: std.mem.Allocator) void {
@@ -154,6 +179,8 @@ pub fn closeVault(self: *State, gpa: std.mem.Allocator) void {
     if (self.indexer_ready) self.indexer.stop();
     if (self.index) |*index| index.deinit();
     self.index = null;
+    if (self.local) |*l| l.deinit();
+    self.local = null;
     if (self.vault_root) |r| gpa.free(r);
     self.vault_root = null;
     self.invalidateCandidates();
@@ -171,6 +198,7 @@ pub fn hasGraphSource(self: *const State) bool {
 pub fn tickWatcher(self: *State) void {
     self.reconcileDirty();
     if (self.watcher_ready) self.watcher.tick();
+    self.pumpIndexer();
 }
 
 /// Drop overlays for documents that are no longer open.
@@ -226,9 +254,10 @@ pub fn hasVault(self: *const State) bool {
 
 pub fn rebuildIndex(self: *State) void {
     if (!self.indexer_ready or self.index == null) return;
-    if (self.indexer.thread == null) {
+    if (!self.indexer.running()) {
         if (self.vault_root) |root| {
-            self.indexer.start(&self.index.?, root) catch return;
+            const gpa = self.indexer.gpa;
+            self.indexer.start(&self.index.?, root, self.sourceFor(gpa, root)) catch return;
             return;
         }
     }

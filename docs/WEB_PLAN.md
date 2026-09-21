@@ -152,6 +152,30 @@ obvious lever left unpulled: `Index.Link` is 88 bytes with three slices for stri
 average a few bytes; packing them as offsets into the note's `derived` blob would take it
 under 40. Not done until a vault needs it.
 
+### Steps 2 + 4 — landed together
+
+`Scan.zig` is the pass over the vault as a stepped `core.work.Task` over a `core.vfs.Fs`:
+listings, stats and reads through a window of 16 in-flight jobs, applied as they land, one
+budget at a time. `Indexer` is the long-lived task around it (a scan in progress, else the
+queue: full scan / sweep / a batch of saved paths as a scoped scan, else park). `State`
+picks the source: a mount's filesystem (pumped by the host; the task runs from the frame,
+4 ms a frame) or an indexer-owned `core.LocalFs` (the task runs on a thread; reads overlap on
+the host's `Io` pool via `io.concurrent`). The 12-thread batch reader, `runFullScan`'s
+walk, the worker loop and every `std.Io.Dir` call on the runtime path are gone.
+
+| simplewiki, cold | SQLite + walk | `Index` + walk | `Index` + `Scan` |
+|---|---|---|---|
+| total | 45.1 s | 10.8 s | **7.5 s** (walk 5.3, relink 2.0) |
+| warm re-scan | 2.9 s | 1.5 s | 1.1 s |
+
+One trap on the way: the scan's queues were `orderedRemove(0)` and a 284k-file directory
+made that quadratic (33 s); they pop from the end now.
+
+Still to do from this pair: the backlinks pane reads a source line from the disk to show a
+row's context (`ui/backlinks.zig`) — on a mount it shows nothing; and a mount has no per-path
+change events (the disk watcher's `onPathsChanged`), so a vault on Drive learns of outside
+edits only from the 2-minute sweep. Both are host follow-ups.
+
 ## Steps, each with a gate
 
 0. **Measure.** Full scan of the vault with timings logged; count the `Db` API surface

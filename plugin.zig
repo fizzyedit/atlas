@@ -16,6 +16,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const icons = @import("icons");
 const sdk = @import("fizzy_sdk");
+const core = @import("core");
 
 const runtime = @import("src/runtime.zig");
 const State = @import("src/State.zig");
@@ -318,8 +319,10 @@ fn requestNewDocumentDialog(_: *anyopaque, parent_path: ?[]const u8, _: usize) v
             "untitled.md"
         else
             std.fmt.bufPrint(&name_buf, "untitled-{d}.md", .{n}) catch return;
-        const candidate = std.fs.path.join(arena, &.{ dir, name }) catch return;
-        std.Io.Dir.accessAbsolute(dvui.io, candidate, .{}) catch break candidate;
+        const candidate = core.paths.join(arena, dir, name) catch return;
+        // Through the host's table, which knows a mount as well as the disk.
+        const files = sdk.host().files orelse return;
+        if (!files.exists(candidate)) break candidate;
     } else return;
 
     (sdk.host().getServiceTyped(sdk.services.files.Api) orelse return).createFile(path) catch |err| {

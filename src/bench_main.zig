@@ -28,6 +28,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
+const core = @import("core");
 const Index = @import("index/Index.zig");
 const Indexer = @import("index/Indexer.zig");
 const Scanner = @import("index/Scanner.zig");
@@ -436,6 +437,10 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     defer indexer.deinit();
     indexer.index = &index;
     indexer.vault_root = dir;
+    // The disk as the app reads it: the indexer's own `LocalFs`, reads on `io`'s pool.
+    var local = core.LocalFs.init(gpa, io);
+    defer local.deinit();
+    indexer.source = .{ .fs = local.fs(), .root = dir, .pump_self = true };
 
     if (index_warm) try indexer.runFullScan(io, .always);
     const t0 = std.Io.Clock.boot.now(io).nanoseconds;
