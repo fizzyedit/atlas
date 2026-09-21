@@ -59,7 +59,7 @@ watcher_ready: bool = false,
 /// backlinks view) memoize against this and drop their caches when it moves — see
 /// `sdk.services.wikilink.Api.generation`. Atomic because the indexer thread will write it
 /// while the UI thread reads it.
-generation: std.atomic.Value(u64) = .init(0),
+generation: Indexer.Generation = .init(0),
 
 /// True while a scan is in flight.
 busy: std.atomic.Value(bool) = .init(false),

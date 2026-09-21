@@ -79,6 +79,12 @@ const Cache = struct {
     /// the same file and this turns a screenful of rows into one read.
     last_path: []const u8 = "",
     last_bytes: []const u8 = "",
+    /// A source file being read through the host's filesystem (the disk's reads land from a
+    /// pool, a mount's from the network): the path asked for, and its bytes once they arrive.
+    /// Rows for that file answer "" until then, un-memoized, and the read's landing repaints.
+    pending_path: []const u8 = "",
+    pending_bytes: ?[]u8 = null,
+    pending_job: ?core.vfs.Job = null,
 
     fn init(gpa: std.mem.Allocator) Cache {
         return .{
@@ -760,19 +766,33 @@ fn contextFor(c: *Cache, root: []const u8, i: usize) []const u8 {
 
     const a = c.arena.allocator();
     const bl = c.links[i];
-    c.ctx[i] = ""; // pessimistic: any failure below leaves this and is not retried
 
     if (!std.mem.eql(u8, c.last_path, bl.path)) {
-        const abs = std.fs.path.join(a, &.{ root, bl.path }) catch return "";
-        const bytes = std.Io.Dir.cwd().readFileAlloc(
-            dvui.io,
-            abs,
-            a,
-            .limited(Indexer.max_file_bytes),
-        ) catch return "";
-        c.last_path = a.dupe(u8, bl.path) catch return "";
-        c.last_bytes = bytes;
+        // Not this file: is it the one on its way?
+        if (std.mem.eql(u8, c.pending_path, bl.path)) {
+            const bytes = c.pending_bytes orelse return ""; // still in flight; ask again next frame
+            c.last_path = c.pending_path;
+            c.last_bytes = a.dupe(u8, bytes) catch return "";
+            sdk.allocator().free(bytes);
+            c.pending_bytes = null;
+            c.pending_path = "";
+        } else {
+            // Ask the host's filesystem — the disk or a mount alike — and answer nothing until
+            // it lands. One read at a time; a later row for another file waits its turn.
+            if (c.pending_job != null) return "";
+            const files = sdk.host().files orelse return "";
+            const abs = core.paths.join(a, root, bl.path) catch return "";
+            const target = files.resolve(abs);
+            c.pending_path = a.dupe(u8, bl.path) catch return "";
+            c.pending_job = target.fs.readFile(sdk.allocator(), target.rel, onContextRead, c) catch {
+                c.pending_path = "";
+                c.ctx[i] = "";
+                return "";
+            };
+            return "";
+        }
     }
+    c.ctx[i] = ""; // pessimistic: any failure below leaves this and is not retried
 
     var line_no: u32 = 0;
     var it = std.mem.splitScalar(u8, c.last_bytes, '\n');
@@ -787,6 +807,19 @@ fn contextFor(c: *Cache, root: []const u8, i: usize) []const u8 {
         return r.text;
     }
     return "";
+}
+
+fn onContextRead(ctx: ?*anyopaque, result: core.vfs.Error!core.vfs.Read) void {
+    const c: *Cache = @ptrCast(@alignCast(ctx.?));
+    c.pending_job = null;
+    const read = result catch {
+        // The rows for it stay empty; the next request for the file asks again.
+        c.pending_path = "";
+        sdk.refresh();
+        return;
+    };
+    c.pending_bytes = read.bytes;
+    sdk.refresh();
 }
 
 /// One group header: the source note, how many times it links here, and a caret.
@@ -1064,6 +1097,11 @@ fn resetContext(c: *Cache, arena: std.mem.Allocator) !void {
     c.ctx_complete = true;
     c.last_path = "";
     c.last_bytes = "";
+    // A read still in flight belongs to a note that is no longer the one shown; its landing is
+    // ignored by path and its bytes dropped.
+    if (c.pending_bytes) |b| sdk.allocator().free(b);
+    c.pending_bytes = null;
+    c.pending_path = "";
 }
 
 /// `buf` holds the returned slice — `vaultRelative` normalizes separators, so the result is a

@@ -96,6 +96,8 @@ pub fn tick(self: *Watcher) void {
     }
 
     if (mounted) return;
+    // The browser has no disk to poll (every vault there is a mount).
+    if (comptime @import("builtin").target.cpu.arch == .wasm32) return;
     if (self.last_poll_ns != 0 and now - self.last_poll_ns < poll_ns) return;
     self.last_poll_ns = now;
 

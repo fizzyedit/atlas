@@ -20,6 +20,7 @@
 //! its own lattice. Nothing here knows about hex cells, panels, or notes.
 
 const std = @import("std");
+const thr = @import("threads");
 const dvui = @import("dvui");
 const radix = @import("radix.zig");
 
@@ -51,7 +52,7 @@ fn pnow() i128 {
     // Inert under test: the clock reads `dvui.io`, which a headless test never initialises, so
     // asking it there is a segfault rather than a measurement.
     if (@import("builtin").is_test) return 0;
-    return std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    return thr.nowNs();
 }
 
 fn plap(mark: *i128) u64 {
@@ -486,7 +487,7 @@ fn relax(
         allocator.free(bufs);
     };
     if (edges.len >= attract_thread_min) {
-        const want = std.Thread.getCpuCount() catch 1;
+        const want = thr.Thread.getCpuCount() catch 1;
         const threads = @min(@max(want, 1), repel_threads_max);
         if (threads > 1) {
             const bufs = try allocator.alloc([]dvui.Point, threads);
@@ -560,14 +561,14 @@ fn attract(
     };
     const threads = bufs.len;
     const chunk = (edges.len + threads - 1) / threads;
-    var handles: [repel_threads_max]std.Thread = undefined;
+    var handles: [repel_threads_max]thr.Thread = undefined;
     var spawned: usize = 0;
     while (spawned < threads) : (spawned += 1) {
         const lo = spawned * chunk;
         if (lo >= edges.len) break;
         const hi = @min(lo + chunk, edges.len);
         @memset(bufs[spawned], .{});
-        handles[spawned] = std.Thread.spawn(.{}, attractRange, .{ edges[lo..hi], mass, pos, bufs[spawned] }) catch {
+        handles[spawned] = thr.Thread.spawn(.{}, attractRange, .{ edges[lo..hi], mass, pos, bufs[spawned] }) catch {
             attractRange(edges[lo..hi], mass, pos, bufs[spawned]);
             spawned += 1;
             break;
@@ -856,7 +857,7 @@ const Grid = struct {
     /// thread computing exactly the same sum it would have computed alone. `solve` stays a pure
     /// function of the graph.
     fn repel(g: Grid, p: Pyramid, n_total: usize, n: usize, pos: []const dvui.Point, force: []dvui.Point, mass: []const f32) void {
-        const want = std.Thread.getCpuCount() catch 1;
+        const want = thr.Thread.getCpuCount() catch 1;
         const threads = @min(@max(want, 1), repel_threads_max);
         // Below this the split costs more than it saves, and the coarse levels of the ladder are
         // all below it.
@@ -872,14 +873,14 @@ const Grid = struct {
             g.repelRange(p, 0, n, cap, near, pos, force, mass);
             return;
         }
-        var handles: [repel_threads_max]std.Thread = undefined;
+        var handles: [repel_threads_max]thr.Thread = undefined;
         const chunk = (n + threads - 1) / threads;
         var spawned: usize = 0;
         while (spawned < threads) : (spawned += 1) {
             const lo = spawned * chunk;
             if (lo >= n) break;
             const hi = @min(lo + chunk, n);
-            handles[spawned] = std.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, near, pos, force, mass }) catch break;
+            handles[spawned] = thr.Thread.spawn(.{}, Grid.repelRange, .{ g, p, lo, hi, cap, near, pos, force, mass }) catch break;
         }
         // Whatever failed to spawn is done on this thread, so a thread-starved system is slower
         // rather than wrong.

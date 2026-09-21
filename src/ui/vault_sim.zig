@@ -11,6 +11,7 @@
 //! settings just at runtime" this window's sidebar widgets read and write directly — no
 //! `sdk.settings.Value`, no persistence, nothing shared with the real bottom panel's own state.
 const std = @import("std");
+const threads = @import("threads");
 const dvui = @import("dvui");
 const sdk = @import("fizzy_sdk");
 const core = @import("core");
@@ -60,7 +61,7 @@ pub fn quantizeNotes(raw: f32) usize {
 /// to the vault-shape/scale simulator that was actually asked for).
 pub const SimState = struct {
     busy: std.atomic.Value(bool) = .init(false),
-    generation: std.atomic.Value(u64) = .init(0),
+    generation: Indexer.Generation = .init(0),
     indexer: Indexer = undefined,
     indexer_ready: bool = false,
     index: ?Index = null,
@@ -106,7 +107,7 @@ const RegenJob = struct {
     done: std.atomic.Value(bool) = .init(false),
     /// First claimer (poll or a cancelled worker) frees the job.
     claimed: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    thread: ?threads.Thread = null,
     fail: ?anyerror = null,
 
     nodes: ?[]Indexer.SnapNode = null,
@@ -356,7 +357,7 @@ pub const Sim = struct {
         const job = self.gpa.create(RegenJob) catch return;
         job.* = .{ .gpa = self.gpa, .spec = self.pending };
         self.job = job;
-        job.thread = std.Thread.spawn(.{}, regenWorker, .{job}) catch {
+        job.thread = threads.Thread.spawn(.{}, regenWorker, .{job}) catch {
             self.job = null;
             job.destroy();
             return;

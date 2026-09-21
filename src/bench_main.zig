@@ -432,7 +432,7 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     defer index.deinit();
 
     var busy: std.atomic.Value(bool) = .init(false);
-    var generation: std.atomic.Value(u64) = .init(0);
+    var generation: Indexer.Generation = .init(0);
     var indexer = Indexer.init(gpa, &busy, &generation);
     defer indexer.deinit();
     indexer.index = &index;

@@ -63,6 +63,7 @@
 //! Pure: no camera, no DB, no dvui frame state. `graph.zig` owns the animation from the old
 //! home to the new target.
 const std = @import("std");
+const threads = @import("threads");
 const dvui = @import("dvui");
 
 const hex = @import("hex.zig");
@@ -281,10 +282,10 @@ pub fn targets(
 
     // Elapsed nanoseconds since the last `lap`, against the monotonic boot clock. Only read when
     // `opts.profile` is set — `dvui.io` is only initialized inside a live app or by the bench.
-    var phase_start: i96 = if (opts.profile != null) std.Io.Clock.boot.now(dvui.io).nanoseconds else 0;
+    var phase_start: i96 = if (opts.profile != null) threads.nowNs() else 0;
     const lap = struct {
         fn f(mark: *i96) u64 {
-            const now = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+            const now = threads.nowNs();
             defer mark.* = now;
             return @intCast(now - mark.*);
         }
@@ -545,7 +546,7 @@ pub fn targets(
         // — that's what lets empty hex cells open up between groups instead of everything
         // settling into one uniform lattice. The grid finds exactly the pairs inside the
         // cutoff; rebuilt each iteration because positions move.
-        var sub: i96 = if (opts.profile != null) std.Io.Clock.boot.now(dvui.io).nanoseconds else 0;
+        var sub: i96 = if (opts.profile != null) threads.nowNs() else 0;
         {
             var grid = try Grid.init(allocator, pos, n, repulse_cut);
             defer grid.deinit(allocator);

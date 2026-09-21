@@ -43,6 +43,7 @@
 //!     gap between them are world units, same as the positions.
 
 const std = @import("std");
+const threads = @import("threads");
 const dvui = @import("dvui");
 
 const fold = @import("fold.zig");
@@ -914,17 +915,17 @@ fn splitOversized(
                 .parts_of = parts_of,
                 .resolution = resolution,
             };
-            const want = @min(@max(std.Thread.getCpuCount() catch 1, 1), max_split_threads);
+            const want = @min(@max(threads.Thread.getCpuCount() catch 1, 1), max_split_threads);
             if (want <= 1 or n_slot < 4) {
                 ctx.range(0, n_slot);
             } else {
-                var handles: [max_split_threads]std.Thread = undefined;
+                var handles: [max_split_threads]threads.Thread = undefined;
                 var spawned: usize = 0;
                 const step = n_slot / want + 1;
                 var lo: usize = 0;
                 while (lo < n_slot and spawned < max_split_threads) : (lo += step) {
                     const hi = @min(lo + step, n_slot);
-                    handles[spawned] = std.Thread.spawn(.{}, SplitCtx.range, .{ &ctx, lo, hi }) catch {
+                    handles[spawned] = threads.Thread.spawn(.{}, SplitCtx.range, .{ &ctx, lo, hi }) catch {
                         ctx.range(lo, hi);
                         continue;
                     };
@@ -1704,17 +1705,17 @@ fn solveInteriors(
         .gpa = arena_gpa,
     };
 
-    const want = @min(@max(std.Thread.getCpuCount() catch 1, 1), max_interior_threads);
+    const want = @min(@max(threads.Thread.getCpuCount() catch 1, 1), max_interior_threads);
     if (want <= 1 or n_comm < 64) {
         ctx.run(0, @intCast(n_comm));
     } else {
         var bounds: [max_interior_threads + 1]u32 = undefined;
         stripeByNotes(count, n_comm, want, bounds[0 .. want + 1]);
-        var handles: [max_interior_threads]std.Thread = undefined;
+        var handles: [max_interior_threads]threads.Thread = undefined;
         var spawned: usize = 0;
         for (0..want) |t| {
             if (bounds[t] == bounds[t + 1]) continue;
-            handles[spawned] = std.Thread.spawn(.{}, InteriorCtx.run, .{ &ctx, bounds[t], bounds[t + 1] }) catch {
+            handles[spawned] = threads.Thread.spawn(.{}, InteriorCtx.run, .{ &ctx, bounds[t], bounds[t + 1] }) catch {
                 ctx.run(bounds[t], bounds[t + 1]);
                 continue;
             };
@@ -1782,7 +1783,7 @@ pub var stage_ns: std.EnumArray(Stage, u64) = .initFill(0);
 /// the panel leaves it off and pays nothing.
 fn stageNow(opts: Options) u64 {
     if (!opts.profile) return 0;
-    return @intCast(std.Io.Clock.boot.now(dvui.io).nanoseconds);
+    return @intCast(threads.nowNs());
 }
 
 fn stageAdd(opts: Options, s: Stage, since: u64) void {

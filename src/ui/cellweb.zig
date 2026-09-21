@@ -36,6 +36,7 @@
 //! exchange for a per-frame cost proportional to the budget.
 
 const std = @import("std");
+const threads = @import("threads");
 const fold = @import("fold.zig");
 const radix = @import("radix.zig");
 
@@ -270,17 +271,17 @@ fn csrFromPairs(gpa: std.mem.Allocator, n_cells: usize, all: []const Pair) !Cell
     // writes. This was 214 ms of a 637 ms `cellweb.build` on a Wikipedia-sized ladder, and it is
     // 353,000 independent sorts — the shape a thread pool exists for.
     var ctx: SortCtx = .{ .web = &web, .gpa = gpa };
-    const want = @min(@max(std.Thread.getCpuCount() catch 1, 1), max_sort_threads);
+    const want = @min(@max(threads.Thread.getCpuCount() catch 1, 1), max_sort_threads);
     if (want <= 1 or n_cells < 4096) {
         ctx.range(0, n_cells);
     } else {
-        var handles: [max_sort_threads]std.Thread = undefined;
+        var handles: [max_sort_threads]threads.Thread = undefined;
         var spawned: usize = 0;
         const step = n_cells / want + 1;
         var lo: usize = 0;
         while (lo < n_cells) : (lo += step) {
             const hi = @min(lo + step, n_cells);
-            handles[spawned] = std.Thread.spawn(.{}, SortCtx.range, .{ &ctx, lo, hi }) catch {
+            handles[spawned] = threads.Thread.spawn(.{}, SortCtx.range, .{ &ctx, lo, hi }) catch {
                 ctx.range(lo, hi);
                 continue;
             };

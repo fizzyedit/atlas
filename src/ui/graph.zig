@@ -22,6 +22,7 @@
 //! Positions come from `layout.solve`; the drawing hierarchy from `spatial` via `World.initFrom`.
 //! A prose save that does not change links keeps the live World and patches note metadata.
 const std = @import("std");
+const threads = @import("threads");
 const dvui = @import("dvui");
 const core = @import("core");
 const sdk = @import("fizzy_sdk");
@@ -555,7 +556,7 @@ const LayoutJob = struct {
     /// that is about to be unloaded — so the only way to make closing the app prompt is to give
     /// the work somewhere to stop.
     cancel: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
+    thread: ?threads.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     /// Set by the worker when the solve fails; re-raised on the UI thread at apply time.
     fail: ?anyerror = null,
@@ -688,7 +689,7 @@ const LayoutJob = struct {
             for (note_ids, 0..) |*d, i| d.* = i;
         }
 
-        const t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+        const t0 = threads.nowNs();
         const fold_opts: fold.Options = .{ .cancel = &job.cancel, .bodies = bodies };
 
         var lay = try layout.solve(gpa, job.n, links, path_arg, .{
@@ -728,7 +729,7 @@ const LayoutJob = struct {
         dvui.log.info("atlas world: {d} notes / {d} edges coarsened and placed in {d}ms", .{
             job.n,
             links.len,
-            @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - t0, 1_000_000),
+            @divTrunc(threads.nowNs() - t0, 1_000_000),
         });
     }
 
@@ -2191,7 +2192,7 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     };
     errdefer job.arena.deinit();
     const arena = job.arena.allocator();
-    const prep_t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    const prep_t0 = threads.nowNs();
 
     try prepFullJob(p, st, job, arena, &carry);
     p.note_count = if (st.indexer_ready) st.indexer.counts().note_count else job.snap.note_count;
@@ -2243,7 +2244,7 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     // Settled after a full copy: still skip the worker and World rebuild.
     if (job.settled != null and p.world_state != null and p.nodes.len == n) {
         dvui.log.info("atlas prep: settled skip {d}ms ({d} notes)", .{
-            @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - prep_t0, 1_000_000),
+            @divTrunc(threads.nowNs() - prep_t0, 1_000_000),
             n,
         });
         try finishSettledJob(p, st, job);
@@ -2259,11 +2260,11 @@ fn rebuildIfNeeded(p: *Panel, st: anytype) !void {
     }
 
     dvui.log.info("atlas prep: {d}ms on the UI thread ({d} notes, {d} edges)", .{
-        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - prep_t0, 1_000_000),
+        @divTrunc(threads.nowNs() - prep_t0, 1_000_000),
         n,
         job.edges.len,
     });
-    job.thread = std.Thread.spawn(.{}, LayoutJob.run, .{job}) catch {
+    job.thread = threads.Thread.spawn(.{}, LayoutJob.run, .{job}) catch {
         defer job.deinit(gpa);
         try job.solve();
         try finishRebuild(p, st, job);
@@ -2453,9 +2454,9 @@ fn dirtyNodeInfo(p: *Panel, job: *LayoutJob) ![]const Indexer.SnapNode {
 /// Turn a solved job into the panel's live arrangement. UI thread only, and only once `done`.
 fn finishRebuild(p: *Panel, st: anytype, job: *LayoutJob) !void {
     const gpa = sdk.allocator();
-    const finish_t0 = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    const finish_t0 = threads.nowNs();
     defer dvui.log.info("atlas adopt: {d}ms on the UI thread", .{
-        @divTrunc(std.Io.Clock.boot.now(dvui.io).nanoseconds - finish_t0, 1_000_000),
+        @divTrunc(threads.nowNs() - finish_t0, 1_000_000),
     });
     // Adopt this solve's interiors as the next one's memo, and let the old set go.
     if (job.next_reuse) |r| {
@@ -5186,7 +5187,7 @@ fn updateLabels(
     // are empty strings, and a placer that finds room for nobody — and from the outside all three
     // look identical.
     if (label_debug) {
-        const now_s = @as(f64, @floatFromInt(std.Io.Clock.boot.now(dvui.io).nanoseconds)) / 1e9;
+        const now_s = @as(f64, @floatFromInt(threads.nowNs())) / 1e9;
         if (now_s - label_debug_last > 1.0) {
             label_debug_last = now_s;
             var titled: usize = 0;
@@ -5904,7 +5905,7 @@ fn drawFitButton(p: *Panel, container: *dvui.WidgetData) void {
 }
 
 fn profNow() i96 {
-    return std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    return threads.nowNs();
 }
 
 /// Nanoseconds since `mark`, and advance it.
@@ -5916,7 +5917,7 @@ fn profNow() i96 {
 /// the frame was spent outside every bucket. A clock read is ~20ns and there are a dozen per
 /// frame; that is not worth being unable to see the hot path.
 fn profLap(mark: *i96) u64 {
-    const now = std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    const now = threads.nowNs();
     defer mark.* = now;
     return @intCast(now - mark.*);
 }
@@ -7020,7 +7021,8 @@ test "an interior fit uses the cloud radius, not the overview dinner-plate cap" 
 fn envFlag(comptime name: []const u8, cache: *?bool) bool {
     if (cache.*) |v| return v;
     const v = blk: {
-        if (@import("builtin").is_test or @import("builtin").os.tag == .windows) break :blk false;
+        const b = @import("builtin");
+        if (b.is_test or b.os.tag == .windows or b.target.cpu.arch == .wasm32) break :blk false;
         var i: usize = 0;
         while (std.c.environ[i]) |entry| : (i += 1) {
             const kv = std.mem.span(entry);

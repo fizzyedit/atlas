@@ -21,6 +21,16 @@ pub fn build(b: *std.Build) void {
     });
     batch2d_mod.addImport("dvui", fizzy_dep.module("dvui"));
     plugin.module.addImport("batch2d", batch2d_mod);
+    // `threads`: std.Thread or its wasm stand-in, plus the clock (`src/threads.zig`). A fresh
+    // Module per artifact — see the note on `content_graph` below for why they cannot be shared.
+    const Threads = struct {
+        fn module(bb: *std.Build, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, dvui: *std.Build.Module) *std.Build.Module {
+            const m = bb.createModule(.{ .target = t, .optimize = o, .root_source_file = bb.path("src/threads.zig") });
+            m.addImport("dvui", dvui);
+            return m;
+        }
+    };
+    plugin.module.addImport("threads", Threads.module(b, target, optimize, fizzy_dep.module("dvui")));
 
     fizzy.plugin.install(b, plugin.lib, .{});
 
@@ -106,6 +116,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     world_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+    world_tests.root_module.addImport("threads", Threads.module(b, target, optimize, fizzy_dep.module("dvui")));
     test_step.dependOn(&b.addRunArtifact(world_tests).step);
 
     // The link-gravity layout that owns note positions. Needs `dvui` only because
@@ -119,6 +130,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     layout_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+    layout_tests.root_module.addImport("threads", Threads.module(b, target, optimize, fizzy_dep.module("dvui")));
     test_step.dependOn(&b.addRunArtifact(layout_tests).step);
 
     // Scanner uses the SDK wikilink tokenizer so it and the markdown renderer can't drift.
@@ -169,6 +181,7 @@ pub fn build(b: *std.Build) void {
     indexer_tests.root_module.addImport("dvui", fizzy_dep.module("dvui"));
     indexer_tests.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
     indexer_tests.root_module.addImport("core", fizzy_dep.module("core"));
+    indexer_tests.root_module.addImport("threads", Threads.module(b, target, optimize, fizzy_dep.module("dvui")));
     test_step.dependOn(&b.addRunArtifact(indexer_tests).step);
 
     // Graph camera + radial layout: pure math over `dvui.Point`/`Rect`, no window needed.
@@ -204,6 +217,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         t.root_module.addImport("dvui", fizzy_dep.module("dvui"));
+        t.root_module.addImport("threads", Threads.module(b, target, optimize, fizzy_dep.module("dvui")));
         if (std.mem.eql(u8, entry[0], "atlas-galaxy-tests")) {
             t.root_module.addImport("batch2d", batch2d_mod);
         }
@@ -241,6 +255,7 @@ pub fn build(b: *std.Build) void {
         bench.root_module.addImport("dvui", fizzy_dep.module("dvui"));
         bench.root_module.addImport("fizzy_sdk", fizzy_dep.module("fizzy_sdk"));
         bench.root_module.addImport("core", fizzy_dep.module("core"));
+        bench.root_module.addImport("threads", Threads.module(b, target, optimize, fizzy_dep.module("dvui")));
         // `--index` drives the real `Indexer` against a real database, which is the only way to
         // time the scan the rest of this harness skips.
         // A distinct module object from `content_graph_mod`/`cg_for_query_test` above, deliberately —

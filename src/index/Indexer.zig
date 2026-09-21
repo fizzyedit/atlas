@@ -18,6 +18,7 @@ const vfs = core.vfs;
 
 const Index = @import("Index.zig");
 const Scan = @import("Scan.zig");
+const threads = @import("threads");
 const Scanner = @import("Scanner.zig");
 const resolve = @import("resolve.zig");
 const query = @import("query.zig");
@@ -213,7 +214,7 @@ vault_root: []const u8 = "",
 
 quit: std.atomic.Value(bool) = .init(false),
 busy: *std.atomic.Value(bool),
-generation: *std.atomic.Value(u64),
+generation: *Generation,
 
 /// Guards `want_full`/`want_sweep`/`pending`, written by the UI (enqueue) and read by the task.
 mutex: std.Io.Mutex = .init,
@@ -309,12 +310,12 @@ pub const Timings = struct {
 /// ungated read there is a crash rather than a measurement.
 pub fn markNs(self: *const Indexer) i96 {
     if (!self.timing) return 0;
-    return std.Io.Clock.boot.now(dvui.io).nanoseconds;
+    return threads.nowNs();
 }
 
 pub fn sinceNs(self: *const Indexer, from: i96) u64 {
     if (!self.timing or from == 0) return 0;
-    const d = std.Io.Clock.boot.now(dvui.io).nanoseconds - from;
+    const d = threads.nowNs() - from;
     return if (d > 0) @intCast(d) else 0;
 }
 
@@ -334,10 +335,30 @@ pub const Pending = struct {
 
 pub const Source = Scan.Source;
 
+/// The generation counter's type: atomic where there are threads to race, a plain counter
+/// on wasm32, whose atomics stop at 32 bits and whose one thread needs none.
+pub const Generation = if (is_wasm) struct {
+    raw: u64,
+    pub fn init(v: u64) @This() {
+        return .{ .raw = v };
+    }
+    pub fn load(self: *const @This(), _: std.builtin.AtomicOrder) u64 {
+        return self.raw;
+    }
+    pub fn store(self: *@This(), v: u64, _: std.builtin.AtomicOrder) void {
+        self.raw = v;
+    }
+    pub fn fetchAdd(self: *@This(), v: u64, _: std.builtin.AtomicOrder) u64 {
+        const old = self.raw;
+        self.raw += v;
+        return old;
+    }
+} else std.atomic.Value(u64);
+
 pub fn init(
     gpa: std.mem.Allocator,
     busy: *std.atomic.Value(bool),
-    generation: *std.atomic.Value(u64),
+    generation: *Generation,
 ) Indexer {
     return .{
         .gpa = gpa,
@@ -393,11 +414,9 @@ fn wakeHost() void {
     sdk.refresh();
 }
 
-/// The runner's clock. The boot clock through the host's `Io` natively (any thread); the
-/// frame's high-resolution timer on the web, where that `Io` cannot tell the time.
+/// The runner's clock — see `threads.nowNs`.
 pub fn nowNs() i64 {
-    if (is_wasm) return @intCast(dvui.currentWindow().backend.nanoTime());
-    return @intCast(std.Io.Clock.boot.now(dvui.io).nanoseconds);
+    return @intCast(threads.nowNs());
 }
 
 /// Stop the task and join it. Safe to call when never started.
@@ -1662,7 +1681,7 @@ const TestVault = struct {
     /// A bare host, so `sdk.refresh` and `isPathIgnored` have something to answer from.
     host: sdk.Host,
     busy: std.atomic.Value(bool) = .init(false),
-    gen: std.atomic.Value(u64) = .init(0),
+    gen: Generation = .init(0),
     indexer: Indexer = undefined,
 
     fn create(gpa: std.mem.Allocator) !*TestVault {
@@ -1935,7 +1954,7 @@ test "publishSynthetic marks its snapshot complete" {
     // and no relink to wait for, so the simulator must not sit behind the gate forever.
     const gpa = testing.allocator;
     var busy = std.atomic.Value(bool).init(false);
-    var gen = std.atomic.Value(u64).init(0);
+    var gen = Generation.init(0);
     var ix = Indexer.init(gpa, &busy, &gen);
     defer ix.deinit();
 
@@ -1951,7 +1970,7 @@ test "publishSynthetic marks its snapshot complete" {
 test "publishSynthetic replaces the previous snapshot wholesale" {
     const gpa = testing.allocator;
     var busy = std.atomic.Value(bool).init(false);
-    var gen = std.atomic.Value(u64).init(0);
+    var gen = Generation.init(0);
     var ix = Indexer.init(gpa, &busy, &gen);
     defer ix.deinit();
 
