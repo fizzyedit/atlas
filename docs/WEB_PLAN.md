@@ -194,6 +194,35 @@ under 40. Not done until a vault needs it.
   MB of strings and edges, fine. Two snapshots (the ring) stay; the index itself is not copied
   into them.
 
+## Web housekeeping that is not code (but blocks shipping)
+
+- **Google's consent screen** needs a privacy-policy URL and a terms URL on the app's
+  branding page, and the site they live on must be a verified domain of the project. A
+  static page in `fizzyedit/website` (`/privacy`, `/terms`) is enough; it should say what the
+  Drive plugin does with the token (kept in the browser's memory for the session, never sent
+  anywhere but Google) and that fizzy stores no user data server-side. Full-drive scope is
+  *restricted*: publishing past "Testing" means Google's verification, which reads that page.
+- **Cookies**: the web app sets none; `localStorage` holds settings (see below). No banner is
+  required for storage that is strictly necessary for the app the user asked for, and nothing
+  here is tracking — say so on the privacy page and do not add a banner.
+- **Credentials on the web**: an implicit-grant access token lives in wasm memory for the
+  hour it is valid; there is no refresh token in a browser flow, so there is nothing to
+  persist and `Host.setSecret` on wasm should stay a no-op (or be session-only). A user signs
+  in again per visit, silently when Google still has a session (`prompt=none`).
+- **Settings on the web**: `settings.zon` needs a home — `localStorage` behind the same
+  `app/settings` file API (a JS shim like `fizzy_web_request`), per origin, so each plugin's
+  settings persist across visits without a server. Same for `recents.zon`; `layout.zon` too.
+
+## A further step: plugins as their own web apps
+
+Two things fizzy already has make this cheap: a plugin bundles into an app through
+`fizzy.buildApp` (`examples/minimal-app`), and `docs/REVIEW_2026-09.md` proved loading a
+plugin as a separate wasm side module at runtime feasible. So each plugin could get, for
+free from the build helper, (a) a `zig build web` that emits a page of *just that plugin on
+a minimal fizzy* — atlas-as-a-site, drive-as-a-site — and (b) a side-module build the full
+web app loads on demand. (a) is build glue over what exists; (b) is the review's follow-up.
+Both come after the index and the vfs work, which they need anyway.
+
 ## Out of scope for this pass
 
 wasm threads; SQLite on wasm; a Drive-side search API (the index is local by design);
