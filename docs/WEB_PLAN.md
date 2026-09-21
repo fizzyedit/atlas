@@ -282,11 +282,26 @@ changes for it: a side module is the dylib model with table indices for function
   `PluginManager.installFromUrl` → `Editor.loadWebPlugin` straight from the release URL;
   `plugin-build-action` has the seventh, best-effort target (uncommitted in that checkout).
 
-Still open in step 7: a plugin's *own* drawing through the render bridge is unexercised in the
-browser (drive and atlas draw little of their own until a vault is open); the enabled/installed
-set persists nowhere on the web yet (`localStorage`); the web host must ship the store's
-optimize class (ReleaseFast) for fingerprints to match release builds; CORS on GitHub release
-assets is assumed, not yet tried.
+Later the same day:
+
+- **The graph, in the browser, from a runtime side module.** `?plugin=atlas&open=vaults/tree.zip`
+  mounts the 1365-note gauntlet vault (a zip fetched by the page and opened as an upload
+  would be — `FizzyWebOpenBytes`), atlas indexes it from the frame budget and draws its
+  panel through the render bridge. On the way: the zip reader refused every *deflated*
+  entry (an exact size limit that `allocRemaining` reports as too long) — only stored
+  archives had ever opened; fixed with a regression test.
+- ReleaseSmall host + ReleaseSmall side modules (atlas 2.6 MB, drive 0.6 MB) load in ~10 s
+  in the pane; an optimized build calls `ldexpf` by name, which the host now provides, and
+  the loader names a missing import instead of "Import #12".
+- The page remembers store-installed plugins in `localStorage` and brings them back next
+  visit; uninstall forgets (a side module cannot leave the page).
+- A frame-driven scan kept parking: the app only renders when asked, so the indexer asks for
+  a frame while it has work; and an immediate backend's answers are drained within the step.
+
+Still open in step 7: CORS on GitHub release assets is assumed, not yet tried (the registry
+has no `web-wasm32` builds yet — the action gained the target, uncommitted); the host must
+ship the store's optimize class; settings/recents on the web (`localStorage` behind the
+settings file API); the layout solve runs inline on the web.
 
 ## A further step: plugins as their own web apps
 
