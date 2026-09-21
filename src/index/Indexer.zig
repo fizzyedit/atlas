@@ -368,7 +368,7 @@ pub fn init(
 }
 
 /// Begin indexing `vault_root` (as the host names it) into `index`, reading through `source`.
-/// Queues a full scan and starts the runner: on a thread when the source pumps itself (the
+/// Queues a full scan and starts the runner: on a thread when the source allows it (the
 /// disk), from the frame otherwise (a mount, the web) — the caller then calls `pump` once a
 /// frame. `vault_root` is borrowed for the life of the indexer (State owns it).
 pub fn start(self: *Indexer, index: *Index, vault_root: []const u8, source: Source) !void {
@@ -388,7 +388,7 @@ pub fn start(self: *Indexer, index: *Index, vault_root: []const u8, source: Sour
     self.want_full = true;
     self.mutex.unlock(dvui.io);
 
-    const mode: work.Mode = if (source.pump_self and !is_wasm) .thread else .pump;
+    const mode: work.Mode = if (source.threaded and !is_wasm) .thread else .pump;
     self.runner = work.Runner.init(self.gpa, dvui.io, nowNs, wakeHost);
     self.runner.?.start(self.task(), mode) catch |err| {
         // No runner means no publish means nothing to wait for.
@@ -408,6 +408,15 @@ pub fn running(self: *const Indexer) bool {
 /// `.pump` mode: give the task up to `budget_ns` of this frame. No-op for a threaded runner.
 pub fn pump(self: *Indexer, budget_ns: i64) void {
     if (self.runner) |*r| _ = r.pump(budget_ns);
+}
+
+/// Whether a frame-driven task has work in hand (a scan in progress, or a queue to look at):
+/// the caller's cue to ask for another frame.
+pub fn pumping(self: *const Indexer) bool {
+    const r = &(self.runner orelse return false);
+    if (r.mode != .pump or !r.running()) return false;
+    if (self.scan != null) return true;
+    return self.want_full or self.want_sweep or self.pending.items.len != 0;
 }
 
 fn wakeHost() void {
@@ -1722,7 +1731,7 @@ const TestVault = struct {
     /// Point the indexer at a real folder on disk, borrowed for the test.
     fn useDisk(self: *TestVault, vault: []const u8) void {
         self.indexer.vault_root = vault;
-        self.indexer.source = .{ .fs = self.local.fs(), .root = vault, .pump_self = true };
+        self.indexer.source = .{ .fs = self.local.fs(), .root = vault, .threaded = true };
     }
 
     /// One incremental edit, exactly as the worker runs it for a live editor buffer.
@@ -2365,7 +2374,7 @@ test "a mounted vault is indexed from the frame, a budget at a time" {
     try mem.put("/notes/Beta.md", "# Beta\n\nback to [[Alpha]]\n");
     try mem.put("/diagram.png", "");
 
-    try v.indexer.start(&v.index, "mem://box", .{ .fs = mem.fs(), .root = "/", .pump_self = false });
+    try v.indexer.start(&v.index, "mem://box", .{ .fs = mem.fs(), .root = "/", .threaded = false });
     // Frames: the host pumps the mount, then gives the task its slice.
     var frames: usize = 0;
     while (frames < 10_000) : (frames += 1) {

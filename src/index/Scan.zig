@@ -30,9 +30,11 @@ pub const Source = struct {
     /// The vault root as `fs` names it: an absolute OS path for the local disk, a `/`-rooted
     /// path inside a mount.
     root: []const u8,
-    /// Whether this scan pumps `fs` itself (its own `LocalFs`, on its own thread) or the host
-    /// does (a mount, whose completions the frame pump delivers before the task is stepped).
-    pump_self: bool,
+    /// Whether the indexer may run this scan on its own thread: only for a filesystem the
+    /// indexer owns (its `LocalFs`), whose completions land on that thread. A mount's belong
+    /// to the host's thread, so a scan over one runs from the frame — where pumping the mount
+    /// from the task is fine, and gets a fast backend's (a zip's) answers within the step.
+    threaded: bool,
 };
 
 pub const Mode = enum {
@@ -194,7 +196,7 @@ pub fn runBlocking(self: *Scan) !void {
 pub fn step(self: *Scan, deadline_ns: i64) work.Status {
     const ix = self.indexer;
     if (ix.quit.load(.acquire)) return .done;
-    if (self.src.pump_self) self.src.fs.pump();
+    self.src.fs.pump();
     return self.stepInner(deadline_ns) catch |err| {
         log.err("scan: {s}", .{@errorName(err)});
         return .done;
@@ -221,7 +223,13 @@ fn stepInner(self: *Scan, deadline_ns: i64) !work.Status {
                     if (overBudget(deadline_ns)) return .more;
                     continue;
                 }
-                if (self.in_flight.count() != 0) return .waiting;
+                if (self.in_flight.count() != 0) {
+                    // A backend that answers at once (the disk, a zip in memory) has the window's
+                    // worth landed already; take it now rather than a frame later.
+                    self.src.fs.pump();
+                    if (self.landed.items.len != 0 and !overBudget(deadline_ns)) continue;
+                    return .waiting;
+                }
                 // Nothing queued, nothing in flight: the phase is over.
                 switch (self.phase) {
                     .count => {

@@ -440,7 +440,7 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     // The disk as the app reads it: the indexer's own `LocalFs`, reads on `io`'s pool.
     var local = core.LocalFs.init(gpa, io);
     defer local.deinit();
-    indexer.source = .{ .fs = local.fs(), .root = dir, .pump_self = true };
+    indexer.source = .{ .fs = local.fs(), .root = dir, .threaded = true };
 
     if (index_warm) try indexer.runFullScan(io, .always);
     const t0 = std.Io.Clock.boot.now(io).nanoseconds;

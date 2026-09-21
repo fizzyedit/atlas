@@ -153,24 +153,27 @@ pub fn openVault(self: *State, gpa: std.mem.Allocator, root: []const u8) !void {
     }
 }
 
-/// Where the vault's bytes come from: a mount's filesystem when the root is on one (the host
-/// pumps it; the indexer runs from the frame), else this machine's disk through an indexer-
-/// owned `LocalFs` (the indexer runs on its own thread and pumps it itself).
+/// Where the vault's bytes come from: a mount's filesystem when the root is on one (the
+/// indexer runs from the frame), else this machine's disk through an indexer-owned `LocalFs`
+/// (the indexer runs on its own thread).
 fn sourceFor(self: *State, gpa: std.mem.Allocator, root: []const u8) Indexer.Source {
     if (sdk.host().files) |files| {
         if (files.isMounted(root)) {
             const r = files.resolve(root);
-            return .{ .fs = r.fs, .root = r.rel, .pump_self = false };
+            return .{ .fs = r.fs, .root = r.rel, .threaded = false };
         }
     }
     if (self.local == null) self.local = core.LocalFs.init(gpa, dvui.io);
-    return .{ .fs = self.local.?.fs(), .root = root, .pump_self = true };
+    return .{ .fs = self.local.?.fs(), .root = root, .threaded = true };
 }
 
 /// Once a frame: a task run from the frame (a mount, the web) gets its budget here.
 pub fn pumpIndexer(self: *State) void {
     if (!self.indexer_ready) return;
     self.indexer.pump(4 * std.time.ns_per_ms);
+    // A task run from the frame only advances when frames happen: keep them coming while
+    // there is work, or an idle app would leave the scan parked between two keystrokes.
+    if (self.indexer.pumping()) sdk.refresh();
 }
 
 pub fn closeVault(self: *State, gpa: std.mem.Allocator) void {
