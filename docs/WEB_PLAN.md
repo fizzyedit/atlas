@@ -301,11 +301,18 @@ Later the same day:
 - Settings, recents and keybinds persist on the web: `core.fs.read/write/remove` is the
   app's small-file seam on both targets (localStorage keyed by path), the wasm gates around
   them are gone, and recents save as they change (a tab is closed, never quit).
+- `layout.zon` persists on the web too: the file code moved out of the native backend into
+  `src/backend/layout_file.zig` over the same `core.fs` seam, and both backends re-export
+  it, so a region the user drags or a pane they assign comes back next visit. The macOS
+  NSWindow frame stays a native-only writer into the same file.
+- A runtime-loaded plugin has no page of its own to open, so Drive's Google Picker comes up
+  through `WebOAuth.beginPage`: the plugin carries the HTML, the page turns it into a
+  same-origin blob URL with the token in the `#hash`, and the popup reports back the way the
+  OAuth loopback does.
 
 Still open in step 7: CORS on GitHub release assets is assumed, not yet tried (the registry
 has no `web-wasm32` builds yet — the action gained the target, uncommitted); the host must
-ship the store's optimize class; `layout.zon`/`window.zon` still go through the native
-backend; the layout solve runs inline on the web — stepping it means restructuring
+ship the store's optimize class; the layout solve runs inline on the web — stepping it means restructuring
 `layout.solve`'s fold/Louvain/containment pipeline, a separate piece of work.
 
 **Local test loop** (until the registry serves web builds): in a plugin checkout
