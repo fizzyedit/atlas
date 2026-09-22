@@ -296,7 +296,7 @@ fn zoomGraphToFit(_: *anyopaque) !void {
 /// the workbench service: `.md` stays owned by the text plugin, exactly as for a note made any
 /// other way. Every failure here is a dead end rather than a partial state — nothing is revealed
 /// that was not created.
-fn requestNewDocumentDialog(_: *anyopaque, parent_path: ?[]const u8, _: usize) void {
+fn requestNewDocumentDialog(_: *anyopaque, _: ?[]const u8, parent_path: ?[]const u8, _: usize) void {
     const host = runtime.host();
     // The folder right-clicked in the explorer, else the project root. A note has to live
     // somewhere; with no folder open there is no tree to rename it in either.
