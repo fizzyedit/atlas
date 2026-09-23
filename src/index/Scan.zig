@@ -38,7 +38,7 @@ pub const Source = struct {
 };
 
 pub const Mode = enum {
-    /// Folder open / explicit rebuild: count first, publish whatever happened.
+    /// Folder open / explicit rebuild: count first (on a local vault), publish whatever happened.
     always,
     /// A background sweep: publish only if something moved.
     if_changed,
@@ -349,7 +349,11 @@ pub fn begin(self: *Scan) !void {
         ix.publishCandidates();
         sdk.refresh();
     }
-    if (self.mode == .always) {
+    // The count is a whole second walk, for a progress total. On the disk that is a few
+    // milliseconds of `readdir`; on a remote vault it is one API call per folder against a
+    // per-minute quota — as many again as the walk itself — so there the walk goes alone and
+    // progress reads "Building N notes…" without a total.
+    if (self.mode == .always and !self.src.fs.remote) {
         self.phase = .count;
         try self.dirs.append(ix.gpa, try ix.gpa.dupe(u8, ""));
     } else {

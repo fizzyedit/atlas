@@ -172,9 +172,16 @@ One trap on the way: the scan's queues were `orderedRemove(0)` and a 284k-file d
 made that quadratic (33 s); they pop from the end now.
 
 Still to do from this pair: the backlinks pane reads a source line from the disk to show a
-row's context (`ui/backlinks.zig`) — on a mount it shows nothing; and a mount has no per-path
-change events (the disk watcher's `onPathsChanged`), so a vault on Drive learns of outside
-edits only from the 2-minute sweep. Both are host follow-ups.
+row's context (`ui/backlinks.zig`) — on a mount it shows nothing. A host follow-up.
+
+Outside edits on a Drive vault arrive as per-path events: the drive plugin folds each entry of
+Drive's `changes.list` into its own index and hands the result to `host.notifyFolderPathsChanged`,
+so they reach `Watcher.onPathsChanged` exactly like the disk watcher's (no SDK change — it is a
+`Host` function a plugin can call). The mount sweep is a 30-minute net under that. A remote vault
+also skips the count pre-pass (`Scan.begin`): it was a second walk, one quota-charged call per
+folder. And the drive answers most listings without a request — it prefetches an opened folder's
+tree in batched `'a' in parents or 'b' in parents …` queries and serves listed folders from its
+index while the change feed runs (`drive/src/drive.zig`, header).
 
 ## Steps, each with a gate
 

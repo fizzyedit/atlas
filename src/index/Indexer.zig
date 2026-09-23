@@ -2408,3 +2408,95 @@ test "a mounted vault is indexed from the frame, a budget at a time" {
     v.indexer.stop();
     v.indexer.index = &v.index;
 }
+
+// A remote vault is walked once: the count pre-pass is a second walk, which on a cloud drive is
+// one quota-charged call per folder over again.
+test "a remote vault's full scan lists each folder once" {
+    const gpa = testing.allocator;
+    var v = try TestVault.create(gpa);
+    defer v.destroy(gpa);
+    dvui.io = v.threaded.io();
+
+    var mem = try core.vfs.Mem.init(gpa);
+    defer mem.deinit();
+    try mem.putDir("/notes");
+    try mem.put("/notes/Alpha.md", "# Alpha\n\nsee [[Beta]]\n");
+    try mem.put("/Beta.md", "# Beta\n");
+
+    // `mem`, remote, counting its listings.
+    const Counting = struct {
+        inner: core.vfs.Fs,
+        lists: usize = 0,
+        fn fwd_listDir(ptr: *anyopaque, a: std.mem.Allocator, path: []const u8, cb: core.vfs.ListDirFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lists += 1;
+            return self.inner.listDir(a, path, cb, ctx);
+        }
+        fn fwd_stat(ptr: *anyopaque, path: []const u8, cb: core.vfs.StatFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.stat(path, cb, ctx);
+        }
+        fn fwd_readFile(ptr: *anyopaque, a: std.mem.Allocator, path: []const u8, cb: core.vfs.ReadFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.readFile(a, path, cb, ctx);
+        }
+        fn fwd_writeFile(ptr: *anyopaque, path: []const u8, bytes: []const u8, opts: core.vfs.WriteOptions, cb: core.vfs.DoneFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.writeFile(path, bytes, opts, cb, ctx);
+        }
+        fn fwd_createFile(ptr: *anyopaque, path: []const u8, cb: core.vfs.DoneFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.createFile(path, cb, ctx);
+        }
+        fn fwd_mkdir(ptr: *anyopaque, path: []const u8, cb: core.vfs.DoneFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.mkdir(path, cb, ctx);
+        }
+        fn fwd_rename(ptr: *anyopaque, path: []const u8, new_path: []const u8, cb: core.vfs.DoneFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.rename(path, new_path, cb, ctx);
+        }
+        fn fwd_remove(ptr: *anyopaque, path: []const u8, cb: core.vfs.DoneFn, ctx: ?*anyopaque) core.vfs.Error!core.vfs.Job {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.inner.remove(path, cb, ctx);
+        }
+        fn fwd_cancel(ptr: *anyopaque, job: core.vfs.Job) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.inner.cancel(job);
+        }
+        fn fwd_pump(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.inner.pump();
+        }
+        const vtable: core.vfs.Fs.VTable = .{
+            .listDir = fwd_listDir,
+            .stat = fwd_stat,
+            .readFile = fwd_readFile,
+            .writeFile = fwd_writeFile,
+            .createFile = fwd_createFile,
+            .mkdir = fwd_mkdir,
+            .rename = fwd_rename,
+            .remove = fwd_remove,
+            .cancel = fwd_cancel,
+            .pump = fwd_pump,
+        };
+        fn fs(self: *@This()) core.vfs.Fs {
+            return .{ .ptr = self, .vtable = &vtable, .remote = true };
+        }
+    };
+    var counting: Counting = .{ .inner = mem.fs() };
+
+    try v.indexer.start(&v.index, "mem://box", .{ .fs = counting.fs(), .root = "/", .threaded = false });
+    var frames: usize = 0;
+    while (frames < 10_000) : (frames += 1) {
+        counting.fs().pump();
+        v.indexer.pump(1 * std.time.ns_per_ms);
+        if (v.indexer.counts().complete) break;
+    }
+    try testing.expect(v.indexer.counts().complete);
+    try testing.expectEqual(@as(u32, 2), v.indexer.counts().note_count);
+    // `/` and `/notes`, once each.
+    try testing.expectEqual(@as(usize, 2), counting.lists);
+    v.indexer.stop();
+    v.indexer.index = &v.index;
+}

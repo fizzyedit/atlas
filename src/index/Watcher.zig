@@ -40,9 +40,11 @@ pub const sweep_ns: i96 = 15 * std.time.ns_per_s;
 /// enough to bound how wrong the graph can get if the platform's watcher stops delivering
 /// without saying so.
 pub const watched_sweep_ns: i96 = 5 * std.time.ns_per_min;
-/// A vault on a mount: every sweep is a listing round trip per folder, so rarely — the mount's
-/// own change feed keeps the explorer fresh in between.
-pub const mount_sweep_ns: i96 = 2 * std.time.ns_per_min;
+/// A vault on a mount. The mount's plugin reports outside edits as `folderPathsChanged` events
+/// from its own change feed (a drive's `changes.list`), routed here like the disk watcher's, so
+/// the sweep is only the net under a feed that stopped without saying so. A walk over a remote
+/// tree is a round trip per folder the mount cannot answer from its own index — rarely, then.
+pub const mount_sweep_ns: i96 = 30 * std.time.ns_per_min;
 
 indexer: *Indexer,
 vault_root: []const u8 = "",
@@ -81,9 +83,8 @@ pub fn tick(self: *Watcher) void {
     const now: i96 = Indexer.nowNs();
 
     const host = sdk.host();
-    // A vault on a mount has no disk to poll and no host watcher; its listings say when a
-    // file changed, so the sweep is the whole mechanism — at a pace a round trip per folder
-    // can afford. Per-path change events for mounts are a host follow-up (WEB_PLAN).
+    // A vault on a mount has no disk to poll and no host watcher: the mount's plugin feeds
+    // `onPathsChanged` from its own change feed instead, and the sweep is only the net.
     const mounted = if (host.files) |files| files.isMounted(self.vault_root) else false;
     const interval: i96 = if (mounted) mount_sweep_ns else if (host.folderWatchActive()) watched_sweep_ns else sweep_ns;
     if (self.last_sweep_ns == 0) {
