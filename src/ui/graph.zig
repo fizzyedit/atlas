@@ -942,6 +942,9 @@ pub const Panel = struct {
     /// Frames the claim has gone unconfirmed, so a click that never opens anything cannot pin the
     /// highlight forever.
     focus_claim_frames: u16 = 0,
+    /// `focus_node` once it has been seen open, so the hold can tell a note the reader closed
+    /// from one still loading (a mount's open lands well after the click's claim has lapsed).
+    focus_opened: u32 = fold.invalid,
 
     /// What the overview draws this frame: notes where they have separated enough to be told
     /// apart, cluster markers where they have not. Rebuilt every frame by `syncNodesFromWorld`,
@@ -4373,6 +4376,14 @@ fn focusNodeIndex(p: *Panel) ?u32 {
     }
     if (activeNodeIndex(p)) |gi| {
         p.focus_node = gi;
+    } else if (p.focus_node != fold.invalid and p.focus_node == p.focus_opened and
+        p.focus_node < p.nodes.len and !p.nodes[p.focus_node].open)
+    {
+        // The held note was open and now is not: it was closed. Holding it is only for the
+        // frames between two tabs, and "any document open" is not that — a tab outside the vault
+        // kept a closed note's web lit for as long as it stayed open. Seed from what is open.
+        p.focus_opened = fold.invalid;
+        p.focus_node = if (p.open_notes.items.len > 0) p.open_notes.items[0] else fold.invalid;
     } else if (p.focus_node == fold.invalid and p.open_notes.items.len > 0) {
         // Tab order, and *only* as a seed when nothing is held yet. Letting it run on every frame
         // with no active document is what made a click on a new node animate twice: the frame
@@ -4394,6 +4405,7 @@ fn focusNodeIndex(p: *Panel) ?u32 {
         p.focus_node = fold.invalid;
         return null;
     }
+    if (p.nodes[p.focus_node].open) p.focus_opened = p.focus_node;
     return p.focus_node;
 }
 
@@ -6808,17 +6820,16 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
         return;
     }
 
-    const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, n.path }) catch return;
-    if (open_side) {
-        const g = wb.newGrouping();
-        _ = sdk.host().openFilePath(abs, g) catch |err| {
-            dvui.log.err("atlas: open {s}: {any}", .{ abs, err });
-        };
-    } else {
-        _ = sdk.host().revealPosition(abs, 0, 0, false) catch |err| {
-            dvui.log.err("atlas: revealPosition {s}: {any}", .{ abs, err });
-        };
-    }
+    // `core.paths.join`, not `std.fs.path.join`: a vault on a mount (`gdrive://me/…`) is
+    // `/`-separated on every OS. And `openFilePath` rather than `revealPosition` — both focus a
+    // note that is already open, but the host's `revealPosition` runs the path through
+    // `std.fs.path.resolve`, which folds `gdrive://` to `gdrive:/`, and the open that follows no
+    // longer knows the path is on the mount.
+    const abs = core.paths.join(dvui.currentWindow().arena(), root, n.path) catch return;
+    const g = if (open_side) wb.newGrouping() else wb.currentGrouping();
+    _ = sdk.host().openFilePath(abs, g) catch |err| {
+        dvui.log.err("atlas: open {s}: {any}", .{ abs, err });
+    };
 }
 
 fn pointerTargetsMainPane(pt: dvui.Point.Physical) bool {

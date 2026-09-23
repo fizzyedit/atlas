@@ -198,7 +198,7 @@ edits only from the 2-minute sweep. Both are host follow-ups.
    loop that returns when out of budget or waiting on bytes. The worker thread is deleted;
    `Runner` drives it. Progress and `busy` unchanged. *Gate: native scan speed unchanged;
    the web build indexes a small vault without a dropped frame over 16 ms.*
-5. **Web bundle** (fizzy). `web_plugin_dirs = { zig-drive, atlas }`; `dvui.io` on web gets a
+5. **Web bundle** (fizzy). `web_plugin_dirs = { drive, atlas }`; `dvui.io` on web gets a
    clock (`Io.Threaded.global_single_threaded` is enough for clocks and mutexes); check the
    graph's render targets on the web backend (the icon-target softness suggests a real
    backend difference to find, not to route around). *Gate: `zig build web`, graph draws.*
