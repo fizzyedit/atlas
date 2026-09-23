@@ -6788,7 +6788,6 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
     const root = st.vault_root orelse return;
     const n = p.nodes[idx];
     if (n.path.len == 0 and !n.phantom) return;
-    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api) orelse return;
 
     if (n.phantom) {
         // Only invent a note for note-like phantoms. Never turn `foo.zig` into `foo.zig.md`.
@@ -6825,8 +6824,13 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
     // note that is already open, but the host's `revealPosition` runs the path through
     // `std.fs.path.resolve`, which folds `gdrive://` to `gdrive:/`, and the open that follows no
     // longer knows the path is on the mount.
+    //
+    // The workbench service is optional — the web registers none — so it is asked for only to
+    // mint a pane for "open to the side"; grouping 0 is the pane the user is in. Requiring it
+    // was why a click on the web selected a node and opened nothing.
     const abs = core.paths.join(dvui.currentWindow().arena(), root, n.path) catch return;
-    const g = if (open_side) wb.newGrouping() else wb.currentGrouping();
+    const wb = sdk.host().getServiceTyped(sdk.services.workbench.Api);
+    const g: u64 = if (open_side and wb != null) wb.?.newGrouping() else 0;
     _ = sdk.host().openFile(.{ .path = abs, .grouping = g }) catch |err| {
         dvui.log.err("atlas: open {s}: {any}", .{ abs, err });
     };

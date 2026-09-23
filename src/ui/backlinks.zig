@@ -923,7 +923,8 @@ fn drawGroupHeader(bl: query.Backlink, count: usize, id_extra: usize, height: f3
 /// Open the note a backlink comes *from*, scrolled to the line the link is on.
 fn revealBacklink(st: anytype, bl: query.Backlink, open_side: bool) void {
     const root = st.vault_root orelse return;
-    const abs = std.fs.path.join(dvui.currentWindow().arena(), &.{ root, bl.path }) catch return;
+    // `/`-joined on a mount (`gdrive://me/…`) whatever the OS.
+    const abs = core.paths.join(dvui.currentWindow().arena(), root, bl.path) catch return;
     _ = sdk.host().revealPosition(abs, bl.line, bl.col, open_side) catch |err| {
         dvui.log.err("atlas: revealPosition {s}: {any}", .{ abs, err });
     };
