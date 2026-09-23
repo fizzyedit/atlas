@@ -54,18 +54,10 @@ const window: usize = 16;
 /// slow and finishes; sixteen is fast until it stops.
 const remote_window: usize = 4;
 
-/// Whether the vault is reached over a network. A mount's path carries its scheme
-/// (`gdrive://…`), and a plain path never contains `://` — the disk has no scheme, and neither
-/// does a Windows drive letter. Crude on purpose: the alternative is the host telling us, and
-/// that is a question for the SDK rather than a reason to crawl a cloud drive at disk speed in
-/// the meantime.
-fn isRemote(vault_root: []const u8) bool {
-    const scheme_end = std.mem.indexOf(u8, vault_root, "://") orelse return false;
-    return !std.mem.eql(u8, vault_root[0..scheme_end], "file");
-}
-
-fn windowFor(vault_root: []const u8) usize {
-    return if (isRemote(vault_root)) remote_window else window;
+/// The filesystem says whether it is reached over a network (`vfs.Fs.remote`), so this does not
+/// have to guess from the path.
+fn windowFor(fs: vfs.Fs) usize {
+    return if (fs.remote) remote_window else window;
 }
 /// Files in a directory listing that get their `stat` from the listing itself (a mount says
 /// size and modified time; the disk does not) skip the stat job.
@@ -239,7 +231,7 @@ fn stepInner(self: *Scan, deadline_ns: i64) !work.Status {
                     if (overBudget(deadline_ns)) break;
                 }
                 try self.issue();
-                if (self.landed.items.len != 0 or (self.hasQueued() and self.in_flight.count() < windowFor(self.indexer.vault_root))) {
+                if (self.landed.items.len != 0 or (self.hasQueued() and self.in_flight.count() < windowFor(self.src.fs))) {
                     if (overBudget(deadline_ns)) return .more;
                     continue;
                 }
@@ -375,7 +367,7 @@ fn beginWalk(self: *Scan) !void {
 /// stats, then listings.
 fn issue(self: *Scan) !void {
     const gpa = self.indexer.gpa;
-    while (self.in_flight.count() < windowFor(self.indexer.vault_root)) {
+    while (self.in_flight.count() < windowFor(self.src.fs)) {
         if (self.reads.items.len != 0) {
             const todo = self.reads.pop().?;
             try self.start(.{ .read = .{ .todo = todo } });
@@ -608,14 +600,11 @@ test "a remote vault crawls at a fraction of the disk's width" {
     // The failure this exists for: sixteen parallel listings against a mounted Google Drive
     // spent its per-minute query quota in seconds, after which Drive refused everything —
     // including the folder the user was looking at — and the tree filled with Forbidden.
-    try std.testing.expect(Scan.isRemote("gdrive://someone@example.com/Vault"));
-    try std.testing.expect(Scan.isRemote("store://Google Drive.fizzyplugin"));
-    try std.testing.expect(!Scan.isRemote("/Users/someone/Notes"));
-    try std.testing.expect(!Scan.isRemote("C:\\Users\\someone\\Notes"));
-    // A local file:// URL is still the disk.
-    try std.testing.expect(!Scan.isRemote("file:///Users/someone/Notes"));
-
-    try std.testing.expectEqual(remote_window, Scan.windowFor("gdrive://someone@example.com/Vault"));
-    try std.testing.expectEqual(window, Scan.windowFor("/Users/someone/Notes"));
+    var remote = try vfs.Mem.init(std.testing.allocator);
+    defer remote.deinit();
+    var fs = remote.fs();
+    try std.testing.expectEqual(window, Scan.windowFor(fs));
+    fs.remote = true;
+    try std.testing.expectEqual(remote_window, Scan.windowFor(fs));
     try std.testing.expect(remote_window < window);
 }

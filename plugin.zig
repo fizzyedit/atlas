@@ -329,7 +329,7 @@ fn requestNewDocumentDialog(_: *anyopaque, _: ?[]const u8, parent_path: ?[]const
         dvui.log.err("atlas: failed to create note {s}: {any}", .{ path, err });
         return;
     };
-    _ = sdk.host().openFilePath(path, wb.currentGrouping()) catch |err| {
+    _ = sdk.host().openFile(.{ .path = path, .grouping = wb.currentGrouping() }) catch |err| {
         // The note exists and the tree will show it; only the tab is missing. Still worth
         // revealing below, so this is logged rather than returned on.
         dvui.log.err("atlas: failed to open note {s}: {any}", .{ path, err });

@@ -6821,13 +6821,13 @@ fn openNode(p: *Panel, st: anytype, idx: usize, open_side: bool) void {
     }
 
     // `core.paths.join`, not `std.fs.path.join`: a vault on a mount (`gdrive://me/…`) is
-    // `/`-separated on every OS. And `openFilePath` rather than `revealPosition` — both focus a
+    // `/`-separated on every OS. And `openFile` rather than `revealPosition` — both focus a
     // note that is already open, but the host's `revealPosition` runs the path through
     // `std.fs.path.resolve`, which folds `gdrive://` to `gdrive:/`, and the open that follows no
     // longer knows the path is on the mount.
     const abs = core.paths.join(dvui.currentWindow().arena(), root, n.path) catch return;
     const g = if (open_side) wb.newGrouping() else wb.currentGrouping();
-    _ = sdk.host().openFilePath(abs, g) catch |err| {
+    _ = sdk.host().openFile(.{ .path = abs, .grouping = g }) catch |err| {
         dvui.log.err("atlas: open {s}: {any}", .{ abs, err });
     };
 }
