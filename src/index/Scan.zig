@@ -444,17 +444,20 @@ fn land(job: *Job) void {
     _ = self.in_flight.swapRemove(job.id);
     self.landed.append(self.indexer.gpa, job) catch job.destroy(self.indexer.gpa);
 }
-fn onListed(ctx: ?*anyopaque, result: vfs.Error![]vfs.Entry) void {
+fn onListed(ctx: ?*anyopaque, answer: vfs.Result([]vfs.Entry)) void {
+    const result = answer.get();
     const job: *Job = @ptrCast(@alignCast(ctx.?));
     job.kind.list.result = result;
     land(job);
 }
-fn onStat(ctx: ?*anyopaque, result: vfs.Error!vfs.Stat) void {
+fn onStat(ctx: ?*anyopaque, answer: vfs.Result(vfs.Stat)) void {
+    const result = answer.get();
     const job: *Job = @ptrCast(@alignCast(ctx.?));
     job.kind.stat.result = result;
     land(job);
 }
-fn onRead(ctx: ?*anyopaque, result: vfs.Error!vfs.Read) void {
+fn onRead(ctx: ?*anyopaque, answer: vfs.Result(vfs.Read)) void {
+    const result = answer.get();
     const job: *Job = @ptrCast(@alignCast(ctx.?));
     job.kind.read.result = result;
     land(job);

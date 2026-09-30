@@ -2393,7 +2393,7 @@ test "a mounted vault is indexed from the frame, a budget at a time" {
     // A save arrives as a queued path: the scoped scan runs from the frame too. Written the way
     // a save is — through the filesystem, landing on a pump.
     const Done = struct {
-        fn f(_: ?*anyopaque, _: core.vfs.Error!void) void {}
+        fn f(_: ?*anyopaque, _: core.vfs.Result(void)) void {}
     };
     _ = try mem.fs().writeFile("/notes/Beta.md", "# Beta\n\nno links now\n", .{}, Done.f, null);
     mem.fs().pump();
@@ -2468,7 +2468,7 @@ test "a remote vault's full scan lists each folder once" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.inner.pump();
         }
-        const vtable: core.vfs.Fs.VTable = .{
+        const vtable: core.vfs.Fs.VTable = .of(.{
             .listDir = fwd_listDir,
             .stat = fwd_stat,
             .readFile = fwd_readFile,
@@ -2479,7 +2479,7 @@ test "a remote vault's full scan lists each folder once" {
             .remove = fwd_remove,
             .cancel = fwd_cancel,
             .pump = fwd_pump,
-        };
+        });
         fn fs(self: *@This()) core.vfs.Fs {
             return .{ .ptr = self, .vtable = &vtable, .remote = true };
         }

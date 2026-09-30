@@ -809,7 +809,8 @@ fn contextFor(c: *Cache, root: []const u8, i: usize) []const u8 {
     return "";
 }
 
-fn onContextRead(ctx: ?*anyopaque, result: core.vfs.Error!core.vfs.Read) void {
+fn onContextRead(ctx: ?*anyopaque, answer: core.vfs.Result(core.vfs.Read)) void {
+    const result = answer.get();
     const c: *Cache = @ptrCast(@alignCast(ctx.?));
     c.pending_job = null;
     const read = result catch {
