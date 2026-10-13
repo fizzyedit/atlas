@@ -45,7 +45,6 @@ const vtable: sdk.Plugin.VTable = .{
     .needsContinuousRepaint = needsContinuousRepaint,
     .endFrame = endFrame,
     .drawOverlay = vault_sim.drawOverlay,
-    .requestNewDocumentDialog = requestNewDocumentDialog,
 };
 
 var plugin_state: State = .{};
@@ -161,6 +160,16 @@ pub fn register(host: *sdk.Host) !void {
         .run = cmdConvertWikilinks,
         .isEnabled = cmdConvertWikilinksEnabled,
         .icon = icons.tvg.lucide.link,
+    });
+    // New File's entry for a note (`atlas.new`). Internal: fizzy's New File… is the way in.
+    try host.registerCommand(.{
+        .id = "atlas.new",
+        .owner = &plugin,
+        .title = "Note",
+        .visibility = .internal,
+        .params = NewNote.params,
+        .runWith = NewNote.bind(cmdNewNote),
+        .icon = icons.tvg.lucide.@"notebook-pen",
     });
     try host.registerCommand(.{
         .id = "atlas.openVaultSimulator",
@@ -308,11 +317,14 @@ fn zoomGraphToFit(_: *anyopaque) !void {
 /// the workbench service: `.md` stays owned by the text plugin, exactly as for a note made any
 /// other way. Every failure here is a dead end rather than a partial state — nothing is revealed
 /// that was not created.
-fn requestNewDocumentDialog(_: *anyopaque, _: ?[]const u8, parent_path: ?[]const u8, _: usize) void {
+const NewNote = sdk.Command.Params(struct {
+    parent_path: sdk.Command.Arg([]const u8, .{ .description = "The folder to create it in. Empty: the project folder." }) = .init(""),
+});
+fn cmdNewNote(_: *anyopaque, args: NewNote.Args, _: *sdk.Command.Call) anyerror!void {
     const host = runtime.host();
     // The folder right-clicked in the explorer, else the project root. A note has to live
     // somewhere; with no folder open there is no tree to rename it in either.
-    const dir = parent_path orelse host.folder() orelse {
+    const dir = (if (args.parent_path.len > 0) args.parent_path else null) orelse host.folder() orelse {
         dvui.log.err("atlas: New Note needs an open folder", .{});
         return;
     };
