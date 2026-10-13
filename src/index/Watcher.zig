@@ -149,7 +149,7 @@ pub fn tick(self: *Watcher) void {
 ///   * **attachments** — an embed resolves against the media table, which the indexer only
 ///     rebuilds from a walk; there is no single-path entry point for it the way `enqueue` is one
 ///     for notes.
-pub fn onPathsChanged(self: *Watcher, changes: sdk.Plugin.PathChanges) void {
+pub fn onPathsChanged(self: *Watcher, changes: sdk.events.FilesChanged) void {
     if (self.vault_root.len == 0) return;
     // `truncated` means the host dropped events, so the list is not a description of what
     // happened and there is nothing to be gained by walking it.

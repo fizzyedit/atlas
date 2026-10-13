@@ -1271,7 +1271,7 @@ pub fn panelTimings(p: *const Panel) PanelStats {
 /// deinited map, memcpy into an unmapped label buffer.
 pub fn shutdownPanel(p: *Panel) void {
     p.dropArrangement();
-    // So the subsequent `onFolderOpen` of the *same* folder still looks like a vault switch
+    // So the subsequent `fizzy.folder.opened` of the *same* folder still looks like a vault switch
     // and does not skip `dropArrangement` on a matching `vault_key`.
     p.vault_key = 0;
 }
@@ -6956,7 +6956,7 @@ test "dropping a vault forgets hover, interior, camera, and the previous generat
 }
 
 test "closing a folder leaves the panel safe to rebuild into" {
-    // `setProjectFolder` always fires onFolderClose then onFolderOpen, even for the folder
+    // fizzy always announces fizzy.folder.closed then .opened, even for the folder
     // that is already open. shutdown used to deinit `path_index`/`label_live` without
     // emptying them, and skip `dropArrangement` because `vault_key` still matched — so the
     // next `finishRebuild` walked freed maps (SEGV).
