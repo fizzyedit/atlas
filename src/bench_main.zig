@@ -491,7 +491,7 @@ fn indexVault(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
 }
 
 /// Time the three steps a single edited buffer costs: writing the note's rows, resolving links,
-/// and republishing the snapshot. This is the interactive path — `documentContentChanged` fires on
+/// and republishing the snapshot. This is the interactive path — `fizzy.document.changed` is heard on
 /// a typing lull, and everything it triggers happens before the graph can show the edit.
 fn timeOneEdit(gpa: std.mem.Allocator, io: std.Io, index: *Index, indexer: *Indexer) !void {
     // A real note, edited the way a reader edits one: same file, different body. The content must

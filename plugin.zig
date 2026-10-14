@@ -8,7 +8,7 @@
 //! the link layer around it rather than claiming the file type. That's what lets it index
 //! markdown it never renders, and why the vtable here is a *utility* vtable.
 //!
-//! The index is built from **saved files only**. `documentContentChanged` is taken as a hint to
+//! The index is built from **saved files only**. `fizzy.document.changed` is taken as a hint to
 //! go and stat the file, never as content to index — see `State.setDirtyContent` for why a
 //! half-typed document must not reach the graph. Unsaved bytes are kept as an overlay for the
 //! backlinks pane and nothing else.
@@ -42,14 +42,9 @@ var plugin: sdk.Plugin = .{
 
 const vtable: sdk.Plugin.VTable = .{
     .deinit = pluginDeinit,
-    .onFolderOpen = onFolderOpen,
-    .onFolderClose = onFolderClose,
-    .documentContentChanged = documentContentChanged,
-    .folderPathsChanged = folderPathsChanged,
     .needsContinuousRepaint = needsContinuousRepaint,
     .endFrame = endFrame,
     .drawOverlay = vault_sim.drawOverlay,
-    .requestNewDocumentDialog = requestNewDocumentDialog,
 };
 
 var plugin_state: State = .{};
@@ -112,6 +107,10 @@ pub fn register(host: *sdk.Host) !void {
     runtime.adoptState(&plugin_state);
 
     try host.registerPlugin(&plugin);
+    try host.subscribe(.{ .event = "fizzy.folder.opened", .owner = &plugin, .handler = folderOpened });
+    try host.subscribe(.{ .event = "fizzy.folder.closed", .owner = &plugin, .handler = folderClosed });
+    try host.subscribe(.{ .event = "fizzy.document.changed", .owner = &plugin, .handler = documentChanged });
+    try host.subscribe(.{ .event = "fizzy.files.changed", .owner = &plugin, .handler = filesChanged });
     plugin_state.loadSettings(host);
     try plugin_state.registerSettings(host, &plugin);
     try host.registerLanguageSupport(language_support);
@@ -162,6 +161,16 @@ pub fn register(host: *sdk.Host) !void {
         .isEnabled = cmdConvertWikilinksEnabled,
         .icon = icons.tvg.lucide.link,
     });
+    // New File's entry for a note (`atlas.new`). Internal: fizzy's New File… is the way in.
+    try host.registerCommand(.{
+        .id = "atlas.new",
+        .owner = &plugin,
+        .title = "Note",
+        .visibility = .internal,
+        .params = NewNote.params,
+        .runWith = NewNote.bind(cmdNewNote),
+        .icon = icons.tvg.lucide.@"notebook-pen",
+    });
     try host.registerCommand(.{
         .id = "atlas.openVaultSimulator",
         .owner = &plugin,
@@ -171,7 +180,7 @@ pub fn register(host: *sdk.Host) !void {
     });
 
     // A folder may already be open when a plugin is loaded mid-session (install, or re-enable
-    // from the store), and `onFolderOpen` only fires on a *change*. Without this, atlas would
+    // from the store), and `fizzy.folder.opened` is only heard on a *change*. Without this, atlas would
     // sit idle until the user switched folders.
     if (host.folder()) |root| plugin_state.openVault(host.allocator, root) catch {};
 }
@@ -190,15 +199,15 @@ fn openVaultSimulator(_: *anyopaque) !void {
     vault_sim.toggleOpen();
 }
 
-fn onFolderOpen(state: *anyopaque, allocator: std.mem.Allocator) void {
+fn folderOpened(state: *anyopaque, e: sdk.events.Event) void {
     const st: *State = @ptrCast(@alignCast(state));
-    const root = sdk.host().folder() orelse return;
-    st.openVault(allocator, root) catch |err| {
-        dvui.log.err("atlas: could not open vault {s}: {any}", .{ root, err });
+    const folder = sdk.events.parse(sdk.events.Path, sdk.host().arena(), e) catch return;
+    st.openVault(sdk.allocator(), folder.path) catch |err| {
+        dvui.log.err("atlas: could not open vault {s}: {any}", .{ folder.path, err });
     };
 }
 
-fn onFolderClose(state: *anyopaque) void {
+fn folderClosed(state: *anyopaque, _: sdk.events.Event) void {
     // A layout worker for the folder being closed has nothing left to deliver, and `draw`
     // returns early once there is no vault, so it would never be collected there. This has to
     // forget the whole arrangement, not just join the worker: the host fires close then open
@@ -209,16 +218,28 @@ fn onFolderClose(state: *anyopaque) void {
     st.closeVault(sdk.allocator());
 }
 
-fn documentContentChanged(state: *anyopaque, path: []const u8, bytes: []const u8) void {
+/// An open document's unsaved contents settled. The event names it; the unsaved text, which the
+/// backlinks panel overlays, comes from its owner, and only for a note in the vault.
+fn documentChanged(state: *anyopaque, e: sdk.events.Event) void {
     const st: *State = @ptrCast(@alignCast(state));
-    st.setDirtyContent(path, bytes);
+    const host = sdk.host();
+    const changed = sdk.events.parse(sdk.events.Path, host.arena(), e) catch return;
+    if (!st.wantsDirtyContent(changed.path)) return;
+    const doc = host.docFromPath(changed.path) orelse return;
+    const bytes = (doc.owner.documentBytes(doc, changed.path, host.arena()) catch return) orelse return;
+    st.setDirtyContent(changed.path, bytes);
 }
 
 /// Files changed on disk under the open folder. This is what keeps the graph honest about notes
 /// nobody has open — a wikilink deleted from a closed file used to sit in the graph until
 /// something happened to re-read that file.
-fn folderPathsChanged(state: *anyopaque, changes: sdk.Plugin.PathChanges) void {
+fn filesChanged(state: *anyopaque, e: sdk.events.Event) void {
     const st: *State = @ptrCast(@alignCast(state));
+    const changes = sdk.events.parse(sdk.events.FilesChanged, sdk.host().arena(), e) catch {
+        // Unreadable is as good as truncated: go and look.
+        st.folderPathsChanged(.{ .events = &.{}, .truncated = true });
+        return;
+    };
     st.folderPathsChanged(changes);
 }
 
@@ -296,11 +317,14 @@ fn zoomGraphToFit(_: *anyopaque) !void {
 /// the workbench service: `.md` stays owned by the text plugin, exactly as for a note made any
 /// other way. Every failure here is a dead end rather than a partial state — nothing is revealed
 /// that was not created.
-fn requestNewDocumentDialog(_: *anyopaque, _: ?[]const u8, parent_path: ?[]const u8, _: usize) void {
+const NewNote = sdk.Command.Params(struct {
+    parent_path: sdk.Command.Arg([]const u8, .{ .description = "The folder to create it in. Empty: the project folder." }) = .init(""),
+});
+fn cmdNewNote(_: *anyopaque, args: NewNote.Args, _: *sdk.Command.Call) anyerror!void {
     const host = runtime.host();
     // The folder right-clicked in the explorer, else the project root. A note has to live
     // somewhere; with no folder open there is no tree to rename it in either.
-    const dir = parent_path orelse host.folder() orelse {
+    const dir = (if (args.parent_path.len > 0) args.parent_path else null) orelse host.folder() orelse {
         dvui.log.err("atlas: New Note needs an open folder", .{});
         return;
     };

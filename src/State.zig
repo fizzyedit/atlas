@@ -1,7 +1,7 @@
 //! Plugin-owned state: the open vault and everything derived from it.
 //!
 //! One instance, created in `register` and torn down in `deinit`. Everything keyed to a
-//! particular open folder lives behind `vault` and is rebuilt from scratch on `onFolderOpen` —
+//! particular open folder lives behind `vault` and is rebuilt from scratch on `fizzy.folder.opened` —
 //! the filesystem is the source of truth, so there is nothing here worth preserving across a
 //! folder switch.
 //!
@@ -86,7 +86,7 @@ cand_index: ?resolve.Index = null,
 /// with no precedence rule that could land `[[Target]]` on `Target.png`.
 media_candidates: []const resolve.Candidate = &.{},
 
-/// Unsaved buffer overlays: absolute path → owned bytes. Populated by `documentContentChanged`;
+/// Unsaved buffer overlays: absolute path → owned bytes. Populated on `fizzy.document.changed` (the text from its owner);
 /// dropped when the document closes (`reconcileDirty`) or the vault does. The index still
 /// reflects disk; this is a read-time overlay so a newly typed `[[Link]]` can show up in
 /// backlinks before save.
@@ -247,7 +247,7 @@ fn documentIsOpen(abs: []const u8) bool {
     return false;
 }
 
-pub fn folderPathsChanged(self: *State, changes: sdk.Plugin.PathChanges) void {
+pub fn folderPathsChanged(self: *State, changes: sdk.events.FilesChanged) void {
     if (self.watcher_ready) self.watcher.onPathsChanged(changes);
 }
 
@@ -403,11 +403,8 @@ fn invalidateCandidates(self: *State) void {
 /// tens of milliseconds, and the reader is left watching a stale graph for up to two seconds.
 pub fn setDirtyContent(self: *State, path: []const u8, bytes: []const u8) void {
     const gpa = self.dirty_gpa;
-    // No vault means nothing to overlay onto, and no path means an unsaved buffer with no identity
-    // for the panel to match against.
-    const root = self.vault_root orelse return;
-    if (path.len == 0) return;
-    if (!query.isMarkdownPath(path)) return;
+    if (!self.wantsDirtyContent(path)) return;
+    const root = self.vault_root.?;
 
     // Path only — see above. `indexOne` stats it and does nothing if the file has not moved.
     if (self.indexer_ready) {
@@ -431,6 +428,14 @@ pub fn setDirtyContent(self: *State, path: []const u8, bytes: []const u8) void {
         }
         return;
     };
+}
+
+/// Whether an unsaved buffer at `path` is one this overlays: a note, in an open vault. No vault
+/// means nothing to overlay onto, and no path means an unsaved buffer with no identity for the
+/// panel to match against.
+pub fn wantsDirtyContent(self: *const State, path: []const u8) bool {
+    if (self.vault_root == null or path.len == 0) return false;
+    return query.isMarkdownPath(path);
 }
 
 fn clearDirty(self: *State) void {

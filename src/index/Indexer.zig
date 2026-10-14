@@ -322,7 +322,7 @@ pub fn sinceNs(self: *const Indexer, from: i96) u64 {
 /// One queued reindex: a vault-relative path to go and re-read.
 ///
 /// It used to be able to carry *bytes* as well — a live editor buffer from
-/// `Plugin.documentContentChanged`, so an unsaved edit reached the graph. That is gone on purpose:
+/// `fizzy.document.changed`, so an unsaved edit reached the graph. That is gone on purpose:
 /// those bytes arrive on a typing lull, and half a wikilink resolves to nothing and materialises a
 /// phantom note for it, so indexing them filled the vault with debris. See `State.setDirtyContent`.
 pub const Pending = struct {
