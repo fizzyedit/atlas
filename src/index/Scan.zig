@@ -61,7 +61,6 @@ fn windowFor(fs: vfs.Fs) usize {
 }
 /// Files in a directory listing that get their `stat` from the listing itself (a mount says
 /// size and modified time; the disk does not) skip the stat job.
-
 indexer: *Indexer,
 src: Source,
 mode: Mode,
