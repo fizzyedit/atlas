@@ -2375,11 +2375,13 @@ test "a mounted vault is indexed from the frame, a budget at a time" {
     try mem.put("/diagram.png", "");
 
     try v.indexer.start(&v.index, "mem://box", .{ .fs = mem.fs(), .root = "/", .threaded = false });
-    // Frames: the host pumps the mount, then gives the task its slice.
+    // Frames: the host pumps the mount, then gives the task its slice. The slice is empty, so
+    // every frame ends at the first step that returns: with a real budget "it yielded" is a
+    // claim about the machine's speed, and a fast one scans three notes inside a millisecond.
     var frames: usize = 0;
     while (frames < 10_000) : (frames += 1) {
         mem.fs().pump();
-        v.indexer.pump(1 * std.time.ns_per_ms);
+        v.indexer.pump(0);
         if (v.indexer.counts().complete) break;
     }
     const c = v.indexer.counts();
