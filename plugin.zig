@@ -349,7 +349,8 @@ fn cmdNewNote(_: *anyopaque, args: NewNote.Args, _: *sdk.Command.Call) anyerror!
         if (!files.exists(candidate)) break candidate;
     } else return;
 
-    (sdk.host().getServiceTyped(sdk.services.files.Api) orelse return).createFile(path) catch |err| {
+    const files = sdk.host().getServiceTyped(sdk.services.files.Api) orelse return;
+    files.createFile(path) catch |err| {
         dvui.log.err("atlas: failed to create note {s}: {any}", .{ path, err });
         return;
     };
@@ -358,9 +359,9 @@ fn cmdNewNote(_: *anyopaque, args: NewNote.Args, _: *sdk.Command.Call) anyerror!
         // revealing below, so this is logged rather than returned on.
         dvui.log.err("atlas: failed to open note {s}: {any}", .{ path, err });
     };
-    host.setExplorerNewFilePath(path) catch |err| {
-        dvui.log.err("atlas: failed to reveal note {s}: {any}", .{ path, err });
-    };
+    // Selected in the tree with its name open for editing (fizzy#449: the files service's
+    // `reveal`, where `Host.setExplorerNewFilePath` was).
+    files.reveal(path);
 }
 
 comptime {
