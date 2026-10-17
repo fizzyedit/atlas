@@ -190,7 +190,7 @@ pub fn noteContentGraph(
             });
             try heading_rows.append(arena, .{ .line = h.line, .level = level });
         }
-        for (n.blocks) |b| try block_rows.append(arena, .{ .kind = @intFromEnum(b.kind), .line_start = b.line_start, .line_end = b.line_end, .weight = b.weight });
+        for (n.blocks) |b| try block_rows.append(arena, .{ .kind = @backingInt(b.kind), .line_start = b.line_start, .line_end = b.line_end, .weight = b.weight });
         for (n.tags) |t| try tag_rows.append(arena, .{ .tag = try arena.dupe(u8, t.tag), .line = t.line });
         // Embeds are kept apart from the same-note cross-reference edges below rather than
         // merged into them.
@@ -254,7 +254,7 @@ pub fn noteContentGraph(
         },
         .block => {
             const b = block_rows.items[m.idx];
-            const kind: content_graph.ItemKind = switch (@as(schema.BlockKind, @enumFromInt(b.kind))) {
+            const kind: content_graph.ItemKind = switch (@as(schema.BlockKind, @fromBackingInt(@intCast(b.kind)))) {
                 .paragraph => .paragraph,
                 .list => .list,
                 .code => .code,
@@ -335,7 +335,7 @@ fn appendBodyItem(
 }
 
 fn ordinalKey(parent_id: i64, kind: content_graph.ItemKind) u64 {
-    return (@as(u64, @bitCast(parent_id)) *% 1099511628211) ^ @as(u64, @intFromEnum(kind));
+    return (@as(u64, @bitCast(parent_id)) *% 1099511628211) ^ @as(u64, @backingInt(kind));
 }
 
 /// Identity for a non-heading item: unstable across edits that reorder or insert siblings under
@@ -343,7 +343,7 @@ fn ordinalKey(parent_id: i64, kind: content_graph.ItemKind) u64 {
 fn contentItemId(kind: content_graph.ItemKind, parent_id: i64, ordinal: u32) i64 {
     var h = std.hash.Wyhash.init(ordinal);
     h.update(std.mem.asBytes(&parent_id));
-    h.update(&[_]u8{@intFromEnum(kind)});
+    h.update(&[_]u8{@backingInt(kind)});
     const v: i64 = @intCast(h.final() & 0x7fff_ffff_ffff_ffff);
     return if (v == 0) 1 else v;
 }
@@ -513,7 +513,7 @@ pub fn vaultRelative(vault: []const u8, abs: []const u8, buf: []u8) ?[]const u8 
     if (rest.len == 0 or rest.len > buf.len) return null;
     const out = buf[0..rest.len];
     @memcpy(out, rest);
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         std.mem.replaceScalar(u8, out, std.fs.path.sep_windows, std.fs.path.sep_posix);
     }
     return out;
@@ -528,7 +528,7 @@ const sep_any = &[_]u8{ std.fs.path.sep_posix, std.fs.path.sep_windows };
 fn hasPathPrefix(abs: []const u8, vault: []const u8) bool {
     if (abs.len < vault.len) return false;
     if (std.mem.eql(u8, abs[0..vault.len], vault)) return true;
-    if (builtin.os.tag != .windows) return false;
+    if (builtin.target.os.tag != .windows) return false;
     for (abs[0..vault.len], vault) |a, v| {
         const an = if (a == std.fs.path.sep_windows) std.fs.path.sep_posix else std.ascii.toLower(a);
         const vn = if (v == std.fs.path.sep_windows) std.fs.path.sep_posix else std.ascii.toLower(v);

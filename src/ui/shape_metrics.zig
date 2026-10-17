@@ -60,10 +60,10 @@ pub const Kind = enum {
 };
 
 pub const CommHist = struct {
-    counts: [std.meta.fields(Kind).len]u32 = .{0} ** std.meta.fields(Kind).len,
+    counts: [std.meta.fieldNames(Kind).len]u32 = @splat(0),
 
     fn add(self: *CommHist, k: Kind) void {
-        self.counts[@intFromEnum(k)] += 1;
+        self.counts[@backingInt(k)] += 1;
     }
 
     pub fn total(self: CommHist) u32 {
@@ -84,7 +84,7 @@ pub const CommHist = struct {
                 n += 1;
             }
             first = false;
-            const k: Kind = @enumFromInt(i);
+            const k: Kind = @fromBackingInt(@intCast(i));
             const w = std.fmt.bufPrint(buf[n..], "{d}{c}", .{ c, k.letter() }) catch break;
             n += w.len;
         }
@@ -133,7 +133,7 @@ pub fn printHeader() void {
             "ovlp",  "penet", "leaf", "hwy",   "d-p50",  "d-p99", "graph",  "communities",
         },
     );
-    std.debug.print("{s}\n", .{"-" ** 148});
+    std.debug.print("{s}\n", .{&@as([148]u8, @splat('-'))});
 }
 
 pub fn printRow(label: []const u8, r: Report) void {
@@ -444,7 +444,7 @@ fn radial(gpa: std.mem.Allocator, r: *Report, pos: []const Vec2, ext: f64) !void
     cy /= nf;
 
     const rings = 8;
-    var hist: [rings]usize = .{0} ** rings;
+    var hist: [rings]usize = @splat(0);
     const radii = try gpa.alloc(f32, pos.len);
     defer gpa.free(radii);
 

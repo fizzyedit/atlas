@@ -550,7 +550,7 @@ fn freeReuse(gpa: std.mem.Allocator, r: layout.Reuse) void {
 
 const LayoutJob = struct {
     arena: std.heap.ArenaAllocator,
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(JobPhase.solving)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(JobPhase.solving)),
     /// Set by `shutdownPanel` so the worker can abandon a long build instead of making teardown
     /// wait for it. The join itself is not optional — the worker is executing code inside a dylib
     /// that is about to be unloaded — so the only way to make closing the app prompt is to give
@@ -662,7 +662,7 @@ const LayoutJob = struct {
             // remaining hitch on a prose save.
             return;
         }
-        job.phase.store(@intFromEnum(JobPhase.building_map), .release);
+        job.phase.store(@backingInt(JobPhase.building_map), .release);
         const gpa = sdk.allocator();
         const a = job.arena.allocator();
 
@@ -999,7 +999,7 @@ pub const Panel = struct {
 
     interior: Interior,
 
-    touches: [10]Touch = [_]Touch{.{}} ** 10,
+    touches: [10]Touch = @as([10]Touch, @splat(.{})),
     gesture_active: bool = false,
     last_centroid: dvui.Point.Physical = .{},
     last_pinch: f32 = 0,
@@ -1387,7 +1387,7 @@ pub fn drawPanel(p: *Panel, st: anytype) !void {
     // wait it reports.
     if ((p.job != null or p.rebuild_waiting) and p.nodes.len == 0) {
         const building_map = if (p.job) |j|
-            j.phase.load(.acquire) == @intFromEnum(JobPhase.building_map)
+            j.phase.load(.acquire) == @backingInt(JobPhase.building_map)
         else
             false;
         if (building_map) {
@@ -6470,7 +6470,7 @@ fn updateTouchGesture(p: *Panel, pane: *dvui.WidgetData) void {
         if (e.evt != .mouse) continue;
         const me = e.evt.mouse;
         if (!me.button.touch()) continue;
-        const slot_signed = @intFromEnum(me.button) - @intFromEnum(dvui.enums.Button.touch0);
+        const slot_signed = @backingInt(me.button) - @backingInt(dvui.enums.Button.touch0);
         if (slot_signed < 0 or slot_signed >= p.touches.len) continue;
         const slot: usize = @intCast(slot_signed);
         const inside = pane.rectScale().r.contains(me.p);
