@@ -60,7 +60,7 @@ pub fn deinit(self: *SoftAtlas, gpa: std.mem.Allocator) void {
 /// neighbouring atlas cell (kinds sit in one horizontal strip).
 pub fn uv(self: *const SoftAtlas, kind: Kind) UvRect {
     _ = self;
-    const i: u32 = @intFromEnum(kind);
+    const i: u32 = @backingInt(kind);
     const size: f32 = @floatFromInt(atlas_w);
     const h: f32 = @floatFromInt(pad_px);
     const x0: f32 = @floatFromInt(i * cell_px);
@@ -255,7 +255,7 @@ const testing = std.testing;
 test "atlas cells are non-empty and non-overlapping in alpha mass" {
     var a = try SoftAtlas.init(testing.allocator);
     defer a.deinit(testing.allocator);
-    var mass: [cells]u32 = .{0} ** cells;
+    var mass: [cells]u32 = @splat(0);
     for (0..cells) |c| {
         const ox = c * cell_px;
         for (0..cell_px) |y| {
@@ -287,8 +287,8 @@ test "dash ring has less alpha mass than solid ring" {
     defer a.deinit(testing.allocator);
     var solid: u32 = 0;
     var dashed: u32 = 0;
-    const ox_r = @intFromEnum(Kind.ring) * cell_px;
-    const ox_d = @intFromEnum(Kind.dash_ring) * cell_px;
+    const ox_r = @backingInt(Kind.ring) * cell_px;
+    const ox_d = @backingInt(Kind.dash_ring) * cell_px;
     for (0..cell_px) |y| {
         for (0..cell_px) |x| {
             solid += a.pixels[y * atlas_w + ox_r + x].a;

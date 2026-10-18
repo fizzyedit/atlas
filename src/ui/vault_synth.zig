@@ -1649,10 +1649,10 @@ test "synthContentGraph produces a well-formed document graph" {
     try testing.expect(g.items.len > 1);
     try testing.expectEqual(content_graph.ItemKind.root, g.items[0].kind);
 
-    var counts = [_]usize{0} ** 9; // indexed by @intFromEnum(ItemKind)
-    for (g.items) |it| counts[@intFromEnum(it.kind)] += 1;
-    try testing.expect(counts[@intFromEnum(content_graph.ItemKind.heading)] > 0);
-    try testing.expect(counts[@intFromEnum(content_graph.ItemKind.paragraph)] > 0);
+    var counts = @as([9]usize, @splat(0)); // indexed by @intFromEnum(ItemKind)
+    for (g.items) |it| counts[@backingInt(it.kind)] += 1;
+    try testing.expect(counts[@backingInt(content_graph.ItemKind.heading)] > 0);
+    try testing.expect(counts[@backingInt(content_graph.ItemKind.paragraph)] > 0);
 
     // Only .outline edges in this pass.
     for (g.edges) |e| try testing.expect(e.kind == .outline);

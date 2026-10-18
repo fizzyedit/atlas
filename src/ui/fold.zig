@@ -45,7 +45,7 @@ pub const Arity = enum(u8) {
     seven = 7,
 
     pub fn n(self: Arity) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

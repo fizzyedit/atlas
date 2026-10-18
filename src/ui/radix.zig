@@ -47,7 +47,7 @@ pub fn sortByKey(
     var dst = scratch[0..items.len];
     var shift: u6 = 0;
     while (true) {
-        var counts = [_]u32{0} ** 256;
+        var counts = @as([256]u32, @splat(0));
         for (src) |it| counts[@as(u8, @truncate(keyOf(it) >> shift))] += 1;
 
         // Every element in one bucket means this digit orders nothing, and moving them all would be

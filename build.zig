@@ -269,7 +269,7 @@ pub fn build(b: *std.Build) void {
         });
         bench.root_module.addImport("content_graph", cg_for_bench);
         const run_bench = b.addRunArtifact(bench);
-        if (b.args) |a| run_bench.addArgs(a);
+        run_bench.addPassthruArgs();
         b.step("bench", "Scan/resolve timings, --stats, --world, --shapes, --stability").dependOn(&run_bench.step);
     }
 
@@ -286,7 +286,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const run_wiki = b.addRunArtifact(wiki);
-        if (b.args) |a| run_wiki.addArgs(a);
+        run_wiki.addPassthruArgs();
         b.step("wiki-import", "MediaWiki XML dump -> markdown vault").dependOn(&run_wiki.step);
     }
 

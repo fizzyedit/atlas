@@ -2045,8 +2045,8 @@ test "every slot lands on the hex lattice and is unique" {
     const n = 24;
     const snap = snapSpacingFor(n);
     var out: [n]dvui.Point = undefined;
-    var seeds: [n]?dvui.Point = .{null} ** n;
-    var deg: [n]u32 = .{0} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
+    var deg: [n]u32 = @splat(0);
     // A path so the force layout has something to pull on.
     var edges: [n - 1]Edge = undefined;
     for (0..n - 1) |i| edges[i] = .{ .a = i, .b = i + 1 };
@@ -2073,7 +2073,7 @@ test "linked nodes end up closer than unrelated ones" {
     // and meaningfully so: the snap lattice is half a packing slot, and springs are tuned so
     // a link settles near one snap cell while islands sit a packing slot apart.
     var out: [4]dvui.Point = undefined;
-    var seeds: [4]?dvui.Point = .{null} ** 4;
+    var seeds: [4]?dvui.Point = @splat(null);
     var deg: [4]u32 = .{ 1, 1, 1, 1 };
     const edges = [_]Edge{ .{ .a = 0, .b = 1 }, .{ .a = 2, .b = 3 } };
     try targets(testing.allocator, 4, &edges, &seeds, &deg, .{}, &out);
@@ -2094,8 +2094,8 @@ test "survivors keep their cell when nothing changed" {
     const n = 8;
     const slot = slotSpacingFor(n);
     var out1: [n]dvui.Point = undefined;
-    var seeds: [n]?dvui.Point = .{null} ** n;
-    var deg: [n]u32 = .{0} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
+    var deg: [n]u32 = @splat(0);
     var edges: [n - 1]Edge = undefined;
     for (0..n - 1) |i| {
         edges[i] = .{ .a = i, .b = i + 1 };
@@ -2120,7 +2120,7 @@ test "adding a link pulls the endpoints closer" {
     const n = 5;
     const slot = slotSpacingFor(n);
     var out1: [n]dvui.Point = undefined;
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var deg: [n]u32 = .{ 1, 2, 2, 2, 1 };
     const path = [_]Edge{
         .{ .a = 0, .b = 1 },
@@ -2154,8 +2154,8 @@ test "anchoring everything makes a reindex a no-op" {
     const n = 10;
     const slot = slotSpacingFor(n);
     var out1: [n]dvui.Point = undefined;
-    var seeds: [n]?dvui.Point = .{null} ** n;
-    var deg: [n]u32 = .{0} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
+    var deg: [n]u32 = @splat(0);
     var edges: [6]Edge = undefined;
     for (0..6) |i| {
         edges[i] = .{ .a = i, .b = i + 1 };
@@ -2166,7 +2166,7 @@ test "anchoring everything makes a reindex a no-op" {
 
     var seeds2: [n]?dvui.Point = undefined;
     for (0..n) |i| seeds2[i] = out1[i];
-    const all_anchored: [n]bool = .{true} ** n;
+    const all_anchored: [n]bool = @splat(true);
     var out2: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds2, &deg, .{ .anchored = &all_anchored, .prior_slot = slot }, &out2);
 
@@ -2190,7 +2190,7 @@ test "a new link moves its endpoints and leaves the rest of the vault alone" {
         .{ .a = 5, .b = 6 },
         .{ .a = 6, .b = 7 },
     };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out1: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &before, &seeds, &deg, .{}, &out1);
     const gap_before = dist(out1[3], out1[4]);
@@ -2200,7 +2200,7 @@ test "a new link moves its endpoints and leaves the rest of the vault alone" {
     const after = before ++ [_]Edge{.{ .a = 3, .b = 4 }};
     var deg2: [n]u32 = .{ 1, 2, 2, 2, 2, 2, 2, 1 };
     // Only the two endpoints of the new link have a changed neighbour set.
-    var anchored: [n]bool = .{true} ** n;
+    var anchored: [n]bool = @splat(true);
     anchored[3] = false;
     anchored[4] = false;
     var out2: [n]dvui.Point = undefined;
@@ -2234,14 +2234,14 @@ test "restoring a node's pre-change cell honours it exactly" {
         .{ .a = 5, .b = 6 },
         .{ .a = 6, .b = 7 },
     };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var start: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &plain, &seeds, &deg, .{}, &start);
 
     // Link 3—4: only those two are mobile.
     const linked = plain ++ [_]Edge{.{ .a = 3, .b = 4 }};
     var deg_linked: [n]u32 = .{ 1, 2, 2, 2, 2, 2, 2, 1 };
-    var anchored: [n]bool = .{true} ** n;
+    var anchored: [n]bool = @splat(true);
     anchored[3] = false;
     anchored[4] = false;
     var seeds_linked: [n]?dvui.Point = undefined;
@@ -2255,7 +2255,7 @@ test "restoring a node's pre-change cell honours it exactly" {
     for (0..n) |i| seeds_back[i] = mid[i];
     seeds_back[3] = start[3];
     seeds_back[4] = start[4];
-    var all_anchored: [n]bool = .{true} ** n;
+    var all_anchored: [n]bool = @splat(true);
     var back: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &plain, &seeds_back, &deg, .{ .anchored = &all_anchored, .prior_slot = slot }, &back);
 
@@ -2278,14 +2278,14 @@ test "a node that loses its only link stays put instead of being flung out" {
         .{ .a = 2, .b = 3 },
         .{ .a = 3, .b = 4 },
     };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out1: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &chain, &seeds, &deg, .{}, &out1);
 
     // Drop 4's only link, leaving it isolated.
     const cut = chain[0..3];
     var deg2: [n]u32 = .{ 1, 2, 2, 1, 0 };
-    var anchored: [n]bool = .{true} ** n;
+    var anchored: [n]bool = @splat(true);
     anchored[3] = false;
     anchored[4] = false;
     var seeds2: [n]?dvui.Point = undefined;
@@ -2309,7 +2309,7 @@ test "an anchored node yields its cell to nobody" {
         .{ .a = 0, .b = 2 },
         .{ .a = 0, .b = 3 },
     };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out1: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{}, &out1);
 
@@ -2317,7 +2317,7 @@ test "an anchored node yields its cell to nobody" {
     var seeds2: [n]?dvui.Point = undefined;
     for (0..n) |i| seeds2[i] = out1[i];
     seeds2[0] = out1[1];
-    var anchored: [n]bool = .{true} ** n;
+    var anchored: [n]bool = @splat(true);
     anchored[0] = false;
     var out2: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds2, &deg, .{ .anchored = &anchored, .prior_slot = slot }, &out2);
@@ -2344,12 +2344,12 @@ test "a vault of mostly-unlinked notes packs densely" {
     // near the lattice minimum instead.
     const n = 33;
     const slot = slotSpacingFor(n);
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     deg[0] = 1;
     deg[1] = 2;
     deg[2] = 1;
     const edges = [_]Edge{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 } };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{}, &out);
 
@@ -2365,9 +2365,9 @@ test "packing follows the panel's proportions" {
     // A disc fits a wide short panel badly: the fit is height-limited and most of the width goes to
     // margin. Packing to the panel's shape spends that width on zoom instead.
     const n = 40;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var no_edges: [0]Edge = .{};
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
 
     var round: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &seeds, &deg, .{}, &round);
@@ -2392,9 +2392,9 @@ test "a reshape repacks a cloud that is already laid out" {
     // themselves to their old seed here, which both froze them and tripped `any_fixed` in
     // `packComponents` — so `aspect` was thrown away and a resize reshaped nothing.
     const n = 40;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var no_edges: [0]Edge = .{};
-    var no_seeds: [n]?dvui.Point = .{null} ** n;
+    var no_seeds: [n]?dvui.Point = @splat(null);
 
     var round: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &no_seeds, &deg, .{}, &round);
@@ -2402,7 +2402,7 @@ test "a reshape repacks a cloud that is already laid out" {
     // Now reshape *that* arrangement, exactly as `rebuildIfNeeded` does on a bucket change.
     var seeds: [n]?dvui.Point = undefined;
     for (round, 0..) |p, i| seeds[i] = p;
-    const anchored: [n]bool = .{false} ** n;
+    const anchored: [n]bool = @splat(false);
     var wide: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &seeds, &deg, .{
         .anchored = &anchored,
@@ -2419,9 +2419,9 @@ test "the whole range a panel can ask for produces distinct shapes" {
     // number and gave a byte-identical layout — so dragging the panel reshaped nothing at all, and
     // the shaping looked broken when it was only saturated.
     const n = 40;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var no_edges: [0]Edge = .{};
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
 
     const ratios = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     var spans: [ratios.len]f32 = undefined;
@@ -2440,11 +2440,11 @@ test "a cluster keeps its own shape through a reshape" {
     // line with its nodes sitting on top of their own connecting edges. Proportions belong to where
     // islands are *placed*, never to the coordinates inside one.
     const n = 24;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     // A triangle, and 21 loose notes for the packer to spread around it.
     const edges = [_]Edge{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 }, .{ .a = 2, .b = 0 } };
     for (0..3) |i| deg[i] = 2;
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
 
     var square: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{ .aspect = 1 }, &square);
@@ -2452,7 +2452,7 @@ test "a cluster keeps its own shape through a reshape" {
     // Reshape hard, the way dragging a bottom panel wide does.
     var carried: [n]?dvui.Point = undefined;
     for (square, 0..) |q, i| carried[i] = q;
-    const anchored: [n]bool = .{false} ** n;
+    const anchored: [n]bool = @splat(false);
     var wide: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &carried, &deg, .{
         .anchored = &anchored,
@@ -2488,7 +2488,7 @@ test "one dominant cluster does not pin the cloud's shape" {
     // own, an area-preserving stretch only widened the island ring by √a, so a 3.5:1 panel gave a
     // ~1.9:1 cloud and pulling the panel wider did almost nothing visible.
     const n = 90;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var el: [44]Edge = undefined;
     // Half the vault in one cluster, half loose — the loose ones are what carry the shape.
     for (1..45) |i| {
@@ -2497,7 +2497,7 @@ test "one dominant cluster does not pin the cloud's shape" {
         deg[parent] += 1;
         deg[i] += 1;
     }
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
 
     var prev: f32 = 0;
     for ([_]f32{ 1.0, 2.0, 3.5, 5.0, 8.0 }) |asp| {
@@ -2517,18 +2517,18 @@ test "an incremental rebuild still holds link-less notes still" {
     // The flip side of the reshape fix: when the caller *is* anchoring, a note with no links has
     // nothing to solve for it and must not be carried off by the packer.
     const n = 12;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     deg[0] = 1;
     deg[1] = 1;
     const edges = [_]Edge{.{ .a = 0, .b = 1 }};
-    var no_seeds: [n]?dvui.Point = .{null} ** n;
+    var no_seeds: [n]?dvui.Point = @splat(null);
     var base: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &no_seeds, &deg, .{}, &base);
 
     var seeds: [n]?dvui.Point = undefined;
     for (base, 0..) |p, i| seeds[i] = p;
     // Everything anchored except one loose note, which carries a seed but no say-so of its own.
-    var anchored: [n]bool = .{true} ** n;
+    var anchored: [n]bool = @splat(true);
     anchored[n - 1] = false;
     var out: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{ .anchored = &anchored }, &out);
@@ -2542,16 +2542,16 @@ test "a settle reshape parks islands into new proportions without reshaping clus
     // a fresh ellipse for the new aspect. Clusters stay rigid (triangle side lengths hold);
     // loners carry the wide/tall outline.
     const n = 24;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     const edges = [_]Edge{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 }, .{ .a = 2, .b = 0 } };
     for (0..3) |i| deg[i] = 2;
-    var no_seeds: [n]?dvui.Point = .{null} ** n;
+    var no_seeds: [n]?dvui.Point = @splat(null);
     var square: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &no_seeds, &deg, .{ .aspect = 1 }, &square);
 
     var seeds: [n]?dvui.Point = undefined;
     for (0..n) |i| seeds[i] = square[i];
-    const free: [n]bool = .{false} ** n;
+    const free: [n]bool = @splat(false);
     var wide: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{
         .anchored = &free,
@@ -2589,15 +2589,15 @@ test "a settle reshape into the same aspect is idempotent" {
     // Two packs at the same aspect with the same seeds must agree. Otherwise a settle that
     // fires twice (or a chattering end-of-drag) hands the ease two homes to thrash between.
     const n = 20;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var no_edges: [0]Edge = .{};
-    var no_seeds: [n]?dvui.Point = .{null} ** n;
+    var no_seeds: [n]?dvui.Point = @splat(null);
     var base: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &no_seeds, &deg, .{ .aspect = 1.5 }, &base);
 
     var seeds: [n]?dvui.Point = undefined;
     for (0..n) |i| seeds[i] = base[i];
-    const free: [n]bool = .{false} ** n;
+    const free: [n]bool = @splat(false);
     var a: [n]dvui.Point = undefined;
     var b: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &seeds, &deg, .{
@@ -2624,20 +2624,20 @@ test "a single connected component still takes the pane aspect on reshape" {
     // to the pane and re-relaxes springs. Without that, a fully-linked vault could never become
     // wide or tall — only zoom with the camera.
     const n = 12;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var edges: [n - 1]Edge = undefined;
     for (0..n - 1) |i| {
         edges[i] = .{ .a = i, .b = i + 1 };
         deg[i] += 1;
         deg[i + 1] += 1;
     }
-    var no_seeds: [n]?dvui.Point = .{null} ** n;
+    var no_seeds: [n]?dvui.Point = @splat(null);
     var base: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &no_seeds, &deg, .{ .aspect = 1 }, &base);
 
     var seeds: [n]?dvui.Point = undefined;
     for (0..n) |i| seeds[i] = base[i];
-    const free: [n]bool = .{false} ** n;
+    const free: [n]bool = @splat(false);
     var wide: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{
         .anchored = &free,
@@ -2681,13 +2681,13 @@ test "same-folder notes huddle closer than cross-folder peers" {
     // Three notes in `proj/` and three in `other/`, no wikilinks. Folder kinship alone should
     // pull each cohort together — without it they scatter like any other loners.
     const n = 6;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var no_edges: [0]Edge = .{};
     const paths = [_][]const u8{
         "proj/a.md",  "proj/b.md",  "proj/c.md",
         "other/x.md", "other/y.md", "other/z.md",
     };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &seeds, &deg, .{ .paths = &paths }, &out);
 
@@ -2720,10 +2720,10 @@ test "a linked pair sits tighter than neighbouring loners" {
     // spacing of unlinked ones. Same packing slot for everyone used to put both at one lattice
     // step, which is why clusters never looked tighter than the loners around them.
     const n = 18;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     const edges = [_]Edge{ .{ .a = 0, .b = 1 }, .{ .a = 1, .b = 2 }, .{ .a = 2, .b = 0 } };
     for (0..3) |i| deg[i] = 2;
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{}, &out);
 
@@ -2742,7 +2742,7 @@ test "a linked pair sits tighter than neighbouring loners" {
 test "a cluster sits nearer the middle than the loose notes do" {
     // Clusters in, singles out — the reading the user gets from the shape of the board.
     const n = 24;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     for (0..6) |i| deg[i] = 2;
     const edges = [_]Edge{
         .{ .a = 0, .b = 1 },
@@ -2752,7 +2752,7 @@ test "a cluster sits nearer the middle than the loose notes do" {
         .{ .a = 4, .b = 5 },
         .{ .a = 5, .b = 0 },
     };
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &edges, &seeds, &deg, .{}, &out);
 
@@ -2769,9 +2769,9 @@ test "a newly linked pair is parked near itself, not out past the vault" {
     // board — so two notes finding each other threw them both to the rim.
     const n = 20;
     const slot = slotSpacingFor(n);
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var no_edges: [0]Edge = .{};
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out1: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, &no_edges, &seeds, &deg, .{}, &out1);
 
@@ -2780,10 +2780,10 @@ test "a newly linked pair is parked near itself, not out past the vault" {
 
     // Link 4—5, anchor everyone else.
     const linked = [_]Edge{.{ .a = 4, .b = 5 }};
-    var deg2: [n]u32 = .{0} ** n;
+    var deg2: [n]u32 = @splat(0);
     deg2[4] = 1;
     deg2[5] = 1;
-    var anchored: [n]bool = .{true} ** n;
+    var anchored: [n]bool = @splat(true);
     anchored[4] = false;
     anchored[5] = false;
     var seeds2: [n]?dvui.Point = undefined;
@@ -2809,7 +2809,7 @@ test "a triangle inside a cluster does not snap into a straight line" {
     // makes them contend for cells at snap time. Displacing every contender the same fixed
     // direction is what lined them up. See `findFreeCell`.
     const n = 12;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var edges: std.ArrayList(Edge) = .empty;
     defer edges.deinit(testing.allocator);
     try edges.appendSlice(testing.allocator, &.{
@@ -2826,7 +2826,7 @@ test "a triangle inside a cluster does not snap into a straight line" {
         deg[e.b] += 1;
     }
 
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var out: [n]dvui.Point = undefined;
     try targets(testing.allocator, n, edges.items, &seeds, &deg, .{ .aspect = 2 }, &out);
 
@@ -2893,7 +2893,7 @@ test "a group's links stay near the tightest the lattice allows" {
 
     // A chain of triangles: nothing forces a long link, so nothing should be long.
     {
-        var deg: [n]u32 = .{0} ** n;
+        var deg: [n]u32 = @splat(0);
         var edges: std.ArrayList(Edge) = .empty;
         defer edges.deinit(gpa);
         var k: usize = 0;
@@ -2907,7 +2907,7 @@ test "a group's links stay near the tightest the lattice allows" {
             deg[e.a] += 1;
             deg[e.b] += 1;
         }
-        var seeds: [n]?dvui.Point = .{null} ** n;
+        var seeds: [n]?dvui.Point = @splat(null);
         var out: [n]dvui.Point = undefined;
         try targets(gpa, n, edges.items, &seeds, &deg, .{ .aspect = 1.6 }, &out);
 
@@ -2928,7 +2928,7 @@ test "a group's links stay near the tightest the lattice allows" {
     // that is geometry rather than slack — so this only guards against the mean drifting well
     // past what a disc of that many cells measures (~1.7 cells).
     {
-        var deg: [n]u32 = .{0} ** n;
+        var deg: [n]u32 = @splat(0);
         var edges: std.ArrayList(Edge) = .empty;
         defer edges.deinit(gpa);
         for (1..24) |k| try edges.append(gpa, .{ .a = 0, .b = k });
@@ -2937,7 +2937,7 @@ test "a group's links stay near the tightest the lattice allows" {
             deg[e.a] += 1;
             deg[e.b] += 1;
         }
-        var seeds: [n]?dvui.Point = .{null} ** n;
+        var seeds: [n]?dvui.Point = @splat(null);
         var out: [n]dvui.Point = undefined;
         try targets(gpa, n, edges.items, &seeds, &deg, .{ .aspect = 1.6 }, &out);
 
@@ -2962,7 +2962,7 @@ test "a reshape leaves the vault on the lattice" {
     // that was stretched.
     const gpa = testing.allocator;
     const n = 30;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var edges: std.ArrayList(Edge) = .empty;
     defer edges.deinit(gpa);
     for ([_]usize{ 0, 5, 10 }) |b| {
@@ -2980,13 +2980,13 @@ test "a reshape leaves the vault on the lattice" {
         deg[e.b] += 1;
     }
 
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var cur: [n]dvui.Point = undefined;
     try targets(gpa, n, edges.items, &seeds, &deg, .{ .aspect = 3.0 }, &cur);
 
     const snap = snapSpacingFor(n);
     var carried: [n]?dvui.Point = undefined;
-    const free: [n]bool = .{false} ** n;
+    const free: [n]bool = @splat(false);
     // Drag the pane from wide through square to tall, carrying each result into the next the way
     // the panel does.
     for ([_]f32{ 1.6, 1.0, 0.6 }) |a| {
@@ -3024,7 +3024,7 @@ test "files added to a hub one at a time do not end up behind each other" {
     // them, and those are both shorter and clear.
     const gpa = testing.allocator;
     const n = 24;
-    var deg: [n]u32 = .{0} ** n;
+    var deg: [n]u32 = @splat(0);
     var edges: std.ArrayList(Edge) = .empty;
     defer edges.deinit(gpa);
     try edges.append(gpa, .{ .a = 20, .b = 21 });
@@ -3032,7 +3032,7 @@ test "files added to a hub one at a time do not end up behind each other" {
         deg[e.a] += 1;
         deg[e.b] += 1;
     }
-    var seeds: [n]?dvui.Point = .{null} ** n;
+    var seeds: [n]?dvui.Point = @splat(null);
     var cur: [n]dvui.Point = undefined;
     try targets(gpa, n, edges.items, &seeds, &deg, .{ .aspect = 2.2 }, &cur);
 
@@ -3044,7 +3044,7 @@ test "files added to a hub one at a time do not end up behind each other" {
 
         // The anchoring `graph.zig` hands over: the two endpoints of the new link, plus the
         // immediate neighbours of both.
-        var anchored: [n]bool = .{true} ** n;
+        var anchored: [n]bool = @splat(true);
         anchored[0] = false;
         anchored[k] = false;
         for (edges.items) |e| {

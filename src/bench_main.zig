@@ -303,7 +303,7 @@ pub fn main(init: std.process.Init) !void {
             "{s:<22}{s:>7}{s:>8}{s:>9}{s:>8}{s:>10}{s:>8}{s:>9}{s:>8}{s:>8}{s:>9}{s:>11}\n",
             .{ "vault", "notes", "edges", "read", "scan", "resolve", "hop2", "force", "pack", "relax", "snap+ref", "LAYOUT" },
         );
-        std.debug.print("{s}\n", .{"-" ** 117});
+        std.debug.print("{s}\n", .{&@as([117]u8, @splat('-'))});
     }
 
     var i: usize = 1;
@@ -1100,9 +1100,9 @@ fn linkSpreadReport(
 
         // The same sample, split by the busier endpoint's degree.
         const cuts = [_]u32{ 8, 32, 128, 512, std.math.maxInt(u32) };
-        var b_sum: [cuts.len]f64 = .{0} ** cuts.len;
-        var b_far: [cuts.len]usize = .{0} ** cuts.len;
-        var b_n: [cuts.len]usize = .{0} ** cuts.len;
+        var b_sum: [cuts.len]f64 = @splat(0);
+        var b_far: [cuts.len]usize = @splat(0);
+        var b_n: [cuts.len]usize = @splat(0);
         var ei: usize = 0;
         while (ei < edges.len) : (ei += stride) {
             const e = edges[ei];
@@ -1464,7 +1464,7 @@ fn layoutReport(
     // blank annulus the reader sees around the giant component is a trailing zero.
     {
         const rings = 8;
-        var hist: [rings]usize = .{0} ** rings;
+        var hist: [rings]usize = @splat(0);
         var total: usize = 0;
         const n_notes = w.lad.leaf_cell.len;
         const stride = @max(1, n_notes / sample_cap);
@@ -2271,7 +2271,7 @@ fn printStabilityHeader() void {
             "fine p50/p90/max", "region p50/p90/max", "fine%", "region%",
         },
     );
-    std.debug.print("{s}\n", .{"-" ** 120});
+    std.debug.print("{s}\n", .{&@as([120]u8, @splat('-'))});
 }
 
 fn printStabilityRow(label: []const u8, n: usize, e: usize, s: louvain.Stability) void {

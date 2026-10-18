@@ -338,9 +338,9 @@ pub const Field = struct {
         // memoised in `expanded` — the relaxation is paid on the frame a cell first opens and never
         // again, which is the same budget the permutation search lived in.
         const n = kids.len;
-        var p: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
-        var sep_r: [8]f32 = .{0} ** 8;
-        var mass: [8]f32 = .{1} ** 8;
+        var p: [8]Vec2 = @splat(Vec2{ .x = 0, .y = 0 });
+        var sep_r: [8]f32 = @splat(0);
+        var mass: [8]f32 = @splat(1);
         var big: usize = 0;
         for (kids, 0..) |k, i| {
             sep_r[i] = self.separationRadius(lad, k);
@@ -351,8 +351,8 @@ pub const Field = struct {
         }
 
         // Where each child's out-of-cell neighbours lie, as one unit direction per child.
-        var ext_dir: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
-        var ext_mag: [8]f32 = .{0} ** 8;
+        var ext_dir: [8]Vec2 = @splat(Vec2{ .x = 0, .y = 0 });
+        var ext_mag: [8]f32 = @splat(0);
         if (self.opts.ext_k != 0) {
             for (lad.extOf(cell)) |e| {
                 if (e.child >= n or e.toward >= self.pos.len) continue;
@@ -484,7 +484,7 @@ pub const Field = struct {
         }
 
         // Which bodies were touching someone on the previous step. Cohesion skips them.
-        var crowded: [8]bool = .{false} ** 8;
+        var crowded: [8]bool = @splat(false);
 
         var step: usize = 0;
         while (step < relax_steps) : (step += 1) {
@@ -518,7 +518,7 @@ pub const Field = struct {
             }
 
             // separation — last, and it wins
-            crowded = .{false} ** 8;
+            crowded = @splat(false);
             for (0..n) |i| {
                 for (i + 1..n) |j| {
                     var dx = p[j].x - p[i].x;
@@ -635,10 +635,10 @@ pub const Field = struct {
     ) void {
         const n = kids.len;
         const r_parent = self.estimatedRadius(lad, cell);
-        var p: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
-        var sep_r: [8]f32 = .{0} ** 8;
-        var mass: [8]f32 = .{1} ** 8;
-        var sib_deg: [8]f32 = .{1} ** 8;
+        var p: [8]Vec2 = @splat(Vec2{ .x = 0, .y = 0 });
+        var sep_r: [8]f32 = @splat(0);
+        var mass: [8]f32 = @splat(1);
+        var sib_deg: [8]f32 = @splat(1);
         for (kids, 0..) |k, i| {
             sep_r[i] = self.separationRadius(lad, k);
             mass[i] = 1 + lad.cells[k].weight + self.bodyMass(lad.cells[k].body);
@@ -649,8 +649,8 @@ pub const Field = struct {
             sib_deg[sp.j] += sp.w;
         }
 
-        var ext_dir: [8]Vec2 = .{Vec2{ .x = 0, .y = 0 }} ** 8;
-        var ext_mag: [8]f32 = .{0} ** 8;
+        var ext_dir: [8]Vec2 = @splat(Vec2{ .x = 0, .y = 0 });
+        var ext_mag: [8]f32 = @splat(0);
         if (self.opts.ext_k != 0) {
             for (lad.extOf(cell)) |e| {
                 if (e.child >= n or e.toward >= self.pos.len) continue;
