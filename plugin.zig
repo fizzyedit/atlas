@@ -310,7 +310,7 @@ fn zoomGraphToFit(_: *anyopaque) !void {
 ///
 /// There is no dialog of atlas's own here. A note has nothing to configure the way pixi's canvas
 /// dimensions do, and the chooser the user just clicked is already shrinking towards its own
-/// centre — `setExplorerNewFilePath` is what lets fizzy re-aim that close at the row the tree
+/// centre. The `files` service's `reveal` is what lets the tree re-aim that close at the row it
 /// grows a frame later, so the dialog reads as flying into the thing it created.
 ///
 /// Atlas owns no documents (see this file's header), so both the create and the open go through
